@@ -86,6 +86,9 @@ void loadConfig() {
 // 检查推送通道是否有效配置
 bool isPushChannelValid(const PushChannel& ch) {
   if (!ch.enabled) return false;
+  if (ch.url.indexOf('\r') >= 0 || ch.url.indexOf('\n') >= 0 ||
+      ch.key1.indexOf('\r') >= 0 || ch.key1.indexOf('\n') >= 0 ||
+      ch.key2.indexOf('\r') >= 0 || ch.key2.indexOf('\n') >= 0) return false;
   
   switch (ch.type) {
     case PUSH_TYPE_POST_JSON:

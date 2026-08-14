@@ -1,5 +1,6 @@
 #include "modem.h"
 #include "web_handlers.h"
+#include "utf8_validation.h"
 
 // 发送AT命令并获取响应
 String sendATCommand(const char* cmd, unsigned long timeout) {
@@ -178,7 +179,7 @@ static bool smsInfo(const char* message, bool& gsm7, int& units) {
   int gsmUnits = 0;
   int ucsUnits = 0;
   while (*message) {
-    int bytes = pdu.utf8Length(message);
+    int bytes = validUtf8CharLength(message);
     if (bytes < 1) return false;
     unsigned short ucs2[2] = {0, 0};
     int ucsBytes = pdu.utf8_to_ucs2_single(message, ucs2);
@@ -193,7 +194,8 @@ static bool smsInfo(const char* message, bool& gsm7, int& units) {
 }
 
 static int smsCharUnits(const char* text, bool gsm7, int& bytes) {
-  bytes = pdu.utf8Length(text);
+  bytes = validUtf8CharLength(text);
+  if (bytes < 1) return -1;
   unsigned short ucs2[2] = {0, 0};
   int ucsBytes = pdu.utf8_to_ucs2_single(text, ucs2);
   if (!gsm7) return ucsBytes / 2;

@@ -1,7 +1,6 @@
 #include "push.h"
 #include "web_handlers.h"
 #include "config.h"
-#include "web_handlers.h"
 #include <HTTPClient.h>
 #include <mbedtls/md.h>
 #include <base64.h>
@@ -27,7 +26,10 @@ void sendEmailNotification(const char* subject, const char* body) {
     msg.headers.add(rfc822_from, from.c_str());
     String to = "your_email <"; to += config.smtpSendTo; to += ">";
     msg.headers.add(rfc822_to, to.c_str());
-    msg.headers.add(rfc822_subject, subject);
+    String safeSubject = String(subject);
+    safeSubject.replace('\r', ' ');
+    safeSubject.replace('\n', ' ');
+    msg.headers.add(rfc822_subject, safeSubject.c_str());
     msg.text.body(body);
     msg.timestamp = time(nullptr);
     smtp.send(msg);
@@ -40,11 +42,11 @@ void sendEmailNotification(const char* subject, const char* body) {
 // URL编码辅助函数
 String urlEncode(const String& str) {
   String encoded = "";
-  char c;
+  unsigned char c;
   char code0;
   char code1;
   for (unsigned int i = 0; i < str.length(); i++) {
-    c = str.charAt(i);
+    c = static_cast<unsigned char>(str.charAt(i));
     if (c == ' ') {
       encoded += '+';
     } else if (isalnum(c)) {
@@ -94,13 +96,19 @@ int64_t getUtcMillis() {
 String jsonEscape(const String& str) {
   String result = "";
   for (unsigned int i = 0; i < str.length(); i++) {
-    char c = str.charAt(i);
+    unsigned char c = static_cast<unsigned char>(str.charAt(i));
     if (c == '"') result += "\\\"";
     else if (c == '\\') result += "\\\\";
     else if (c == '\n') result += "\\n";
     else if (c == '\r') result += "\\r";
     else if (c == '\t') result += "\\t";
-    else result += c;
+    else if (c < 0x20) {
+      char escaped[7];
+      snprintf(escaped, sizeof(escaped), "\\u%04X", c);
+      result += escaped;
+    } else {
+      result += static_cast<char>(c);
+    }
   }
   return result;
 }
@@ -116,8 +124,16 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   if (needUrl && channel.url.length() == 0) return;
   
   HTTPClient http;
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
   String channelName = channel.name.length() > 0 ? channel.name : ("通道" + String(channel.type));
   logCaptureLn(String("发送到推送通道: " + channelName));
+
+  if ((channel.type == PUSH_TYPE_DINGTALK || channel.type == PUSH_TYPE_FEISHU) &&
+      channel.key1.length() > 0 && !timeSynced) {
+    logCaptureLn(String("时间尚未同步，跳过需要时间签名的推送"));
+    return;
+  }
   
   int httpCode = 0;
   String senderEscaped = jsonEscape(String(sender));
@@ -134,7 +150,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       jsonData += "\"message\":\"" + messageEscaped + "\",";
       jsonData += "\"timestamp\":\"" + timestampEscaped + "\"";
       jsonData += "}";
-      logCaptureLn(String("POST JSON: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -147,7 +162,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       jsonData += "\"title\":\"" + senderEscaped + "\",";
       jsonData += "\"body\":\"" + messageEscaped + "\"";
       jsonData += "}";
-      logCaptureLn(String("BARK JSON: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -163,7 +177,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       getUrl += "sender=" + urlEncode(String(sender));
       getUrl += "&message=" + urlEncode(String(message));
       getUrl += "&timestamp=" + urlEncode(String(timestamp));
-      logCaptureLn(String("GET URL: " + getUrl));
       http.begin(getUrl);
       httpCode = http.GET();
       break;
@@ -194,14 +207,13 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       String jsonData = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
       jsonData += "📱短信通知\\n发送者: " + senderEscaped + "\\n内容: " + messageEscaped + "\\n时间: " + timestampEscaped;
       jsonData += "\"}}";
-      logCaptureLn(String("钉钉: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
 
     case PUSH_TYPE_PUSHPLUS: {
       // PushPlus
-      String pushUrl = channel.url.length() > 0 ? channel.url : "http://www.pushplus.plus/send";
+      String pushUrl = channel.url.length() > 0 ? channel.url : "https://www.pushplus.plus/send";
       http.begin(pushUrl);
       http.addHeader("Content-Type", "application/json");
       // 发送渠道
@@ -215,12 +227,11 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
           }
       }
       String jsonData = "{";
-      jsonData += "\"token\":\"" + channel.key1 + "\",";
+      jsonData += "\"token\":\"" + jsonEscape(channel.key1) + "\",";
       jsonData += "\"title\":\"短信来自: " + senderEscaped + "\",";
       jsonData += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
       jsonData += "\"channel\":\"" + channelValue + "\"";
       jsonData += "}";
-      logCaptureLn(String("PushPlus: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -232,7 +243,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       http.addHeader("Content-Type", "application/x-www-form-urlencoded");
       String postData = "title=" + urlEncode("短信来自: " + String(sender));
       postData += "&desp=" + urlEncode("**发送者:** " + String(sender) + "\n\n**时间:** " + String(timestamp) + "\n\n**内容:**\n\n" + String(message));
-      logCaptureLn(String("Server酱: " + postData));
       httpCode = http.POST(postData);
       break;
     }
@@ -249,7 +259,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       body.replace("{sender}", senderEscaped);
       body.replace("{message}", messageEscaped);
       body.replace("{timestamp}", timestampEscaped);
-      logCaptureLn(String("自定义: " + body));
       httpCode = http.POST(body);
       break;
     }
@@ -286,7 +295,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       
       http.begin(webhookUrl);
       http.addHeader("Content-Type", "application/json");
-      logCaptureLn(String("飞书: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -305,7 +313,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       jsonData += "\"message\":\"" + messageEscaped + "\\n\\n时间: " + timestampEscaped + "\",";
       jsonData += "\"priority\":5";
       jsonData += "}";
-      logCaptureLn(String("Gotify: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -321,12 +328,12 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       http.addHeader("Content-Type", "application/json");
       
       String jsonData = "{";
-      jsonData += "\"chat_id\":\"" + channel.key1 + "\",";
-      String text = "📱短信通知\n发送者: " + senderEscaped + "\n内容: " + messageEscaped + "\n时间: " + timestampEscaped;
-      jsonData += "\"text\":\"" + text + "\"";
+      jsonData += "\"chat_id\":\"" + jsonEscape(channel.key1) + "\",";
+      String text = "📱短信通知\n发送者: " + String(sender) +
+                    "\n内容: " + String(message) + "\n时间: " + String(timestamp);
+      jsonData += "\"text\":\"" + jsonEscape(text) + "\"";
       jsonData += "}";
       
-      logCaptureLn(String("Telegram: " + jsonData));
       httpCode = http.POST(jsonData);
       break;
     }
@@ -338,10 +345,6 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   
   if (httpCode > 0) {
     logCaptureF("[%s] 响应码: %d\n", channelName.c_str(), httpCode);
-    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
-      String response = http.getString();
-      logCaptureLn(String("响应: " + response));
-    }
   } else {
     logCaptureF("[%s] HTTP请求失败: %s\n", channelName.c_str(), http.errorToString(httpCode).c_str());
   }

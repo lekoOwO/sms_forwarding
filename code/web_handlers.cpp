@@ -82,19 +82,22 @@ static void sendActionResult(int status, bool success, const char* code,
   String json = "{\"success\":" + String(success ? "true" : "false") +
                 ",\"code\":\"" + code + "\",\"data\":" + data +
                 ",\"detail\":\"" + jsonEscape(detail) + "\"}";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(status, "application/json", json);
 }
 
 // 从 LittleFS 提供前端构建产物
 void handleRoot() {
   if (!checkAuth()) return;
+  server.sendHeader("Content-Security-Policy", "frame-ancestors 'none'");
+  server.sendHeader("X-Frame-Options", "DENY");
+  server.sendHeader("Cache-Control", "no-store");
   File file = LittleFS.open("/index.html.gz", "r");
   if (!file) {
     server.send(503, "text/plain; charset=utf-8", "Web bundle missing. Build and upload LittleFS.");
     return;
   }
   server.sendHeader("Content-Encoding", "gzip");
-  server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Vary", "Accept-Encoding");
   server.streamFile(file, "text/html; charset=utf-8");
   file.close();
@@ -148,6 +151,7 @@ void handleConfig() {
     json += "\"customBody\":\"" + jsonEscape(channel.customBody) + "\"}";
   }
   json += "]}}";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
@@ -521,8 +525,6 @@ void handleSendSms() {
     code = "ACTION_SMS_CONTENT_REQUIRED";
   } else {
     logCaptureLn(String("网页端发送短信请求"));
-    logCaptureLn(String("目标号码: " + phone));
-    logCaptureLn(String("短信内容: " + content));
     
     success = sendSMS(phone.c_str(), content.c_str());
     code = success ? "ACTION_SMS_SENT" : "ACTION_SMS_FAILED";
@@ -709,6 +711,10 @@ void handlePing() {
 void handleSave() {
   if (!checkAuth()) return;
 
+  String previousSmtpServer = config.smtpServer;
+  int previousSmtpPort = config.smtpPort;
+  String previousSmtpUser = config.smtpUser;
+
   // 账号管理表单：空账号会停用该组，空密码会保留现有密码
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
@@ -741,8 +747,8 @@ void handleSave() {
     config.smtpServer = server.arg("smtpServer");
   }
   if (server.hasArg("smtpPort")) {
-    config.smtpPort = server.arg("smtpPort").toInt();
-    if (config.smtpPort == 0) config.smtpPort = 465;
+    long smtpPort = server.arg("smtpPort").toInt();
+    config.smtpPort = smtpPort > 0 && smtpPort <= 65535 ? smtpPort : 465;
   }
   if (server.hasArg("smtpUser")) {
     config.smtpUser = server.arg("smtpUser");
@@ -752,6 +758,11 @@ void handleSave() {
   }
   if (server.hasArg("smtpSendTo")) {
     config.smtpSendTo = server.arg("smtpSendTo");
+  }
+  if (!server.hasArg("smtpPass") &&
+      (config.smtpServer != previousSmtpServer || config.smtpPort != previousSmtpPort ||
+       config.smtpUser != previousSmtpUser)) {
+    config.smtpPass = "";
   }
   // 管理员 & 黑名单表单：只在字段存在时更新
   if (server.hasArg("adminPhone")) {
@@ -815,6 +826,7 @@ void handleLog() {
     json += "\"" + jsonEscape(logBuffer[pos]) + "\"";
   }
   json += "]";
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
 
@@ -853,6 +865,7 @@ void handleModem() {
     logCaptureLn(String("网页端请求硬重启模组..."));
     sendActionResult(200, true, "ACTION_MODEM_HARD_RESTARTING");
     resetModule();
+    busy = false;
     return;
   }
   else if (action == "signal") {

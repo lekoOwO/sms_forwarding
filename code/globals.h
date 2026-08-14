@@ -24,6 +24,7 @@
 
 #define SERIAL_BUFFER_SIZE 500
 #define MAX_PDU_LENGTH 300
+#define PDU_WAIT_TIMEOUT_MS 5000
 
 // 全局变量声明
 extern Config config;
