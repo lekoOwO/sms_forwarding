@@ -12,12 +12,15 @@ String sendATCommand(const char* cmd, unsigned long timeout) {
   while (millis() - start < timeout) {
     if (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
+      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
       if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
         // 读取剩余数据（最多 50ms）
         unsigned long t = millis();
         while (millis() - t < 50) {
-          if (Serial1.available()) resp += (char)Serial1.read();
+          if (Serial1.available()) {
+            char remaining = Serial1.read();
+            if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += remaining;
+          }
           server.handleClient();
         }
         return resp;
@@ -138,7 +141,7 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   while (millis() - start < timeout) {
     if (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
+      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
       if (resp.indexOf("OK") >= 0) return true;
       if (resp.indexOf("ERROR") >= 0) return false;
     }
@@ -156,7 +159,7 @@ bool waitCEREG() {
   while (millis() - start < 2000) {
     if (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
+      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
       if (resp.indexOf("+CEREG:") >= 0) {
         if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) return true;
         if (resp.indexOf(",0") >= 0 || resp.indexOf(",2") >= 0 || 
@@ -249,7 +252,7 @@ static bool sendEncodedPdu(int pduLen) {
   while (millis() - start < 30000) {
     while (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
+      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
       logCapture(String(c));
       if (resp.indexOf("OK") >= 0) {
         logCaptureLn(String("\n短信发送成功"));

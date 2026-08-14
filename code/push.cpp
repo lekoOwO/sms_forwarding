@@ -6,6 +6,15 @@
 #include <base64.h>
 #include <sys/time.h>
 
+static bool hmacSha256(const String& key, const String& data, uint8_t output[32]) {
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  return info != nullptr &&
+         mbedtls_md_hmac(info,
+                         reinterpret_cast<const unsigned char*>(key.c_str()), key.length(),
+                         reinterpret_cast<const unsigned char*>(data.c_str()), data.length(),
+                         output) == 0;
+}
+
 // 发送邮件通知函数
 void sendEmailNotification(const char* subject, const char* body) {
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
@@ -69,14 +78,8 @@ String urlEncode(const String& str) {
 String dingtalkSign(const String& secret, int64_t timestamp) {
   String stringToSign = String(timestamp) + "\n" + secret;
   
-  uint8_t hmacResult[32];
-  mbedtls_md_context_t ctx;
-  mbedtls_md_init(&ctx);
-  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-  mbedtls_md_hmac_starts(&ctx, (const unsigned char*)secret.c_str(), secret.length());
-  mbedtls_md_hmac_update(&ctx, (const unsigned char*)stringToSign.c_str(), stringToSign.length());
-  mbedtls_md_hmac_finish(&ctx, hmacResult);
-  mbedtls_md_free(&ctx);
+  uint8_t hmacResult[32] = {0};
+  if (!hmacSha256(secret, stringToSign, hmacResult)) return "";
   
   String base64Encoded = base64::encode(hmacResult, 32);
   return urlEncode(base64Encoded);
@@ -191,6 +194,10 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         // 获取UTC毫秒级时间戳（钉钉要求）
         int64_t ts = getUtcMillis();
         String sign = dingtalkSign(channel.key1, ts);
+        if (sign.length() == 0) {
+          logCaptureLn(String("钉钉签名失败，跳过发送"));
+          return;
+        }
         if (webhookUrl.indexOf('?') == -1) {
           webhookUrl += "?";
         } else {
@@ -274,13 +281,11 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         int64_t ts = time(nullptr);
         // 飞书签名: base64(HMAC-SHA256(key=timestamp + "\n" + secret, msg=""))
         String stringToSign = String(ts) + "\n" + channel.key1;
-        uint8_t hmacResult[32];
-        mbedtls_md_context_t ctx;
-        mbedtls_md_init(&ctx);
-        mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
-        mbedtls_md_hmac_starts(&ctx, (const unsigned char*)stringToSign.c_str(), stringToSign.length());
-        mbedtls_md_hmac_finish(&ctx, hmacResult);
-        mbedtls_md_free(&ctx);
+        uint8_t hmacResult[32] = {0};
+        if (!hmacSha256(stringToSign, "", hmacResult)) {
+          logCaptureLn(String("飞书签名失败，跳过发送"));
+          return;
+        }
         String sign = base64::encode(hmacResult, 32);
         
         jsonData += "\"timestamp\":\"" + String(ts) + "\",";

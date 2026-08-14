@@ -24,14 +24,24 @@ static void _logCommit() {
   }
 }
 
+static void _logAppendFragment(const String& msg) {
+  if (_logLine.length() >= LOG_LINE_MAX_LENGTH) return;
+  _logLine += msg.substring(0, LOG_LINE_MAX_LENGTH - _logLine.length());
+}
+
+static void _logAppendFragment(const char* msg) {
+  if (_logLine.length() >= LOG_LINE_MAX_LENGTH) return;
+  _logLine.concat(msg, LOG_LINE_MAX_LENGTH - _logLine.length());
+}
+
 void logCapture(const String& msg) {
   Serial.print(msg);
-  _logLine += msg;
+  _logAppendFragment(msg);
 }
 
 void logCapture(const char* msg) {
   Serial.print(msg);
-  _logLine += msg;
+  _logAppendFragment(msg);
 }
 
 void logCaptureF(const char* fmt, ...) {
@@ -41,7 +51,7 @@ void logCaptureF(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
-  _logLine += buf;
+  _logAppendFragment(buf);
   // 如果格式化字符串以 \n 结尾，则提交此行
   size_t len = strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') {
@@ -52,13 +62,13 @@ void logCaptureF(const char* fmt, ...) {
 
 void logCaptureLn(const String& msg) {
   Serial.println(msg);
-  _logLine += msg;
+  _logAppendFragment(msg);
   _logCommit();
 }
 
 void logCaptureLn(const char* msg) {
   Serial.println(msg);
-  _logLine += msg;
+  _logAppendFragment(msg);
   _logCommit();
 }
 
@@ -574,7 +584,7 @@ void handlePing() {
   while (millis() - start < 35000) {
     while (Serial1.available()) {
       char c = Serial1.read();
-      resp += c;
+      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
       logCapture(String(c));  // 调试输出
       
       // 检查是否收到OK

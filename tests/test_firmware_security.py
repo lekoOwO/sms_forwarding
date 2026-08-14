@@ -89,6 +89,25 @@ int main() {
         hard_reset = handlers[handlers.index('else if (action == "hardreset")'):]
         self.assertLess(hard_reset.index("busy = false;"), hard_reset.index("return;"))
 
+    def test_modem_and_log_buffers_are_bounded(self):
+        globals_header = (ROOT / "code/globals.h").read_text()
+        modem = (ROOT / "code/modem.cpp").read_text()
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        self.assertIn("#define MODEM_RESPONSE_MAX_LENGTH", globals_header)
+        self.assertIn("#define LOG_LINE_MAX_LENGTH", globals_header)
+        self.assertGreaterEqual(
+            modem.count("resp.length() < MODEM_RESPONSE_MAX_LENGTH"), 5
+        )
+        self.assertIn("_logAppendFragment(msg);", handlers)
+        self.assertNotIn("_logLine += msg;", handlers)
+
+    def test_hmac_failures_abort_signed_pushes(self):
+        push = (ROOT / "code/push.cpp").read_text()
+        self.assertIn("static bool hmacSha256", push)
+        self.assertGreaterEqual(push.count("if (!hmacSha256("), 2)
+        self.assertIn("if (sign.length() == 0)", push)
+        self.assertNotIn("uint8_t hmacResult[32];", push)
+
 
 if __name__ == "__main__":
     unittest.main()

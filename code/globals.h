@@ -25,6 +25,8 @@
 #define SERIAL_BUFFER_SIZE 500
 #define MAX_PDU_LENGTH 300
 #define PDU_WAIT_TIMEOUT_MS 5000
+#define MODEM_RESPONSE_MAX_LENGTH 1024
+#define LOG_LINE_MAX_LENGTH 512
 
 // 全局变量声明
 extern Config config;
