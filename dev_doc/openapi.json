@@ -1,0 +1,562 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SMS Forwarding Device API",
+    "version": "1.0.0",
+    "description": "The ESP32-C3 management API. All routes require HTTP Basic Auth. The API uses plain HTTP on a trusted network."
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4174",
+      "description": "Local mock server. The Compose LAN service disables authentication."
+    },
+    {
+      "url": "{deviceUrl}",
+      "description": "ESP32-C3 device",
+      "variables": {
+        "deviceUrl": {
+          "default": "http://192.168.1.50"
+        }
+      }
+    }
+  ],
+  "security": [
+    {
+      "basicAuth": []
+    }
+  ],
+  "tags": [
+    { "name": "UI" },
+    { "name": "Configuration" },
+    { "name": "Messaging" },
+    { "name": "Device" }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["UI"],
+        "summary": "Get the management page",
+        "responses": {
+          "200": { "$ref": "#/components/responses/ManagementPage" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": {
+            "description": "The LittleFS Web bundle is not available.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/tools": {
+      "get": {
+        "tags": ["UI"],
+        "summary": "Get the management page from the tools alias",
+        "responses": {
+          "200": { "$ref": "#/components/responses/ManagementPage" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": {
+            "description": "The LittleFS Web bundle is not available."
+          }
+        }
+      }
+    },
+    "/sms": {
+      "get": {
+        "tags": ["UI"],
+        "summary": "Get the management page from the messaging alias",
+        "responses": {
+          "200": { "$ref": "#/components/responses/ManagementPage" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": {
+            "description": "The LittleFS Web bundle is not available."
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Get the device state and configuration",
+        "description": "Password values are empty strings in this response.",
+        "responses": {
+          "200": {
+            "description": "The current state and configuration.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DeviceSnapshot" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/save": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Update the configuration",
+        "description": "The request can contain one configuration section. A blank account username disables that account. A blank account password keeps its stored password. The device restores the default account when no usable account remains. A present empty smtpPass clears the SMTP password.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": { "$ref": "#/components/schemas/ConfigUpdate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The configuration was stored.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/sendsms": {
+      "post": {
+        "tags": ["Messaging"],
+        "summary": "Send an SMS",
+        "description": "The device splits long content into multipart SMS messages. One request can contain at most 255 encoded parts.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "type": "object",
+                "required": ["phone", "content"],
+                "properties": {
+                  "phone": { "type": "string" },
+                  "content": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The result from the modem.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/ping": {
+      "post": {
+        "tags": ["Device"],
+        "summary": "Ping 8.8.8.8 through the cellular modem",
+        "description": "The device enables the PDP context for this operation. Then the device disables the PDP context.",
+        "responses": {
+          "200": {
+            "description": "The ping result.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/query": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Query device information",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["ati", "signal", "siminfo", "network", "wifi"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The query result. The localized status is selected from code; parsed diagnostic values are returned in data.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/flight": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Query or change flight mode",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["query", "toggle", "on", "off"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The flight-mode result.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/at": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Send an AT command",
+        "parameters": [
+          {
+            "name": "cmd",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The raw modem response.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/log": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Get the device log",
+        "responses": {
+          "200": {
+            "description": "Up to 120 log lines in chronological order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "maxItems": 120,
+                  "items": { "type": "string" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/modem": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Control or query the modem",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["restart", "hardreset", "signal", "operator", "imei"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The modem operation result.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": {
+            "description": "The modem is busy.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/wifi": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Reconnect WiFi",
+        "parameters": [
+          {
+            "name": "action",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["restart"]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The WiFi operation result.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": {
+            "description": "WiFi is busy.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ActionResult" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "basicAuth": {
+        "type": "http",
+        "scheme": "basic"
+      }
+    },
+    "responses": {
+      "ManagementPage": {
+        "description": "The same production HTML that the ESP32-C3 serves.",
+        "headers": {
+          "Content-Encoding": {
+            "description": "The firmware sends gzip. The mock server can send an uncompressed response.",
+            "schema": { "type": "string", "examples": ["gzip"] }
+          }
+        },
+        "content": {
+          "text/html": {
+            "schema": { "type": "string" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "HTTP Basic Auth failed.",
+        "headers": {
+          "WWW-Authenticate": {
+            "required": true,
+            "schema": { "type": "string", "examples": ["Basic realm=\"SMS Forwarding\""] }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ActionResult": {
+        "type": "object",
+        "required": ["success", "code", "data", "detail"],
+        "additionalProperties": false,
+        "properties": {
+          "success": { "type": "boolean" },
+          "code": {
+            "type": "string",
+            "description": "Stable code translated by the frontend. Firmware and mock server expose the same set.",
+            "enum": [
+              "ACTION_CONFIG_SAVED",
+              "ACTION_SMS_PHONE_REQUIRED",
+              "ACTION_SMS_CONTENT_REQUIRED",
+              "ACTION_SMS_SENT",
+              "ACTION_SMS_FAILED",
+              "ACTION_PING_OK",
+              "ACTION_PING_MODEM_ERROR",
+              "ACTION_PING_UNREACHABLE",
+              "ACTION_PING_TIMEOUT",
+              "ACTION_QUERY_OK",
+              "ACTION_QUERY_FAILED",
+              "ACTION_QUERY_UNKNOWN",
+              "ACTION_FLIGHT_STATUS_NORMAL",
+              "ACTION_FLIGHT_STATUS_OFF",
+              "ACTION_FLIGHT_STATUS_ON",
+              "ACTION_FLIGHT_STATUS_UNKNOWN",
+              "ACTION_FLIGHT_ENABLED",
+              "ACTION_FLIGHT_DISABLED",
+              "ACTION_FLIGHT_FAILED",
+              "ACTION_UNKNOWN",
+              "ACTION_AT_REQUIRED",
+              "ACTION_AT_OK",
+              "ACTION_AT_TIMEOUT",
+              "ACTION_MODEM_BUSY",
+              "ACTION_MODEM_RESTARTING",
+              "ACTION_MODEM_HARD_RESTARTING",
+              "ACTION_MODEM_OK",
+              "ACTION_MODEM_FAILED",
+              "ACTION_WIFI_BUSY",
+              "ACTION_WIFI_RESTARTING"
+            ]
+          },
+          "data": { "$ref": "#/components/schemas/ActionData" },
+          "detail": {
+            "type": "string",
+            "description": "Raw diagnostic text for failures. It is empty when code and data are sufficient."
+          }
+        }
+      },
+      "ActionData": {
+        "type": "object",
+        "description": "Structured operation output. Fields are present only when relevant to the requested action.",
+        "additionalProperties": false,
+        "properties": {
+          "manufacturer": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "revision": { "type": ["string", "null"] },
+          "rsrpDbm": { "type": ["number", "null"] },
+          "rsrqDb": { "type": ["number", "null"] },
+          "cesq": { "type": "string" },
+          "imsi": { "type": ["string", "null"] },
+          "iccid": { "type": ["string", "null"] },
+          "msisdn": { "type": ["string", "null"] },
+          "registration": { "type": ["integer", "null"] },
+          "operator": { "type": ["string", "null"] },
+          "pdpActive": { "type": "boolean" },
+          "apn": { "type": ["string", "null"] },
+          "wifiStatus": { "type": "integer" },
+          "ssid": { "type": ["string", "null"] },
+          "rssiDbm": { "type": "integer" },
+          "ip": { "type": "string" },
+          "gateway": { "type": "string" },
+          "netmask": { "type": "string" },
+          "dns": { "type": "string" },
+          "mac": { "type": "string" },
+          "bssid": { "type": "string" },
+          "channel": { "type": "integer" },
+          "mode": { "type": "integer" },
+          "raw": { "type": "string" },
+          "latencyMs": { "type": "integer" },
+          "ttl": { "type": ["integer", "null"] },
+          "signalDbm": { "type": ["integer", "null"] },
+          "rssi": { "type": "integer" },
+          "ber": { "type": "integer" },
+          "imei": { "type": "string" }
+        }
+      },
+      "WebAccount": {
+        "type": "object",
+        "required": ["username", "password"],
+        "additionalProperties": false,
+        "properties": {
+          "username": { "type": "string" },
+          "password": { "type": "string", "const": "" }
+        }
+      },
+      "PushChannel": {
+        "type": "object",
+        "required": ["enabled", "type", "name", "url", "key1", "key2", "customBody"],
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "type": { "type": "integer", "minimum": 0, "maximum": 10 },
+          "name": { "type": "string" },
+          "url": { "type": "string" },
+          "key1": { "type": "string" },
+          "key2": { "type": "string" },
+          "customBody": { "type": "string" }
+        }
+      },
+      "DeviceSnapshot": {
+        "type": "object",
+        "required": ["status", "config"],
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "object",
+            "required": ["ip", "wifiSsid", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels"],
+            "additionalProperties": false,
+            "properties": {
+              "ip": { "type": "string" },
+              "wifiSsid": { "type": "string" },
+              "freeHeapKb": { "type": "integer", "minimum": 0 },
+              "uptimeSeconds": { "type": "integer", "minimum": 0 },
+              "modemReady": { "type": "boolean" },
+              "emailConfigured": { "type": "boolean" },
+              "enabledPushChannels": { "type": "integer", "minimum": 0, "maximum": 5 }
+            }
+          },
+          "config": {
+            "type": "object",
+            "required": ["webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "pushChannels"],
+            "additionalProperties": false,
+            "properties": {
+              "webAccounts": {
+                "type": "array",
+                "minItems": 10,
+                "maxItems": 10,
+                "items": { "$ref": "#/components/schemas/WebAccount" }
+              },
+              "smtpServer": { "type": "string" },
+              "smtpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "smtpUser": { "type": "string" },
+              "smtpPass": { "type": "string", "const": "" },
+              "smtpSendTo": { "type": "string" },
+              "adminPhone": { "type": "string" },
+              "numberBlackList": { "type": "string" },
+              "pushChannels": {
+                "type": "array",
+                "minItems": 5,
+                "maxItems": 5,
+                "items": { "$ref": "#/components/schemas/PushChannel" }
+              }
+            }
+          }
+        }
+      },
+      "ConfigUpdate": {
+        "type": "object",
+        "minProperties": 1,
+        "additionalProperties": false,
+        "properties": {
+          "smtpServer": { "type": "string" },
+          "smtpPort": { "type": "integer", "minimum": 0, "maximum": 65535 },
+          "smtpUser": { "type": "string" },
+          "smtpPass": { "type": "string" },
+          "smtpSendTo": { "type": "string" },
+          "adminPhone": { "type": "string" },
+          "numberBlackList": { "type": "string" }
+        },
+        "patternProperties": {
+          "^account[0-9]user$": { "type": "string" },
+          "^account[0-9]pass$": { "type": "string" },
+          "^push[0-4]en$": { "type": "string", "enum": ["on"] },
+          "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 10 },
+          "^push[0-4](name|url|key1|key2|body)$": { "type": "string" }
+        }
+      }
+    }
+  }
+}

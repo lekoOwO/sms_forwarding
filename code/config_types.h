@@ -20,6 +20,7 @@ enum PushType {
 
 // 最大推送通道数
 #define MAX_PUSH_CHANNELS 5
+#define MAX_WEB_ACCOUNTS 10
 
 // 推送通道配置（通用设计，支持多种推送方式）
 struct PushChannel {
@@ -32,6 +33,11 @@ struct PushChannel {
   String customBody;      // 自定义请求体模板（使用 {sender} {message} {timestamp} 占位符）
 };
 
+struct WebAccount {
+  String username;
+  String password;
+};
+
 // 配置参数结构体
 struct Config {
   String smtpServer;
@@ -41,8 +47,7 @@ struct Config {
   String smtpSendTo;
   String adminPhone;
   PushChannel pushChannels[MAX_PUSH_CHANNELS];  // 多推送通道
-  String webUser;      // Web管理账号
-  String webPass;      // Web管理密码
+  WebAccount webAccounts[MAX_WEB_ACCOUNTS];
   String numberBlackList;  // 号码黑名单（换行符分隔）
 };
 

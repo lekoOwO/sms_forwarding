@@ -10,8 +10,13 @@ void saveConfig() {
   preferences.putString("smtpPass", config.smtpPass);
   preferences.putString("smtpSendTo", config.smtpSendTo);
   preferences.putString("adminPhone", config.adminPhone);
-  preferences.putString("webUser", config.webUser);
-  preferences.putString("webPass", config.webPass);
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
+    String prefix = "account" + String(i);
+    preferences.putString((prefix + "user").c_str(), config.webAccounts[i].username);
+    preferences.putString((prefix + "pass").c_str(), config.webAccounts[i].password);
+  }
+  preferences.putString("webUser", config.webAccounts[0].username);
+  preferences.putString("webPass", config.webAccounts[0].password);
   preferences.putString("numBlkList", config.numberBlackList);
   
   // 保存推送通道配置
@@ -39,8 +44,17 @@ void loadConfig() {
   config.smtpPass = preferences.getString("smtpPass", "");
   config.smtpSendTo = preferences.getString("smtpSendTo", "");
   config.adminPhone = preferences.getString("adminPhone", "");
-  config.webUser = preferences.getString("webUser", DEFAULT_WEB_USER);
-  config.webPass = preferences.getString("webPass", DEFAULT_WEB_PASS);
+  bool hasAccountList = preferences.isKey("account0user");
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
+    String prefix = "account" + String(i);
+    if (i == 0 && !hasAccountList) {
+      config.webAccounts[i].username = preferences.getString("webUser", DEFAULT_WEB_USER);
+      config.webAccounts[i].password = preferences.getString("webPass", DEFAULT_WEB_PASS);
+    } else {
+      config.webAccounts[i].username = preferences.getString((prefix + "user").c_str(), "");
+      config.webAccounts[i].password = preferences.getString((prefix + "pass").c_str(), "");
+    }
+  }
   config.numberBlackList = preferences.getString("numBlkList", "");
   
   // 加载推送通道配置

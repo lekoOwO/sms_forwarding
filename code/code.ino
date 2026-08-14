@@ -1,14 +1,11 @@
 #include "globals.h"
+#include <LittleFS.h>
 #include "wifi_config.h"
 #include "config.h"
 #include "web_handlers.h"
-#include "web_handlers.h"
 #include "modem.h"
-#include "web_handlers.h"
 #include "push.h"
-#include "web_handlers.h"
 #include "sms_process.h"
-#include "web_handlers.h"
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
@@ -55,7 +52,12 @@ void setup() {
     ESP.restart();
   }
 
+  if (!LittleFS.begin(false)) {
+    logCaptureLn(String("LittleFS挂载失败，管理页面不可用"));
+  }
+
   server.on("/", handleRoot);
+  server.on("/api/config", handleConfig);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/tools", handleRoot);
   server.on("/sms", handleRoot);

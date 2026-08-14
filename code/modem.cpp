@@ -167,33 +167,61 @@ bool waitCEREG() {
   return false;
 }
 
-// 发送短信（PDU模式）
-bool sendSMS(const char* phoneNumber, const char* message) {
-  logCaptureLn(String("准备发送短信..."));
-  logCapture(String("目标号码: ")); logCaptureLn(String(phoneNumber));
-  logCapture(String("短信内容: ")); logCaptureLn(String(message));
+static bool isGsm7Extension(unsigned short value) {
+  return value == 0x000C || value == '^' || value == '{' || value == '}' ||
+         value == '\\' || value == '[' || value == '~' || value == ']' ||
+         value == '|' || value == 0x20AC;
+}
 
-  // 使用pdulib编码PDU
-  pdu.setSCAnumber();  // 使用默认短信中心
-  int pduLen = pdu.encodePDU(phoneNumber, message);
-  
-  if (pduLen < 0) {
-    logCapture(String("PDU编码失败，错误码: "));
-    logCaptureLn(String(pduLen));
-    return false;
+static bool smsInfo(const char* message, bool& gsm7, int& units) {
+  gsm7 = true;
+  int gsmUnits = 0;
+  int ucsUnits = 0;
+  while (*message) {
+    int bytes = pdu.utf8Length(message);
+    if (bytes < 1) return false;
+    unsigned short ucs2[2] = {0, 0};
+    int ucsBytes = pdu.utf8_to_ucs2_single(message, ucs2);
+    unsigned short value = (ucs2[0] << 8) | (ucs2[0] >> 8);
+    if (!pdu.isGSM7(&value)) gsm7 = false;
+    gsmUnits += isGsm7Extension(value) ? 2 : 1;
+    ucsUnits += ucsBytes / 2;
+    message += bytes;
   }
-  
-  logCapture(String("PDU数据: ")); logCaptureLn(String(pdu.getSMS()));
-  logCapture(String("PDU长度: ")); logCaptureLn(String(pduLen));
-  
-  // 发送AT+CMGS命令
-  String cmgsCmd = "AT+CMGS=";
-  cmgsCmd += pduLen;
-  
+  units = gsm7 ? gsmUnits : ucsUnits;
+  return true;
+}
+
+static int smsCharUnits(const char* text, bool gsm7, int& bytes) {
+  bytes = pdu.utf8Length(text);
+  unsigned short ucs2[2] = {0, 0};
+  int ucsBytes = pdu.utf8_to_ucs2_single(text, ucs2);
+  if (!gsm7) return ucsBytes / 2;
+  unsigned short value = (ucs2[0] << 8) | (ucs2[0] >> 8);
+  return isGsm7Extension(value) ? 2 : 1;
+}
+
+static int smsPartCount(const char* message, bool gsm7, int limit) {
+  int parts = 1;
+  int used = 0;
+  while (*message) {
+    int bytes = 0;
+    int units = smsCharUnits(message, gsm7, bytes);
+    if (bytes < 1 || units < 1 || units > limit) return -1;
+    if (used + units > limit) {
+      parts++;
+      used = 0;
+    }
+    used += units;
+    message += bytes;
+  }
+  return parts;
+}
+
+static bool sendEncodedPdu(int pduLen) {
   while (Serial1.available()) Serial1.read();
-  Serial1.println(cmgsCmd);
+  Serial1.println("AT+CMGS=" + String(pduLen));
   
-  // 等待 > 提示符
   unsigned long start = millis();
   bool gotPrompt = false;
   while (millis() - start < 5000) {
@@ -213,11 +241,7 @@ bool sendSMS(const char* phoneNumber, const char* message) {
     return false;
   }
   
-  // 发送PDU数据
   Serial1.print(pdu.getSMS());
-  Serial1.write(0x1A);  // Ctrl+Z 结束
-  
-  // 等待响应
   start = millis();
   String resp = "";
   while (millis() - start < 30000) {
@@ -238,4 +262,41 @@ bool sendSMS(const char* phoneNumber, const char* message) {
   }
   logCaptureLn(String("短信发送超时"));
   return false;
+}
+
+// 发送短信（PDU模式，长内容自动拆成 concatenated SMS）
+bool sendSMS(const char* phoneNumber, const char* message) {
+  bool gsm7 = true;
+  int units = 0;
+  if (!smsInfo(message, gsm7, units)) return false;
+
+  int singleLimit = gsm7 ? 160 : 70;
+  int partLimit = gsm7 ? 152 : 66;
+  int totalParts = units <= singleLimit ? 1 : smsPartCount(message, gsm7, partLimit);
+  if (totalParts < 1 || totalParts > 255) return false;
+
+  pdu.setSCAnumber();
+  unsigned short reference = (unsigned short)(millis() & 0xFFFF);
+  if (reference == 0) reference = 1;
+  const char* cursor = message;
+
+  for (int partNumber = 1; partNumber <= totalParts; partNumber++) {
+    String part;
+    int used = 0;
+    int limit = totalParts == 1 ? singleLimit : partLimit;
+    while (*cursor) {
+      int bytes = 0;
+      int charUnits = smsCharUnits(cursor, gsm7, bytes);
+      if (used + charUnits > limit) break;
+      part.concat(cursor, bytes);
+      cursor += bytes;
+      used += charUnits;
+    }
+
+    int pduLen = totalParts == 1
+      ? pdu.encodePDU(phoneNumber, part.c_str())
+      : pdu.encodePDU(phoneNumber, part.c_str(), reference, totalParts, partNumber);
+    if (pduLen < 0 || !sendEncodedPdu(pduLen)) return false;
+  }
+  return true;
 }

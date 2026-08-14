@@ -1,185 +1,153 @@
-# 系统架构
+# 系統架構
 
-## 模块依赖关系
+## 執行模型
 
-```
-                    ┌─────────────────────┐
-                    │    config_types.h    │  (枚举/结构体/常量，无依赖)
-                    └─────────┬───────────┘
-                              │
-                    ┌─────────▼───────────┐
-                    │     globals.h       │  (全局变量声明 + 公共头文件)
-                    │     globals.cpp     │  (全局变量定义)
-                    └─────────┬───────────┘
-                              │
-        ┌─────────┬───────────┼───────────┬───────────┐
-        │         │           │           │           │
-   ┌────▼───┐ ┌───▼────┐ ┌───▼────┐ ┌───▼────┐ ┌───▼────┐
-   │config  │ │ modem  │ │ push   │ │sms_prc │ │web_hdl │
-   │.h/.cpp │ │.h/.cpp │ │.h/.cpp │ │.h/.cpp │ │.h/.cpp │
-   └────────┘ └───┬──┬─┘ └───┬─┬──┘ └───┬────┘ └───┬────┘
-                  │  │       │ │        │          │
-                  │  └───────┼─┼────────┘    ┌─────┘
-                  │          │ └─────────────┘
-                  │    ┌─────▼──────┐    ┌───▼────┐
-                  │    │sms_process │    │web_html│
-                  │    │  .h/.cpp   │    │.h/.cpp │
-                  │    └────────────┘    └────────┘
-         ┌────────▼─────────┐
-         │    code.ino      │  (入口: setup + loop)
-         │ (wifi_config.h)  │
-         └──────────────────┘
-```
+韌體使用標準 Arduino 單執行緒事件迴圈。HTTP、UART、長簡訊逾時、SMTP
+與推送沒有獨立工作執行緒；任何阻塞操作都會推遲其他工作。現有 AT 等待
+迴圈多半穿插 `server.handleClient()`，修改時須保留這項特性。
 
-箭头方向 = `#include` 依赖方向。`config_types.h` 是最底层，`code.ino` 是最顶层。
+核心全域服務由 `globals.cpp` 建立：`WebServer(80)`、NVS `Preferences`、
+`PDU(4096)`、`WiFiClientSecure` 與 `SMTPClient`。
 
-## 数据流总览
+## 啟動順序
 
-### 短信接收流程
+目前 `setup()` 的實際順序如下：
 
-```
-4G模组 UART
-    │
-    ▼
-checkSerial1URC()          [sms_process.cpp]
-    │  逐行读取 Serial1
-    │  识别 "+CMT:" 头
-    │  接收 PDU hex 数据
-    ▼
-pdu.decodePDU()            [pdulib 库]
-    │  提取 sender / timestamp / text
-    │  提取长短信 concatInfo (refNumber, partNumber, totalParts)
-    ▼
-┌─[长短信? totalParts > 1]─┐
-│                           │
-▼ 是                     ▼ 否 (普通短信)
-findOrCreateConcatSlot()    │
-  → 缓存分段                │
-  → 收齐后合并              │
-  → assembleConcatSms()     │
-         │                  │
-         └──────┬───────────┘
-                ▼
-         processSmsContent()
-           ├── isInNumberBlackList()? → 忽略
-           ├── isAdmin()? → processAdminCommand()
-           │                  ├── "SMS:号码:内容" → sendSMS()
-           │                  └── "RESET" → resetModule() + ESP.restart()
-           ├── sendSMSToServer()     [push.cpp]
-           │     └── sendToChannel() × N
-           └── sendEmailNotification()  [push.cpp]
+1. 初始化 LED、USB Serial 與 GPIO 4 RX / GPIO 3 TX 的 `Serial1`。
+2. 以 GPIO 5 對模組斷電再上電。
+3. 清空長簡訊緩衝、從 NVS 載入設定並計算 `configValid`。
+4. 連接 WiFi；20 秒未連上就重新啟動 ESP32。
+5. 掛載 LittleFS，註冊並啟動 HTTP server，因此後續慢操作期間頁面已可存取。
+6. 嘗試 NTP 同步，然後將 SMTP 使用的 TLS client 設為不驗證憑證。
+7. 設定有效時寄出啟動通知。
+8. 執行 `modemInit()`：AT 握手、讀取型號、停用 PDP、設定簡訊 URC 與
+   PDU 模式，最後等待 LTE 註冊。
+
+AT 握手、`CGACT`（ML307Y 除外）、`CNMI` 與 `CMGF` 目前會持續重試；網路
+註冊最多輪詢 30 次。這兩種策略不可在文件中混為同一種有限重試。
+
+## 主迴圈
+
+`loop()` 每輪依序：
+
+1. 處理一輪 HTTP client。
+2. 設定無效時，每秒輸出管理頁位址提示。
+3. 轉發超過 30 秒仍不完整的長簡訊。
+4. 將 USB Serial 的一個 byte 透傳到模組 UART。
+5. 讀取並處理一行模組 URC。
+
+## 簡訊資料流
+
+```text
+4G 模組 +CMT URC
+  -> readSerialLine()
+  -> 十六進位格式檢查
+  -> pdulib decodePDU()
+  -> 普通簡訊：processSmsContent()
+     長簡訊：依 sender + reference number 暫存，收齊或 30 秒後合併
+  -> 黑名單過濾
+  -> 管理員命令（SMS:號碼:內容 或 RESET），命中後不走一般通知
+  -> 所有有效推送通道
+  -> SMTP 通知
 ```
 
-### HTTP 请求流程
+長簡訊上限來自 `config_types.h`：同時 5 組、每組 10 段。緩衝滿時覆蓋最
+舊一組；逾時輸出會用 `[缺失分段N]` 標記缺段。超過 10 段的訊息不能只靠
+編譯宣稱支援，需先調整界限並用 PDU fixture 或硬體報告驗證。
 
-```
-浏览器 (SPA 单页应用)
-    │  侧边栏切换面板，所有功能在一个 HTML 页面
-    │  JS 控制 panel 可见性，无需页面跳转
-    ▼
-server.handleClient()     [code.ino loop]
-    │
-    ▼
-checkAuth()               [web_handlers.cpp]
-    │  HTTP Basic Auth
-    │  账号: config.webUser
-    │  密码: config.webPass
-    ▼
-路由分发:
-    GET  /         → handleRoot()        SPA 主页 (HTML 模板变量替换，含 10 个面板)
-    GET  /tools    → handleRoot()        兼容旧链接，返回同一 SPA 页面
-    GET  /sms      → handleRoot()        兼容旧链接，返回同一 SPA 页面
-    POST /save     → handleSave()        保存配置 → saveConfig() → 发邮件
-    POST /sendsms  → handleSendSms()     网页发送短信 → sendSMS()
-    POST /ping     → handlePing()        AT+CGACT=1 → MPING → AT+CGACT=0
-    GET  /query    → handleQuery()       查询 ATI/CESQ/ICCID/CEREG 等
-    GET  /flight   → handleFlightMode()  AT+CFUN 查询/切换飞行模式
-    GET  /at       → handleATCommand()   透传 AT 指令到模组
-    GET  /log      → handleLog()         返回环形缓冲区日志 (JSON 数组)
-```
+## 設定資料流
 
-### 日志系统架构
+`handleSave()` 只更新請求中出現的表單區塊，再由 `saveConfig()` 寫入 NVS
+namespace `sms_config`。`loadConfig()` 提供預設值，並可把舊 `httpUrl`/
+`barkMode` 遷移到第一個推送通道。
 
-```
-业务代码调用:
-    logCapture("目标号码: ");       → Serial.print() + 追加到 _logLine
-    logCaptureLn(String(phone));    → Serial.println() + 提交 _logLine 到环形缓冲区
-    logCaptureF("ref=%d\n", ref);    → Serial.print() + 以 \n 结尾时自动提交整行
-         │
-         ▼
-    _logLine (行缓冲区)              // 累积 logCapture 调用直到 logCaptureLn 或 \n
-         │
-         ▼  logCaptureLn / logCaptureF(\n)
-    _logAppend()                    // 写入环形缓冲区
-         │
-         ▼
-    logBuffer[120]                  // 环形缓冲区，循环覆盖
-         │
-         ▼
-    handleLog()                     // GET /log → JSON ["line1","line2",...]
-         │
-         ▼
-    Web 日志面板                   // 每 2 秒自动轮询，终端风格深色主题
-```
+設定有效的條件是完整 SMTP 設定，或至少一個通過 provider 必填欄位檢查
+的推送通道。最多可設定十組 Web 帳密；空白使用者名稱會停用該組帳號。
+Web 帳密、管理員號碼和黑名單不影響 `configValid`。舊版單一帳密會在讀取
+時遷移到第一組帳號。
 
-### 配置持久化流程
+任何 NVS 欄位變更都必須同時處理：型別、load、save、舊設備預設值、Web
+表單，以及必要的相容遷移。
 
-```
-Web 表单提交 /save
-    │
-    ▼
-handleSave()
-    │  解析 POST 参数
-    │  赋值到 config 全局结构体
-    ▼
-saveConfig()              [config.cpp]
-    │  Preferences(NVS) 写入
-    │  namespace: "sms_config"
-    ▼
-configValid = isConfigValid()  重新校验
-    │
-    ▼
-sendEmailNotification()   发送 "配置已更新" 邮件
-```
+## 推送 provider
 
-## 线程/任务模型
+裝置最多啟用五個通道；provider enum 共十種：
 
-单线程事件循环（标准 Arduino 模型），所有操作在主 loop 中串行执行：
+| 值 | Provider | 必填設定 |
+|---:|---|---|
+| 1 | POST JSON | URL |
+| 2 | Bark | URL |
+| 3 | GET | URL |
+| 4 | DingTalk | URL；secret 選填 |
+| 5 | PushPlus | token；URL 與 channel 選填 |
+| 6 | ServerChan | SendKey；URL 選填 |
+| 7 | Custom JSON body | URL 與 body template |
+| 8 | Feishu | URL；secret 選填 |
+| 9 | Gotify | URL 與 token |
+| 10 | Telegram | chat ID 與 bot token；base URL 選填 |
 
-| 操作 | 频率 | 超时保护 |
+新增 provider 的完整修改點列在 `../code/AGENTS.md`。HTTP delivery 目前逐
+通道同步執行、不重試，兩個通道之間固定延遲 100 ms。
+
+## HTTP 管理面
+
+所有已註冊 route 都由 handler 執行 HTTP Basic Auth。`/tools` 與 `/sms`
+只是回傳同一份主頁的相容入口。
+
+Machine-readable contract 位於 [`openapi.json`](openapi.json)。Route 或 payload
+變更時，必須在同一個變更中更新該文件與 contract test。
+
+操作端點統一回傳 `success`、穩定的 `code`、結構化 `data` 與錯誤用的
+`detail`。前端依 `code` 顯示本地化狀態，並直接呈現 `data` 欄位；只有無法
+安全解析的失敗回應才放入 `detail`，不應再從顯示字串反向解析資料。
+
+管理頁原始碼在 `web/`。SvelteKit static build 把 JavaScript 與 CSS 全部 inline
+進單一 HTML，再以 deterministic gzip 產生 `code/data/index.html.gz`。韌體不把
+頁面編入 app partition，而是從 LittleFS 串流檔案；瀏覽器載入後透過 JSON
+route 讀取狀態與執行操作。密碼內容不會由設定 API 回傳。
+
+| Method | Route | 用途與副作用 |
 |---|---|---|
-| HTTP 请求处理 | 每帧 | 无（非阻塞） |
-| 长短信超时检查 | 每帧 | 30s 超时自动转发不完整消息 |
-| Serial→Serial1 透传 | 每帧 | 无（单字节读） |
-| Serial1 URC 检查 | 每帧 | 逐行读取，无行则立即返回 |
-| 配置无效告警 | 每秒 | 仅 configValid=false 时 |
+| GET | `/`、`/tools`、`/sms` | 從 LittleFS 串流 gzip 管理頁 |
+| GET | `/api/config` | 回傳裝置狀態與不含密碼內容的設定 JSON |
+| POST | `/save` | 寫入 NVS、回傳 JSON；設定有效時寄通知信 |
+| POST | `/sendsms` | 由模組發送簡訊並回傳 JSON |
+| POST | `/ping` | 暫時啟用 PDP、Ping 8.8.8.8、再停用 PDP |
+| GET | `/query?type=...` | 查 `ati`、`signal`、`siminfo`、`network`、`wifi` |
+| GET | `/flight?action=...` | 查詢或變更 `CFUN` |
+| GET | `/at?cmd=...` | 任意 AT 指令透傳 |
+| GET | `/log` | 回傳最多 120 行裝置日誌 |
+| GET | `/modem?action=...` | 重啟模組或查信號、營運商、IMEI |
+| GET | `/wifi?action=restart` | 重新連接 WiFi |
 
-## 内存管理
+這不是公開 Internet API。它使用明文 HTTP，第一組帳號預設為
+`admin/admin123`，而且 AT、重啟與發送簡訊端點都有高權限副作用。僅應部署
+在受信任網路，首次啟動後立即改密碼，不可將管理 port 直接暴露到 Internet。
 
-- ESP32-C3 可用内存：~327KB
-- 全局变量占用：~43KB
-- PDU 缓冲区：4096 字节（`pdu = PDU(4096)`）
-- 长短信缓存：5 组 × 10 段，每段内容动态分配（`String`）
-- 日志环形缓冲区：120 行 × String，约 12KB
-- 日志行缓冲区：1 个 String（`_logLine`），用于合并 logCapture 输出
-- 串口行缓冲：500 字节（`SERIAL_BUFFER_SIZE`）
-- HTTP 响应在函数内栈分配，调用结束自动释放
+發送介面不限制輸入字數。韌體會依 GSM-7 或 UCS-2 編碼切割長訊息，單次
+請求最多 255 段；實際模組與電信網路相容性仍須用硬體驗證。
 
-## 关键硬件引脚
+## 重要限制與敏感資料
 
-| 定义 | GPIO | 功能 |
-|---|---|---|
-| `TXD` | 3 | 模组 UART TX |
-| `RXD` | 4 | 模组 UART RX |
-| `MODEM_EN_PIN` | 5 | 模组 EN 使能（LOW=关机, HIGH=开机） |
-| `LED_BUILTIN` | 8 | 板载 LED（LOW=亮） |
+- `code/wifi_config.h` 已被 Git 追蹤；`.gitignore` 中同名規則不會保護已
+  追蹤檔案。提交前必須確認 diff 中沒有真實 WiFi 帳密。
+- Compose 開發映像與 GitHub workflow 使用相同 ESP32 core、pdulib 與
+  ReadyMail 版本。版本與命令以 `development.md` 為準。
+- `ssl_client.setInsecure()` 會停用 SMTP TLS 憑證驗證。
+- 日誌與部分 HTTP delivery debug 會包含電話號碼和簡訊內容。將 Web 日誌
+  與 Serial output 視為敏感資料。
+- `SERIAL_BUFFER_SIZE` 是 500 bytes；超長行目前會從頭覆寫累積位置。
+- 模組資料面預設停用，但 ML307Y 因已知相容性分支會跳過啟動時的
+  `AT+CGACT=0,1`。
 
-## 错误处理策略
+## 變更定位
 
-- **模组 AT 无响应**：重试（最多 10 次），LED 闪烁指示
-- **WiFi 连接失败**：阻塞等待，LED 闪烁
-- **NTP 同步失败**：记录日志，后续推送使用设备时间
-- **HTTP 推送失败**：记录错误码和响应内容，不重试（避免卡顿）
-- **PDU 解析失败**：记录日志，丢弃该条短信
-- **长短信超时**：强制转发已收到的分段（标记缺失段）
-- **配置无效**：每秒打印设备 IP 提示用户配置
+| 想改的行為 | 先看 |
+|---|---|
+| 啟動、WiFi、NTP、route | `code/code.ino` |
+| 設定欄位或相容性 | `config_types.h`、`config.cpp`、Web 表單 |
+| AT 時序或簡訊發送 | `modem.cpp` |
+| PDU、長簡訊、黑名單、管理員命令 | `sms_process.cpp` |
+| SMTP 或推送格式 | `push.cpp` |
+| 管理端點、驗證、日誌 | `web_handlers.cpp` |
+| 頁面結構、翻譯與瀏覽器互動 | `web/src/`、`web/AGENTS.md` |

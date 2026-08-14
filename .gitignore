@@ -1,1 +1,4 @@
 code/wifi_config.h
+compose.override.yaml
+__pycache__/
+*.pyc

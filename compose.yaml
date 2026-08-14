@@ -1,0 +1,36 @@
+name: sms-forwarding
+
+services:
+  dev:
+    container_name: sms-forwarding-dev
+    build:
+      context: .
+      network: host
+      args:
+        USER_ID: "${USER_ID:-1000}"
+        GROUP_ID: "${GROUP_ID:-1000}"
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    ports:
+      - "5174:5173"
+    init: true
+    stdin_open: true
+    tty: true
+    command: ["sleep", "infinity"]
+
+  mock-server:
+    container_name: sms-forwarding-mock-server
+    build:
+      context: ./mock_server
+    environment:
+      PORT: "3000"
+      AUTH_REQUIRED: "false"
+      WEB_ROOT: /web/build
+      OPENAPI_PATH: /spec/openapi.json
+    volumes:
+      - ./web:/web:ro
+      - ./dev_doc/openapi.json:/spec/openapi.json:ro
+    ports:
+      - "4174:3000"
+    init: true
