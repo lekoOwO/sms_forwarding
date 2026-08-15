@@ -38,9 +38,10 @@ class ActionResultsTest(unittest.TestCase):
         })
 
         firmware = (ROOT / "code/web_handlers.cpp").read_text()
+        self.assertIn('setStringOrNull(dataObject, "manufacturer", manufacturer)', firmware)
         mock = (ROOT / "mock_server/server.mjs").read_text()
         for field in fields:
-            self.assertIn(f'\\"{field}\\"', firmware, field)
+            self.assertIn(f'"{field}"', firmware, field)
             self.assertRegex(mock, rf"\b{field}\s*:", field)
 
         component = (ROOT / "web/src/lib/components/ActionResult.svelte").read_text()

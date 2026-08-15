@@ -108,6 +108,7 @@ ESP32C3 与 ML307R-DC 通过串口（UART）连接，接线如下：
 `Arduino IDE`中单独安装：
 
 - **ReadyMail** by Mobizt
+- **ArduinoJson 7.4.3** by Benoit Blanchon
 
 需要在`Arduino IDE`中安装ESP32开发板支持，参考[官方文档](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)，版型选`MakerGO ESP32 C3 SuperMini`。
 

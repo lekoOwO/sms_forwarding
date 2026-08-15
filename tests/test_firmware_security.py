@@ -27,6 +27,8 @@ int main() {
   const char surrogate[] = {char(0xed), char(0xa0), char(0x80), 0};
   const char tooHigh[] = {char(0xf4), char(0x90), char(0x80), char(0x80), 0};
   const char truncated[] = {char(0xe2), char(0x82), 0};
+  const char control[] = {char(0x01), 0};
+  const char multiline[] = {'a', '\n', '\t', 'b', 0};
   return validUtf8CharLength(ascii) == 1 &&
          validUtf8CharLength(euro) == 3 &&
          validUtf8CharLength(maxCodePoint) == 4 &&
@@ -34,7 +36,14 @@ int main() {
          validUtf8CharLength(overlong) == 0 &&
          validUtf8CharLength(surrogate) == 0 &&
          validUtf8CharLength(tooHigh) == 0 &&
-         validUtf8CharLength(truncated) == 0 ? 0 : 1;
+         validUtf8CharLength(truncated) == 0 &&
+         isValidUtf8(ascii) && isValidUtf8(euro) && isValidUtf8(maxCodePoint) &&
+         !isValidUtf8(stray) && !isValidUtf8(overlong) &&
+         !isValidUtf8(surrogate) && !isValidUtf8(tooHigh) &&
+         !isValidUtf8(truncated) && isValidUtf8(control) &&
+         !isValidUtf8Text(control) && isValidUtf8Text(multiline) &&
+         !hasValidJsonEncoding(control) && hasValidJsonEncoding(ascii) &&
+         hasValidJsonEncoding(euro) ? 0 : 1;
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
@@ -73,18 +82,33 @@ int main() {
 
     def test_push_output_is_bounded_and_context_escaped(self):
         push = (ROOT / "code/push.cpp").read_text()
-        self.assertIn('snprintf(escaped, sizeof(escaped), "\\\\u%04X"', push)
-        self.assertIn("validUtf8CharLength(str.c_str() + i)", push)
+        self.assertIn("serializeJson", push)
+        self.assertNotIn("jsonEscape", push)
+        self.assertNotIn("jsonData +=", push)
         self.assertNotIn("http.getString()", push)
         self.assertIn("https://www.pushplus.plus/send", push)
         self.assertIn("String safeSubject = String(subject);", push)
-        self.assertIn("jsonEscape(text)", push)
         for sensitive_log in (
             'logCaptureLn(String("GET URL: "',
             'logCaptureLn(String("PushPlus: "',
             'logCaptureLn(String("Telegram: "',
         ):
             self.assertNotIn(sensitive_log, push)
+
+    def test_arduinojson_is_pinned_and_owns_firmware_json(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        push = (ROOT / "code/push.cpp").read_text()
+        self.assertIn("ARG ARDUINOJSON_VERSION=7.4.3", dockerfile)
+        self.assertIn('ArduinoJson@${ARDUINOJSON_VERSION}', dockerfile)
+        self.assertIn('ArduinoJson@7.4.3', workflow)
+        for source in (handlers, push):
+            self.assertIn("#include <ArduinoJson.h>", source)
+            self.assertIn("serializeJson", source)
+            self.assertIn("hasValidJsonEncoding", source)
+            self.assertNotIn("jsonEscape", source)
+        self.assertNotIn('data = "{\\"', handlers)
 
     def test_sms_bodies_are_not_copied_to_device_logs(self):
         sms = (ROOT / "code/sms_process.cpp").read_text()
@@ -96,15 +120,29 @@ int main() {
     def test_management_responses_apply_small_security_headers(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
         self.assertIn('server.sendHeader("Content-Security-Policy", "frame-ancestors \'none\'")', handlers)
-        self.assertGreaterEqual(handlers.count('server.sendHeader("Cache-Control", "no-store")'), 4)
+        self.assertNotIn('server.sendHeader("Content-Encoding", "gzip")', handlers)
+        self.assertGreaterEqual(handlers.count('server.sendHeader("Cache-Control", "no-store")'), 3)
+        self.assertIn("static void sendJson(", handlers)
+        self.assertIn("static void sendJsonFailure()", handlers)
         self.assertIn("if (rejectModemBusy()) return;", handlers)
         self.assertNotIn("server.handleClient()", handlers)
+
+    def test_wifi_restart_allows_response_to_leave_before_disconnect(self):
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        start = handlers.index("void handleWifi()")
+        wifi_handler = handlers[start:]
+        response = wifi_handler.index('sendActionResult(200, true, "ACTION_WIFI_RESTARTING")')
+        grace_period = wifi_handler.index("delay(500);", response)
+        disconnect = wifi_handler.index("WiFi.disconnect(true);", response)
+        self.assertLess(response, grace_period)
+        self.assertLess(grace_period, disconnect)
 
     def test_account_updates_cannot_restore_default_credentials(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
         self.assertIn("Config next = config;", handlers)
         self.assertIn("if (!saveConfig(next))", handlers)
         self.assertIn("config = next;", handlers)
+        self.assertIn("ACTION_INPUT_INVALID", handlers)
         self.assertIn("ACTION_CONFIG_ACCOUNT_REQUIRED", handlers)
         self.assertNotIn(
             "config.webAccounts[0].username = DEFAULT_WEB_USER", handlers

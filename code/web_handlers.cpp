@@ -1,8 +1,10 @@
 #include "web_handlers.h"
+#include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "config.h"
 #include "modem.h"
 #include "push.h"
+#include "utf8_validation.h"
 #include "wifi_config.h"
 
 // ---- Log ring buffer ----
@@ -90,27 +92,70 @@ bool checkAuth() {
   return false;
 }
 
-static String jsonStringOrNull(const String& value) {
-  return value == "N/A" ? "null" : "\"" + jsonEscape(value) + "\"";
+static const size_t JSON_RESPONSE_MAX_LENGTH = 128 * 1024;
+
+static void sendJsonFailure() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(500, PSTR("application/json"),
+                PSTR("{\"error\":\"JSON serialization failed\"}"));
 }
 
-static void sendActionResult(int status, bool success, const char* code,
-                             const String& data = "{}", const String& detail = "") {
-  String json = "{\"success\":" + String(success ? "true" : "false") +
-                ",\"code\":\"" + code + "\",\"data\":" + data +
-                ",\"detail\":\"" + jsonEscape(detail) + "\"}";
+static void sendJson(int status, JsonDocument& document) {
+  size_t length = measureJson(document);
+  String json;
+  if (document.overflowed() || length > JSON_RESPONSE_MAX_LENGTH || !json.reserve(length) ||
+      serializeJson(document, json) != length || json.length() != length ||
+      !hasValidJsonEncoding(json.c_str())) {
+    sendJsonFailure();
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
   server.send(status, "application/json", json);
 }
 
-static bool rejectTooLong(const String& value, size_t maxBytes, const String& field) {
-  if (value.length() <= maxBytes) return false;
-  sendActionResult(400, false, "ACTION_INPUT_TOO_LONG", "{}", field);
-  return true;
+static void sendActionResult(int status, bool success, const char* code,
+                             const String& detail = "") {
+  JsonDocument response;
+  response["success"] = success;
+  response["code"] = code;
+  response["data"].to<JsonObject>();
+  response["detail"] = detail;
+  sendJson(status, response);
 }
 
-static bool rejectArgTooLong(const String& field, size_t maxBytes) {
-  return server.hasArg(field) && rejectTooLong(server.arg(field), maxBytes, field);
+static void sendActionResult(int status, bool success, const char* code,
+                             JsonDocument& data, const String& detail = "") {
+  if (data.overflowed()) {
+    sendJsonFailure();
+    return;
+  }
+  JsonDocument response;
+  response["success"] = success;
+  response["code"] = code;
+  response["data"].set(data.as<JsonVariantConst>());
+  response["detail"] = detail;
+  sendJson(status, response);
+}
+
+static void setStringOrNull(JsonObject& object, const char* key, const String& value) {
+  if (value == "N/A") object[key] = nullptr;
+  else object[key] = value;
+}
+
+static bool rejectInvalidOrTooLong(const String& value, size_t maxBytes, const String& field) {
+  if (!isValidUtf8Text(value.c_str())) {
+    sendActionResult(400, false, "ACTION_INPUT_INVALID", field);
+    return true;
+  }
+  if (value.length() > maxBytes) {
+    sendActionResult(400, false, "ACTION_INPUT_TOO_LONG", field);
+    return true;
+  }
+  return false;
+}
+
+static bool rejectArgInvalidOrTooLong(const String& field, size_t maxBytes) {
+  return server.hasArg(field) && rejectInvalidOrTooLong(server.arg(field), maxBytes, field);
 }
 
 static bool rejectModemBusy() {
@@ -130,7 +175,6 @@ void handleRoot() {
     server.send(503, "text/plain; charset=utf-8", "Web bundle missing. Build and upload LittleFS.");
     return;
   }
-  server.sendHeader("Content-Encoding", "gzip");
   server.sendHeader("Vary", "Accept-Encoding");
   server.streamFile(file, "text/html; charset=utf-8");
   file.close();
@@ -147,45 +191,43 @@ void handleConfig() {
     if (config.pushChannels[i].enabled) pushCount++;
   }
 
-  String json;
-  json.reserve(3072);
-  json += "{\"status\":{";
-  json += "\"ip\":\"" + jsonEscape(WiFi.localIP().toString()) + "\",";
-  json += "\"wifiSsid\":\"" + jsonEscape(WiFi.SSID()) + "\",";
-  json += "\"freeHeapKb\":" + String(ESP.getFreeHeap() / 1024) + ",";
-  json += "\"uptimeSeconds\":" + String(millis() / 1000) + ",";
-  json += "\"modemReady\":" + String(modemReady ? "true" : "false") + ",";
-  json += "\"emailConfigured\":" + String(emailOk ? "true" : "false") + ",";
-  json += "\"enabledPushChannels\":" + String(pushCount) + "},";
-  json += "\"config\":{";
-  json += "\"webAccounts\":[";
+  JsonDocument json;
+  JsonObject status = json["status"].to<JsonObject>();
+  status["ip"] = WiFi.localIP().toString();
+  status["wifiSsid"] = WiFi.SSID();
+  status["freeHeapKb"] = ESP.getFreeHeap() / 1024;
+  status["uptimeSeconds"] = millis() / 1000;
+  status["modemReady"] = modemReady;
+  status["emailConfigured"] = emailOk;
+  status["enabledPushChannels"] = pushCount;
+
+  JsonObject configJson = json["config"].to<JsonObject>();
+  JsonArray webAccounts = configJson["webAccounts"].to<JsonArray>();
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
-    if (i > 0) json += ",";
-    json += "{\"username\":\"" + jsonEscape(config.webAccounts[i].username) + "\",\"password\":\"\"}";
+    JsonObject account = webAccounts.add<JsonObject>();
+    account["username"] = config.webAccounts[i].username;
+    account["password"] = "";
   }
-  json += "],";
-  json += "\"smtpServer\":\"" + jsonEscape(config.smtpServer) + "\",";
-  json += "\"smtpPort\":" + String(config.smtpPort) + ",";
-  json += "\"smtpUser\":\"" + jsonEscape(config.smtpUser) + "\",";
-  json += "\"smtpPass\":\"\",";
-  json += "\"smtpSendTo\":\"" + jsonEscape(config.smtpSendTo) + "\",";
-  json += "\"adminPhone\":\"" + jsonEscape(config.adminPhone) + "\",";
-  json += "\"numberBlackList\":\"" + jsonEscape(config.numberBlackList) + "\",";
-  json += "\"pushChannels\":[";
+  configJson["smtpServer"] = config.smtpServer;
+  configJson["smtpPort"] = config.smtpPort;
+  configJson["smtpUser"] = config.smtpUser;
+  configJson["smtpPass"] = "";
+  configJson["smtpSendTo"] = config.smtpSendTo;
+  configJson["adminPhone"] = config.adminPhone;
+  configJson["numberBlackList"] = config.numberBlackList;
+  JsonArray pushChannels = configJson["pushChannels"].to<JsonArray>();
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
-    if (i > 0) json += ",";
     const PushChannel& channel = config.pushChannels[i];
-    json += "{\"enabled\":" + String(channel.enabled ? "true" : "false") + ",";
-    json += "\"type\":" + String((int)channel.type) + ",";
-    json += "\"name\":\"" + jsonEscape(channel.name) + "\",";
-    json += "\"url\":\"" + jsonEscape(channel.url) + "\",";
-    json += "\"key1\":\"" + jsonEscape(channel.key1) + "\",";
-    json += "\"key2\":\"" + jsonEscape(channel.key2) + "\",";
-    json += "\"customBody\":\"" + jsonEscape(channel.customBody) + "\"}";
+    JsonObject channelJson = pushChannels.add<JsonObject>();
+    channelJson["enabled"] = channel.enabled;
+    channelJson["type"] = static_cast<int>(channel.type);
+    channelJson["name"] = channel.name;
+    channelJson["url"] = channel.url;
+    channelJson["key1"] = channel.key1;
+    channelJson["key2"] = channel.key2;
+    channelJson["customBody"] = channel.customBody;
   }
-  json += "]}}";
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", json);
+  sendJson(200, json);
 }
 
 // Handle flight mode control requests.
@@ -193,10 +235,11 @@ void handleFlightMode() {
   if (!checkAuth()) return;
   
   String action = server.arg("action");
-  if (rejectTooLong(action, 32, "action")) return;
+  if (rejectInvalidOrTooLong(action, 32, "action")) return;
   if (rejectModemBusy()) return;
   bool success = false;
-  String data = "{}";
+  JsonDocument data;
+  JsonObject dataObject = data.to<JsonObject>();
   String detail = "";
   const char* code = "ACTION_UNKNOWN";
   
@@ -220,7 +263,7 @@ void handleFlightMode() {
       } else {
         code = "ACTION_FLIGHT_STATUS_UNKNOWN";
       }
-      data = "{\"mode\":" + String(mode) + "}";
+      dataObject["mode"] = mode;
     } else {
       code = "ACTION_FLIGHT_FAILED";
       detail = resp;
@@ -288,14 +331,15 @@ void handleATCommand() {
   if (!checkAuth()) return;
   
   String cmd = server.arg("cmd");
-  if (rejectTooLong(cmd, 256, "cmd")) return;
+  if (rejectInvalidOrTooLong(cmd, 256, "cmd")) return;
   if (cmd.length() > 0 && !modemCommandAllowed(cmd)) {
     sendActionResult(400, false, "ACTION_AT_REJECTED");
     return;
   }
   if (rejectModemBusy()) return;
   bool success = false;
-  String data = "{}";
+  JsonDocument data;
+  JsonObject dataObject = data.to<JsonObject>();
   const char* code = "ACTION_AT_REQUIRED";
   
   if (cmd.length() == 0) {
@@ -307,7 +351,7 @@ void handleATCommand() {
     if (resp.length() > 0) {
       success = true;
       code = "ACTION_AT_OK";
-      data = "{\"raw\":\"" + jsonEscape(resp) + "\"}";
+      dataObject["raw"] = resp;
     } else {
       code = "ACTION_AT_TIMEOUT";
     }
@@ -321,10 +365,11 @@ void handleQuery() {
   if (!checkAuth()) return;
   
   String type = server.arg("type");
-  if (rejectTooLong(type, 32, "type")) return;
+  if (rejectInvalidOrTooLong(type, 32, "type")) return;
   if (type != "wifi" && rejectModemBusy()) return;
   bool success = false;
-  String data = "{}";
+  JsonDocument data;
+  JsonObject dataObject = data.to<JsonObject>();
   String detail = "";
   const char* code = "ACTION_QUERY_UNKNOWN";
   
@@ -358,9 +403,9 @@ void handleQuery() {
         }
       }
       
-      data = "{\"manufacturer\":" + jsonStringOrNull(manufacturer) +
-             ",\"model\":" + jsonStringOrNull(model) +
-             ",\"revision\":" + jsonStringOrNull(version) + "}";
+      setStringOrNull(dataObject, "manufacturer", manufacturer);
+      setStringOrNull(dataObject, "model", model);
+      setStringOrNull(dataObject, "revision", version);
     } else {
       code = "ACTION_QUERY_FAILED";
       detail = resp;
@@ -397,24 +442,20 @@ void handleQuery() {
       
       // Convert RSRP to dBm (0-97 maps to -140 through -44 dBm; 99 means unknown).
       int rsrp = values[5].toInt();
-      String rsrpValue;
       if (rsrp == 99 || rsrp == 255) {
-        rsrpValue = "null";
+        dataObject["rsrpDbm"] = nullptr;
       } else {
-        rsrpValue = String(-140 + rsrp);
+        dataObject["rsrpDbm"] = -140 + rsrp;
       }
       
       // Convert RSRQ (0-34 maps to -19.5 through -3 dB).
       int rsrq = values[4].toInt();
-      String rsrqValue;
       if (rsrq == 99 || rsrq == 255) {
-        rsrqValue = "null";
+        dataObject["rsrqDb"] = nullptr;
       } else {
-        rsrqValue = String(-19.5 + rsrq * 0.5, 1);
+        dataObject["rsrqDb"] = -19.5 + rsrq * 0.5;
       }
-      
-      data = "{\"rsrpDbm\":" + rsrpValue + ",\"rsrqDb\":" + rsrqValue +
-             ",\"cesq\":\"" + jsonEscape(params) + "\"}";
+      dataObject["cesq"] = params;
     } else {
       code = "ACTION_QUERY_FAILED";
       detail = resp;
@@ -463,9 +504,9 @@ void handleQuery() {
         }
       }
     }
-    data = "{\"imsi\":" + jsonStringOrNull(imsi) +
-           ",\"iccid\":" + jsonStringOrNull(iccid) +
-           ",\"msisdn\":" + jsonStringOrNull(phoneNum) + "}";
+    setStringOrNull(dataObject, "imsi", imsi);
+    setStringOrNull(dataObject, "iccid", iccid);
+    setStringOrNull(dataObject, "msisdn", phoneNum);
   }
   else if (type == "network") {
     // Query network status.
@@ -489,7 +530,7 @@ void handleQuery() {
     }
     // Query PDP context activation status.
     resp = sendATCommand("AT+CGACT?", 2000);
-    String pdpStatus = "null";
+    int pdpStatus = -1;
     int cgact = resp.indexOf("+CGACT:");
     while (cgact >= 0) {
       String line = resp.substring(cgact + 7);
@@ -506,10 +547,10 @@ void handleQuery() {
       for (size_t i = 0; valid && i < cid.length(); i++) valid = isDigit(cid[i]);
       if (valid) {
         if (cid == "1" && state == "1") {
-          pdpStatus = "true";
+          pdpStatus = 1;
           break;
         }
-        pdpStatus = "false";
+        pdpStatus = 0;
       }
       cgact = resp.indexOf("+CGACT:", cgact + 7);
     }
@@ -529,10 +570,12 @@ void handleQuery() {
         }
       }
     }
-    data = "{\"registration\":" + (regStatus < 0 ? String("null") : String(regStatus)) +
-           ",\"operator\":" + jsonStringOrNull(oper) +
-           ",\"pdpActive\":" + pdpStatus +
-           ",\"apn\":" + jsonStringOrNull(apn) + "}";
+    if (regStatus < 0) dataObject["registration"] = nullptr;
+    else dataObject["registration"] = regStatus;
+    setStringOrNull(dataObject, "operator", oper);
+    if (pdpStatus < 0) dataObject["pdpActive"] = nullptr;
+    else dataObject["pdpActive"] = pdpStatus == 1;
+    setStringOrNull(dataObject, "apn", apn);
   }
   else if (type == "wifi") {
     // Query WiFi status.
@@ -545,16 +588,16 @@ void handleQuery() {
     // RSSI signal strength.
     int rssi = WiFi.RSSI();
 
-    data = "{\"wifiStatus\":" + String((int)WiFi.status()) +
-           ",\"ssid\":" + jsonStringOrNull(ssid) +
-           ",\"rssiDbm\":" + String(rssi) +
-           ",\"ip\":\"" + jsonEscape(WiFi.localIP().toString()) +
-           "\",\"gateway\":\"" + jsonEscape(WiFi.gatewayIP().toString()) +
-           "\",\"netmask\":\"" + jsonEscape(WiFi.subnetMask().toString()) +
-           "\",\"dns\":\"" + jsonEscape(WiFi.dnsIP().toString()) +
-           "\",\"mac\":\"" + jsonEscape(WiFi.macAddress()) +
-           "\",\"bssid\":\"" + jsonEscape(WiFi.BSSIDstr()) +
-           "\",\"channel\":" + String(WiFi.channel()) + "}";
+    dataObject["wifiStatus"] = static_cast<int>(WiFi.status());
+    setStringOrNull(dataObject, "ssid", ssid);
+    dataObject["rssiDbm"] = rssi;
+    dataObject["ip"] = WiFi.localIP().toString();
+    dataObject["gateway"] = WiFi.gatewayIP().toString();
+    dataObject["netmask"] = WiFi.subnetMask().toString();
+    dataObject["dns"] = WiFi.dnsIP().toString();
+    dataObject["mac"] = WiFi.macAddress();
+    dataObject["bssid"] = WiFi.BSSIDstr();
+    dataObject["channel"] = WiFi.channel();
   }
 
   sendActionResult(200, success, code, data, detail);
@@ -566,7 +609,8 @@ void handleSendSms() {
   
   String phone = server.arg("phone");
   String content = server.arg("content");
-  if (rejectTooLong(phone, 32, "phone") || rejectTooLong(content, 2048, "content")) return;
+  if (rejectInvalidOrTooLong(phone, 32, "phone") ||
+      rejectInvalidOrTooLong(content, 2048, "content")) return;
   if (rejectModemBusy()) return;
   
   phone.trim();
@@ -605,7 +649,7 @@ void handlePing() {
 
   int mping = response.indexOf("+MPING:");
   if (!activated || response.indexOf("ERROR") >= 0) {
-    sendActionResult(200, false, "ACTION_PING_MODEM_ERROR", "{}", response);
+    sendActionResult(200, false, "ACTION_PING_MODEM_ERROR", response);
     return;
   }
   if (mping < 0) {
@@ -620,11 +664,13 @@ void handlePing() {
   int firstComma = params.indexOf(',');
   int result = (firstComma < 0 ? params : params.substring(0, firstComma)).toInt();
   if (firstComma < 0 && result != 0 && result != 1) {
-    sendActionResult(200, false, "ACTION_PING_UNREACHABLE", "{}", params);
+    sendActionResult(200, false, "ACTION_PING_UNREACHABLE", params);
     return;
   }
 
-  String data = "{\"ip\":\"8.8.8.8\"}";
+  JsonDocument data;
+  JsonObject dataObject = data.to<JsonObject>();
+  dataObject["ip"] = "8.8.8.8";
   if (firstComma >= 0) {
     String rest = params.substring(firstComma + 1);
     int ipEnd = rest.indexOf(',');
@@ -640,9 +686,10 @@ void handlePing() {
         String ttl = timeEnd < 0 ? "" : rest.substring(timeEnd + 1);
         latency.trim();
         ttl.trim();
-        data = "{\"ip\":\"" + jsonEscape(ip) + "\",\"latencyMs\":" +
-               String(latency.toInt()) + ",\"ttl\":" +
-               (ttl.length() ? String(ttl.toInt()) : String("null")) + "}";
+        dataObject["ip"] = ip;
+        dataObject["latencyMs"] = latency.toInt();
+        if (ttl.length()) dataObject["ttl"] = ttl.toInt();
+        else dataObject["ttl"] = nullptr;
       }
     }
   }
@@ -658,24 +705,31 @@ void handleSave() {
   int previousSmtpPort = next.smtpPort;
   String previousSmtpUser = next.smtpUser;
 
-  if (rejectArgTooLong("smtpServer", 253) || rejectArgTooLong("smtpPort", 32) ||
-      rejectArgTooLong("smtpUser", 254) ||
-      rejectArgTooLong("smtpPass", 256) || rejectArgTooLong("smtpSendTo", 254) ||
-      rejectArgTooLong("adminPhone", 32) || rejectArgTooLong("numberBlackList", 1024)) return;
+  if (rejectArgInvalidOrTooLong("smtpServer", 253) ||
+      rejectArgInvalidOrTooLong("smtpPort", 32) ||
+      rejectArgInvalidOrTooLong("smtpUser", 254) ||
+      rejectArgInvalidOrTooLong("smtpPass", 256) ||
+      rejectArgInvalidOrTooLong("smtpSendTo", 254) ||
+      rejectArgInvalidOrTooLong("adminPhone", 32) ||
+      rejectArgInvalidOrTooLong("numberBlackList", 1024)) return;
 
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String prefix = "push" + String(i);
-    if (rejectArgTooLong(prefix + "en", 32) || rejectArgTooLong(prefix + "type", 32) ||
-        rejectArgTooLong(prefix + "url", 512) || rejectArgTooLong(prefix + "name", 64) ||
-        rejectArgTooLong(prefix + "key1", 256) || rejectArgTooLong(prefix + "key2", 256) ||
-        rejectArgTooLong(prefix + "body", 2048)) return;
+    if (rejectArgInvalidOrTooLong(prefix + "en", 32) ||
+        rejectArgInvalidOrTooLong(prefix + "type", 32) ||
+        rejectArgInvalidOrTooLong(prefix + "url", 512) ||
+        rejectArgInvalidOrTooLong(prefix + "name", 64) ||
+        rejectArgInvalidOrTooLong(prefix + "key1", 256) ||
+        rejectArgInvalidOrTooLong(prefix + "key2", 256) ||
+        rejectArgInvalidOrTooLong(prefix + "body", 2048)) return;
   }
 
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
     String userKey = prefix + "user";
     String passKey = prefix + "pass";
-    if (rejectArgTooLong(userKey, 64) || rejectArgTooLong(passKey, 96)) return;
+    if (rejectArgInvalidOrTooLong(userKey, 64) ||
+        rejectArgInvalidOrTooLong(passKey, 96)) return;
     String username = server.hasArg(userKey) ? server.arg(userKey) : next.webAccounts[i].username;
     String password = server.hasArg(passKey) && server.arg(passKey).length() > 0
                         ? server.arg(passKey) : next.webAccounts[i].password;
@@ -683,7 +737,7 @@ void handleSave() {
     if (username.length() == 0) password = "";
     if ((server.hasArg(userKey) || server.hasArg(passKey)) &&
         username.length() + password.length() + 1 > 180) {
-      sendActionResult(400, false, "ACTION_INPUT_TOO_LONG", "{}",
+      sendActionResult(400, false, "ACTION_INPUT_TOO_LONG",
                        server.hasArg(passKey) ? passKey : userKey);
       return;
     }
@@ -795,29 +849,28 @@ void handleSave() {
 void handleLog() {
   if (!checkAuth()) return;
 
-  String json = "[";
+  JsonDocument json;
+  JsonArray lines = json.to<JsonArray>();
   int total = logBufCount;
   int start = total < LOG_BUF_SIZE ? 0 : logBufIdx;
   for (int i = 0; i < total; i++) {
     int pos = (start + i) % LOG_BUF_SIZE;
-    if (i > 0) json += ",";
-    json += "\"" + jsonEscape(logBuffer[pos]) + "\"";
+    lines.add(JsonString(logBuffer[pos].c_str(), logBuffer[pos].length(), true));
   }
-  json += "]";
-  server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "application/json", json);
+  sendJson(200, json);
 }
 
 // Modem control commands.
 void handleModem() {
   if (!checkAuth()) return;
 
-  if (rejectTooLong(server.arg("action"), 32, "action")) return;
+  if (rejectInvalidOrTooLong(server.arg("action"), 32, "action")) return;
   if (rejectModemBusy()) return;
 
   String action = server.arg("action");
   bool success = false;
-  String data = "{}";
+  JsonDocument data;
+  JsonObject dataObject = data.to<JsonObject>();
   String detail = "";
   const char* code = "ACTION_UNKNOWN";
 
@@ -850,9 +903,10 @@ void handleModem() {
       if (commaIdx >= 0) {
         int rssi = csqLine.substring(csqLine.indexOf(':') + 1, commaIdx).toInt();
         int ber = csqLine.substring(commaIdx + 1).toInt();
-        String dbm = rssi == 99 ? "null" : String(-113 + rssi * 2);
-        data = "{\"signalDbm\":" + dbm + ",\"rssi\":" + String(rssi) +
-               ",\"ber\":" + String(ber) + "}";
+        if (rssi == 99) dataObject["signalDbm"] = nullptr;
+        else dataObject["signalDbm"] = -113 + rssi * 2;
+        dataObject["rssi"] = rssi;
+        dataObject["ber"] = ber;
         success = true;
         code = "ACTION_MODEM_OK";
       }
@@ -873,11 +927,11 @@ void handleModem() {
       int q1 = copsLine.indexOf('"');
       int q2 = copsLine.indexOf('"', q1 + 1);
       if (q1 >= 0 && q2 >= 0) {
-        data = "{\"operator\":\"" + jsonEscape(copsLine.substring(q1 + 1, q2)) + "\"}";
+        dataObject["operator"] = copsLine.substring(q1 + 1, q2);
         success = true;
         code = "ACTION_MODEM_OK";
       } else {
-        data = "{\"operator\":\"" + jsonEscape(copsLine) + "\"}";
+        dataObject["operator"] = copsLine;
         success = true;
         code = "ACTION_MODEM_OK";
       }
@@ -897,7 +951,7 @@ void handleModem() {
     if (gsnIdx >= 0) resp = resp.substring(gsnIdx + 6);
     resp.trim();
     if (resp.length() > 0) {
-      data = "{\"imei\":\"" + jsonEscape(resp) + "\"}";
+      dataObject["imei"] = resp;
       success = true;
       code = "ACTION_MODEM_OK";
     } else {
@@ -915,14 +969,14 @@ void handleModem() {
 void handleWifi() {
   if (!checkAuth()) return;
 
-  if (rejectTooLong(server.arg("action"), 32, "action")) return;
+  if (rejectInvalidOrTooLong(server.arg("action"), 32, "action")) return;
 
   String action = server.arg("action");
   if (action == "restart") {
     logCaptureLn(String("Web UI requested a WiFi restart..."));
     sendActionResult(200, true, "ACTION_WIFI_RESTARTING");
-    WiFi.disconnect(true);
     delay(500);
+    WiFi.disconnect(true);
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.setScanMethod(WIFI_FAST_SCAN);

@@ -175,6 +175,7 @@
 	"ACTION_CONFIG_SAVE_FAILED": "设置无法保存。请重试，并在设备重启后确认。",
 	"ACTION_CONFIG_ACCOUNT_REQUIRED": "请至少保留一个管理账号。",
 	"ACTION_INPUT_TOO_LONG": "指出的字段超过 UTF-8 字节上限。",
+	"ACTION_INPUT_INVALID": "指出的字段包含无效的 UTF-8 文本或控制字符。",
 	"ACTION_SMS_PHONE_REQUIRED": "请输入目标号码。",
 	"ACTION_SMS_CONTENT_REQUIRED": "请输入短信内容。",
 	"ACTION_SMS_SENT": "短信已发送。",

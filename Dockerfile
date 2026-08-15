@@ -4,6 +4,7 @@ FROM alpine:${ALPINE_VERSION}
 ARG ARDUINO_CLI_VERSION=1.5.1
 ARG ESP32_CORE_VERSION=3.3.10
 ARG READYMAIL_VERSION=0.4.2
+ARG ARDUINOJSON_VERSION=7.4.3
 ARG TARGETARCH
 ARG USER_ID=1000
 ARG GROUP_ID=1000
@@ -44,6 +45,7 @@ RUN apk add --no-cache \
     && arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json \
     && /tmp/esp32-webserver-patch/apply-esp32-webserver-3.3.10-patch.sh \
     && arduino-cli lib install "ReadyMail@${READYMAIL_VERSION}" \
+    && arduino-cli lib install "ArduinoJson@${ARDUINOJSON_VERSION}" \
     && rm -rf /tmp/esp32-webserver-patch \
     && rm -rf \
         "${ARDUINO_DIRECTORIES_DATA}/packages/esp32/tools/esp-x32" \

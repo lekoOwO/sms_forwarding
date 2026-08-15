@@ -28,4 +28,35 @@ inline int validUtf8CharLength(const char* text) {
   return 0;
 }
 
+inline bool isValidUtf8(const char* text) {
+  if (!text) return false;
+  while (*text) {
+    int length = validUtf8CharLength(text);
+    if (length == 0) return false;
+    text += length;
+  }
+  return true;
+}
+
+inline bool isValidUtf8Text(const char* text) {
+  if (!text) return false;
+  while (*text) {
+    uint8_t first = static_cast<uint8_t>(*text);
+    if (first < 0x20 && first != '\t' && first != '\n' && first != '\r') return false;
+    int length = validUtf8CharLength(text);
+    if (length == 0) return false;
+    text += length;
+  }
+  return true;
+}
+
+inline bool hasValidJsonEncoding(const char* text) {
+  if (!isValidUtf8(text)) return false;
+  while (*text) {
+    if (static_cast<uint8_t>(*text) < 0x20) return false;
+    text++;
+  }
+  return true;
+}
+
 #endif

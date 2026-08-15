@@ -60,6 +60,7 @@ DNS 問題；執行中的 `dev` container 仍使用一般 Compose network。
 | Alpine-native esptool | 5.3.0 |
 | pdulib | 0.5.11（固定在 `code/src/pdulib/`） |
 | ReadyMail | 0.4.2 |
+| ArduinoJson | 7.4.3 |
 
 ESP32 core 安裝後必須執行
 `scripts/apply-esp32-webserver-3.3.10-patch.sh`。腳本先驗證原始
@@ -166,7 +167,7 @@ CI 的唯一基線命令是：
 docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
 ```
 
-目前鎖定版本的基線結果為 Flash `1312783 / 2097152 bytes`（62%）、全域變數
+目前鎖定版本的基線結果為 Flash `1320871 / 2097152 bytes`（62%）、全域變數
 `44276 / 327680 bytes`（13%）。這只證明編譯與靜態配置，不代表實機 heap
 尖峰、UART 時序或 modem 相容性已驗證。
 

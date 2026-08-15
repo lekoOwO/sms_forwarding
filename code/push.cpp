@@ -2,6 +2,7 @@
 #include "web_handlers.h"
 #include "config.h"
 #include "utf8_validation.h"
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <mbedtls/md.h>
 #include <base64.h>
@@ -34,6 +35,40 @@ static String htmlEscape(const String& value) {
     }
   }
   return escaped;
+}
+
+static bool serializeJsonChecked(const JsonDocument& json, String& output) {
+  const size_t expectedSize = json.overflowed() ? 0 : measureJson(json);
+  output = "";
+  if (expectedSize == 0 || !output.reserve(expectedSize) ||
+      serializeJson(json, output) != expectedSize || output.length() != expectedSize ||
+      !hasValidJsonEncoding(output.c_str())) {
+    logCaptureLn(String("Failed to build push JSON payload; skipping delivery"));
+    return false;
+  }
+  return true;
+}
+
+static bool postJson(HTTPClient& http, const String& url, const JsonDocument& json, int& httpCode) {
+  String payload;
+  if (!serializeJsonChecked(json, payload)) return false;
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  httpCode = http.POST(payload);
+  return true;
+}
+
+static bool serializeJsonStringContent(const String& value, String& output) {
+  JsonDocument json;
+  json.set(value);
+  if (!serializeJsonChecked(json, output)) return false;
+  if (output.length() < 2 || output[0] != '"' || output[output.length() - 1] != '"') {
+    logCaptureLn(String("Failed to build custom push placeholders; skipping delivery"));
+    return false;
+  }
+  output.remove(output.length() - 1);
+  output.remove(0, 1);
+  return true;
 }
 
 // Send an email notification
@@ -121,38 +156,6 @@ int64_t getUtcMillis() {
   return (int64_t)time(nullptr) * 1000LL;
 }
 
-// Escape a string for JSON
-String jsonEscape(const String& str) {
-  String result = "";
-  result.reserve(str.length());
-  for (unsigned int i = 0; i < str.length(); i++) {
-    unsigned char c = static_cast<unsigned char>(str.charAt(i));
-    if (c == '"') result += "\\\"";
-    else if (c == '\\') result += "\\\\";
-    else if (c == '\n') result += "\\n";
-    else if (c == '\r') result += "\\r";
-    else if (c == '\t') result += "\\t";
-    else if (c < 0x20) {
-      char escaped[7];
-      snprintf(escaped, sizeof(escaped), "\\u%04X", c);
-      result += escaped;
-    } else if (c >= 0x80) {
-      int utf8Length = validUtf8CharLength(str.c_str() + i);
-      if (utf8Length > 0) {
-        result.concat(str.c_str() + i, utf8Length);
-        i += utf8Length - 1;
-      } else {
-        char escaped[7];
-        snprintf(escaped, sizeof(escaped), "\\u%04X", c);
-        result += escaped;
-      }
-    } else {
-      result += static_cast<char>(c);
-    }
-  }
-  return result;
-}
-
 // Send to one push channel
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
   if (!channel.enabled) return;
@@ -176,33 +179,27 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   }
   
   int httpCode = 0;
-  String senderEscaped = jsonEscape(String(sender));
-  String messageEscaped = jsonEscape(String(message));
-  String timestampEscaped = jsonEscape(String(timestamp));
+  const String senderValue(sender);
+  const String messageValue(message);
+  const String timestampValue(timestamp);
   
   switch (channel.type) {
     case PUSH_TYPE_POST_JSON: {
       // Standard POST JSON format
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"sender\":\"" + senderEscaped + "\",";
-      jsonData += "\"message\":\"" + messageEscaped + "\",";
-      jsonData += "\"timestamp\":\"" + timestampEscaped + "\"";
-      jsonData += "}";
-      httpCode = http.POST(jsonData);
+      JsonDocument json;
+      json["sender"] = senderValue;
+      json["message"] = messageValue;
+      json["timestamp"] = timestampValue;
+      if (!postJson(http, channel.url, json, httpCode)) return;
       break;
     }
     
     case PUSH_TYPE_BARK: {
       // Bark push format
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"title\":\"" + senderEscaped + "\",";
-      jsonData += "\"body\":\"" + messageEscaped + "\"";
-      jsonData += "}";
-      httpCode = http.POST(jsonData);
+      JsonDocument json;
+      json["title"] = senderValue;
+      json["body"] = messageValue;
+      if (!postJson(http, channel.url, json, httpCode)) return;
       break;
     }
     
@@ -246,20 +243,18 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         webhookUrl += "timestamp=" + String(tsBuf) + "&sign=" + sign;
       }
       
-      http.begin(webhookUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{\"msgtype\":\"text\",\"text\":{\"content\":\"";
-      jsonData += "📱 SMS notification\\nSender: " + senderEscaped + "\\nMessage: " + messageEscaped + "\\nTime: " + timestampEscaped;
-      jsonData += "\"}}";
-      httpCode = http.POST(jsonData);
+      JsonDocument json;
+      json["msgtype"] = "text";
+      JsonObject text = json["text"].to<JsonObject>();
+      text["content"] = "📱 SMS notification\nSender: " + senderValue +
+                        "\nMessage: " + messageValue + "\nTime: " + timestampValue;
+      if (!postJson(http, webhookUrl, json, httpCode)) return;
       break;
     }
 
     case PUSH_TYPE_PUSHPLUS: {
       // PushPlus
       String pushUrl = channel.url.length() > 0 ? channel.url : "https://www.pushplus.plus/send";
-      http.begin(pushUrl);
-      http.addHeader("Content-Type", "application/json");
       // Delivery channel
       String channelValue = "wechat";
       if (channel.key2.length() > 0) {
@@ -270,16 +265,16 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
               logCaptureLn(String("Invalid PushPlus channel '" + channel.key2 + "'. Using default 'wechat'."));
           }
       }
-      String jsonData = "{";
-      String senderHtml = jsonEscape(htmlEscape(String(sender)));
-      String messageHtml = jsonEscape(htmlEscape(String(message)));
-      String timestampHtml = jsonEscape(htmlEscape(String(timestamp)));
-      jsonData += "\"token\":\"" + jsonEscape(channel.key1) + "\",";
-      jsonData += "\"title\":\"SMS from: " + senderHtml + "\",";
-      jsonData += "\"content\":\"<b>Sender:</b> " + senderHtml + "<br><b>Time:</b> " + timestampHtml + "<br><b>Message:</b><br>" + messageHtml + "\",";
-      jsonData += "\"channel\":\"" + channelValue + "\"";
-      jsonData += "}";
-      httpCode = http.POST(jsonData);
+      String senderHtml = htmlEscape(senderValue);
+      String messageHtml = htmlEscape(messageValue);
+      String timestampHtml = htmlEscape(timestampValue);
+      JsonDocument json;
+      json["token"] = channel.key1;
+      json["title"] = "SMS from: " + senderHtml;
+      json["content"] = "<b>Sender:</b> " + senderHtml + "<br><b>Time:</b> " + timestampHtml +
+                        "<br><b>Message:</b><br>" + messageHtml;
+      json["channel"] = channelValue;
+      if (!postJson(http, pushUrl, json, httpCode)) return;
       break;
     }
 
@@ -300,12 +295,18 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         logCaptureLn(String("Custom template is empty; skipping delivery"));
         return;
       }
+      String senderContent;
+      String messageContent;
+      String timestampContent;
+      if (!serializeJsonStringContent(senderValue, senderContent) ||
+          !serializeJsonStringContent(messageValue, messageContent) ||
+          !serializeJsonStringContent(timestampValue, timestampContent)) return;
       http.begin(channel.url);
       http.addHeader("Content-Type", "application/json");
       String body = channel.customBody;
-      body.replace("{sender}", senderEscaped);
-      body.replace("{message}", messageEscaped);
-      body.replace("{timestamp}", timestampEscaped);
+      body.replace("{sender}", senderContent);
+      body.replace("{message}", messageContent);
+      body.replace("{timestamp}", timestampContent);
       httpCode = http.POST(body);
       break;
     }
@@ -313,7 +314,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
     case PUSH_TYPE_FEISHU: {
       // Feishu bot
       String webhookUrl = channel.url;
-      String jsonData = "{";
+      JsonDocument json;
       
       // Add a signature when a secret is configured.
       if (channel.key1.length() > 0) {
@@ -328,19 +329,16 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         }
         String sign = base64::encode(hmacResult, 32);
         
-        jsonData += "\"timestamp\":\"" + String(ts) + "\",";
-        jsonData += "\"sign\":\"" + sign + "\",";
+        json["timestamp"] = String(ts);
+        json["sign"] = sign;
       }
       
       // Feishu message body
-      jsonData += "\"msg_type\":\"text\",";
-      jsonData += "\"content\":{\"text\":\"";
-      jsonData += "📱 SMS notification\\nSender: " + senderEscaped + "\\nMessage: " + messageEscaped + "\\nTime: " + timestampEscaped;
-      jsonData += "\"}}";
-      
-      http.begin(webhookUrl);
-      http.addHeader("Content-Type", "application/json");
-      httpCode = http.POST(jsonData);
+      json["msg_type"] = "text";
+      JsonObject content = json["content"].to<JsonObject>();
+      content["text"] = "📱 SMS notification\nSender: " + senderValue +
+                        "\nMessage: " + messageValue + "\nTime: " + timestampValue;
+      if (!postJson(http, webhookUrl, json, httpCode)) return;
       break;
     }
     
@@ -351,14 +349,11 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       if (!gotifyUrl.endsWith("/")) gotifyUrl += "/";
       gotifyUrl += "message?token=" + channel.key1;
       
-      http.begin(gotifyUrl);
-      http.addHeader("Content-Type", "application/json");
-      String jsonData = "{";
-      jsonData += "\"title\":\"SMS from: " + senderEscaped + "\",";
-      jsonData += "\"message\":\"" + messageEscaped + "\\n\\nTime: " + timestampEscaped + "\",";
-      jsonData += "\"priority\":5";
-      jsonData += "}";
-      httpCode = http.POST(jsonData);
+      JsonDocument json;
+      json["title"] = "SMS from: " + senderValue;
+      json["message"] = messageValue + "\n\nTime: " + timestampValue;
+      json["priority"] = 5;
+      if (!postJson(http, gotifyUrl, json, httpCode)) return;
       break;
     }
     
@@ -369,17 +364,12 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       if (tgBaseUrl.endsWith("/")) tgBaseUrl.remove(tgBaseUrl.length() - 1);
       
       String tgUrl = tgBaseUrl + "/bot" + channel.key2 + "/sendMessage";
-      http.begin(tgUrl);
-      http.addHeader("Content-Type", "application/json");
-      
-      String jsonData = "{";
-      jsonData += "\"chat_id\":\"" + jsonEscape(channel.key1) + "\",";
       String text = "📱 SMS notification\nSender: " + String(sender) +
                     "\nMessage: " + String(message) + "\nTime: " + String(timestamp);
-      jsonData += "\"text\":\"" + jsonEscape(text) + "\"";
-      jsonData += "}";
-      
-      httpCode = http.POST(jsonData);
+      JsonDocument json;
+      json["chat_id"] = channel.key1;
+      json["text"] = text;
+      if (!postJson(http, tgUrl, json, httpCode)) return;
       break;
     }
     

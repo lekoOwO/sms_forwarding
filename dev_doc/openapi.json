@@ -29,7 +29,7 @@
     "requestLineBytes": 2048,
     "totalHeaderBytes": 8192,
     "bodyBytes": 16384,
-    "description": "Limits are enforced before authentication. Rejections use 414, 431, or 413 with Connection: close and Cache-Control: no-store. Field limits count UTF-8 bytes, reject without truncation, and use ACTION_INPUT_TOO_LONG with detail set only to the field name."
+    "description": "Limits are enforced before authentication. Rejections use 414, 431, or 413 with Connection: close and Cache-Control: no-store. Fields must contain valid UTF-8 text and stay within their byte limits; rejections leave state unchanged and put only the field name in detail."
   },
   "tags": [
     { "name": "UI" },
@@ -96,7 +96,8 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/JsonSerializationFailure" }
         }
       }
     },
@@ -289,7 +290,8 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/JsonSerializationFailure" }
         }
       }
     },
@@ -394,7 +396,7 @@
         }
       },
       "InputTooLong": {
-        "description": "Invalid bounded input. ACTION_INPUT_TOO_LONG leaves configuration unchanged and detail contains only the field name; the AT route can instead return ACTION_AT_REJECTED for unsafe command classes.",
+        "description": "Invalid bounded input. ACTION_INPUT_TOO_LONG and ACTION_INPUT_INVALID leave configuration unchanged and detail contains only the field name; the AT route can instead return ACTION_AT_REJECTED for unsafe command classes.",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/ActionResult" }
@@ -409,6 +411,21 @@
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/ActionResult" }
+          }
+        }
+      },
+      "JsonSerializationFailure": {
+        "description": "The device could not serialize the resource response.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": ["error"],
+              "additionalProperties": false,
+              "properties": {
+                "error": { "type": "string" }
+              }
+            }
           }
         }
       }
@@ -428,6 +445,7 @@
               "ACTION_CONFIG_SAVE_FAILED",
               "ACTION_CONFIG_ACCOUNT_REQUIRED",
               "ACTION_INPUT_TOO_LONG",
+              "ACTION_INPUT_INVALID",
               "ACTION_SMS_PHONE_REQUIRED",
               "ACTION_SMS_CONTENT_REQUIRED",
               "ACTION_SMS_SENT",
@@ -462,7 +480,7 @@
           "data": { "$ref": "#/components/schemas/ActionData" },
           "detail": {
             "type": "string",
-            "description": "Raw diagnostic text for failures. For ACTION_INPUT_TOO_LONG it contains only the field name; otherwise it is empty when code and data are sufficient."
+            "description": "Raw diagnostic text for failures. For ACTION_INPUT_TOO_LONG and ACTION_INPUT_INVALID it contains only the field name; otherwise it is empty when code and data are sufficient."
           }
         }
       },
