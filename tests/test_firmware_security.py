@@ -114,6 +114,12 @@ int main() {
         self.assertIn("_logAppendFragment(msg);", handlers)
         self.assertNotIn("_logLine += msg;", handlers)
 
+    def test_usb_logging_does_not_block_the_main_loop(self):
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        self.assertIn("Serial.availableForWrite()", handlers)
+        self.assertNotIn("Serial.print(msg);", handlers)
+        self.assertNotIn("Serial.println(msg);", handlers)
+
     def test_hmac_failures_abort_signed_pushes(self):
         push = (ROOT / "code/push.cpp").read_text()
         self.assertIn("static bool hmacSha256", push)

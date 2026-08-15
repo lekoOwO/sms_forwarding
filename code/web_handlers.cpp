@@ -11,6 +11,13 @@ int logBufIdx = 0;
 int logBufCount = 0;
 static String _logLine;  // 行缓冲：logCapture 写入这里，logCaptureLn 提交整行
 
+static void _serialWrite(const char* msg, size_t length, bool newline = false) {
+  size_t required = length + (newline ? 2 : 0);
+  if ((size_t)Serial.availableForWrite() < required) return;
+  Serial.write((const uint8_t*)msg, length);
+  if (newline) Serial.write((const uint8_t*)"\r\n", 2);
+}
+
 static void _logAppend(const String& line) {
   logBuffer[logBufIdx] = line;
   logBufIdx = (logBufIdx + 1) % LOG_BUF_SIZE;
@@ -35,12 +42,12 @@ static void _logAppendFragment(const char* msg) {
 }
 
 void logCapture(const String& msg) {
-  Serial.print(msg);
+  _serialWrite(msg.c_str(), msg.length());
   _logAppendFragment(msg);
 }
 
 void logCapture(const char* msg) {
-  Serial.print(msg);
+  _serialWrite(msg, strlen(msg));
   _logAppendFragment(msg);
 }
 
@@ -50,7 +57,7 @@ void logCaptureF(const char* fmt, ...) {
   va_start(args, fmt);
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
-  Serial.print(buf);
+  _serialWrite(buf, strlen(buf));
   _logAppendFragment(buf);
   // 如果格式化字符串以 \n 结尾，则提交此行
   size_t len = strlen(buf);
@@ -61,13 +68,13 @@ void logCaptureF(const char* fmt, ...) {
 }
 
 void logCaptureLn(const String& msg) {
-  Serial.println(msg);
+  _serialWrite(msg.c_str(), msg.length(), true);
   _logAppendFragment(msg);
   _logCommit();
 }
 
 void logCaptureLn(const char* msg) {
-  Serial.println(msg);
+  _serialWrite(msg, strlen(msg), true);
   _logAppendFragment(msg);
   _logCommit();
 }
