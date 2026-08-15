@@ -4,7 +4,13 @@ import test from "node:test";
 import puppeteer from "puppeteer-core";
 import { createApp } from "../server.mjs";
 
+const settle = (page) => page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+
 async function clickNamed(page, name, startsWith = false) {
+	await page.waitForFunction(({ name, startsWith }) => [...document.querySelectorAll("button, a")].some((node) => {
+		const label = node.getAttribute("aria-label") ?? node.textContent?.trim() ?? "";
+		return startsWith ? label.startsWith(name) : label === name;
+	}), { timeout: 60_000 }, { name, startsWith });
 	const clicked = await page.evaluate(({ name, startsWith }) => {
 		const element = [...document.querySelectorAll("button, a")].find((node) => {
 			const label = node.getAttribute("aria-label") ?? node.textContent?.trim() ?? "";
@@ -15,6 +21,13 @@ async function clickNamed(page, name, startsWith = false) {
 		return true;
 	}, { name, startsWith });
 	assert.ok(clicked, `Missing control: ${name}`);
+	await settle(page);
+}
+
+async function click(page, selector) {
+	await page.waitForSelector(selector);
+	await page.$eval(selector, (node) => node.click());
+	await settle(page);
 }
 
 async function fill(page, selector, value) {
@@ -96,22 +109,22 @@ test("the production UI works with the mock API", async () => {
 		await page.select("#push-type-0", "2");
 		assert.equal(await page.$eval("#push-title-template-0", (node) => node.value), "SMS from {sender}");
 		assert.match(await page.$eval("#push-body-template-0", (node) => node.value), /Device: \{device\}/);
-		await page.click("#push-enabled-0");
+		await click(page, "#push-enabled-0");
 		assert.doesNotMatch(await page.$eval('button[data-slot="tabs-trigger"]', (node) => node.className), /bg-primary/);
-		await page.click("#push-enabled-0");
+		await click(page, "#push-enabled-0");
 		await clickNamed(page, "Email", true);
 		await fill(page, "#smtp-server", "smtp.example.com");
 		await fill(page, "#smtp-user", "sender@example.com");
 		await fill(page, "#smtp-pass", "secret");
 		await fill(page, "#smtp-to", "recipient@example.com");
-		await page.click('button[form="email-form"]');
+		await click(page, 'button[form="email-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 
 		await clickNamed(page, "Messaging");
 		assert.equal(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), "Send SMS");
 		await fill(page, "#sms-phone", "+886900000000");
 		await fill(page, "#sms-message", "Mock message");
-		await page.click('button[form="sms-form"]');
+		await click(page, 'button[form="sms-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("SMS sent."));
 
 		await clickNamed(page, "Device");
@@ -137,7 +150,7 @@ test("the production UI works with the mock API", async () => {
 		await clickNamed(page, "Account 2", true);
 		await fill(page, "#account-user-1", "operator");
 		await fill(page, "#account-pass-1", "secret");
-		await page.click('button[form="security-form"]');
+		await click(page, 'button[form="security-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 	} finally {
 		await browser.close();
