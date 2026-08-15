@@ -173,6 +173,7 @@
 	"resultFieldImei": "IMEI",
 	"ACTION_CONFIG_SAVED": "Configuration saved.",
 	"ACTION_CONFIG_SAVE_FAILED": "Configuration could not be saved. Retry and verify after restarting the device.",
+	"ACTION_CONFIG_ACCOUNT_REQUIRED": "Keep at least one management account.",
 	"ACTION_SMS_PHONE_REQUIRED": "Enter a destination number.",
 	"ACTION_SMS_CONTENT_REQUIRED": "Enter an SMS message.",
 	"ACTION_SMS_SENT": "SMS sent.",

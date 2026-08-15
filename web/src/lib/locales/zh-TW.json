@@ -173,6 +173,7 @@
 	"resultFieldImei": "IMEI",
 	"ACTION_CONFIG_SAVED": "設定已儲存。",
 	"ACTION_CONFIG_SAVE_FAILED": "設定無法儲存。請重試，並在裝置重新啟動後確認。",
+	"ACTION_CONFIG_ACCOUNT_REQUIRED": "請至少保留一個管理帳號。",
 	"ACTION_SMS_PHONE_REQUIRED": "請輸入目標號碼。",
 	"ACTION_SMS_CONTENT_REQUIRED": "請輸入簡訊內容。",
 	"ACTION_SMS_SENT": "簡訊已送出。",

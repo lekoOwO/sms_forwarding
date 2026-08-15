@@ -91,6 +91,14 @@ int main() {
         hard_reset = handlers[handlers.index('else if (action == "hardreset")'):]
         self.assertLess(hard_reset.index("busy = false;"), hard_reset.index("return;"))
 
+    def test_account_updates_cannot_restore_default_credentials(self):
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        self.assertIn("WebAccount nextWebAccounts[MAX_WEB_ACCOUNTS]", handlers)
+        self.assertIn("ACTION_CONFIG_ACCOUNT_REQUIRED", handlers)
+        self.assertNotIn(
+            "config.webAccounts[0].username = DEFAULT_WEB_USER", handlers
+        )
+
     def test_modem_and_log_buffers_are_bounded(self):
         globals_header = (ROOT / "code/globals.h").read_text()
         modem = (ROOT / "code/modem.cpp").read_text()

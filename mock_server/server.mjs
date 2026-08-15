@@ -47,6 +47,7 @@ function initialState() {
 const actionCodes = new Set([
 	"ACTION_CONFIG_SAVED",
 	"ACTION_CONFIG_SAVE_FAILED",
+	"ACTION_CONFIG_ACCOUNT_REQUIRED",
 	"ACTION_SMS_PHONE_REQUIRED",
 	"ACTION_SMS_CONTENT_REQUIRED",
 	"ACTION_SMS_SENT",
@@ -145,8 +146,9 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	app.post("/save", (request, response) => {
 		const body = request.body;
 		const config = state.config;
+		const nextAccounts = config.webAccounts.map((account) => ({ ...account }));
 		for (let index = 0; index < 10; index += 1) {
-			const account = config.webAccounts[index];
+			const account = nextAccounts[index];
 			const userKey = `account${index}user`;
 			const passKey = `account${index}pass`;
 			if (Object.hasOwn(body, userKey)) {
@@ -156,9 +158,11 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 			if (Object.hasOwn(body, passKey) && body[passKey]) account.password = body[passKey];
 			if (!account.password) account.username = "";
 		}
-		if (!config.webAccounts.some((account) => account.username && account.password)) {
-			config.webAccounts[0] = { username: "admin", password: "admin123" };
+		if (!nextAccounts.some((account) => account.username && account.password)) {
+			response.status(400).json(result(false, "ACTION_CONFIG_ACCOUNT_REQUIRED"));
+			return;
 		}
+		config.webAccounts = nextAccounts;
 		if (Object.hasOwn(body, "smtpServer")) config.smtpServer = body.smtpServer;
 		if (Object.hasOwn(body, "smtpPort")) config.smtpPort = Number.parseInt(body.smtpPort, 10) || 465;
 		if (Object.hasOwn(body, "smtpUser")) config.smtpUser = body.smtpUser;

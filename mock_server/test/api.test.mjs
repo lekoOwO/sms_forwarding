@@ -28,6 +28,29 @@ test("authentication can be disabled for the LAN development server", async () =
 	}, { authRequired: false });
 });
 
+test("clearing all accounts does not restore the default credentials", async () => {
+	await withServer(async (baseUrl) => {
+		const headers = { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" };
+		const changed = await fetch(`${baseUrl}/save`, {
+			method: "POST",
+			headers,
+			body: new URLSearchParams({ account0user: "operator", account0pass: "secret" })
+		});
+		assert.equal(changed.status, 200);
+
+		const operatorAuth = `Basic ${Buffer.from("operator:secret").toString("base64")}`;
+		const cleared = await fetch(`${baseUrl}/save`, {
+			method: "POST",
+			headers: { Authorization: operatorAuth, "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ account0user: "", account0pass: "" })
+		});
+		assert.equal(cleared.status, 400);
+		assert.equal((await cleared.json()).code, "ACTION_CONFIG_ACCOUNT_REQUIRED");
+		assert.equal((await fetch(`${baseUrl}/api/config`, { headers: { Authorization: operatorAuth } })).status, 200);
+		assert.equal((await fetch(`${baseUrl}/api/config`, { headers: { Authorization: auth } })).status, 401);
+	});
+});
+
 test("the mock implements the documented API", async () => {
 	await withServer(async (baseUrl) => {
 		const unauthorized = await fetch(`${baseUrl}/api/config`);

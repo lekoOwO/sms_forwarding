@@ -726,31 +726,34 @@ void handleSave() {
   String previousSmtpUser = config.smtpUser;
 
   // 账号管理表单：空账号会停用该组，空密码会保留现有密码
+  WebAccount nextWebAccounts[MAX_WEB_ACCOUNTS];
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) nextWebAccounts[i] = config.webAccounts[i];
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
     String userKey = prefix + "user";
     String passKey = prefix + "pass";
     if (server.hasArg(userKey)) {
-      config.webAccounts[i].username = server.arg(userKey);
-      config.webAccounts[i].username.trim();
-      if (config.webAccounts[i].username.length() == 0) config.webAccounts[i].password = "";
+      nextWebAccounts[i].username = server.arg(userKey);
+      nextWebAccounts[i].username.trim();
+      if (nextWebAccounts[i].username.length() == 0) nextWebAccounts[i].password = "";
     }
     if (server.hasArg(passKey) && server.arg(passKey).length() > 0) {
-      config.webAccounts[i].password = server.arg(passKey);
+      nextWebAccounts[i].password = server.arg(passKey);
     }
-    if (config.webAccounts[i].password.length() == 0) config.webAccounts[i].username = "";
+    if (nextWebAccounts[i].password.length() == 0) nextWebAccounts[i].username = "";
   }
   bool hasWebAccount = false;
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
-    if (config.webAccounts[i].username.length() > 0 && config.webAccounts[i].password.length() > 0) {
+    if (nextWebAccounts[i].username.length() > 0 && nextWebAccounts[i].password.length() > 0) {
       hasWebAccount = true;
       break;
     }
   }
   if (!hasWebAccount) {
-    config.webAccounts[0].username = DEFAULT_WEB_USER;
-    config.webAccounts[0].password = DEFAULT_WEB_PASS;
+    sendActionResult(400, false, "ACTION_CONFIG_ACCOUNT_REQUIRED");
+    return;
   }
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) config.webAccounts[i] = nextWebAccounts[i];
 
   // 邮件通知表单：只在字段存在时更新
   if (server.hasArg("smtpServer")) {
