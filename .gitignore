@@ -3,5 +3,6 @@ compose.override.yaml
 .secrets/
 /build/
 /code/build/
+.worktrees/
 __pycache__/
 *.pyc
