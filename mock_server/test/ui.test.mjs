@@ -4,6 +4,26 @@ import test from "node:test";
 import puppeteer from "puppeteer-core";
 import { createApp } from "../server.mjs";
 
+async function clickNamed(page, name, startsWith = false) {
+	const clicked = await page.evaluate(({ name, startsWith }) => {
+		const element = [...document.querySelectorAll("button, a")].find((node) => {
+			const label = node.getAttribute("aria-label") ?? node.textContent?.trim() ?? "";
+			return startsWith ? label.startsWith(name) : label === name;
+		});
+		if (!element) return false;
+		element.click();
+		return true;
+	}, { name, startsWith });
+	assert.ok(clicked, `Missing control: ${name}`);
+}
+
+async function fill(page, selector, value) {
+	await page.$eval(selector, (node, nextValue) => {
+		node.value = nextValue;
+		node.dispatchEvent(new Event("input", { bubbles: true }));
+	}, value);
+}
+
 test("the production UI works with the mock API", async () => {
 	const server = createApp({ authRequired: false }).listen(0, "127.0.0.1");
 	await new Promise((resolve) => server.once("listening", resolve));
@@ -15,7 +35,7 @@ test("the production UI works with the mock API", async () => {
 
 	try {
 		const page = await browser.newPage();
-		page.setDefaultTimeout(90_000);
+		page.setDefaultTimeout(60_000);
 		const browserErrors = [];
 		page.on("pageerror", (error) => browserErrors.push(error.message));
 		page.on("requestfailed", (request) => browserErrors.push(`${request.url()}: ${request.failure()?.errorText ?? "request failed"}`));
@@ -58,46 +78,46 @@ test("the production UI works with the mock API", async () => {
 		assert.equal(await page.$$eval("table", (nodes) => nodes.length), 0);
 		assert.ok(await page.$$eval("dl", (nodes) => nodes.length) >= 2);
 		assert.ok(await page.$eval("header p", (node) => Number.parseFloat(getComputedStyle(node).fontSize)) >= 18);
-		await page.locator('::-p-aria(Dark mode)').click();
+		await clickNamed(page, "Dark mode");
 		await page.waitForFunction(() => document.documentElement.classList.contains("dark"));
-		await page.locator('::-p-aria(Day mode)').wait();
+		await page.waitForSelector('[aria-label="Day mode"]');
 
 		await page.select("#locale", "zh-TW");
 		await page.waitForFunction(() => document.querySelector("h1")?.textContent === "裝置概覽");
 		await page.select("#locale", "en");
 
-		await page.locator('::-p-aria(Notifications)').click();
+		await clickNamed(page, "Notifications");
 		await page.waitForFunction(() => document.body.textContent?.includes("Disabled"));
 		assert.equal(await page.$$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (nodes) => nodes.length), 1);
 		assert.match(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), /^Notification language/);
-		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Push channels")])').click();
+		await clickNamed(page, "Push channels", true);
 		await page.select("#push-type-0", "7");
 		assert.match(await page.$eval("#push-body-0", (node) => node.value), /\{message\}/);
 		await page.select("#push-type-0", "2");
 		assert.equal(await page.$eval("#push-title-template-0", (node) => node.value), "SMS from {sender}");
 		assert.match(await page.$eval("#push-body-template-0", (node) => node.value), /Device: \{device\}/);
-		await page.locator("#push-enabled-0").click();
+		await page.click("#push-enabled-0");
 		assert.doesNotMatch(await page.$eval('button[data-slot="tabs-trigger"]', (node) => node.className), /bg-primary/);
-		await page.locator("#push-enabled-0").click();
-		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Email")])').click();
-		await page.locator("#smtp-server").fill("smtp.example.com");
-		await page.locator("#smtp-user").fill("sender@example.com");
-		await page.locator("#smtp-pass").fill("secret");
-		await page.locator("#smtp-to").fill("recipient@example.com");
-		await page.locator('button[form="email-form"]').click();
+		await page.click("#push-enabled-0");
+		await clickNamed(page, "Email", true);
+		await fill(page, "#smtp-server", "smtp.example.com");
+		await fill(page, "#smtp-user", "sender@example.com");
+		await fill(page, "#smtp-pass", "secret");
+		await fill(page, "#smtp-to", "recipient@example.com");
+		await page.click('button[form="email-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 
-		await page.locator('::-p-aria(Messaging)').click();
+		await clickNamed(page, "Messaging");
 		assert.equal(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), "Send SMS");
-		await page.locator("#sms-phone").fill("+886900000000");
-		await page.locator("#sms-message").fill("Mock message");
-		await page.locator('button[form="sms-form"]').click();
+		await fill(page, "#sms-phone", "+886900000000");
+		await fill(page, "#sms-message", "Mock message");
+		await page.click('button[form="sms-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("SMS sent."));
 
-		await page.locator('::-p-aria(Device)').click();
+		await clickNamed(page, "Device");
 		assert.equal(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), "Identity");
-		await page.locator('::-p-aria(Diagnostics)').click();
-		await page.locator('::-p-aria(Modem information)').click();
+		await clickNamed(page, "Diagnostics");
+		await clickNamed(page, "Modem information");
 		await page.waitForFunction(() => document.body.textContent?.includes("Mock LTE-C3"));
 		assert.ok(await page.$eval('[role="status"] dl', (node) => ["Manufacturer", "Model", "Revision"].every((label) => node.textContent?.includes(label))));
 		assert.ok(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.closest('[data-slot="accordion-item"]')?.querySelector('[data-slot="accordion-content"]')?.textContent?.includes("Query completed.")));
@@ -105,7 +125,7 @@ test("the production UI works with the mock API", async () => {
 		await page.waitForFunction(() => document.body.textContent?.includes("查詢已完成。"));
 		await page.select("#locale", "en");
 		await page.waitForFunction(() => document.documentElement.lang === "en");
-		await page.locator('::-p-aria(Logs)').click();
+		await clickNamed(page, "Logs");
 		await page.waitForFunction(() => document.body.textContent?.includes("Mock device started"));
 		await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some((node) =>
 			node.textContent?.includes("Query completed.") && node.closest('[data-slot="accordion-content"]')?.getBoundingClientRect().height === 0));
@@ -114,10 +134,10 @@ test("the production UI works with the mock API", async () => {
 		await new Promise((resolve) => setTimeout(resolve, 300));
 		assert.equal(await page.$eval("h1", (node) => node.textContent), "Account security");
 		assert.equal(await page.$$eval('button[data-slot="tabs-trigger"]', (nodes) => nodes.length), 0);
-		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Account 2")])').click();
-		await page.locator("#account-user-1").fill("operator");
-		await page.locator("#account-pass-1").fill("secret");
-		await page.locator('button[form="security-form"]').click();
+		await clickNamed(page, "Account 2", true);
+		await fill(page, "#account-user-1", "operator");
+		await fill(page, "#account-pass-1", "secret");
+		await page.click('button[form="security-form"]');
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 	} finally {
 		await browser.close();
