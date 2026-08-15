@@ -257,7 +257,7 @@ void setDefaults(Config& value) {
   for (int i = 0; i < MAX_PUSH_CHANNELS; ++i) {
     value.pushChannels[i].enabled = false;
     value.pushChannels[i].type = PUSH_TYPE_POST_JSON;
-    value.pushChannels[i].name = "通道" + String(i + 1);
+    value.pushChannels[i].name = "Channel " + String(i + 1);
   }
 }
 
@@ -298,7 +298,7 @@ LegacyStatus loadLegacyConfig(Config& value) {
     channel.enabled = preferences.getBool((prefix + "en").c_str(), false);
     channel.type = static_cast<PushType>(preferences.getUChar((prefix + "type").c_str(), PUSH_TYPE_POST_JSON));
     channel.url = preferences.getString((prefix + "url").c_str(), "");
-    channel.name = preferences.getString((prefix + "name").c_str(), "通道" + String(i + 1));
+    channel.name = preferences.getString((prefix + "name").c_str(), "Channel " + String(i + 1));
     channel.key1 = preferences.getString((prefix + "k1").c_str(), "");
     channel.key2 = preferences.getString((prefix + "k2").c_str(), "");
     channel.customBody = preferences.getString((prefix + "body").c_str(), "");
@@ -308,7 +308,7 @@ LegacyStatus loadLegacyConfig(Config& value) {
     value.pushChannels[0].enabled = true;
     value.pushChannels[0].url = oldHttpUrl;
     value.pushChannels[0].type = preferences.getUChar("barkMode", 0) != 0 ? PUSH_TYPE_BARK : PUSH_TYPE_POST_JSON;
-    value.pushChannels[0].name = "迁移通道";
+    value.pushChannels[0].name = "Migrated channel";
   }
   preferences.end();
   return storageSemanticsValid(value) ? LEGACY_OK : LEGACY_ERROR;
@@ -331,7 +331,7 @@ bool saveConfig(const Config& candidate) {
   uint32_t generation = activeGeneration + 1;
   OwnedBuffer blob;
   if (!encodeConfig(candidate, generation, blob) || !openConfigStorage()) {
-    logCaptureLn("配置保存失败");
+    logCaptureLn("Failed to save configuration");
     return false;
   }
 
@@ -362,12 +362,12 @@ bool saveConfig(const Config& candidate) {
   preferences.end();
 
   if (!ok) {
-    logCaptureLn("配置保存失败：新槽未提交");
+    logCaptureLn("Failed to save configuration: new slot was not committed");
     return false;
   }
   activeSlot = targetSlot;
   activeGeneration = generation;
-  logCaptureLn("配置已保存");
+  logCaptureLn("Configuration saved");
   return true;
 }
 
@@ -375,7 +375,7 @@ ConfigLoadStatus loadConfig() {
   activeSlot = -1;
   activeGeneration = 0;
   if (!openConfigStorage()) {
-    logCaptureLn("配置加载失败：无法打开appcfg NVS");
+    logCaptureLn("Failed to load configuration: could not open appcfg NVS");
     return CONFIG_LOAD_STORAGE_ERROR;
   }
 
@@ -391,7 +391,7 @@ ConfigLoadStatus loadConfig() {
   preferences.end();
   if (hasValidSlot) {
     if (!stateOk) {
-      logCaptureLn("配置加载失败：无法提交存储状态");
+      logCaptureLn("Failed to load configuration: could not commit storage state");
       return CONFIG_LOAD_STORAGE_ERROR;
     }
     int selected = !slots[0].valid ? 1 : !slots[1].valid ? 0 :
@@ -399,20 +399,20 @@ ConfigLoadStatus loadConfig() {
     config = slots[selected].value;
     activeSlot = selected;
     activeGeneration = slots[selected].generation;
-    logCaptureLn("配置已加载");
+    logCaptureLn("Configuration loaded");
     return CONFIG_LOAD_OK;
   }
   bool hasSlotData = slots[0].present || slots[1].present;
   bool canMigrate = storageState == CONFIG_STATE_MIGRATING ||
                     (storageState == 0 && !hasSlotData);
   if (!canMigrate) {
-    logCaptureLn("配置加载失败：两个配置槽均无效");
+    logCaptureLn("Failed to load configuration: both configuration slots are invalid");
     return CONFIG_LOAD_STORAGE_ERROR;
   }
 
   if (storageState != CONFIG_STATE_MIGRATING &&
       !setConfigState(CONFIG_STATE_MIGRATING)) {
-    logCaptureLn("配置迁移失败：无法提交迁移状态");
+    logCaptureLn("Failed to migrate configuration: could not commit migration state");
     return CONFIG_LOAD_STORAGE_ERROR;
   }
 
@@ -420,11 +420,11 @@ ConfigLoadStatus loadConfig() {
   LegacyStatus legacyStatus = loadLegacyConfig(legacy);
   if (legacyStatus == LEGACY_ERROR || !saveConfig(legacy) ||
       !setConfigState(CONFIG_STATE_READY)) {
-    logCaptureLn("配置迁移失败");
+    logCaptureLn("Failed to migrate configuration");
     return CONFIG_LOAD_STORAGE_ERROR;
   }
   config = legacy;
-  logCaptureLn(legacyStatus == LEGACY_ABSENT ? "首次启动配置已建立" : "旧配置已迁移");
+  logCaptureLn(legacyStatus == LEGACY_ABSENT ? "Initial configuration created" : "Legacy configuration migrated");
   return legacyStatus == LEGACY_ABSENT ? CONFIG_LOAD_FIRST_BOOT : CONFIG_LOAD_OK;
 }
 

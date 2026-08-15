@@ -88,7 +88,7 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertIn("config = next;", handlers)
         self.assertIn("configLoadStatus != CONFIG_LOAD_STORAGE_ERROR", sketch)
         self.assertIn("if (configStorageAvailable)", sketch)
-        self.assertIn("管理HTTP已停用", sketch)
+        self.assertIn("management HTTP disabled", sketch)
 
 
 if __name__ == "__main__":

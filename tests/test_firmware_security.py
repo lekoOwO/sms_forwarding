@@ -8,6 +8,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FirmwareSecurityTest(unittest.TestCase):
+    def test_firmware_sources_use_english_text(self):
+        for suffix in ("*.ino", "*.cpp", "*.h"):
+            for path in (ROOT / "code").rglob(suffix):
+                text = path.read_text()
+                self.assertNotRegex(text, r"[\u3400-\u9fff]", str(path))
+
     def test_utf8_validator_rejects_malformed_sequences(self):
         source = r'''
 #include "utf8_validation.h"
@@ -61,13 +67,14 @@ int main() {
         self.assertNotIn("allowAdminCommands", header)
         self.assertNotIn('startsWith("SMS:")', sms)
         self.assertNotIn('equals("RESET")', sms)
-        self.assertIn("管理员长短信不完整，已丢弃", sms)
+        self.assertIn("Incomplete administrator multipart SMS discarded", sms)
         reset = sms.index("concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;")
         self.assertLess(reset, sms.index("pdu.decodePDU"))
 
     def test_push_output_is_bounded_and_context_escaped(self):
         push = (ROOT / "code/push.cpp").read_text()
         self.assertIn('snprintf(escaped, sizeof(escaped), "\\\\u%04X"', push)
+        self.assertIn("validUtf8CharLength(str.c_str() + i)", push)
         self.assertNotIn("http.getString()", push)
         self.assertIn("https://www.pushplus.plus/send", push)
         self.assertIn("String safeSubject = String(subject);", push)
@@ -82,9 +89,9 @@ int main() {
     def test_sms_bodies_are_not_copied_to_device_logs(self):
         sms = (ROOT / "code/sms_process.cpp").read_text()
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
-        self.assertNotIn('logCaptureLn(String("收到PDU数据: "', sms)
-        self.assertNotIn('logCaptureLn(String("内容: " + String(text)))', sms)
-        self.assertNotIn('logCaptureLn(String("短信内容: " + content))', handlers)
+        self.assertNotIn('logCaptureLn(String("Received PDU data: "', sms)
+        self.assertNotIn('logCaptureLn(String("Message: " + String(text)))', sms)
+        self.assertNotIn('logCaptureLn(String("SMS content: " + content))', handlers)
 
     def test_management_responses_apply_small_security_headers(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()

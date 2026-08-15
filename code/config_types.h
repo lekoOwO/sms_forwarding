@@ -3,34 +3,34 @@
 
 #include <Arduino.h>
 
-// 推送通道类型
+// Push channel types
 enum PushType {
-  PUSH_TYPE_NONE = 0,      // 未启用
-  PUSH_TYPE_POST_JSON = 1, // POST JSON格式 {"sender":"xxx","message":"xxx","timestamp":"xxx"}
-  PUSH_TYPE_BARK = 2,      // Bark格式 POST {"title":"xxx","body":"xxx"}
-  PUSH_TYPE_GET = 3,       // GET请求，参数放URL中
-  PUSH_TYPE_DINGTALK = 4,  // 钉钉机器人
+  PUSH_TYPE_NONE = 0,      // Disabled
+  PUSH_TYPE_POST_JSON = 1, // POST JSON format: {"sender":"xxx","message":"xxx","timestamp":"xxx"}
+  PUSH_TYPE_BARK = 2,      // Bark format: POST {"title":"xxx","body":"xxx"}
+  PUSH_TYPE_GET = 3,       // GET request with parameters in the URL
+  PUSH_TYPE_DINGTALK = 4,  // DingTalk bot
   PUSH_TYPE_PUSHPLUS = 5,  // PushPlus
-  PUSH_TYPE_SERVERCHAN = 6,// Server酱
-  PUSH_TYPE_CUSTOM = 7,    // 自定义模板
-  PUSH_TYPE_FEISHU = 8,    // 飞书机器人
+  PUSH_TYPE_SERVERCHAN = 6,// ServerChan
+  PUSH_TYPE_CUSTOM = 7,    // Custom template
+  PUSH_TYPE_FEISHU = 8,    // Feishu bot
   PUSH_TYPE_GOTIFY = 9,    // Gotify
   PUSH_TYPE_TELEGRAM = 10  // Telegram Bot
 };
 
-// 最大推送通道数
+// Maximum number of push channels
 #define MAX_PUSH_CHANNELS 5
 #define MAX_WEB_ACCOUNTS 10
 
-// 推送通道配置（通用设计，支持多种推送方式）
+// Push channel configuration shared by all providers
 struct PushChannel {
-  bool enabled;           // 是否启用
-  PushType type;          // 推送类型
-  String name;            // 通道名称（用于显示）
-  String url;             // 推送URL（webhook地址）
-  String key1;            // 额外参数1（如：钉钉secret、pushplus token等）
-  String key2;            // 额外参数2（备用）
-  String customBody;      // 自定义请求体模板（使用 {sender} {message} {timestamp} 占位符）
+  bool enabled;           // Whether the channel is enabled
+  PushType type;          // Push provider type
+  String name;            // Display name
+  String url;             // Push or webhook URL
+  String key1;            // Provider-specific value, such as a secret or token
+  String key2;            // Secondary provider-specific value
+  String customBody;      // Custom request body with {sender}, {message}, and {timestamp} placeholders
 };
 
 struct WebAccount {
@@ -38,7 +38,7 @@ struct WebAccount {
   String password;
 };
 
-// 配置参数结构体
+// Configuration values
 struct Config {
   String smtpServer;
   int smtpPort;
@@ -46,36 +46,36 @@ struct Config {
   String smtpPass;
   String smtpSendTo;
   String adminPhone;
-  PushChannel pushChannels[MAX_PUSH_CHANNELS];  // 多推送通道
+  PushChannel pushChannels[MAX_PUSH_CHANNELS];  // Push channels
   WebAccount webAccounts[MAX_WEB_ACCOUNTS];
-  String numberBlackList;  // 号码黑名单（换行符分隔）
+  String numberBlackList;  // Phone number blacklist, one number per line
 };
 
-// 默认Web管理账号密码
+// Default web management credentials
 #define DEFAULT_WEB_USER "admin"
 #define DEFAULT_WEB_PASS "admin123"
 
-// 长短信合并相关定义
-#define MAX_CONCAT_PARTS 10       // 最大支持的长短信分段数
-#define CONCAT_TIMEOUT_MS 30000   // 长短信等待超时时间(毫秒)
-#define MAX_CONCAT_MESSAGES 5     // 最多同时缓存的长短信组数
+// Concatenated SMS limits
+#define MAX_CONCAT_PARTS 10       // Maximum number of parts per concatenated SMS
+#define CONCAT_TIMEOUT_MS 30000   // Time to wait for missing parts, in milliseconds
+#define MAX_CONCAT_MESSAGES 5     // Maximum number of concatenated SMS messages buffered at once
 
-// 长短信分段结构
+// One part of a concatenated SMS
 struct SmsPart {
-  bool valid;           // 该分段是否有效
-  String text;          // 分段内容
+  bool valid;           // Whether this part has been received
+  String text;          // Part contents
 };
 
-// 长短信缓存结构
+// Buffered concatenated SMS
 struct ConcatSms {
-  bool inUse;                           // 是否正在使用
-  int refNumber;                        // 参考号
-  String sender;                        // 发送者
-  String timestamp;                     // 时间戳（使用第一个收到的分段的时间戳）
-  int totalParts;                       // 总分段数
-  int receivedParts;                    // 已收到的分段数
-  unsigned long firstPartTime;          // 收到第一个分段的时间
-  SmsPart parts[MAX_CONCAT_PARTS];      // 各分段内容
+  bool inUse;                           // Whether this slot is in use
+  int refNumber;                        // Concatenation reference number
+  String sender;                        // Sender
+  String timestamp;                     // Timestamp from the first received part
+  int totalParts;                       // Expected number of parts
+  int receivedParts;                    // Number of received parts
+  unsigned long firstPartTime;          // Time when the first part was received
+  SmsPart parts[MAX_CONCAT_PARTS];      // Part contents
 };
 
 #endif

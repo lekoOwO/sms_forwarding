@@ -5,11 +5,11 @@
 #include "push.h"
 #include "wifi_config.h"
 
-// ---- 日志环形缓冲区 ----
+// ---- Log ring buffer ----
 String logBuffer[LOG_BUF_SIZE];
 int logBufIdx = 0;
 int logBufCount = 0;
-static String _logLine;  // 行缓冲：logCapture 写入这里，logCaptureLn 提交整行
+static String _logLine;  // logCapture writes here; logCaptureLn commits the complete line.
 
 static void _serialWrite(const char* msg, size_t length, bool newline = false) {
   size_t required = length + (newline ? 2 : 0);
@@ -59,10 +59,10 @@ void logCaptureF(const char* fmt, ...) {
   va_end(args);
   _serialWrite(buf, strlen(buf));
   _logAppendFragment(buf);
-  // 如果格式化字符串以 \n 结尾，则提交此行
+  // Commit the line when the formatted string ends with \n.
   size_t len = strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') {
-    _logLine.trim();  // 去掉尾部空格和可能多余的 \n
+    _logLine.trim();  // Remove trailing whitespace and any extra \n.
     _logCommit();
   }
 }
@@ -79,14 +79,14 @@ void logCaptureLn(const char* msg) {
   _logCommit();
 }
 
-// 检查HTTP Basic认证
+// Check HTTP Basic authentication.
 bool checkAuth() {
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     const WebAccount& account = config.webAccounts[i];
     if (account.username.length() > 0 && account.password.length() > 0 &&
         server.authenticate(account.username.c_str(), account.password.c_str())) return true;
   }
-  server.requestAuthentication(BASIC_AUTH, "SMS Forwarding", "请输入管理员账号密码");
+  server.requestAuthentication(BASIC_AUTH, "SMS Forwarding", "Enter the administrator username and password");
   return false;
 }
 
@@ -119,7 +119,7 @@ static bool rejectModemBusy() {
   return true;
 }
 
-// 从 LittleFS 提供前端构建产物
+// Serve the frontend build from LittleFS.
 void handleRoot() {
   if (!checkAuth()) return;
   server.sendHeader("Content-Security-Policy", "frame-ancestors 'none'");
@@ -136,7 +136,7 @@ void handleRoot() {
   file.close();
 }
 
-// 前端初始化所需的状态与配置。密码内容不返回。
+// Return the status and configuration needed to initialize the frontend. Passwords are omitted.
 void handleConfig() {
   if (!checkAuth()) return;
 
@@ -188,7 +188,7 @@ void handleConfig() {
   server.send(200, "application/json", json);
 }
 
-// 处理飞行模式控制请求
+// Handle flight mode control requests.
 void handleFlightMode() {
   if (!checkAuth()) return;
   
@@ -201,10 +201,10 @@ void handleFlightMode() {
   const char* code = "ACTION_UNKNOWN";
   
   if (action == "query") {
-    // 查询当前功能模式
-    logCaptureLn(String("网页端查询飞行模式: AT+CFUN?"));
+    // Query the current operating mode.
+    logCaptureLn(String("Web UI queried flight mode: AT+CFUN?"));
     String resp = sendATCommand("AT+CFUN?", 2000);
-    logCaptureLn(String("CFUN查询响应: " + resp));
+    logCaptureLn(String("CFUN query response: " + resp));
     
     if (resp.indexOf("+CFUN:") >= 0) {
       success = true;
@@ -227,21 +227,21 @@ void handleFlightMode() {
     }
   }
   else if (action == "toggle") {
-    // 先查询当前状态
+    // Query the current state first.
     String resp = sendATCommand("AT+CFUN?", 2000);
-    logCaptureLn(String("CFUN查询响应: " + resp));
+    logCaptureLn(String("CFUN query response: " + resp));
     
     if (resp.indexOf("+CFUN:") >= 0) {
       int idx = resp.indexOf("+CFUN:");
       int currentMode = resp.substring(idx + 6).toInt();
       
-      // 切换模式：1(正常) <-> 4(飞行模式)
+      // Toggle between mode 1 (normal) and mode 4 (flight mode).
       int newMode = (currentMode == 1) ? 4 : 1;
       String cmd = "AT+CFUN=" + String(newMode);
       
-      logCaptureLn(String("切换飞行模式: " + cmd));
+      logCaptureLn(String("Toggling flight mode: " + cmd));
       String setResp = sendATCommand(cmd.c_str(), 5000);
-      logCaptureLn(String("CFUN设置响应: " + setResp));
+      logCaptureLn(String("CFUN set response: " + setResp));
       
       if (setResp.indexOf("OK") >= 0) {
         success = true;
@@ -256,8 +256,8 @@ void handleFlightMode() {
     }
   }
   else if (action == "on") {
-    // 强制开启飞行模式
-    logCaptureLn(String("网页端强制开启飞行模式: AT+CFUN=4"));
+    // Force flight mode on.
+    logCaptureLn(String("Web UI enabled flight mode: AT+CFUN=4"));
     String resp = sendATCommand("AT+CFUN=4", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
@@ -268,8 +268,8 @@ void handleFlightMode() {
     }
   }
   else if (action == "off") {
-    // 强制关闭飞行模式
-    logCaptureLn(String("网页端关闭飞行模式: AT+CFUN=1"));
+    // Force flight mode off.
+    logCaptureLn(String("Web UI disabled flight mode: AT+CFUN=1"));
     String resp = sendATCommand("AT+CFUN=1", 5000);
     if (resp.indexOf("OK") >= 0) {
       success = true;
@@ -283,7 +283,7 @@ void handleFlightMode() {
   sendActionResult(200, success, code, data, detail);
 }
 
-// 处理AT指令测试请求
+// Handle AT command test requests.
 void handleATCommand() {
   if (!checkAuth()) return;
   
@@ -300,9 +300,9 @@ void handleATCommand() {
   
   if (cmd.length() == 0) {
   } else {
-    logCaptureLn(String("网页端发送AT指令: " + cmd));
+    logCaptureLn(String("Web UI sent AT command: " + cmd));
     String resp = sendATCommand(cmd.c_str(), 5000);
-    logCaptureLn(String("模组响应: " + resp));
+    logCaptureLn(String("Modem response: " + resp));
     
     if (resp.length() > 0) {
       success = true;
@@ -316,7 +316,7 @@ void handleATCommand() {
   sendActionResult(200, success, code, data);
 }
 
-// 处理模组信息查询请求
+// Handle modem information queries.
 void handleQuery() {
   if (!checkAuth()) return;
   
@@ -329,19 +329,19 @@ void handleQuery() {
   const char* code = "ACTION_QUERY_UNKNOWN";
   
   if (type == "ati") {
-    // 固件信息查询
+    // Query firmware information.
     String resp = sendATCommand("ATI", 2000);
-    logCaptureLn(String("ATI响应: " + resp));
+    logCaptureLn(String("ATI response: " + resp));
     
     if (resp.indexOf("OK") >= 0) {
       success = true;
       code = "ACTION_QUERY_OK";
-      // 解析ATI响应
+      // Parse the ATI response.
       String manufacturer = "N/A";
       String model = "N/A";
       String version = "N/A";
       
-      // 按行解析
+      // Parse the response line by line.
       int lineStart = 0;
       int lineNum = 0;
       for (int i = 0; i < resp.length(); i++) {
@@ -367,14 +367,14 @@ void handleQuery() {
     }
   }
   else if (type == "signal") {
-    // 信号质量查询
+    // Query signal quality.
     String resp = sendATCommand("AT+CESQ", 2000);
-    logCaptureLn(String("CESQ响应: " + resp));
+    logCaptureLn(String("CESQ response: " + resp));
     
     if (resp.indexOf("+CESQ:") >= 0) {
       success = true;
       code = "ACTION_QUERY_OK";
-      // 解析 +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>
+      // Parse +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>.
       int idx = resp.indexOf("+CESQ:");
       String params = resp.substring(idx + 6);
       int endIdx = params.indexOf('\r');
@@ -382,7 +382,7 @@ void handleQuery() {
       if (endIdx > 0) params = params.substring(0, endIdx);
       params.trim();
       
-      // 分割参数
+      // Split the parameters.
       String values[6];
       int valIdx = 0;
       int startPos = 0;
@@ -395,7 +395,7 @@ void handleQuery() {
         }
       }
       
-      // RSRP转换为dBm (0-97映射到-140到-44 dBm, 99表示未知)
+      // Convert RSRP to dBm (0-97 maps to -140 through -44 dBm; 99 means unknown).
       int rsrp = values[5].toInt();
       String rsrpValue;
       if (rsrp == 99 || rsrp == 255) {
@@ -404,7 +404,7 @@ void handleQuery() {
         rsrpValue = String(-140 + rsrp);
       }
       
-      // RSRQ转换 (0-34映射到-19.5到-3 dB)
+      // Convert RSRQ (0-34 maps to -19.5 through -3 dB).
       int rsrq = values[4].toInt();
       String rsrqValue;
       if (rsrq == 99 || rsrq == 255) {
@@ -421,11 +421,11 @@ void handleQuery() {
     }
   }
   else if (type == "siminfo") {
-    // SIM卡信息查询
+    // Query SIM card information.
     success = true;
     code = "ACTION_QUERY_OK";
     
-    // 查询IMSI
+    // Query the IMSI.
     String resp = sendATCommand("AT+CIMI", 2000);
     String imsi = "N/A";
     if (resp.indexOf("OK") >= 0) {
@@ -440,7 +440,7 @@ void handleQuery() {
         }
       }
     }
-    // 查询ICCID
+    // Query the ICCID.
     resp = sendATCommand("AT+ICCID", 2000);
     String iccid = "N/A";
     if (resp.indexOf("+ICCID:") >= 0) {
@@ -451,7 +451,7 @@ void handleQuery() {
       if (endIdx > 0) iccid = tmp.substring(0, endIdx);
       iccid.trim();
     }
-    // 查询本机号码 (如果SIM卡支持)
+    // Query this device's phone number when supported by the SIM card.
     resp = sendATCommand("AT+CNUM", 2000);
     String phoneNum = "N/A";
     if (resp.indexOf("+CNUM:") >= 0) {
@@ -468,14 +468,14 @@ void handleQuery() {
            ",\"msisdn\":" + jsonStringOrNull(phoneNum) + "}";
   }
   else if (type == "network") {
-    // 网络状态查询
+    // Query network status.
     success = true;
     code = "ACTION_QUERY_OK";
     
-    // 查询网络注册状态
+    // Query network registration status.
     String resp = sendATCommand("AT+CEREG?", 2000);
     int regStatus = modemParseCeregQueryStatus(resp);
-    // 查询运营商
+    // Query the network operator.
     resp = sendATCommand("AT+COPS?", 2000);
     String oper = "N/A";
     if (resp.indexOf("+COPS:") >= 0) {
@@ -487,7 +487,7 @@ void handleQuery() {
         }
       }
     }
-    // 查询PDP上下文激活状态
+    // Query PDP context activation status.
     resp = sendATCommand("AT+CGACT?", 2000);
     String pdpStatus = "null";
     int cgact = resp.indexOf("+CGACT:");
@@ -513,13 +513,13 @@ void handleQuery() {
       }
       cgact = resp.indexOf("+CGACT:", cgact + 7);
     }
-    // 查询APN
+    // Query the APN.
     resp = sendATCommand("AT+CGDCONT?", 2000);
     String apn = "N/A";
     if (resp.indexOf("+CGDCONT:") >= 0) {
       int idx = resp.indexOf(",\"");
       if (idx >= 0) {
-        idx = resp.indexOf(",\"", idx + 2);  // 跳过PDP类型
+        idx = resp.indexOf(",\"", idx + 2);  // Skip the PDP type.
         if (idx >= 0) {
           int endIdx = resp.indexOf("\"", idx + 2);
           if (endIdx > idx) {
@@ -535,14 +535,14 @@ void handleQuery() {
            ",\"apn\":" + jsonStringOrNull(apn) + "}";
   }
   else if (type == "wifi") {
-    // WiFi状态查询
+    // Query WiFi status.
     success = true;
     code = "ACTION_QUERY_OK";
     
     // SSID
     String ssid = WiFi.SSID();
     if (ssid.length() == 0) ssid = "N/A";
-    // 信号强度 RSSI
+    // RSSI signal strength.
     int rssi = WiFi.RSSI();
 
     data = "{\"wifiStatus\":" + String((int)WiFi.status()) +
@@ -560,7 +560,7 @@ void handleQuery() {
   sendActionResult(200, success, code, data, detail);
 }
 
-// 处理发送短信请求
+// Handle SMS send requests.
 void handleSendSms() {
   if (!checkAuth()) return;
   
@@ -580,7 +580,7 @@ void handleSendSms() {
   } else if (content.length() == 0) {
     code = "ACTION_SMS_CONTENT_REQUIRED";
   } else {
-    logCaptureLn(String("网页端发送短信请求"));
+    logCaptureLn(String("Web UI requested SMS send"));
     
     success = sendSMS(phone.c_str(), content.c_str());
     code = success ? "ACTION_SMS_SENT" : "ACTION_SMS_FAILED";
@@ -589,7 +589,7 @@ void handleSendSms() {
   sendActionResult(200, success, code);
 }
 
-// 处理Ping请求
+// Handle Ping requests.
 void handlePing() {
   if (!checkAuth()) return;
   if (rejectModemBusy()) return;
@@ -649,7 +649,7 @@ void handlePing() {
   sendActionResult(200, true, "ACTION_PING_OK", data);
 }
 
-// 处理保存配置请求
+// Handle configuration save requests.
 void handleSave() {
   if (!checkAuth()) return;
 
@@ -689,7 +689,7 @@ void handleSave() {
     }
   }
 
-  // 账号管理表单：空账号会停用该组，空密码会保留现有密码
+  // Account form: a blank username disables the account; a blank password preserves it.
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
     String userKey = prefix + "user";
@@ -716,7 +716,7 @@ void handleSave() {
     return;
   }
 
-  // 邮件通知表单：只在字段存在时更新
+  // Email notification form: update only fields present in the request.
   if (server.hasArg("smtpServer")) {
     next.smtpServer = server.arg("smtpServer");
   }
@@ -738,7 +738,7 @@ void handleSave() {
        next.smtpUser != previousSmtpUser)) {
     next.smtpPass = "";
   }
-  // 管理员 & 黑名单表单：只在字段存在时更新
+  // Administrator and blacklist form: update only fields present in the request.
   if (server.hasArg("adminPhone")) {
     next.adminPhone = server.arg("adminPhone");
   }
@@ -746,7 +746,7 @@ void handleSave() {
     next.numberBlackList = server.arg("numberBlackList");
   }
 
-  // 推送通道配置：只在对应通道的字段存在时更新
+  // Push channel configuration: update only when that channel's fields are present.
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String idx = String(i);
     String enKey = "push" + idx + "en";
@@ -756,7 +756,7 @@ void handleSave() {
     String k1Key = "push" + idx + "key1";
     String k2Key = "push" + idx + "key2";
     String bodyKey = "push" + idx + "body";
-    // 只要该通道的任一字段存在，就更新整个通道
+    // Update the entire channel when any of its fields are present.
     if (server.hasArg(enKey) || server.hasArg(typeKey) || server.hasArg(urlKey) ||
         server.hasArg(nameKey) || server.hasArg(k1Key) || server.hasArg(k2Key) ||
         server.hasArg(bodyKey)) {
@@ -768,7 +768,7 @@ void handleSave() {
       next.pushChannels[i].key2 = server.arg(k2Key);
       next.pushChannels[i].customBody = server.arg(bodyKey);
       if (next.pushChannels[i].name.length() == 0) {
-        next.pushChannels[i].name = "通道" + String(i + 1);
+        next.pushChannels[i].name = "Channel " + String(i + 1);
       }
     }
   }
@@ -782,16 +782,16 @@ void handleSave() {
   
   sendActionResult(200, true, "ACTION_CONFIG_SAVED");
   
-  // 如果配置有效，发送启动通知
+  // Send a startup notification when the configuration is valid.
   if (configValid) {
-    logCaptureLn(String("配置有效，发送启动通知..."));
-    String subject = "短信转发器配置已更新";
-    String body = "设备配置已更新\n设备地址: " + getDeviceUrl();
+    logCaptureLn(String("Configuration valid; sending startup notification..."));
+    String subject = "SMS Forwarder Configuration Updated";
+    String body = "Device configuration updated\nDevice URL: " + getDeviceUrl();
     sendEmailNotification(subject.c_str(), body.c_str());
   }
 }
 
-// 处理日志查询请求 — 返回环形缓冲区中的日志行
+// Handle log queries by returning the lines in the ring buffer.
 void handleLog() {
   if (!checkAuth()) return;
 
@@ -808,7 +808,7 @@ void handleLog() {
   server.send(200, "application/json", json);
 }
 
-// 模组控制命令
+// Modem control commands.
 void handleModem() {
   if (!checkAuth()) return;
 
@@ -822,24 +822,24 @@ void handleModem() {
   const char* code = "ACTION_UNKNOWN";
 
   if (action == "restart") {
-    // AT 软重启 — 先响应浏览器再初始化，防止浏览器超时重试
-    logCaptureLn(String("网页端请求软重启模组..."));
+    // For an AT soft restart, respond before initialization to prevent browser retries.
+    logCaptureLn(String("Web UI requested a modem soft restart..."));
     sendActionResult(200, true, "ACTION_MODEM_RESTARTING");
     String resp = sendATCommand("AT+CFUN=1,1", 15000);
     success = (resp.indexOf("OK") >= 0);
-    logCaptureLn(String(success ? "模组软重启成功: " : "软重启失败: ") + resp);
+    logCaptureLn(String(success ? "Modem soft restart succeeded: " : "Soft restart failed: ") + resp);
     if (success) modemInit();
     return;
   }
   else if (action == "hardreset") {
-    // EN 引脚断电重启（内部已调用 modemInit()）
-    logCaptureLn(String("网页端请求硬重启模组..."));
+    // Power-cycle through the EN pin; resetModule() calls modemInit().
+    logCaptureLn(String("Web UI requested a modem hard restart..."));
     sendActionResult(200, true, "ACTION_MODEM_HARD_RESTARTING");
     resetModule();
     return;
   }
   else if (action == "signal") {
-    logCaptureLn(String("网页端查询信号: AT+CSQ"));
+    logCaptureLn(String("Web UI queried signal strength: AT+CSQ"));
     String resp = sendATCommand("AT+CSQ", 3000);
     int csqIdx = resp.indexOf("+CSQ:");
     if (csqIdx >= 0) {
@@ -863,7 +863,7 @@ void handleModem() {
     }
   }
   else if (action == "operator") {
-    logCaptureLn(String("网页端查询运营商: AT+COPS?"));
+    logCaptureLn(String("Web UI queried the network operator: AT+COPS?"));
     String resp = sendATCommand("AT+COPS?", 5000);
     int copsIdx = resp.indexOf("+COPS:");
     if (copsIdx >= 0) {
@@ -888,7 +888,7 @@ void handleModem() {
     }
   }
   else if (action == "imei") {
-    logCaptureLn(String("网页端查询IMEI: AT+GSN"));
+    logCaptureLn(String("Web UI queried the IMEI: AT+GSN"));
     String resp = sendATCommand("AT+GSN", 3000);
     resp.trim();
     int okIdx = resp.lastIndexOf("OK");
@@ -911,7 +911,7 @@ void handleModem() {
   sendActionResult(200, success, code, data, detail);
 }
 
-// WiFi 重启
+// WiFi restart.
 void handleWifi() {
   if (!checkAuth()) return;
 
@@ -919,7 +919,7 @@ void handleWifi() {
 
   String action = server.arg("action");
   if (action == "restart") {
-    logCaptureLn(String("网页端请求重启WiFi..."));
+    logCaptureLn(String("Web UI requested a WiFi restart..."));
     sendActionResult(200, true, "ACTION_WIFI_RESTARTING");
     WiFi.disconnect(true);
     delay(500);
@@ -927,15 +927,15 @@ void handleWifi() {
     WiFi.setAutoReconnect(true);
     WiFi.setScanMethod(WIFI_FAST_SCAN);
     WiFi.begin(WIFI_SSID, WIFI_PASS);
-    logCaptureLn(String("正在重新连接WiFi: " + String(WIFI_SSID)));
+    logCaptureLn(String("Reconnecting to WiFi: " + String(WIFI_SSID)));
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
       delay(50);
     }
     if (WiFi.status() == WL_CONNECTED) {
-      logCaptureLn(String("WiFi 重连成功, IP: " + WiFi.localIP().toString()));
+      logCaptureLn(String("WiFi reconnected, IP: " + WiFi.localIP().toString()));
     } else {
-      logCaptureLn(String("WiFi 重连失败，将在后台持续尝试"));
+      logCaptureLn(String("WiFi reconnection failed; retrying in the background"));
     }
   } else {
     sendActionResult(200, false, "ACTION_UNKNOWN");

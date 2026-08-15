@@ -149,27 +149,27 @@ bool modemSetDataActive(bool active, String& response) {
   return ok;
 }
 
-// 新增"模组断电重启"函数
+// Power-cycle the modem
 void modemPowerCycle() {
   pinMode(MODEM_EN_PIN, OUTPUT);
 
-  logCaptureLn(String("EN 拉低：关闭模组"));
+  logCaptureLn(String("EN low: powering off modem"));
   digitalWrite(MODEM_EN_PIN, LOW);
-  delay(1200);  // 关机时间给够
+  delay(1200);  // Allow enough time for the modem to power off.
 
-  logCaptureLn(String("EN 拉高：开启模组"));
+  logCaptureLn(String("EN high: powering on modem"));
   digitalWrite(MODEM_EN_PIN, HIGH);
-  delay(6000);  // 等模组完全启动再发AT（关键）
+  delay(6000);  // Wait for the modem to finish booting before sending AT commands.
 }
 
-// 重启模组（EN引脚断电重启 + 重新初始化）
+// Power-cycle and reinitialize the modem
 void resetModule() {
-  logCaptureLn(String("正在硬重启模组（EN 断电重启）..."));
+  logCaptureLn(String("Hard-resetting modem with an EN power cycle..."));
   modemPowerCycle();
   modemInit();
 }
 
-// 模组 AT 初始化流程（setup 中调用，resetModule 后也调用）
+// Initialize the modem AT interface during setup and after resetModule()
 void modemInit() {
   const int INIT_RETRIES = 5;
   modemReady = false;
@@ -181,14 +181,14 @@ void modemInit() {
       initialized = true;
       break;
     }
-    logCaptureLn(String("AT未响应，重试..."));
+    logCaptureLn(String("No AT response; retrying..."));
     blink_short();
   }
   if (!initialized) {
-    logCaptureLn(String("⚠️ AT握手失败，模组进入降级状态"));
+    logCaptureLn(String("⚠️ AT handshake failed; modem is degraded"));
     return;
   }
-  logCaptureLn(String("模组AT响应正常"));
+  logCaptureLn(String("Modem AT interface is responding"));
 
   detectedModel = "";
   String resp = sendATCommand("ATI", 2000);
@@ -196,11 +196,11 @@ void modemInit() {
 
   String dataResponse;
   if (modemSetDataActive(false, dataResponse) && detectedModel != "ML307Y") {
-    logCaptureLn(String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗"));
+    logCaptureLn(String("Data connection disabled with AT+CGACT=0,1 to prevent data usage"));
   } else if (detectedModel == "ML307Y") {
-    logCaptureLn(String("ML307Y不支援安全停用PDP，数据状态未知"));
+    logCaptureLn(String("ML307Y cannot safely deactivate PDP; data state is unknown"));
   } else {
-    logCaptureLn(String("⚠️ 停用PDP失败，数据状态未知"));
+    logCaptureLn(String("⚠️ Failed to deactivate PDP; data state is unknown"));
   }
 
   initialized = false;
@@ -209,14 +209,14 @@ void modemInit() {
       initialized = true;
       break;
     }
-    logCaptureLn(String("设置CNMI失败，重试..."));
+    logCaptureLn(String("Failed to configure CNMI; retrying..."));
     blink_short();
   }
   if (!initialized) {
-    logCaptureLn(String("⚠️ CNMI设置失败，模组进入降级状态"));
+    logCaptureLn(String("⚠️ Failed to configure CNMI; modem is degraded"));
     return;
   }
-  logCaptureLn(String("CNMI参数设置完成"));
+  logCaptureLn(String("CNMI configured"));
 
   initialized = false;
   for (int retry = 0; retry < INIT_RETRIES; retry++) {
@@ -224,25 +224,25 @@ void modemInit() {
       initialized = true;
       break;
     }
-    logCaptureLn(String("设置PDU模式失败，重试..."));
+    logCaptureLn(String("Failed to set PDU mode; retrying..."));
     blink_short();
   }
   if (!initialized) {
-    logCaptureLn(String("⚠️ PDU模式设置失败，模组进入降级状态"));
+    logCaptureLn(String("⚠️ Failed to set PDU mode; modem is degraded"));
     return;
   }
-  logCaptureLn(String("PDU模式设置完成"));
+  logCaptureLn(String("PDU mode configured"));
   int ceregRetry = 0;
   while (!waitCEREG() && ceregRetry < 30) {
-    logCaptureLn(String("等待网络注册..."));
+    logCaptureLn(String("Waiting for network registration..."));
     ceregRetry++;
     blink_short();
   }
   if (ceregRetry < 30) {
-    logCaptureLn(String("网络已注册"));
+    logCaptureLn(String("Network registered"));
     modemReady = true;
   } else {
-    logCaptureLn(String("⚠️ 网络注册超时（无SIM卡或信号差），模组功能不可用"));
+    logCaptureLn(String("⚠️ Network registration timed out (missing SIM or weak signal); modem is unavailable"));
     modemReady = false;
   }
 }
@@ -260,8 +260,8 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
   return result == MODEM_COMMAND_COMPLETED && resp.indexOf("OK") >= 0;
 }
 
-// 检测网络注册状态（LTE/4G）
-// CEREG状态: 1=已注册本地, 5=已注册漫游
+// Check LTE/4G network registration status
+// CEREG status: 1 = registered locally, 5 = registered while roaming
 int modemParseCeregQueryStatus(const String& response) {
   int prefix = response.indexOf("+CEREG:");
   if (prefix < 0) return -1;
@@ -347,21 +347,21 @@ static bool sendEncodedPdu(int pduLen) {
   ModemCommandResult result = runTransaction(command.c_str(), 5000, response,
                                               nullptr, true, false);
   if (result != MODEM_COMMAND_COMPLETED || !transactionPrompt) {
-    logCaptureLn(String("未收到>提示符"));
+    logCaptureLn(String("Did not receive the > prompt"));
     return false;
   }
 
   Serial1.print(pdu.getSMS());
   result = runTransaction(nullptr, 30000, response, nullptr, false, false);
   if (result == MODEM_COMMAND_COMPLETED && response.indexOf("OK") >= 0) {
-    logCaptureLn(String("短信发送成功"));
+    logCaptureLn(String("SMS sent successfully"));
     return true;
   }
-  logCaptureLn(String(result == MODEM_COMMAND_TIMEOUT ? "短信发送超时" : "短信发送失败"));
+  logCaptureLn(String(result == MODEM_COMMAND_TIMEOUT ? "SMS send timed out" : "Failed to send SMS"));
   return false;
 }
 
-// 发送短信（PDU模式，长内容自动拆成 concatenated SMS）
+// Send an SMS in PDU mode, splitting long content into concatenated parts
 bool sendSMS(const char* phoneNumber, const char* message) {
   bool gsm7 = true;
   int units = 0;

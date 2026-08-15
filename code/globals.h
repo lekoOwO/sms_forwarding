@@ -12,12 +12,12 @@
 #include <ReadyMail.h>
 #include "config_types.h"
 
-// 串口映射
+// UART pin mapping
 #define TXD 3
 #define RXD 4
 #define MODEM_EN_PIN 5
 
-// LED引脚定义（用于通过CI验证，给个假的）
+// Fallback LED pin used for CI compilation
 #ifndef LED_BUILTIN
 #define LED_BUILTIN 8
 #endif
@@ -33,7 +33,7 @@
 #define ENABLE_MODEM_USB_RAW_BRIDGE 0
 #endif
 
-// 全局变量声明
+// Global declarations
 extern Config config;
 extern Preferences preferences;
 extern PDU pdu;

@@ -166,7 +166,7 @@ CI 的唯一基線命令是：
 docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
 ```
 
-目前鎖定版本的基線結果為 Flash `1312053 / 2097152 bytes`（62%）、全域變數
+目前鎖定版本的基線結果為 Flash `1312783 / 2097152 bytes`（62%）、全域變數
 `44276 / 327680 bytes`（13%）。這只證明編譯與靜態配置，不代表實機 heap
 尖峰、UART 時序或 modem 相容性已驗證。
 

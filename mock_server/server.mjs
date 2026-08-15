@@ -41,7 +41,7 @@ function initialState() {
 			pushChannels: Array.from({ length: 5 }, (_, index) => ({
 				enabled: false,
 				type: 1,
-				name: `通道${index + 1}`,
+				name: `Channel ${index + 1}`,
 				url: "",
 				key1: "",
 				key2: "",
@@ -234,7 +234,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 			channel.enabled = body[`${prefix}en`] === "on";
 			channel.type = Number.parseInt(body[`${prefix}type`], 10) || 0;
 			channel.url = body[`${prefix}url`] ?? "";
-			channel.name = body[`${prefix}name`] || `通道${index + 1}`;
+			channel.name = body[`${prefix}name`] || `Channel ${index + 1}`;
 			channel.key1 = body[`${prefix}key1`] ?? "";
 			channel.key2 = body[`${prefix}key2`] ?? "";
 			channel.customBody = body[`${prefix}body`] ?? "";
