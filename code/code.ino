@@ -7,6 +7,8 @@
 #include "push.h"
 #include "sms_process.h"
 
+static bool managementHttpEnabled = false;
+
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -15,12 +17,13 @@ void setup() {
   delay(200);
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
   Serial1.setRxBufferSize(SERIAL_BUFFER_SIZE);
-  while (Serial1.available()) Serial1.read();
+  modemDrainInput();
   modemPowerCycle();
-  while (Serial1.available()) Serial1.read();
+  modemDrainInput();
   initConcatBuffer();
-  loadConfig();
-  configValid = isConfigValid();
+  ConfigLoadStatus configLoadStatus = loadConfig();
+  bool configStorageAvailable = configLoadStatus != CONFIG_LOAD_STORAGE_ERROR;
+  configValid = configStorageAvailable && isConfigValid();
 
   // ---- WiFi 连接优化 ----
   WiFi.mode(WIFI_STA);
@@ -56,21 +59,26 @@ void setup() {
     logCaptureLn(String("LittleFS挂载失败，管理页面不可用"));
   }
 
-  server.on("/", handleRoot);
-  server.on("/api/config", handleConfig);
-  server.on("/save", HTTP_POST, handleSave);
-  server.on("/tools", handleRoot);
-  server.on("/sms", handleRoot);
-  server.on("/sendsms", HTTP_POST, handleSendSms);
-  server.on("/ping", HTTP_POST, handlePing);
-  server.on("/query", handleQuery);
-  server.on("/flight", handleFlightMode);
-  server.on("/at", handleATCommand);
-  server.on("/log", handleLog);
-  server.on("/modem", handleModem);
-  server.on("/wifi", handleWifi);
-  server.begin();
-  logCaptureLn(String("HTTP服务器已启动"));
+  if (configStorageAvailable) {
+    server.on("/", handleRoot);
+    server.on("/api/config", handleConfig);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/tools", handleRoot);
+    server.on("/sms", handleRoot);
+    server.on("/sendsms", HTTP_POST, handleSendSms);
+    server.on("/ping", HTTP_POST, handlePing);
+    server.on("/query", handleQuery);
+    server.on("/flight", handleFlightMode);
+    server.on("/at", handleATCommand);
+    server.on("/log", handleLog);
+    server.on("/modem", handleModem);
+    server.on("/wifi", handleWifi);
+    server.begin();
+    managementHttpEnabled = true;
+    logCaptureLn("HTTP服务器已启动");
+  } else {
+    logCaptureLn("配置存储故障：管理HTTP已停用，请通过USB恢复");
+  }
 
   // ---- NTP 时间同步 ----
   logCaptureLn(String("正在同步NTP时间..."));
@@ -78,7 +86,7 @@ void setup() {
   int ntpRetry = 0;
   while (time(nullptr) < 100000 && ntpRetry < 100) {
     delay(1);
-    server.handleClient();
+    if (managementHttpEnabled) server.handleClient();
     ntpRetry++;
   }
   if (time(nullptr) >= 100000) {
@@ -88,7 +96,7 @@ void setup() {
     logCapture(String("当前UTC时间戳: "));
     logCaptureLn(String(now));
   } else {
-    logCaptureLn(String("NTP时间同步失败，将使用设备时间"));
+    logCaptureLn(String("NTP时间同步失败，签名通知将暂停至时间有效"));
   }
 
   ssl_client.setInsecure();
@@ -107,14 +115,17 @@ void setup() {
 }
 
 void loop() {
-  server.handleClient();
-  if (!configValid) {
+  if (managementHttpEnabled) server.handleClient();
+  if (managementHttpEnabled && !configValid) {
     if (millis() - lastPrintTime >= 1000) {
       lastPrintTime = millis();
       logCaptureLn(String("⚠️ 请访问 " + getDeviceUrl() + " 配置系统参数"));
     }
   }
   checkConcatTimeout();
-  if (Serial.available()) Serial1.write(Serial.read());
+#if ENABLE_MODEM_USB_RAW_BRIDGE
+  if (!modemIsBusy() && Serial.available()) Serial1.write(Serial.read());
+#endif
+  modemPoll();
   checkSerial1URC();
 }

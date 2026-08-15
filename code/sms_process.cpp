@@ -51,7 +51,6 @@ int findOrCreateConcatSlot(int refNumber, const char* sender, int totalParts) {
     }
   }
   
-  logCaptureLn(String("⚠️ 长短信缓存已满，拒绝新的分段组"));
   return -1;
 }
 
@@ -90,22 +89,16 @@ void checkConcatTimeout() {
   for (int i = 0; i < MAX_CONCAT_MESSAGES; i++) {
     if (concatBuffer[i].inUse) {
       if (now - concatBuffer[i].firstPartTime >= CONCAT_TIMEOUT_MS) {
-        logCaptureLn(String("⏰ 长短信超时，强制转发不完整消息"));
-        logCaptureF("  参考号: %d, 已收到: %d/%d\n", 
-                      concatBuffer[i].refNumber,
-                      concatBuffer[i].receivedParts,
-                      concatBuffer[i].totalParts);
-        
         // 合并已收到的分段
         String fullText = assembleConcatSms(i);
         
-        // 不完整的管理员短信不得进入命令解析或外部转发。
+        // 不完整的管理员短信不得外部转发。
         if (isAdmin(concatBuffer[i].sender.c_str())) {
           logCaptureLn(String("管理员长短信不完整，已丢弃"));
         } else {
           processSmsContent(concatBuffer[i].sender.c_str(),
                             fullText.c_str(),
-                            concatBuffer[i].timestamp.c_str(), false);
+                            concatBuffer[i].timestamp.c_str());
         }
         
         // 清空槽位
@@ -113,34 +106,6 @@ void checkConcatTimeout() {
       }
     }
   }
-}
-
-// 读取串口一行（含回车换行），返回行字符串，无新行时返回空
-String readSerialLine(HardwareSerial& port) {
-  static char lineBuf[SERIAL_BUFFER_SIZE];
-  static int linePos = 0;
-  static bool overflowed = false;
-
-  while (port.available()) {
-    char c = port.read();
-    if (c == '\n') {
-      if (overflowed) {
-        linePos = 0;
-        overflowed = false;
-        return "";
-      }
-      lineBuf[linePos] = 0;
-      String res = String(lineBuf);
-      linePos = 0;
-      return res;
-    } else if (c != '\r') {  // 跳过\r
-      if (!overflowed && linePos < SERIAL_BUFFER_SIZE - 1)
-        lineBuf[linePos++] = c;
-      else
-        overflowed = true;
-    }
-  }
-  return "";
 }
 
 // 检查字符串是否为有效的十六进制PDU数据
@@ -199,84 +164,11 @@ bool isAdmin(const char* sender) {
   return senderStr.length() > 0 && adminStr.length() > 0 && senderStr.equals(adminStr);
 }
 
-// 处理管理员命令
-void processAdminCommand(const char* sender, const char* text) {
-  String cmd = String(text);
-  cmd.trim();
-  
-  logCaptureLn(String("处理管理员命令"));
-  
-  // 处理 SMS:号码:内容 命令
-  if (cmd.startsWith("SMS:")) {
-    int firstColon = cmd.indexOf(':');
-    int secondColon = cmd.indexOf(':', firstColon + 1);
-    
-    if (secondColon > firstColon + 1) {
-      String targetPhone = cmd.substring(firstColon + 1, secondColon);
-      String smsContent = cmd.substring(secondColon + 1);
-      
-      targetPhone.trim();
-      smsContent.trim();
-      
-      bool success = sendSMS(targetPhone.c_str(), smsContent.c_str());
-      
-      // 发送邮件通知结果
-      String subject = success ? "短信发送成功" : "短信发送失败";
-      String body = "管理员命令执行结果:\n";
-      body += "命令: " + cmd + "\n";
-      body += "目标号码: " + targetPhone + "\n";
-      body += "短信内容: " + smsContent + "\n";
-      body += "执行结果: " + String(success ? "成功" : "失败");
-      
-      sendEmailNotification(subject.c_str(), body.c_str());
-    } else {
-      logCaptureLn(String("SMS命令格式错误"));
-      sendEmailNotification("命令执行失败", "SMS命令格式错误，正确格式: SMS:号码:内容");
-    }
-  }
-  // 处理 RESET 命令
-  else if (cmd.equals("RESET")) {
-    logCaptureLn(String("执行RESET命令"));
-    
-    // 先发送邮件通知（因为重启后就发不了了）
-    sendEmailNotification("重启命令已执行", "收到RESET命令，即将重启模组和ESP32...");
-    
-    // 重启模组
-    resetModule();
-    
-    // 重启ESP32
-    logCaptureLn(String("正在重启ESP32..."));
-    delay(1000);
-    ESP.restart();
-  }
-  else {
-  logCaptureLn(String("未知管理员命令"));
-  }
-}
-
-// 处理最终的短信内容（管理员命令检查和转发）
-void processSmsContent(const char* sender, const char* text, const char* timestamp,
-                       bool allowAdminCommands) {
-  logCaptureLn(String("处理收到的短信"));
-
+// 处理最终的短信内容。SMS 一律视为通知数据，不执行管理命令。
+void processSmsContent(const char* sender, const char* text, const char* timestamp) {
   // 检查是否在号码黑名单中
   if (isInNumberBlackList(sender)) {
-    logCaptureLn(String("发送者在号码黑名单中，忽略该短信"));
     return;
-  }
-
-  // 检查是否为管理员命令
-  if (allowAdminCommands && isAdmin(sender)) {
-    logCaptureLn(String("收到管理员短信，检查命令..."));
-    String smsText = String(text);
-    smsText.trim();
-    
-    // 检查是否为命令格式
-    if (smsText.startsWith("SMS:") || smsText.equals("RESET")) {
-      processAdminCommand(sender, text);
-      // 命令已处理，不再发送普通通知邮件
-      return;
-    }
   }
 
   // 发送通知http（推送到所有启用的通道）
@@ -287,59 +179,48 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
   sendEmailNotification(subject.c_str(), body.c_str());
 }
 
-// 处理URC和PDU
+static enum { CMT_IDLE, CMT_WAIT_PDU } cmtState = CMT_IDLE;
+static unsigned long waitPduSince = 0;
+
 void checkSerial1URC() {
-  static enum { IDLE,
-                WAIT_PDU } state = IDLE;
-  static unsigned long waitPduSince = 0;
-
-  if (state == WAIT_PDU && millis() - waitPduSince >= PDU_WAIT_TIMEOUT_MS) {
+  if (cmtState == CMT_WAIT_PDU && millis() - waitPduSince >= PDU_WAIT_TIMEOUT_MS) {
     logCaptureLn(String("等待PDU超时，返回IDLE状态"));
-    state = IDLE;
+    cmtState = CMT_IDLE;
   }
+}
 
-  String line = readSerialLine(Serial1);
-  if (line.length() == 0) return;
+// 由 modem dispatcher 逐行呼叫；回传 true 表示该行是 SMS URC/PDU。
+bool processModemLine(const String& line) {
+  checkSerial1URC();
+  if (line.length() == 0) return false;
 
-  if (state == IDLE) {
+  if (cmtState == CMT_IDLE) {
     // 检测到短信上报URC头
     if (line.startsWith("+CMT:")) {
-      logCaptureLn(String("检测到+CMT，等待PDU数据..."));
-      state = WAIT_PDU;
+      cmtState = CMT_WAIT_PDU;
       waitPduSince = millis();
+      return true;
     }
-  } else if (state == WAIT_PDU) {
-    // 跳过空行
-    if (line.length() == 0) {
-      return;
-    }
-    
+    return false;
+  } else if (cmtState == CMT_WAIT_PDU) {
     // 如果是十六进制字符串，认为是PDU数据
     if (isHexString(line)) {
-      logCaptureLn(String("PDU长度: " + String(line.length()) + " 字符"));
-      
       // 解析PDU
       int* concatInfo = pdu.getConcatInfo();
       concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;
-      if (!pdu.decodePDU(line.c_str())) {
+      if (!pdu.decodePDU(line.c_str(), line.length())) {
         logCaptureLn(String("❌ PDU解析失败！"));
       } else {
-        logCaptureLn(String("✓ PDU解析成功"));
         // 获取长短信信息
         int refNumber = concatInfo[0];
         int partNumber = concatInfo[1];
         int totalParts = concatInfo[2];
         
-        logCaptureF("长短信信息: 参考号=%d, 当前=%d, 总计=%d\n", refNumber, partNumber, totalParts);
-        logCaptureLn(String("==============="));
-
         // 判断是否为长短信
         if (totalParts > 1 && !isValidConcatMetadata(partNumber, totalParts)) {
           logCaptureLn(String("❌ 长短信分段信息无效，已丢弃"));
         } else if (totalParts > 1) {
           // 这是长短信的一部分
-          logCaptureF("📧 收到长短信分段 %d/%d\n", partNumber, totalParts);
-          
           // 查找或创建缓存槽位
           int slot = findOrCreateConcatSlot(refNumber, pdu.getSender(), totalParts);
 
@@ -358,18 +239,10 @@ void checkSerial1URC() {
                 concatBuffer[slot].timestamp = String(pdu.getTimeStamp());
               }
               
-              logCaptureF("  已缓存分段 %d，当前已收到 %d/%d\n", 
-                           partNumber, 
-                           concatBuffer[slot].receivedParts, 
-                           totalParts);
-            } else {
-              logCaptureF("  ⚠️ 分段 %d 已存在，跳过\n", partNumber);
             }
 
             // 检查是否已收齐所有分段
             if (concatBuffer[slot].receivedParts >= concatBuffer[slot].totalParts) {
-              logCaptureLn(String("✅ 长短信已收齐，开始合并转发"));
-
               String fullText = assembleConcatSms(slot);
               processSmsContent(concatBuffer[slot].sender.c_str(),
                                 fullText.c_str(),
@@ -384,12 +257,14 @@ void checkSerial1URC() {
       }
       
       // 返回IDLE状态
-      state = IDLE;
+      cmtState = CMT_IDLE;
     } 
     // 如果是其他内容（OK、ERROR等），也返回IDLE
     else {
       logCaptureLn(String("收到非PDU数据，返回IDLE状态"));
-      state = IDLE;
+      cmtState = CMT_IDLE;
     }
+    return true;
   }
+  return false;
 }

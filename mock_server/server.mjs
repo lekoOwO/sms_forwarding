@@ -6,6 +6,13 @@ import express from "express";
 
 const defaultWebRoot = process.env.WEB_ROOT ?? "/web";
 const defaultOpenApiPath = process.env.OPENAPI_PATH ?? "/spec/openapi.json";
+const byteLength = (value) => Buffer.byteLength(String(value ?? ""), "utf8");
+
+const fieldLimits = {
+	smtpServer: 253, smtpPort: 32, smtpUser: 254, smtpPass: 256, smtpSendTo: 254,
+	adminPhone: 32, numberBlackList: 1024, phone: 32, content: 2048,
+	cmd: 256, action: 32, type: 32
+};
 
 function secureEqual(left, right) {
 	return timingSafeEqual(
@@ -48,6 +55,7 @@ const actionCodes = new Set([
 	"ACTION_CONFIG_SAVED",
 	"ACTION_CONFIG_SAVE_FAILED",
 	"ACTION_CONFIG_ACCOUNT_REQUIRED",
+	"ACTION_INPUT_TOO_LONG",
 	"ACTION_SMS_PHONE_REQUIRED",
 	"ACTION_SMS_CONTENT_REQUIRED",
 	"ACTION_SMS_SENT",
@@ -68,6 +76,7 @@ const actionCodes = new Set([
 	"ACTION_FLIGHT_FAILED",
 	"ACTION_UNKNOWN",
 	"ACTION_AT_REQUIRED",
+	"ACTION_AT_REJECTED",
 	"ACTION_AT_OK",
 	"ACTION_AT_TIMEOUT",
 	"ACTION_MODEM_BUSY",
@@ -75,7 +84,6 @@ const actionCodes = new Set([
 	"ACTION_MODEM_HARD_RESTARTING",
 	"ACTION_MODEM_OK",
 	"ACTION_MODEM_FAILED",
-	"ACTION_WIFI_BUSY",
 	"ACTION_WIFI_RESTARTING"
 ]);
 
@@ -84,10 +92,35 @@ function result(success, code, data = {}, detail = "") {
 	return { success, code, data, detail };
 }
 
+function rejectEnvelope(request, response, next) {
+	const requestLineBytes = byteLength(`${request.method} ${request.originalUrl} HTTP/${request.httpVersion}\r\n`);
+	const headerBytes = request.rawHeaders.reduce((total, value) => total + byteLength(value) + 2, 2);
+	const contentLength = Number.parseInt(request.headers["content-length"] ?? "0", 10);
+	const status = requestLineBytes > 2048 ? 414 : headerBytes > 8192 ? 431 : contentLength > 16384 ? 413 : 0;
+	if (!status) return next();
+	response.set({ "Cache-Control": "no-store", Connection: "close" }).status(status).end();
+}
+
+function rejectField(response, field) {
+	response.status(400).json(result(false, "ACTION_INPUT_TOO_LONG", {}, field));
+}
+
+function overLimit(field, value, limit = fieldLimits[field]) {
+	return limit !== undefined && byteLength(value) > limit;
+}
+
+function modemCommandAllowed(input) {
+	const command = String(input ?? "").trim().toUpperCase();
+	return command.startsWith("AT") && !/[\r\n]/.test(input) && !command.startsWith("ATD") && command !== "ATO" &&
+		!["AT+CMGS", "AT+CMGW", "AT+CGDATA", "AT+CMUX"].some((prefix) => command.startsWith(prefix)) &&
+		!["CIPSEND", "QISEND", "CASEND"].some((value) => command.includes(value));
+}
+
 export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenApiPath, authRequired = true } = {}) {
 	const app = express();
 	const state = initialState();
 	const indexPath = path.join(webRoot, "index.html");
+	app.use(rejectEnvelope);
 
 	if (authRequired) app.use((request, response, next) => {
 		const encoded = request.headers.authorization?.match(/^Basic (.+)$/i)?.[1];
@@ -109,7 +142,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 		next();
 	});
 
-	app.use(express.urlencoded({ extended: false }));
+	app.use(express.urlencoded({ extended: false, limit: 16384 }));
 
 	for (const route of ["/", "/tools", "/sms"]) {
 		app.get(route, (_request, response) => {
@@ -145,7 +178,29 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 
 	app.post("/save", (request, response) => {
 		const body = request.body;
-		const config = state.config;
+		for (const [field, limit] of Object.entries(fieldLimits)) {
+			if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
+		}
+		for (let index = 0; index < 10; index += 1) {
+			const userKey = `account${index}user`;
+			const passKey = `account${index}pass`;
+			if (Object.hasOwn(body, userKey) && overLimit(userKey, body[userKey], 64)) return rejectField(response, userKey);
+			if (Object.hasOwn(body, passKey) && overLimit(passKey, body[passKey], 96)) return rejectField(response, passKey);
+			const username = Object.hasOwn(body, userKey) ? body[userKey].trim() : state.config.webAccounts[index].username;
+			const password = username && Object.hasOwn(body, passKey) && body[passKey]
+				? body[passKey] : username ? state.config.webAccounts[index].password : "";
+			if ((Object.hasOwn(body, userKey) || Object.hasOwn(body, passKey)) && byteLength(`${username}:${password}`) > 180) {
+				return rejectField(response, Object.hasOwn(body, passKey) ? passKey : userKey);
+			}
+		}
+		for (let index = 0; index < 5; index += 1) {
+			for (const [suffix, limit] of [["en", 32], ["type", 32], ["name", 64], ["url", 512], ["key1", 256], ["key2", 256], ["body", 2048]]) {
+				const field = `push${index}${suffix}`;
+				if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
+			}
+		}
+
+		const config = structuredClone(state.config);
 		const nextAccounts = config.webAccounts.map((account) => ({ ...account }));
 		for (let index = 0; index < 10; index += 1) {
 			const account = nextAccounts[index];
@@ -185,11 +240,14 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 			channel.customBody = body[`${prefix}body`] ?? "";
 		}
 
+		state.config = config;
 		state.logs.push("Configuration saved");
 		response.json(result(true, "ACTION_CONFIG_SAVED"));
 	});
 
 	app.post("/sendsms", (request, response) => {
+		if (overLimit("phone", request.body.phone)) return rejectField(response, "phone");
+		if (overLimit("content", request.body.content)) return rejectField(response, "content");
 		const phone = request.body.phone?.trim() ?? "";
 		const content = request.body.content?.trim() ?? "";
 		if (!phone) return response.json(result(false, "ACTION_SMS_PHONE_REQUIRED"));
@@ -204,6 +262,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	});
 
 	app.get("/query", (request, response) => {
+		if (overLimit("type", request.query.type)) return rejectField(response, "type");
 		const dataByType = {
 			ati: { manufacturer: "Mock Telecom", model: "Mock LTE-C3", revision: "1.0.0" },
 			signal: { rsrpDbm: -82, rsrqDb: -9.5, cesq: "99,99,255,255,20,58" },
@@ -221,6 +280,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	});
 
 	app.get("/flight", (request, response) => {
+		if (overLimit("action", request.query.action)) return rejectField(response, "action");
 		if (request.query.action === "query") {
 			response.json(result(true, state.flightMode ? "ACTION_FLIGHT_STATUS_ON" : "ACTION_FLIGHT_STATUS_NORMAL", { mode: state.flightMode ? 4 : 1 }));
 			return;
@@ -235,8 +295,10 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	});
 
 	app.get("/at", (request, response) => {
+		if (overLimit("cmd", request.query.cmd)) return rejectField(response, "cmd");
 		const command = request.query.cmd?.trim() ?? "";
 		if (!command) return response.json(result(false, "ACTION_AT_REQUIRED"));
+		if (!modemCommandAllowed(request.query.cmd)) return response.status(400).json(result(false, "ACTION_AT_REJECTED"));
 		state.logs.push(`AT command: ${command}`);
 		return response.json(result(true, "ACTION_AT_OK", { raw: `${command}\r\nOK` }));
 	});
@@ -244,6 +306,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	app.get("/log", (_request, response) => response.json(state.logs.slice(-120)));
 
 	app.get("/modem", (request, response) => {
+		if (overLimit("action", request.query.action)) return rejectField(response, "action");
 		const results = {
 			restart: result(true, "ACTION_MODEM_RESTARTING"),
 			hardreset: result(true, "ACTION_MODEM_HARD_RESTARTING"),
@@ -258,12 +321,18 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 	});
 
 	app.get("/wifi", (request, response) => {
+		if (overLimit("action", request.query.action)) return rejectField(response, "action");
 		if (request.query.action !== "restart") return response.json(result(false, "ACTION_UNKNOWN"));
 		state.logs.push("WiFi restart requested");
 		return response.json(result(true, "ACTION_WIFI_RESTARTING"));
 	});
 
 	app.get("/openapi.json", (_request, response) => response.sendFile(openApiPath));
+
+	app.use((error, _request, response, next) => {
+		if (error?.type !== "entity.too.large") return next(error);
+		response.set({ "Cache-Control": "no-store", Connection: "close" }).status(413).end();
+	});
 
 	return app;
 }

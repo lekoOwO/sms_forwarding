@@ -6,7 +6,7 @@
 #include <WiFiClientSecure.h>
 #include <WebServer.h>
 #include <Preferences.h>
-#include <pdulib.h>
+#include "src/pdulib/pdulib.h"
 #define ENABLE_SMTP
 #define ENABLE_DEBUG
 #include <ReadyMail.h>
@@ -26,7 +26,12 @@
 #define MAX_PDU_LENGTH 300
 #define PDU_WAIT_TIMEOUT_MS 5000
 #define MODEM_RESPONSE_MAX_LENGTH 1024
+#define MAX_AT_COMMAND_LENGTH 256
 #define LOG_LINE_MAX_LENGTH 512
+
+#ifndef ENABLE_MODEM_USB_RAW_BRIDGE
+#define ENABLE_MODEM_USB_RAW_BRIDGE 0
+#endif
 
 // 全局变量声明
 extern Config config;

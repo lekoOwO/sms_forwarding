@@ -52,9 +52,9 @@ jobs:
     
     - name: Install dependencies
       run: |
-        arduino-cli lib install "pdulib@0.5.11"
         arduino-cli lib install "ReadyMail@0.4.2"
     
     - name: Compile firmware
       run: |
-        arduino-cli compile --fqbn esp32:esp32:esp32c3 ./code
+        scripts/apply-esp32-webserver-3.3.10-patch.sh "$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.10"
+        arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code

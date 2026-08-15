@@ -23,7 +23,8 @@ build_frontend() {
 
 build_firmware() {
 	docker compose up -d dev
-	docker compose exec -T dev arduino-cli compile --fqbn esp32:esp32:esp32c3 ./code
+	docker compose exec -T dev scripts/apply-esp32-webserver-3.3.10-patch.sh
+	docker compose exec -T dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
 }
 
 verb="${1:-}"

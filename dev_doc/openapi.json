@@ -25,6 +25,12 @@
       "basicAuth": []
     }
   ],
+  "x-requestLimits": {
+    "requestLineBytes": 2048,
+    "totalHeaderBytes": 8192,
+    "bodyBytes": 16384,
+    "description": "Limits are enforced before authentication. Rejections use 414, 431, or 413 with Connection: close and Cache-Control: no-store. Field limits count UTF-8 bytes, reject without truncation, and use ACTION_INPUT_TOO_LONG with detail set only to the field name."
+  },
   "tags": [
     { "name": "UI" },
     { "name": "Configuration" },
@@ -98,7 +104,7 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Update the configuration",
-        "description": "The request can contain one configuration section. A blank account username disables that account. A blank account password keeps its stored password. The device restores the default account when no usable account remains. A present empty smtpPass clears the SMTP password.",
+        "description": "The request can contain one configuration section. A blank account username disables that account. A blank account password keeps its stored password. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
           "content": {
@@ -116,7 +122,9 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
         }
       }
     },
@@ -133,8 +141,8 @@
                 "type": "object",
                 "required": ["phone", "content"],
                 "properties": {
-                  "phone": { "type": "string" },
-                  "content": { "type": "string" }
+                  "phone": { "type": "string", "x-maxUtf8Bytes": 32 },
+                  "content": { "type": "string", "x-maxUtf8Bytes": 2048 }
                 }
               }
             }
@@ -149,7 +157,10 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "429": { "$ref": "#/components/responses/ModemBusy" }
         }
       }
     },
@@ -167,7 +178,8 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/ModemBusy" }
         }
       }
     },
@@ -182,6 +194,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "x-maxUtf8Bytes": 32,
               "enum": ["ati", "signal", "siminfo", "network", "wifi"]
             }
           }
@@ -195,7 +208,9 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/ModemBusy" }
         }
       }
     },
@@ -210,6 +225,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "x-maxUtf8Bytes": 32,
               "enum": ["query", "toggle", "on", "off"]
             }
           }
@@ -223,7 +239,9 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/ModemBusy" }
         }
       }
     },
@@ -236,7 +254,7 @@
             "name": "cmd",
             "in": "query",
             "required": true,
-            "schema": { "type": "string" }
+            "schema": { "type": "string", "x-maxUtf8Bytes": 256 }
           }
         ],
         "responses": {
@@ -248,7 +266,9 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/ModemBusy" }
         }
       }
     },
@@ -284,6 +304,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "x-maxUtf8Bytes": 32,
               "enum": ["restart", "hardreset", "signal", "operator", "imei"]
             }
           }
@@ -297,6 +318,7 @@
               }
             }
           },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": {
             "description": "The modem is busy.",
@@ -320,6 +342,7 @@
             "required": true,
             "schema": {
               "type": "string",
+              "x-maxUtf8Bytes": 32,
               "enum": ["restart"]
             }
           }
@@ -333,15 +356,8 @@
               }
             }
           },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "429": {
-            "description": "WiFi is busy.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          }
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     }
@@ -376,6 +392,25 @@
             "schema": { "type": "string", "examples": ["Basic realm=\"SMS Forwarding\""] }
           }
         }
+      },
+      "InputTooLong": {
+        "description": "Invalid bounded input. ACTION_INPUT_TOO_LONG leaves configuration unchanged and detail contains only the field name; the AT route can instead return ACTION_AT_REJECTED for unsafe command classes.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ActionResult" }
+          }
+        }
+      },
+      "BodyTooLarge": {
+        "description": "The request body exceeds 16384 bytes. The server closes the connection and does not cache the response."
+      },
+      "ModemBusy": {
+        "description": "The modem is processing another transaction.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ActionResult" }
+          }
+        }
       }
     },
     "schemas": {
@@ -392,6 +427,7 @@
               "ACTION_CONFIG_SAVED",
               "ACTION_CONFIG_SAVE_FAILED",
               "ACTION_CONFIG_ACCOUNT_REQUIRED",
+              "ACTION_INPUT_TOO_LONG",
               "ACTION_SMS_PHONE_REQUIRED",
               "ACTION_SMS_CONTENT_REQUIRED",
               "ACTION_SMS_SENT",
@@ -412,6 +448,7 @@
               "ACTION_FLIGHT_FAILED",
               "ACTION_UNKNOWN",
               "ACTION_AT_REQUIRED",
+              "ACTION_AT_REJECTED",
               "ACTION_AT_OK",
               "ACTION_AT_TIMEOUT",
               "ACTION_MODEM_BUSY",
@@ -419,14 +456,13 @@
               "ACTION_MODEM_HARD_RESTARTING",
               "ACTION_MODEM_OK",
               "ACTION_MODEM_FAILED",
-              "ACTION_WIFI_BUSY",
               "ACTION_WIFI_RESTARTING"
             ]
           },
           "data": { "$ref": "#/components/schemas/ActionData" },
           "detail": {
             "type": "string",
-            "description": "Raw diagnostic text for failures. It is empty when code and data are sufficient."
+            "description": "Raw diagnostic text for failures. For ACTION_INPUT_TOO_LONG it contains only the field name; otherwise it is empty when code and data are sufficient."
           }
         }
       },
@@ -446,7 +482,7 @@
           "msisdn": { "type": ["string", "null"] },
           "registration": { "type": ["integer", "null"] },
           "operator": { "type": ["string", "null"] },
-          "pdpActive": { "type": "boolean" },
+          "pdpActive": { "type": ["boolean", "null"] },
           "apn": { "type": ["string", "null"] },
           "wifiStatus": { "type": "integer" },
           "ssid": { "type": ["string", "null"] },
@@ -543,20 +579,23 @@
         "minProperties": 1,
         "additionalProperties": false,
         "properties": {
-          "smtpServer": { "type": "string" },
-          "smtpPort": { "type": "integer", "minimum": 0, "maximum": 65535 },
-          "smtpUser": { "type": "string" },
-          "smtpPass": { "type": "string" },
-          "smtpSendTo": { "type": "string" },
-          "adminPhone": { "type": "string" },
-          "numberBlackList": { "type": "string" }
+          "smtpServer": { "type": "string", "x-maxUtf8Bytes": 253 },
+          "smtpPort": { "type": "integer", "minimum": 0, "maximum": 65535, "x-maxUtf8Bytes": 32 },
+          "smtpUser": { "type": "string", "x-maxUtf8Bytes": 254 },
+          "smtpPass": { "type": "string", "x-maxUtf8Bytes": 256 },
+          "smtpSendTo": { "type": "string", "x-maxUtf8Bytes": 254 },
+          "adminPhone": { "type": "string", "x-maxUtf8Bytes": 32 },
+          "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 }
         },
         "patternProperties": {
-          "^account[0-9]user$": { "type": "string" },
-          "^account[0-9]pass$": { "type": "string" },
-          "^push[0-4]en$": { "type": "string", "enum": ["on"] },
-          "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 10 },
-          "^push[0-4](name|url|key1|key2|body)$": { "type": "string" }
+          "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },
+          "^account[0-9]pass$": { "type": "string", "x-maxUtf8Bytes": 96, "x-maxBasicPairUtf8Bytes": 180 },
+          "^push[0-4]en$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
+          "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 10, "x-maxUtf8Bytes": 32 },
+          "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
+          "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512 },
+          "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256 },
+          "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048 }
         }
       }
     }

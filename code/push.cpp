@@ -15,6 +15,26 @@ static bool hmacSha256(const String& key, const String& data, uint8_t output[32]
                          output) == 0;
 }
 
+static bool hasValidEpoch() {
+  return time(nullptr) >= 1700000000;
+}
+
+static String htmlEscape(const String& value) {
+  String escaped;
+  escaped.reserve(value.length());
+  for (size_t i = 0; i < value.length(); ++i) {
+    switch (value[i]) {
+      case '&': escaped += "&amp;"; break;
+      case '<': escaped += "&lt;"; break;
+      case '>': escaped += "&gt;"; break;
+      case '"': escaped += "&quot;"; break;
+      case '\'': escaped += "&#39;"; break;
+      default: escaped += value[i];
+    }
+  }
+  return escaped;
+}
+
 // 发送邮件通知函数
 void sendEmailNotification(const char* subject, const char* body) {
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
@@ -24,11 +44,13 @@ void sendEmailNotification(const char* subject, const char* body) {
   }
   
   auto statusCallback = [](SMTPStatus status) {
-    logCaptureLn(String(status.text));
+    if (status.errorCode != 0) logCaptureF("SMTP状态错误: %d\n", status.errorCode);
   };
-  smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback);
-  if (smtp.isConnected()) {
-    smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password);
+  if (smtp.connect(config.smtpServer.c_str(), config.smtpPort, statusCallback) && smtp.isConnected()) {
+    if (!smtp.authenticate(config.smtpUser.c_str(), config.smtpPass.c_str(), readymail_auth_password)) {
+      logCaptureLn("邮件服务器认证失败");
+      return;
+    }
 
     SMTPMessage msg;
     String from = "sms notify <"; from += config.smtpUser; from += ">";
@@ -41,8 +63,11 @@ void sendEmailNotification(const char* subject, const char* body) {
     msg.headers.add(rfc822_subject, safeSubject.c_str());
     msg.text.body(body);
     msg.timestamp = time(nullptr);
-    smtp.send(msg);
-    logCaptureLn(String("邮件发送完成"));
+    if (smtp.send(msg)) {
+      logCaptureLn("邮件服务器已接受消息");
+    } else {
+      logCaptureLn("邮件发送失败");
+    }
   } else {
     logCaptureLn(String("邮件服务器连接失败"));
   }
@@ -133,7 +158,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   logCaptureLn(String("发送到推送通道: " + channelName));
 
   if ((channel.type == PUSH_TYPE_DINGTALK || channel.type == PUSH_TYPE_FEISHU) &&
-      channel.key1.length() > 0 && !timeSynced) {
+      channel.key1.length() > 0 && !hasValidEpoch()) {
     logCaptureLn(String("时间尚未同步，跳过需要时间签名的推送"));
     return;
   }
@@ -234,9 +259,12 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
           }
       }
       String jsonData = "{";
+      String senderHtml = jsonEscape(htmlEscape(String(sender)));
+      String messageHtml = jsonEscape(htmlEscape(String(message)));
+      String timestampHtml = jsonEscape(htmlEscape(String(timestamp)));
       jsonData += "\"token\":\"" + jsonEscape(channel.key1) + "\",";
-      jsonData += "\"title\":\"短信来自: " + senderEscaped + "\",";
-      jsonData += "\"content\":\"<b>发送者:</b> " + senderEscaped + "<br><b>时间:</b> " + timestampEscaped + "<br><b>内容:</b><br>" + messageEscaped + "\",";
+      jsonData += "\"title\":\"短信来自: " + senderHtml + "\",";
+      jsonData += "\"content\":\"<b>发送者:</b> " + senderHtml + "<br><b>时间:</b> " + timestampHtml + "<br><b>内容:</b><br>" + messageHtml + "\",";
       jsonData += "\"channel\":\"" + channelValue + "\"";
       jsonData += "}";
       httpCode = http.POST(jsonData);
@@ -348,10 +376,10 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       return;
   }
   
-  if (httpCode > 0) {
-    logCaptureF("[%s] 响应码: %d\n", channelName.c_str(), httpCode);
+  if (httpCode >= 200 && httpCode < 300) {
+    logCaptureF("[%s] provider已接受请求: %d\n", channelName.c_str(), httpCode);
   } else {
-    logCaptureF("[%s] HTTP请求失败: %s\n", channelName.c_str(), http.errorToString(httpCode).c_str());
+    logCaptureF("[%s] HTTP请求失败: %d\n", channelName.c_str(), httpCode);
   }
   http.end();
 }

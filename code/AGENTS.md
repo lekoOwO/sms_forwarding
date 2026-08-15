@@ -25,13 +25,15 @@ existing owner already fits.
 
 ## Runtime invariants
 
-- This is a single-threaded Arduino loop. Long waits delay HTTP handling, URC
-  processing, and multipart timeout checks. Existing waits call
-  `server.handleClient()` where possible; preserve that responsiveness.
+- This is a single-threaded Arduino loop. Long waits delay HTTP handling and
+  multipart timeout checks. `modem.cpp` is the only `Serial1` reader and must
+  keep routing URCs while a transaction waits. Do not recursively call
+  `server.handleClient()` from a request handler or modem wait.
 - Keep `Serial1.begin(115200, SERIAL_8N1, RXD, TXD)` aligned with GPIO 4 RX and
   GPIO 3 TX. `MODEM_EN_PIN` is GPIO 5.
-- Preserve NVS key compatibility. Adding a persisted field requires matching
-  load/save logic and a safe default for existing devices.
+- Preserve the versioned config codec and legacy migration. Adding a persisted
+  field requires a schema migration, matching encode/decode validation, and a
+  safe default for existing devices; never raw-serialize Arduino `String`.
 - Web authentication supports ten account slots. Keep legacy `webUser` and
   `webPass` migration when changing account storage.
 - Every management route must pass through `checkAuth()`. Treat `/at`, modem
@@ -64,7 +66,7 @@ patterns already present.
   behavior. Prefer a small host-side pure-logic check when hardware is not
   required.
 - Keep using the same Compose container: `docker compose up -d dev`, then
-  `docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3 ./code`.
+  `docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code`.
   Do not use throwaway `docker compose run --rm` builds.
 - Modem, UART, PDU, SMS, network registration, and flash behavior are not proven
   by compilation. Run the relevant hardware check and record board, modem,

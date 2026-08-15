@@ -51,6 +51,58 @@ test("clearing all accounts does not restore the default credentials", async () 
 	});
 });
 
+test("request and UTF-8 field limits reject before authentication or mutation", async () => {
+	await withServer(async (baseUrl) => {
+		const oversizedRequestLine = await fetch(`${baseUrl}/${"a".repeat(2050)}`);
+		assert.equal(oversizedRequestLine.status, 414);
+		assert.equal(oversizedRequestLine.headers.get("cache-control"), "no-store");
+
+		const oversizedHeader = await fetch(`${baseUrl}/api/config`, {
+			headers: { Authorization: `Basic ${"a".repeat(8200)}` }
+		});
+		assert.equal(oversizedHeader.status, 431);
+		assert.equal(oversizedHeader.headers.get("cache-control"), "no-store");
+		assert.equal(oversizedHeader.headers.get("connection"), "close");
+
+		const oversizedBody = await fetch(`${baseUrl}/save`, {
+			method: "POST",
+			headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+			body: `smtpServer=${"a".repeat(16400)}`
+		});
+		assert.equal(oversizedBody.status, 413);
+
+		const rejected = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ smtpServer: "changed.example", smtpUser: "界".repeat(85) })
+		});
+		assert.equal(rejected.status, 400);
+		assert.deepEqual(await rejected.json(), {
+			success: false, code: "ACTION_INPUT_TOO_LONG", data: {}, detail: "smtpUser"
+		});
+		const snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.smtpServer, "");
+
+		const accepted = await request(baseUrl, "/sendsms", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ phone: "+886900000000", content: "界".repeat(682) })
+		});
+		assert.equal(accepted.status, 200);
+		const tooLong = await request(baseUrl, "/sendsms", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ phone: "+886900000000", content: "界".repeat(683) })
+		});
+		assert.equal(tooLong.status, 400);
+		assert.equal((await tooLong.json()).detail, "content");
+
+		const rejectedCommand = await request(baseUrl, "/at?cmd=AT%2BCMGS%3D1");
+		assert.equal(rejectedCommand.status, 400);
+		assert.equal((await rejectedCommand.json()).code, "ACTION_AT_REJECTED");
+	});
+});
+
 test("the mock implements the documented API", async () => {
 	await withServer(async (baseUrl) => {
 		const unauthorized = await fetch(`${baseUrl}/api/config`);

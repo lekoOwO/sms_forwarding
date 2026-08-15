@@ -8,8 +8,11 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 			...init?.headers
 		}
 	});
-	if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	return response.json() as Promise<T>;
+	const data = await response.json().catch(() => undefined);
+	if (!response.ok && !(data && typeof data === "object" && "code" in data)) {
+		throw new Error(`HTTP ${response.status}`);
+	}
+	return data as T;
 }
 
 export function loadSnapshot(): Promise<DeviceSnapshot> {

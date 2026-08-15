@@ -58,8 +58,10 @@ int main() {
         self.assertIn("return -1;", sms)
         self.assertIn("str.length() > MAX_PDU_LENGTH", sms)
         self.assertIn("str.length() % 2 != 0", sms)
-        self.assertIn("bool allowAdminCommands", header)
-        self.assertIn("timestamp.c_str(), false", sms)
+        self.assertNotIn("allowAdminCommands", header)
+        self.assertNotIn('startsWith("SMS:")', sms)
+        self.assertNotIn('equals("RESET")', sms)
+        self.assertIn("管理员长短信不完整，已丢弃", sms)
         reset = sms.index("concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;")
         self.assertLess(reset, sms.index("pdu.decodePDU"))
 
@@ -88,12 +90,14 @@ int main() {
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
         self.assertIn('server.sendHeader("Content-Security-Policy", "frame-ancestors \'none\'")', handlers)
         self.assertGreaterEqual(handlers.count('server.sendHeader("Cache-Control", "no-store")'), 4)
-        hard_reset = handlers[handlers.index('else if (action == "hardreset")'):]
-        self.assertLess(hard_reset.index("busy = false;"), hard_reset.index("return;"))
+        self.assertIn("if (rejectModemBusy()) return;", handlers)
+        self.assertNotIn("server.handleClient()", handlers)
 
     def test_account_updates_cannot_restore_default_credentials(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
-        self.assertIn("WebAccount nextWebAccounts[MAX_WEB_ACCOUNTS]", handlers)
+        self.assertIn("Config next = config;", handlers)
+        self.assertIn("if (!saveConfig(next))", handlers)
+        self.assertIn("config = next;", handlers)
         self.assertIn("ACTION_CONFIG_ACCOUNT_REQUIRED", handlers)
         self.assertNotIn(
             "config.webAccounts[0].username = DEFAULT_WEB_USER", handlers
@@ -105,9 +109,8 @@ int main() {
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
         self.assertIn("#define MODEM_RESPONSE_MAX_LENGTH", globals_header)
         self.assertIn("#define LOG_LINE_MAX_LENGTH", globals_header)
-        self.assertGreaterEqual(
-            modem.count("resp.length() < MODEM_RESPONSE_MAX_LENGTH"), 5
-        )
+        self.assertIn("transactionResponse.length() < MODEM_RESPONSE_MAX_LENGTH", modem)
+        self.assertIn("MODEM_RESPONSE_MAX_LENGTH - transactionResponse.length()", modem)
         self.assertIn("_logAppendFragment(msg);", handlers)
         self.assertNotIn("_logLine += msg;", handlers)
 

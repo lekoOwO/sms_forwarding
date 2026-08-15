@@ -21,7 +21,7 @@
 - 支持通过WEB界面主动发送短信，以便消耗余额
 - 支持通过WEB界面进行Ping测试，以极低的成本消耗余额
 - 支持长短信自动合并（30秒超时）
-- 支持管理员短信远程发送短信和重启设备
+- 收到的短信只用于通知转发，不执行短信中的远程控制命令
 
 ## 推送通道支持
 
@@ -42,11 +42,11 @@
 
 - **POST JSON**: `{"sender":"发送者号码","message":"短信内容","timestamp":"时间戳"}`
 - **Bark**: `{"title":"发送者号码","body":"短信内容"}`
-- **GET请求**: `URL?sender=xxx&message=xxx&timestamp=xxx`（自动URL编码）
+- **GET请求**: `URL?sender=xxx&message=xxx&timestamp=xxx`（自动URL编码；号码和内容会出现在 URL 与中间设备日志中，只应连接可信端点）
 - **钉钉机器人**: 文本消息格式，支持加签验证
 - **PushPlus**: 使用Token推送，支持HTML格式
 - **Server酱**: 使用SendKey推送，支持Markdown格式
-- **自定义模板**: 使用`{sender}`、`{message}`、`{timestamp}`占位符
+- **自定义模板**: 使用`{sender}`、`{message}`、`{timestamp}`占位符。占位符只适合放在 JSON 字符串值中；模板结构与其他转义由管理员负责
 - **飞书机器人**: 文本消息格式，支持加签验证
 
 |状态信息|主动ping|
@@ -104,12 +104,15 @@ ESP32C3 与 ML307R-DC 通过串口（UART）连接，接线如下：
 - ESP32C3运行自己的`Arduino`固件，负责连接WiFi和接收ML307R-DC发送过来的短信数据，然后转发到指定HTTP接口或邮箱
 - ML307R-DC运行默认的AT固件，不用动
 
-需要在`Arduino IDE`中单独安装这些库：
+`pdulib 0.5.11` 已随源码固定在 `code/src/pdulib/`，不应再安装另一份。需要在
+`Arduino IDE`中单独安装：
 
 - **ReadyMail** by Mobizt
-- **pdulib** by David Henry
 
 需要在`Arduino IDE`中安装ESP32开发板支持，参考[官方文档](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)，版型选`MakerGO ESP32 C3 SuperMini`。
+
+当前固件使用项目自带的 4 MB、无 OTA 分区表。第一次从旧分区升级必须通过
+USB 完整擦除后重刷固件与 LittleFS；设备不支持远端 OTA 回滚。
 
 ## 开发文档
 

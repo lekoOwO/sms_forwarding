@@ -96,6 +96,22 @@ static void sendActionResult(int status, bool success, const char* code,
   server.send(status, "application/json", json);
 }
 
+static bool rejectTooLong(const String& value, size_t maxBytes, const String& field) {
+  if (value.length() <= maxBytes) return false;
+  sendActionResult(400, false, "ACTION_INPUT_TOO_LONG", "{}", field);
+  return true;
+}
+
+static bool rejectArgTooLong(const String& field, size_t maxBytes) {
+  return server.hasArg(field) && rejectTooLong(server.arg(field), maxBytes, field);
+}
+
+static bool rejectModemBusy() {
+  if (!modemIsBusy()) return false;
+  sendActionResult(429, false, "ACTION_MODEM_BUSY");
+  return true;
+}
+
 // 从 LittleFS 提供前端构建产物
 void handleRoot() {
   if (!checkAuth()) return;
@@ -170,6 +186,8 @@ void handleFlightMode() {
   if (!checkAuth()) return;
   
   String action = server.arg("action");
+  if (rejectTooLong(action, 32, "action")) return;
+  if (rejectModemBusy()) return;
   bool success = false;
   String data = "{}";
   String detail = "";
@@ -263,6 +281,12 @@ void handleATCommand() {
   if (!checkAuth()) return;
   
   String cmd = server.arg("cmd");
+  if (rejectTooLong(cmd, 256, "cmd")) return;
+  if (cmd.length() > 0 && !modemCommandAllowed(cmd)) {
+    sendActionResult(400, false, "ACTION_AT_REJECTED");
+    return;
+  }
+  if (rejectModemBusy()) return;
   bool success = false;
   String data = "{}";
   const char* code = "ACTION_AT_REQUIRED";
@@ -290,6 +314,8 @@ void handleQuery() {
   if (!checkAuth()) return;
   
   String type = server.arg("type");
+  if (rejectTooLong(type, 32, "type")) return;
+  if (type != "wifi" && rejectModemBusy()) return;
   bool success = false;
   String data = "{}";
   String detail = "";
@@ -465,9 +491,29 @@ void handleQuery() {
     }
     // 查询PDP上下文激活状态
     resp = sendATCommand("AT+CGACT?", 2000);
-    String pdpStatus = "0";
-    if (resp.indexOf("+CGACT: 1,1") >= 0) {
-      pdpStatus = "1";
+    String pdpStatus = "null";
+    int cgact = resp.indexOf("+CGACT:");
+    while (cgact >= 0) {
+      String line = resp.substring(cgact + 7);
+      int lineEnd = line.indexOf('\n');
+      if (lineEnd >= 0) line = line.substring(0, lineEnd);
+      line.trim();
+      int comma = line.indexOf(',');
+      String cid = comma > 0 ? line.substring(0, comma) : "";
+      String state = comma > 0 ? line.substring(comma + 1) : "";
+      cid.trim();
+      state.trim();
+      bool valid = cid.length() > 0 && state.length() == 1 &&
+                   (state == "0" || state == "1");
+      for (size_t i = 0; valid && i < cid.length(); i++) valid = isDigit(cid[i]);
+      if (valid) {
+        if (cid == "1" && state == "1") {
+          pdpStatus = "true";
+          break;
+        }
+        pdpStatus = "false";
+      }
+      cgact = resp.indexOf("+CGACT:", cgact + 7);
     }
     // 查询APN
     resp = sendATCommand("AT+CGDCONT?", 2000);
@@ -487,7 +533,7 @@ void handleQuery() {
     }
     data = "{\"registration\":" + (regStatus == "N/A" ? String("null") : String(regStatus.toInt())) +
            ",\"operator\":" + jsonStringOrNull(oper) +
-           ",\"pdpActive\":" + String(pdpStatus == "1" ? "true" : "false") +
+           ",\"pdpActive\":" + pdpStatus +
            ",\"apn\":" + jsonStringOrNull(apn) + "}";
   }
   else if (type == "wifi") {
@@ -522,6 +568,8 @@ void handleSendSms() {
   
   String phone = server.arg("phone");
   String content = server.arg("content");
+  if (rejectTooLong(phone, 32, "phone") || rejectTooLong(content, 2048, "content")) return;
+  if (rejectModemBusy()) return;
   
   phone.trim();
   content.trim();
@@ -546,205 +594,121 @@ void handleSendSms() {
 // 处理Ping请求
 void handlePing() {
   if (!checkAuth()) return;
-  
-  logCaptureLn(String("网页端发起Ping请求"));
-  
-  // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
-  
-  // 激活PDP上下文（数据连接）
-  logCaptureLn(String("激活数据连接(CGACT)..."));
-  String activateResp = sendATCommand("AT+CGACT=1,1", 10000);
-  logCaptureLn(String("CGACT响应: " + activateResp));
-  
-  // 检查激活是否成功（OK或已激活的情况）
-  bool networkActivated = (activateResp.indexOf("OK") >= 0);
-  if (!networkActivated) {
-    logCaptureLn(String("数据连接激活失败，尝试继续执行..."));
+  if (rejectModemBusy()) return;
+
+  String activateResponse;
+  bool activated = modemSetDataActive(true, activateResponse);
+  String response = activated
+                      ? sendATCommandUntil("AT+MPING=\"8.8.8.8\",30,1", "+MPING:", 35000)
+                      : activateResponse;
+
+  String deactivateResponse;
+  modemSetDataActive(false, deactivateResponse);
+
+  int mping = response.indexOf("+MPING:");
+  if (!activated || response.indexOf("ERROR") >= 0) {
+    sendActionResult(200, false, "ACTION_PING_MODEM_ERROR", "{}", response);
+    return;
   }
-  
-  // 清空串口缓冲区
-  while (Serial1.available()) Serial1.read();
-  delay(500);  // 等待网络稳定
-  
-  // 发送MPING命令，ping 8.8.8.8，超时30秒，ping 1次
-  Serial1.println("AT+MPING=\"8.8.8.8\",30,1");
-  
-  // 等待响应
-  unsigned long start = millis();
-  String resp = "";
-  bool gotOK = false;
-  bool gotError = false;
-  bool gotPingResult = false;
-  bool pingSucceeded = false;
-  String pingResultMsg = "";
-  String pingData = "{}";
-  
-  // 等待最多35秒（30秒超时 + 5秒余量）
-  while (millis() - start < 35000) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
-      logCapture(String(c));  // 调试输出
-      
-      // 检查是否收到OK
-      if (resp.indexOf("OK") >= 0 && !gotOK) {
-        gotOK = true;
-      }
-      
-      // 检查是否收到ERROR
-      if (resp.indexOf("+CME ERROR") >= 0 || resp.indexOf("ERROR") >= 0) {
-        gotError = true;
-        pingResultMsg = resp;
-        break;
-      }
-      
-      // 检查是否收到Ping结果URC
-      // 成功格式: +MPING: 1,8.8.8.8,32,xxx,xxx
-      // 失败格式: +MPING: 2 或其他
-      int mpingIdx = resp.indexOf("+MPING:");
-      if (mpingIdx >= 0) {
-        // 找到换行符确定完整的一行
-        int lineEnd = resp.indexOf('\n', mpingIdx);
-        if (lineEnd >= 0) {
-          String mpingLine = resp.substring(mpingIdx, lineEnd);
-          mpingLine.trim();
-          logCaptureLn(String("收到MPING结果: " + mpingLine));
-          
-          // 解析结果
-          // +MPING: <result>[,<ip>,<packet_len>,<time>,<ttl>]
-          int colonIdx = mpingLine.indexOf(':');
-          if (colonIdx >= 0) {
-            String params = mpingLine.substring(colonIdx + 1);
-            params.trim();
-            
-            // 获取第一个参数（result）
-            int commaIdx = params.indexOf(',');
-            String resultStr;
-            if (commaIdx >= 0) {
-              resultStr = params.substring(0, commaIdx);
-            } else {
-              resultStr = params;
-            }
-            resultStr.trim();
-            int result = resultStr.toInt();
-            
-            gotPingResult = true;
-            
-            // result=0或1都表示成功（不同模组可能返回不同值）
-            // 如果有完整的响应参数（IP、时间等），也视为成功
-            bool pingSuccess = (result == 0 || result == 1) || (params.indexOf(',') >= 0 && params.length() > 5);
-            
-            if (pingSuccess) {
-              pingSucceeded = true;
-              // 成功，解析详细信息
-              // 格式: 0/1,"8.8.8.8",16,时间,TTL
-              int idx1 = params.indexOf(',');
-              if (idx1 >= 0) {
-                String rest = params.substring(idx1 + 1);
-                // 处理IP地址（可能带引号）
-                String ip;
-                int idx2;
-                if (rest.startsWith("\"")) {
-                  // 带引号的IP
-                  int quoteEnd = rest.indexOf('\"', 1);
-                  if (quoteEnd >= 0) {
-                    ip = rest.substring(1, quoteEnd);
-                    idx2 = rest.indexOf(',', quoteEnd);
-                  } else {
-                    idx2 = rest.indexOf(',');
-                    ip = rest.substring(0, idx2);
-                  }
-                } else {
-                  idx2 = rest.indexOf(',');
-                  ip = rest.substring(0, idx2);
-                }
-                
-                if (idx2 >= 0) {
-                  rest = rest.substring(idx2 + 1);
-                  int idx3 = rest.indexOf(',');  // packet_len后
-                  if (idx3 >= 0) {
-                    rest = rest.substring(idx3 + 1);
-                    int idx4 = rest.indexOf(',');  // time后
-                    String timeStr, ttlStr;
-                    if (idx4 >= 0) {
-                      timeStr = rest.substring(0, idx4);
-                      ttlStr = rest.substring(idx4 + 1);
-                    } else {
-                      timeStr = rest;
-                      ttlStr = "N/A";
-                    }
-                    timeStr.trim();
-                    ttlStr.trim();
-                    pingData = "{\"ip\":\"" + jsonEscape(ip) +
-                               "\",\"latencyMs\":" + String(timeStr.toInt()) +
-                               ",\"ttl\":" + (ttlStr == "N/A" ? String("null") : String(ttlStr.toInt())) + "}";
-                  }
-                }
-              }
-              if (pingData == "{}") {
-                pingData = "{\"ip\":\"8.8.8.8\"}";
-              }
-            } else {
-              // 失败
-              pingResultMsg = "MPING: " + String(result);
-            }
-            break;
-          }
-        }
+  if (mping < 0) {
+    sendActionResult(200, false, "ACTION_PING_TIMEOUT");
+    return;
+  }
+
+  String params = response.substring(mping + 7);
+  int lineEnd = params.indexOf('\n');
+  if (lineEnd >= 0) params = params.substring(0, lineEnd);
+  params.trim();
+  int firstComma = params.indexOf(',');
+  int result = (firstComma < 0 ? params : params.substring(0, firstComma)).toInt();
+  if (firstComma < 0 && result != 0 && result != 1) {
+    sendActionResult(200, false, "ACTION_PING_UNREACHABLE", "{}", params);
+    return;
+  }
+
+  String data = "{\"ip\":\"8.8.8.8\"}";
+  if (firstComma >= 0) {
+    String rest = params.substring(firstComma + 1);
+    int ipEnd = rest.indexOf(',');
+    if (ipEnd >= 0) {
+      String ip = rest.substring(0, ipEnd);
+      ip.replace("\"", "");
+      rest = rest.substring(ipEnd + 1);
+      int packetEnd = rest.indexOf(',');
+      if (packetEnd >= 0) {
+        rest = rest.substring(packetEnd + 1);
+        int timeEnd = rest.indexOf(',');
+        String latency = timeEnd < 0 ? rest : rest.substring(0, timeEnd);
+        String ttl = timeEnd < 0 ? "" : rest.substring(timeEnd + 1);
+        latency.trim();
+        ttl.trim();
+        data = "{\"ip\":\"" + jsonEscape(ip) + "\",\"latencyMs\":" +
+               String(latency.toInt()) + ",\"ttl\":" +
+               (ttl.length() ? String(ttl.toInt()) : String("null")) + "}";
       }
     }
-    
-    if (gotError || gotPingResult) break;
-    server.handleClient();
   }
-  
-  logCaptureLn(String("\nPing操作完成"));
-  
-  // 关闭数据连接以节省流量
-  logCaptureLn(String("关闭PDP上下文(CGACT=0)..."));
-  String deactivateResp = sendATCommand("AT+CGACT=0,1", 5000);
-  logCaptureLn(String("CGACT关闭响应: " + deactivateResp));
-  
-  if (pingSucceeded) {
-    sendActionResult(200, true, "ACTION_PING_OK", pingData);
-  } else if (gotError) {
-    sendActionResult(200, false, "ACTION_PING_MODEM_ERROR", "{}", pingResultMsg);
-  } else if (gotPingResult) {
-    sendActionResult(200, false, "ACTION_PING_UNREACHABLE", "{}", pingResultMsg);
-  } else {
-    sendActionResult(200, false, "ACTION_PING_TIMEOUT");
-  }
+  sendActionResult(200, true, "ACTION_PING_OK", data);
 }
 
 // 处理保存配置请求
 void handleSave() {
   if (!checkAuth()) return;
 
-  String previousSmtpServer = config.smtpServer;
-  int previousSmtpPort = config.smtpPort;
-  String previousSmtpUser = config.smtpUser;
+  Config next = config;
+  String previousSmtpServer = next.smtpServer;
+  int previousSmtpPort = next.smtpPort;
+  String previousSmtpUser = next.smtpUser;
+
+  if (rejectArgTooLong("smtpServer", 253) || rejectArgTooLong("smtpPort", 32) ||
+      rejectArgTooLong("smtpUser", 254) ||
+      rejectArgTooLong("smtpPass", 256) || rejectArgTooLong("smtpSendTo", 254) ||
+      rejectArgTooLong("adminPhone", 32) || rejectArgTooLong("numberBlackList", 1024)) return;
+
+  for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
+    String prefix = "push" + String(i);
+    if (rejectArgTooLong(prefix + "en", 32) || rejectArgTooLong(prefix + "type", 32) ||
+        rejectArgTooLong(prefix + "url", 512) || rejectArgTooLong(prefix + "name", 64) ||
+        rejectArgTooLong(prefix + "key1", 256) || rejectArgTooLong(prefix + "key2", 256) ||
+        rejectArgTooLong(prefix + "body", 2048)) return;
+  }
+
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
+    String prefix = "account" + String(i);
+    String userKey = prefix + "user";
+    String passKey = prefix + "pass";
+    if (rejectArgTooLong(userKey, 64) || rejectArgTooLong(passKey, 96)) return;
+    String username = server.hasArg(userKey) ? server.arg(userKey) : next.webAccounts[i].username;
+    String password = server.hasArg(passKey) && server.arg(passKey).length() > 0
+                        ? server.arg(passKey) : next.webAccounts[i].password;
+    username.trim();
+    if (username.length() == 0) password = "";
+    if ((server.hasArg(userKey) || server.hasArg(passKey)) &&
+        username.length() + password.length() + 1 > 180) {
+      sendActionResult(400, false, "ACTION_INPUT_TOO_LONG", "{}",
+                       server.hasArg(passKey) ? passKey : userKey);
+      return;
+    }
+  }
 
   // 账号管理表单：空账号会停用该组，空密码会保留现有密码
-  WebAccount nextWebAccounts[MAX_WEB_ACCOUNTS];
-  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) nextWebAccounts[i] = config.webAccounts[i];
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
     String userKey = prefix + "user";
     String passKey = prefix + "pass";
     if (server.hasArg(userKey)) {
-      nextWebAccounts[i].username = server.arg(userKey);
-      nextWebAccounts[i].username.trim();
-      if (nextWebAccounts[i].username.length() == 0) nextWebAccounts[i].password = "";
+      next.webAccounts[i].username = server.arg(userKey);
+      next.webAccounts[i].username.trim();
+      if (next.webAccounts[i].username.length() == 0) next.webAccounts[i].password = "";
     }
     if (server.hasArg(passKey) && server.arg(passKey).length() > 0) {
-      nextWebAccounts[i].password = server.arg(passKey);
+      next.webAccounts[i].password = server.arg(passKey);
     }
-    if (nextWebAccounts[i].password.length() == 0) nextWebAccounts[i].username = "";
+    if (next.webAccounts[i].password.length() == 0) next.webAccounts[i].username = "";
   }
   bool hasWebAccount = false;
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
-    if (nextWebAccounts[i].username.length() > 0 && nextWebAccounts[i].password.length() > 0) {
+    if (next.webAccounts[i].username.length() > 0 && next.webAccounts[i].password.length() > 0) {
       hasWebAccount = true;
       break;
     }
@@ -753,36 +717,35 @@ void handleSave() {
     sendActionResult(400, false, "ACTION_CONFIG_ACCOUNT_REQUIRED");
     return;
   }
-  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) config.webAccounts[i] = nextWebAccounts[i];
 
   // 邮件通知表单：只在字段存在时更新
   if (server.hasArg("smtpServer")) {
-    config.smtpServer = server.arg("smtpServer");
+    next.smtpServer = server.arg("smtpServer");
   }
   if (server.hasArg("smtpPort")) {
     long smtpPort = server.arg("smtpPort").toInt();
-    config.smtpPort = smtpPort > 0 && smtpPort <= 65535 ? smtpPort : 465;
+    next.smtpPort = smtpPort > 0 && smtpPort <= 65535 ? smtpPort : 465;
   }
   if (server.hasArg("smtpUser")) {
-    config.smtpUser = server.arg("smtpUser");
+    next.smtpUser = server.arg("smtpUser");
   }
   if (server.hasArg("smtpPass")) {
-    config.smtpPass = server.arg("smtpPass");
+    next.smtpPass = server.arg("smtpPass");
   }
   if (server.hasArg("smtpSendTo")) {
-    config.smtpSendTo = server.arg("smtpSendTo");
+    next.smtpSendTo = server.arg("smtpSendTo");
   }
   if (!server.hasArg("smtpPass") &&
-      (config.smtpServer != previousSmtpServer || config.smtpPort != previousSmtpPort ||
-       config.smtpUser != previousSmtpUser)) {
-    config.smtpPass = "";
+      (next.smtpServer != previousSmtpServer || next.smtpPort != previousSmtpPort ||
+       next.smtpUser != previousSmtpUser)) {
+    next.smtpPass = "";
   }
   // 管理员 & 黑名单表单：只在字段存在时更新
   if (server.hasArg("adminPhone")) {
-    config.adminPhone = server.arg("adminPhone");
+    next.adminPhone = server.arg("adminPhone");
   }
   if (server.hasArg("numberBlackList")) {
-    config.numberBlackList = server.arg("numberBlackList");
+    next.numberBlackList = server.arg("numberBlackList");
   }
 
   // 推送通道配置：只在对应通道的字段存在时更新
@@ -799,23 +762,24 @@ void handleSave() {
     if (server.hasArg(enKey) || server.hasArg(typeKey) || server.hasArg(urlKey) ||
         server.hasArg(nameKey) || server.hasArg(k1Key) || server.hasArg(k2Key) ||
         server.hasArg(bodyKey)) {
-      config.pushChannels[i].enabled = server.arg(enKey) == "on";
-      config.pushChannels[i].type = (PushType)server.arg(typeKey).toInt();
-      config.pushChannels[i].url = server.arg(urlKey);
-      config.pushChannels[i].name = server.arg(nameKey);
-      config.pushChannels[i].key1 = server.arg(k1Key);
-      config.pushChannels[i].key2 = server.arg(k2Key);
-      config.pushChannels[i].customBody = server.arg(bodyKey);
-      if (config.pushChannels[i].name.length() == 0) {
-        config.pushChannels[i].name = "通道" + String(i + 1);
+      next.pushChannels[i].enabled = server.arg(enKey) == "on";
+      next.pushChannels[i].type = (PushType)server.arg(typeKey).toInt();
+      next.pushChannels[i].url = server.arg(urlKey);
+      next.pushChannels[i].name = server.arg(nameKey);
+      next.pushChannels[i].key1 = server.arg(k1Key);
+      next.pushChannels[i].key2 = server.arg(k2Key);
+      next.pushChannels[i].customBody = server.arg(bodyKey);
+      if (next.pushChannels[i].name.length() == 0) {
+        next.pushChannels[i].name = "通道" + String(i + 1);
       }
     }
   }
   
-  if (!saveConfig()) {
+  if (!saveConfig(next)) {
     sendActionResult(500, false, "ACTION_CONFIG_SAVE_FAILED");
     return;
   }
+  config = next;
   configValid = isConfigValid();
   
   sendActionResult(200, true, "ACTION_CONFIG_SAVED");
@@ -850,14 +814,8 @@ void handleLog() {
 void handleModem() {
   if (!checkAuth()) return;
 
-  // 防止重入：modemInit() 内部会调 server.handleClient()，
-  // 若浏览器超时重试会导致嵌套调用，最终拖垮 WiFi
-  static bool busy = false;
-  if (busy) {
-    sendActionResult(429, false, "ACTION_MODEM_BUSY");
-    return;
-  }
-  busy = true;
+  if (rejectTooLong(server.arg("action"), 32, "action")) return;
+  if (rejectModemBusy()) return;
 
   String action = server.arg("action");
   bool success = false;
@@ -873,7 +831,6 @@ void handleModem() {
     success = (resp.indexOf("OK") >= 0);
     logCaptureLn(String(success ? "模组软重启成功: " : "软重启失败: ") + resp);
     if (success) modemInit();
-    busy = false;
     return;
   }
   else if (action == "hardreset") {
@@ -881,7 +838,6 @@ void handleModem() {
     logCaptureLn(String("网页端请求硬重启模组..."));
     sendActionResult(200, true, "ACTION_MODEM_HARD_RESTARTING");
     resetModule();
-    busy = false;
     return;
   }
   else if (action == "signal") {
@@ -954,7 +910,6 @@ void handleModem() {
     detail = action;
   }
 
-  busy = false;
   sendActionResult(200, success, code, data, detail);
 }
 
@@ -962,12 +917,7 @@ void handleModem() {
 void handleWifi() {
   if (!checkAuth()) return;
 
-  static bool busy = false;
-  if (busy) {
-    sendActionResult(429, false, "ACTION_WIFI_BUSY");
-    return;
-  }
-  busy = true;
+  if (rejectTooLong(server.arg("action"), 32, "action")) return;
 
   String action = server.arg("action");
   if (action == "restart") {
@@ -983,7 +933,6 @@ void handleWifi() {
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
       delay(50);
-      server.handleClient();
     }
     if (WiFi.status() == WL_CONNECTED) {
       logCaptureLn(String("WiFi 重连成功, IP: " + WiFi.localIP().toString()));
@@ -993,5 +942,4 @@ void handleWifi() {
   } else {
     sendActionResult(200, false, "ACTION_UNKNOWN");
   }
-  busy = false;
 }

@@ -26,6 +26,11 @@
 	type Theme = "light" | "dark";
 
 	const idle = (): UiResult => ({ state: "idle", code: "", data: {}, detail: "" });
+	const encoder = new TextEncoder();
+	const byteLimits: Record<string, number> = {
+		smtpServer: 253, smtpPort: 32, smtpUser: 254, smtpPass: 256, smtpSendTo: 254,
+		adminPhone: 32, numberBlackList: 1024, phone: 32, content: 2048, cmd: 256
+	};
 	const providers = [
 		"POST JSON",
 		"Bark",
@@ -108,6 +113,11 @@
 	}
 
 	async function save(setResult: (value: UiResult) => void, values: Record<string, string | number | boolean>) {
+		const invalid = tooLong(values);
+		if (invalid) {
+			setResult({ state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: invalid });
+			return;
+		}
 		setResult({ state: "loading", code: "commonSaving", data: {}, detail: "" });
 		try {
 			const response = await postForm("/save", values);
@@ -130,6 +140,11 @@
 	}
 
 	async function sendSms() {
+		const invalid = tooLong({ phone, content: message });
+		if (invalid) {
+			smsResult = { state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: invalid };
+			return;
+		}
 		smsResult = { state: "loading", code: "sending", data: {}, detail: "" };
 		try {
 			const response = await postForm("/sendsms", { phone, content: message });
@@ -170,16 +185,44 @@
 
 	function pushValues() {
 		const values: Record<string, string | number | boolean> = {};
-		snapshot?.config.pushChannels.forEach((channel, index) => {
-			values[`push${index}en`] = channel.enabled;
-			values[`push${index}type`] = channel.type;
-			values[`push${index}name`] = channel.name;
-			values[`push${index}url`] = channel.url;
-			values[`push${index}key1`] = channel.key1;
-			values[`push${index}key2`] = channel.key2;
-			values[`push${index}body`] = channel.customBody;
-		});
+		const index = Number(pushTab);
+		const channel = snapshot?.config.pushChannels[index];
+		if (!channel) return values;
+		values[`push${index}en`] = channel.enabled;
+		values[`push${index}type`] = channel.type;
+		values[`push${index}name`] = channel.name;
+		values[`push${index}url`] = channel.url;
+		values[`push${index}key1`] = channel.key1;
+		values[`push${index}key2`] = channel.key2;
+		values[`push${index}body`] = channel.customBody;
 		return values;
+	}
+
+	function fieldLimit(field: string) {
+		if (/^account\d+user$/.test(field)) return 64;
+		if (/^account\d+pass$/.test(field)) return 96;
+		if (/^push\d+name$/.test(field)) return 64;
+		if (/^push\d+(en|type)$/.test(field)) return 32;
+		if (/^push\d+url$/.test(field)) return 512;
+		if (/^push\d+key[12]$/.test(field)) return 256;
+		if (/^push\d+body$/.test(field)) return 2048;
+		return byteLimits[field];
+	}
+
+	function tooLong(values: Record<string, string | number | boolean>) {
+		for (const [field, value] of Object.entries(values)) {
+			const limit = fieldLimit(field);
+			if (limit !== undefined && encoder.encode(String(value)).length > limit) return field;
+		}
+		return "";
+	}
+
+	function sendAtCommand() {
+		if (tooLong({ cmd: command })) {
+			terminalResult = { state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: "cmd" };
+			return;
+		}
+		void action((value) => terminalResult = value, `/at?cmd=${encodeURIComponent(command)}`);
 	}
 
 	function accountValues() {
@@ -316,7 +359,7 @@
 						<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button><Button onclick={() => action((value) => networkResult = value, "/ping", t("confirmPing"), { method: "POST" })}>{t("ping")}</Button></div><ActionResult result={networkResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form onsubmit={(event) => { event.preventDefault(); void action((value) => terminalResult = value, `/at?cmd=${encodeURIComponent(command)}`); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="logs"><Accordion.Trigger onclick={refreshLogs}>{t("deviceTabLogs")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></Empty.Content></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre><div class="flex justify-end"><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></div>{/if}<ActionResult result={logsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 					</Accordion.Root>
 				</section>

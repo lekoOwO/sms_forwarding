@@ -1,34 +1,152 @@
 #include "modem.h"
 #include "web_handlers.h"
+#include "sms_process.h"
 #include "utf8_validation.h"
 
-// 发送AT命令并获取响应
-String sendATCommand(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
-  
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < timeout) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
-      if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) {
-        // 读取剩余数据（最多 50ms）
-        unsigned long t = millis();
-        while (millis() - t < 50) {
-          if (Serial1.available()) {
-            char remaining = Serial1.read();
-            if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += remaining;
-          }
-          server.handleClient();
-        }
-        return resp;
-      }
-    }
-    server.handleClient();
+static bool transactionBusy = false;
+static bool transactionDone = false;
+static bool transactionPrompt = false;
+static bool expectPrompt = false;
+static String transactionResponse;
+static String transactionTerminal;
+static char modemLine[SERIAL_BUFFER_SIZE];
+static size_t modemLineLength = 0;
+static bool modemLineOverflow = false;
+static String detectedModel;
+static ModemDataState dataState = MODEM_DATA_UNKNOWN;
+
+static void appendTransactionLine(const String& line) {
+  if (transactionResponse.length() < MODEM_RESPONSE_MAX_LENGTH) {
+    transactionResponse.concat(line.c_str(),
+      min((size_t)line.length(),
+          (size_t)MODEM_RESPONSE_MAX_LENGTH - transactionResponse.length()));
+    if (transactionResponse.length() < MODEM_RESPONSE_MAX_LENGTH)
+      transactionResponse += '\n';
   }
-  return resp;
+
+  String trimmed = line;
+  trimmed.trim();
+  bool error = trimmed == "ERROR" || trimmed.startsWith("+CME ERROR") ||
+               trimmed.startsWith("+CMS ERROR");
+  bool terminal = transactionTerminal.length() > 0 &&
+                  line.indexOf(transactionTerminal) >= 0;
+  if (error || terminal ||
+      (transactionTerminal.length() == 0 && trimmed == "OK"))
+    transactionDone = true;
+}
+
+void modemPoll() {
+  while (Serial1.available()) {
+    char c = Serial1.read();
+    if (transactionBusy && expectPrompt && c == '>' && modemLineLength == 0) {
+      transactionPrompt = transactionDone = true;
+      continue;
+    }
+    if (c == '\n') {
+      if (!modemLineOverflow) {
+        modemLine[modemLineLength] = 0;
+        String line(modemLine);
+        if (line.endsWith("\r")) line.remove(line.length() - 1);
+        if (!processModemLine(line) && transactionBusy)
+          appendTransactionLine(line);
+      }
+      modemLineLength = 0;
+      modemLineOverflow = false;
+    } else if (!modemLineOverflow) {
+      if (modemLineLength < sizeof(modemLine) - 1)
+        modemLine[modemLineLength++] = c;
+      else
+        modemLineOverflow = true;
+    }
+  }
+}
+
+void modemDrainInput() {
+  modemPoll();
+}
+
+bool modemIsBusy() {
+  return transactionBusy;
+}
+
+bool modemCommandAllowed(const String& input) {
+  if (input.length() == 0 || input.length() > MAX_AT_COMMAND_LENGTH ||
+      input.indexOf('\r') >= 0 || input.indexOf('\n') >= 0) return false;
+  String cmd = input;
+  cmd.trim();
+  cmd.toUpperCase();
+  if (!cmd.startsWith("AT")) return false;
+  return !cmd.startsWith("ATD") && cmd != "ATO" &&
+         !cmd.startsWith("AT+CMGS") && !cmd.startsWith("AT+CMGW") &&
+         !cmd.startsWith("AT+CGDATA") && !cmd.startsWith("AT+CMUX") &&
+         cmd.indexOf("CIPSEND") < 0 && cmd.indexOf("QISEND") < 0 &&
+         cmd.indexOf("CASEND") < 0;
+}
+
+static ModemCommandResult runTransaction(const char* cmd, unsigned long timeout,
+                                         String& response, const char* terminal,
+                                         bool prompt, bool validate = true) {
+  if (transactionBusy) return MODEM_COMMAND_BUSY;
+  if (validate && cmd && !modemCommandAllowed(String(cmd)))
+    return MODEM_COMMAND_REJECTED;
+
+  modemPoll();
+  transactionBusy = true;
+  transactionDone = false;
+  transactionPrompt = false;
+  expectPrompt = prompt;
+  transactionResponse = "";
+  transactionTerminal = terminal ? terminal : "";
+  if (cmd) Serial1.println(cmd);
+
+  unsigned long start = millis();
+  while (!transactionDone && millis() - start < timeout) {
+    modemPoll();
+    delay(1);
+  }
+  modemPoll();
+  response = transactionResponse;
+  bool completed = transactionDone;
+  transactionBusy = false;
+  expectPrompt = false;
+  transactionTerminal = "";
+  return completed ? MODEM_COMMAND_COMPLETED : MODEM_COMMAND_TIMEOUT;
+}
+
+ModemCommandResult modemTryCommand(const char* cmd, unsigned long timeout,
+                                   String& response, const char* terminal) {
+  return runTransaction(cmd, timeout, response, terminal, false);
+}
+
+String sendATCommand(const char* cmd, unsigned long timeout) {
+  String response;
+  modemTryCommand(cmd, timeout, response);
+  return response;
+}
+
+String sendATCommandUntil(const char* cmd, const char* terminal,
+                          unsigned long timeout) {
+  String response;
+  modemTryCommand(cmd, timeout, response, terminal);
+  return response;
+}
+
+ModemDataState modemGetDataState() {
+  return dataState;
+}
+
+bool modemSetDataActive(bool active, String& response) {
+  if (!active && detectedModel == "ML307Y") {
+    dataState = MODEM_DATA_UNKNOWN;
+    response = "";
+    return true;
+  }
+  ModemCommandResult result = modemTryCommand(
+    active ? "AT+CGACT=1,1" : "AT+CGACT=0,1", 10000, response);
+  bool ok = result == MODEM_COMMAND_COMPLETED && response.indexOf("OK") >= 0;
+  dataState = ok ? (active ? MODEM_DATA_ACTIVE : MODEM_DATA_INACTIVE)
+                 : MODEM_DATA_UNKNOWN;
+  return ok;
 }
 
 // 新增"模组断电重启"函数
@@ -53,62 +171,65 @@ void resetModule() {
 
 // 模组 AT 初始化流程（setup 中调用，resetModule 后也调用）
 void modemInit() {
-  // 清掉上电噪声/残留
-  while (Serial1.available()) Serial1.read();
+  const int INIT_RETRIES = 5;
+  modemReady = false;
+  modemDrainInput();
 
-  while (!sendATandWaitOK("AT", 1000)) {
+  bool initialized = false;
+  for (int retry = 0; retry < INIT_RETRIES; retry++) {
+    if (sendATandWaitOK("AT", 1000)) {
+      initialized = true;
+      break;
+    }
     logCaptureLn(String("AT未响应，重试..."));
     blink_short();
   }
+  if (!initialized) {
+    logCaptureLn(String("⚠️ AT握手失败，模组进入降级状态"));
+    return;
+  }
   logCaptureLn(String("模组AT响应正常"));
 
-  //判断型号，做一些特定操作
-  bool need_set_CGACT = true;
+  detectedModel = "";
   String resp = sendATCommand("ATI", 2000);
-  logCaptureLn(String("ATI响应: " + resp));
-  if (resp.indexOf("OK") >= 0) {
-    // 解析ATI响应
-    String manufacturer = "未知";
-    String model = "未知";
-    String version = "未知";
-    
-    // 按行解析
-    int lineStart = 0;
-    int lineNum = 0;
-    for (int i = 0; i < resp.length(); i++) {
-      if (resp.charAt(i) == '\n' || i == resp.length() - 1) {
-        String line = resp.substring(lineStart, i);
-        line.trim();
-        if (line.length() > 0 && line != "ATI" && line != "OK") {
-          lineNum++;
-          if (lineNum == 1) manufacturer = line;
-          else if (lineNum == 2) model = line;
-          else if (lineNum == 3) version = line;
-        }
-        lineStart = i + 1;
-      }
-    }
-    //这个模组这条命令有bug
-    if(model == "ML307Y") need_set_CGACT = false;
+  if (resp.indexOf("ML307Y") >= 0) detectedModel = "ML307Y";
+
+  String dataResponse;
+  if (modemSetDataActive(false, dataResponse) && detectedModel != "ML307Y") {
+    logCaptureLn(String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗"));
+  } else if (detectedModel == "ML307Y") {
+    logCaptureLn(String("ML307Y不支援安全停用PDP，数据状态未知"));
+  } else {
+    logCaptureLn(String("⚠️ 停用PDP失败，数据状态未知"));
   }
 
-  if(need_set_CGACT) {
-    while (!sendATandWaitOK("AT+CGACT=0,1", 5000)) {
-      logCaptureLn(String("设置CGACT失败，重试..."));
-      blink_short();
+  initialized = false;
+  for (int retry = 0; retry < INIT_RETRIES; retry++) {
+    if (sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000)) {
+      initialized = true;
+      break;
     }
-    logCaptureLn(String("已禁用数据连接(AT+CGACT=0,1)，防止流量消耗"));
-  } else {
-    logCaptureLn(String("该型号无法配置(AT+CGACT=0,1)，跳过该命令，会不会消耗流量？自求多福"));
-  }
-  while (!sendATandWaitOK("AT+CNMI=2,2,0,0,0", 1000)) {
     logCaptureLn(String("设置CNMI失败，重试..."));
     blink_short();
   }
+  if (!initialized) {
+    logCaptureLn(String("⚠️ CNMI设置失败，模组进入降级状态"));
+    return;
+  }
   logCaptureLn(String("CNMI参数设置完成"));
-  while (!sendATandWaitOK("AT+CMGF=0", 1000)) {
+
+  initialized = false;
+  for (int retry = 0; retry < INIT_RETRIES; retry++) {
+    if (sendATandWaitOK("AT+CMGF=0", 1000)) {
+      initialized = true;
+      break;
+    }
     logCaptureLn(String("设置PDU模式失败，重试..."));
     blink_short();
+  }
+  if (!initialized) {
+    logCaptureLn(String("⚠️ PDU模式设置失败，模组进入降级状态"));
+    return;
   }
   logCaptureLn(String("PDU模式设置完成"));
   int ceregRetry = 0;
@@ -134,41 +255,17 @@ void blink_short(unsigned long gap_time) {
 }
 
 bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println(cmd);
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < timeout) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
-      if (resp.indexOf("OK") >= 0) return true;
-      if (resp.indexOf("ERROR") >= 0) return false;
-    }
-    server.handleClient();
-  }
-  return false;
+  String resp;
+  ModemCommandResult result = modemTryCommand(cmd, timeout, resp);
+  return result == MODEM_COMMAND_COMPLETED && resp.indexOf("OK") >= 0;
 }
 
 // 检测网络注册状态（LTE/4G）
 // CEREG状态: 1=已注册本地, 5=已注册漫游
 bool waitCEREG() {
-  Serial1.println("AT+CEREG?");
-  unsigned long start = millis();
-  String resp = "";
-  while (millis() - start < 2000) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
-      if (resp.indexOf("+CEREG:") >= 0) {
-        if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) return true;
-        if (resp.indexOf(",0") >= 0 || resp.indexOf(",2") >= 0 || 
-            resp.indexOf(",3") >= 0 || resp.indexOf(",4") >= 0) return false;
-      }
-    }
-    server.handleClient();
-  }
-  return false;
+  String resp = sendATCommand("AT+CEREG?", 2000);
+  if (resp.indexOf("+CEREG:") < 0) return false;
+  return resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0;
 }
 
 static bool isGsm7Extension(unsigned short value) {
@@ -224,48 +321,22 @@ static int smsPartCount(const char* message, bool gsm7, int limit) {
 }
 
 static bool sendEncodedPdu(int pduLen) {
-  while (Serial1.available()) Serial1.read();
-  Serial1.println("AT+CMGS=" + String(pduLen));
-  
-  unsigned long start = millis();
-  bool gotPrompt = false;
-  while (millis() - start < 5000) {
-    if (Serial1.available()) {
-      char c = Serial1.read();
-      logCapture(String(c));
-      if (c == '>') {
-        gotPrompt = true;
-        break;
-      }
-    }
-    server.handleClient();
-  }
-  
-  if (!gotPrompt) {
+  String command = "AT+CMGS=" + String(pduLen);
+  String response;
+  ModemCommandResult result = runTransaction(command.c_str(), 5000, response,
+                                              nullptr, true, false);
+  if (result != MODEM_COMMAND_COMPLETED || !transactionPrompt) {
     logCaptureLn(String("未收到>提示符"));
     return false;
   }
-  
+
   Serial1.print(pdu.getSMS());
-  start = millis();
-  String resp = "";
-  while (millis() - start < 30000) {
-    while (Serial1.available()) {
-      char c = Serial1.read();
-      if (resp.length() < MODEM_RESPONSE_MAX_LENGTH) resp += c;
-      logCapture(String(c));
-      if (resp.indexOf("OK") >= 0) {
-        logCaptureLn(String("\n短信发送成功"));
-        return true;
-      }
-      if (resp.indexOf("ERROR") >= 0) {
-        logCaptureLn(String("\n短信发送失败"));
-        return false;
-      }
-    }
-    server.handleClient();
+  result = runTransaction(nullptr, 30000, response, nullptr, false, false);
+  if (result == MODEM_COMMAND_COMPLETED && response.indexOf("OK") >= 0) {
+    logCaptureLn(String("短信发送成功"));
+    return true;
   }
-  logCaptureLn(String("短信发送超时"));
+  logCaptureLn(String(result == MODEM_COMMAND_TIMEOUT ? "短信发送超时" : "短信发送失败"));
   return false;
 }
 

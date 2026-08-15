@@ -3,7 +3,6 @@ FROM alpine:${ALPINE_VERSION}
 
 ARG ARDUINO_CLI_VERSION=1.5.1
 ARG ESP32_CORE_VERSION=3.3.10
-ARG PDULIB_VERSION=0.5.11
 ARG READYMAIL_VERSION=0.4.2
 ARG TARGETARCH
 ARG USER_ID=1000
@@ -14,6 +13,12 @@ ENV ARDUINO_DIRECTORIES_DATA=/opt/arduino/data \
     ARDUINO_DIRECTORIES_USER=/opt/arduino/user \
     ARDUINO_UPDATER_ENABLE_NOTIFICATION=false
 
+COPY scripts/apply-esp32-webserver-3.3.10-patch.sh \
+     scripts/check-esp32-webserver-3.3.10-patch.sh \
+     /tmp/esp32-webserver-patch/
+COPY scripts/patches/esp32-webserver-3.3.10-request-limits.patch \
+     /tmp/esp32-webserver-patch/patches/
+
 RUN apk add --no-cache \
         bash \
         ca-certificates \
@@ -21,6 +26,7 @@ RUN apk add --no-cache \
         git \
         gcompat \
         libstdc++ \
+        patch \
         python3 \
         py3-pyserial \
         tar \
@@ -36,7 +42,9 @@ RUN apk add --no-cache \
     && mkdir -p "${ARDUINO_DIRECTORIES_DATA}" "${ARDUINO_DIRECTORIES_DOWNLOADS}" "${ARDUINO_DIRECTORIES_USER}" \
     && arduino-cli core update-index --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json \
     && arduino-cli core install "esp32:esp32@${ESP32_CORE_VERSION}" --additional-urls https://espressif.github.io/arduino-esp32/package_esp32_index.json \
-    && arduino-cli lib install "pdulib@${PDULIB_VERSION}" "ReadyMail@${READYMAIL_VERSION}" \
+    && /tmp/esp32-webserver-patch/apply-esp32-webserver-3.3.10-patch.sh \
+    && arduino-cli lib install "ReadyMail@${READYMAIL_VERSION}" \
+    && rm -rf /tmp/esp32-webserver-patch \
     && rm -rf \
         "${ARDUINO_DIRECTORIES_DATA}/packages/esp32/tools/esp-x32" \
         "${ARDUINO_DIRECTORIES_DATA}/packages/esp32/tools/xtensa-esp-elf-gdb" \

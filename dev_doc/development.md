@@ -37,7 +37,7 @@ docker compose start dev
 
 ```sh
 docker compose exec dev sh
-docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3 ./code
+docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
 ```
 
 停止時用 `docker compose stop dev`，不要用 `docker compose run --rm` 建立一次
@@ -58,8 +58,13 @@ DNS 問題；執行中的 `dev` container 仍使用一般 Compose network。
 | ESP32 Arduino core | 3.3.10 |
 | Node.js | 22（Alpine 3.22 package） |
 | Alpine-native esptool | 5.3.0 |
-| pdulib | 0.5.11 |
+| pdulib | 0.5.11（固定在 `code/src/pdulib/`） |
 | ReadyMail | 0.4.2 |
+
+ESP32 core 安裝後必須執行
+`scripts/apply-esp32-webserver-3.3.10-patch.sh`。腳本先驗證原始
+`Parsing.cpp` SHA-256，再套用 request line/header/body 上限；core 版本或來源
+不符時會直接失敗。Docker image 與 CI 已自動執行，同一腳本可重複執行。
 
 映像支援 Docker 的 `linux/amd64` 與 `linux/arm64`。升級版本時，同步修改
 Dockerfile、重建映像、執行 smoke check 與完整 firmware compile；Arduino
@@ -122,7 +127,7 @@ python3 -m unittest tests/test_web_bundle.py
 
 `npm run build` 會更新 `code/data/index.html.gz`；`npm run filesystem` 另外產生
 `web/build/littlefs.bin`。目前 gzip 約 112 KiB，build 設有 256 KiB 的失敗
-上限；default partition 實際提供 `0x160000` bytes，因此仍保有充足餘裕。
+上限；專案分區提供 `0x1C0000` bytes，因此仍保有充足餘裕。
 `web/build/` 是可重建輸出，不應提交。
 
 ### Mock Server
@@ -158,12 +163,12 @@ python3 -m unittest tests/test_api_contract.py
 CI 的唯一基線命令是：
 
 ```sh
-docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3 ./code
+docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
 ```
 
-目前鎖定版本的基線結果為 Flash `1306583 / 1310720 bytes`（99%）、全域變數
-`44196 / 327680 bytes`（13%）。Flash 只剩 4,137 bytes；增加功能後要重新檢查
-編譯輸出，超過上限時先刪除或縮減既有功能，不要只假設還有空間。
+目前鎖定版本的基線結果為 Flash `1312053 / 2097152 bytes`（62%）、全域變數
+`44276 / 327680 bytes`（13%）。這只證明編譯與靜態配置，不代表實機 heap
+尖峰、UART 時序或 modem 相容性已驗證。
 
 這證明 generic ESP32-C3 編譯通過。實際 MakerGO ESP32 C3 SuperMini 若已由
 所裝 core 提供專用 FQBN，可先查詢再使用：
@@ -205,15 +210,20 @@ docker compose exec dev arduino-cli board list
 ```
 
 管理頁不在 firmware binary 內，所以實機需要分別燒錄 sketch 與 LittleFS。
-以下位址與大小只適用於目前 generic ESP32-C3 的 default 4 MB partition：
+`code/partitions.csv` 是 4 MB、no-OTA layout：2 MiB app、128 KiB `appcfg`
+NVS、`0x1C0000` LittleFS 與 64 KiB coredump。它不提供 OTA slot 或 rollback。
+
+第一次從舊 layout 升級必須先匯出需要保留的設定，再用 USB 完整擦除並重刷
+firmware 與 filesystem。改分區會移動 LittleFS，不能沿用舊 image 位址：
 
 ```sh
-docker compose exec dev arduino-cli compile --upload --fqbn esp32:esp32:esp32c3 --port /dev/ttyACM0 ./code
-docker compose exec dev /opt/esptool-venv/bin/esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x290000 web/build/littlefs.bin
+docker compose exec dev /opt/esptool-venv/bin/esptool --chip esp32c3 --port /dev/ttyACM0 erase-flash
+docker compose exec dev arduino-cli compile --upload --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota --port /dev/ttyACM0 ./code
+docker compose exec dev /opt/esptool-venv/bin/esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x230000 web/build/littlefs.bin
 ```
 
 改用其他 FQBN、flash size 或 partition scheme 前，先讀對應 partition CSV，
-重新確認 filesystem offset 與 size；不可沿用 `0x290000` 猜測燒錄。
+重新確認 filesystem offset 與 size；不可沿用 `0x230000` 猜測燒錄。
 
 下面只是一個 Linux + MakerGO FQBN 範例；請把 FQBN 與 serial
 device 換成實際查到的值：
@@ -247,6 +257,12 @@ source hash 或可重現命令證明結論；硬體觀察要記錄板型、模�
 
 目前倉庫沒有 host test harness。只有在新邏輯可脫離 Arduino runtime 測試
 且確實降低風險時才加入最小測試；不要為單行 mapping 建立框架。
+
+UART dispatcher、PDU、`CGACT`、reset 或 modem retry 的修改可在 deterministic
+fixture 與 CI compile 通過後 commit/push 或放入 draft PR，但在實機 smoke
+完成前不得標為 ready、merge 或 release。最小 smoke 應記錄板型、modem 型號
+與 firmware，並覆蓋 transaction 中插入 `+CMT`、CMGS、普通/UCS-2/multipart
+短信、malformed line、Ping cleanup、finite retry/degraded 與 soft/hard reset。
 
 ## 最小驗證矩陣
 
