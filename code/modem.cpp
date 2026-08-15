@@ -13,6 +13,7 @@ static char modemLine[SERIAL_BUFFER_SIZE];
 static size_t modemLineLength = 0;
 static bool modemLineOverflow = false;
 static String detectedModel;
+static String localNumber;
 static ModemDataState dataState = MODEM_DATA_UNKNOWN;
 
 static void appendTransactionLine(const String& line) {
@@ -149,6 +150,28 @@ bool modemSetDataActive(bool active, String& response) {
   return ok;
 }
 
+bool modemRefreshLocalNumber() {
+  String response = sendATCommand("AT+CNUM", 2000);
+  localNumber = "";
+  int start = response.indexOf(",\"");
+  if (start < 0) return false;
+  int end = response.indexOf('"', start + 2);
+  if (end <= start + 2) return false;
+  String candidate = response.substring(start + 2, end);
+  candidate.trim();
+  if (candidate.length() > 32) return false;
+  for (size_t i = 0; i < candidate.length(); ++i) {
+    char c = candidate[i];
+    if (!isdigit(static_cast<unsigned char>(c)) && c != '+' && c != '*' && c != '#') return false;
+  }
+  localNumber = candidate;
+  return localNumber.length() > 0;
+}
+
+const String& modemGetLocalNumber() {
+  return localNumber;
+}
+
 // Power-cycle the modem
 void modemPowerCycle() {
   pinMode(MODEM_EN_PIN, OUTPUT);
@@ -238,6 +261,7 @@ void modemInit() {
     ceregRetry++;
     blink_short();
   }
+  modemRefreshLocalNumber();
   if (ceregRetry < 30) {
     logCaptureLn(String("Network registered"));
     modemReady = true;

@@ -54,6 +54,7 @@ test("the production UI works with the mock API", async () => {
 		}
 		assert.equal(await page.$eval("h1", (node) => node.textContent), "Device overview");
 		assert.equal(await page.title(), await page.$eval("header p", (node) => node.textContent));
+		assert.equal(await page.$eval("footer", (node) => node.textContent?.trim()), "1");
 		assert.equal(await page.$$eval("table", (nodes) => nodes.length), 0);
 		assert.ok(await page.$$eval("dl", (nodes) => nodes.length) >= 2);
 		assert.ok(await page.$eval("header p", (node) => Number.parseFloat(getComputedStyle(node).fontSize)) >= 18);
@@ -67,7 +68,8 @@ test("the production UI works with the mock API", async () => {
 
 		await page.locator('::-p-aria(Notifications)').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("Disabled"));
-		assert.ok(await page.$$eval('button[data-slot="accordion-trigger"]', (nodes) => nodes.every((node) => node.getAttribute("aria-expanded") === "false")));
+		assert.equal(await page.$$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (nodes) => nodes.length), 1);
+		assert.match(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), /^Notification language/);
 		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Push channels")])').click();
 		await page.select("#push-type-0", "7");
 		assert.match(await page.$eval("#push-body-0", (node) => node.value), /\{message\}/);
@@ -86,14 +88,14 @@ test("the production UI works with the mock API", async () => {
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 
 		await page.locator('::-p-aria(Messaging)').click();
-		await page.locator('::-p-aria(Send SMS)').click();
+		assert.equal(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), "Send SMS");
 		await page.locator("#sms-phone").fill("+886900000000");
 		await page.locator("#sms-message").fill("Mock message");
 		await page.locator('button[form="sms-form"]').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("SMS sent."));
 
 		await page.locator('::-p-aria(Device)').click();
-		assert.equal(await page.$$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (nodes) => nodes.length), 0);
+		assert.equal(await page.$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (node) => node.textContent?.trim()), "Identity");
 		await page.locator('::-p-aria(Diagnostics)').click();
 		await page.locator('::-p-aria(Modem information)').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("Mock LTE-C3"));

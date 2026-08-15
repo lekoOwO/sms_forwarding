@@ -14,7 +14,7 @@ struct PushChannel {
   String key2;            // Secondary provider-specific value
   String titleTemplate;   // Optional title template for typed providers
   String bodyTemplate;    // Optional body template for typed providers
-  String customBody;      // Custom request body with {sender}, {message}, and {timestamp} placeholders
+  String customBody;      // Custom request body using the notification template placeholders
 };
 
 struct WebAccount {

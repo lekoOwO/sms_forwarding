@@ -7,7 +7,15 @@
 #include <HTTPClient.h>
 #include <mbedtls/md.h>
 #include <base64.h>
+#include <cstring>
 #include <sys/time.h>
+#include "modem.h"
+
+static const char* const TEMPLATE_TOKENS[] = {
+  "{sender}", "{message}", "{timestamp}", "{device}",
+  "{localNumber}", "{ip}", "{hostname}", "{wifi}"
+};
+static constexpr size_t TEMPLATE_VALUE_COUNT = sizeof(TEMPLATE_TOKENS) / sizeof(TEMPLATE_TOKENS[0]);
 
 static bool hmacSha256(const String& key, const String& data, uint8_t output[32]) {
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
@@ -72,28 +80,37 @@ static bool serializeJsonStringContent(const String& value, String& output) {
   return true;
 }
 
-static bool renderTemplate(const String& source, const String& sender, const String& message,
-                           const String& timestamp, const String& device, size_t maxBytes,
-                           bool title, String& output) {
+static void collectTemplateValues(const String& sender, const String& message,
+                                  const String& timestamp, String& ip, String& wifi,
+                                  const String* values[TEMPLATE_VALUE_COUNT]) {
+  ip = WiFi.localIP().toString();
+  wifi = WiFi.SSID();
+  values[0] = &sender;
+  values[1] = &message;
+  values[2] = &timestamp;
+  values[3] = &config.deviceName;
+  values[4] = &modemGetLocalNumber();
+  values[5] = &ip;
+  values[6] = &config.hostname;
+  values[7] = &wifi;
+}
+
+static bool renderTemplate(const String& source,
+                           const String* const values[TEMPLATE_VALUE_COUNT],
+                           size_t maxBytes, bool title, String& output) {
   output = "";
-  size_t estimate = source.length() + sender.length() + message.length() +
-                    timestamp.length() + device.length();
+  size_t estimate = source.length();
+  for (size_t i = 0; i < TEMPLATE_VALUE_COUNT; ++i) estimate += values[i]->length();
   if (!output.reserve(static_cast<unsigned int>(min(maxBytes, estimate)))) return false;
   for (size_t i = 0; i < source.length();) {
     const String* replacement = nullptr;
     size_t placeholderLength = 0;
-    if (source.startsWith("{sender}", i)) {
-      replacement = &sender;
-      placeholderLength = 8;
-    } else if (source.startsWith("{message}", i)) {
-      replacement = &message;
-      placeholderLength = 9;
-    } else if (source.startsWith("{timestamp}", i)) {
-      replacement = &timestamp;
-      placeholderLength = 11;
-    } else if (source.startsWith("{device}", i)) {
-      replacement = &device;
-      placeholderLength = 8;
+    for (size_t valueIndex = 0; valueIndex < TEMPLATE_VALUE_COUNT; ++valueIndex) {
+      if (source.startsWith(TEMPLATE_TOKENS[valueIndex], i)) {
+        replacement = values[valueIndex];
+        placeholderLength = strlen(TEMPLATE_TOKENS[valueIndex]);
+        break;
+      }
     }
     if (replacement) {
       if (replacement->length() > maxBytes - output.length()) return false;
@@ -116,10 +133,12 @@ static bool renderTypedNotification(const PushChannel& channel, const String& se
   getDefaultSmsTemplates(config.notificationLocale, defaultTitle, defaultBody);
   const String& titleSource = channel.titleTemplate.length() > 0 ? channel.titleTemplate : defaultTitle;
   const String& bodySource = channel.bodyTemplate.length() > 0 ? channel.bodyTemplate : defaultBody;
-  if (!renderTemplate(titleSource, sender, message, timestamp, config.deviceName,
-                      MAX_RENDERED_TITLE_BYTES, true, title) ||
-      !renderTemplate(bodySource, sender, message, timestamp, config.deviceName,
-                      MAX_RENDERED_BODY_BYTES, false, body)) {
+  String ip;
+  String wifi;
+  const String* values[TEMPLATE_VALUE_COUNT];
+  collectTemplateValues(sender, message, timestamp, ip, wifi, values);
+  if (!renderTemplate(titleSource, values, MAX_RENDERED_TITLE_BYTES, true, title) ||
+      !renderTemplate(bodySource, values, MAX_RENDERED_BODY_BYTES, false, body)) {
     logCaptureLn("Rendered push template is invalid or too long; skipping delivery");
     return false;
   }
@@ -131,10 +150,15 @@ bool buildDefaultSmsNotification(const char* sender, const char* message, const 
   String titleTemplate;
   String bodyTemplate;
   getDefaultSmsTemplates(config.notificationLocale, titleTemplate, bodyTemplate);
-  return renderTemplate(titleTemplate, String(sender), String(message), String(timestamp),
-                        config.deviceName, MAX_RENDERED_TITLE_BYTES, true, title) &&
-         renderTemplate(bodyTemplate, String(sender), String(message), String(timestamp),
-                        config.deviceName, MAX_RENDERED_BODY_BYTES, false, body);
+  String senderValue(sender);
+  String messageValue(message);
+  String timestampValue(timestamp);
+  String ip;
+  String wifi;
+  const String* values[TEMPLATE_VALUE_COUNT];
+  collectTemplateValues(senderValue, messageValue, timestampValue, ip, wifi, values);
+  return renderTemplate(titleTemplate, values, MAX_RENDERED_TITLE_BYTES, true, title) &&
+         renderTemplate(bodyTemplate, values, MAX_RENDERED_BODY_BYTES, false, body);
 }
 
 // Send an email notification
@@ -368,19 +392,21 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         logCaptureLn(String("Custom template is empty; skipping delivery"));
         return;
       }
-      String senderContent;
-      String messageContent;
-      String timestampContent;
-      String deviceContent;
-      if (!serializeJsonStringContent(senderValue, senderContent) ||
-          !serializeJsonStringContent(messageValue, messageContent) ||
-          !serializeJsonStringContent(timestampValue, timestampContent) ||
-          !serializeJsonStringContent(config.deviceName, deviceContent)) return;
+      String ip;
+      String wifi;
+      const String* values[TEMPLATE_VALUE_COUNT];
+      collectTemplateValues(senderValue, messageValue, timestampValue, ip, wifi, values);
+      String escapedValues[TEMPLATE_VALUE_COUNT];
+      const String* escapedValuePointers[TEMPLATE_VALUE_COUNT];
+      for (size_t i = 0; i < TEMPLATE_VALUE_COUNT; ++i) {
+        if (!serializeJsonStringContent(*values[i], escapedValues[i])) return;
+        escapedValuePointers[i] = &escapedValues[i];
+      }
       http.begin(channel.url);
       http.addHeader("Content-Type", "application/json");
       String body;
-      if (!renderTemplate(channel.customBody, senderContent, messageContent, timestampContent,
-                          deviceContent, MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
+      if (!renderTemplate(channel.customBody, escapedValuePointers,
+                          MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
         logCaptureLn("Rendered custom push body is invalid or too long; skipping delivery");
         return;
       }

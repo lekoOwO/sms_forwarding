@@ -42,10 +42,11 @@ class RequestedFeaturesTest(unittest.TestCase):
         for component in ("Accordion.Root", "NavigationMenu.Root", "InputGroup.Root"):
             self.assertIn(component, page)
 
-    def test_management_ui_layout_is_grouped_and_collapsed(self):
+    def test_management_ui_layout_opens_first_accordion_per_tab(self):
         page = (ROOT / "web/src/routes/+page.svelte").read_text()
         self.assertIn('<title>{snapshot?.config.deviceName || t("appName")}</title>', page)
-        self.assertNotRegex(page, r"<Accordion\.Root[^>]*\svalue=")
+        for value in ('notification-locale', 'sms', 'identity', '0'):
+            self.assertIn(f'<Accordion.Root type="single" value="{value}">', page)
         self.assertIn('data-overview-group="identity"', page)
         self.assertIn('data-overview-group="details"', page)
         self.assertIn('value="config-backup"', page)
@@ -68,6 +69,41 @@ class RequestedFeaturesTest(unittest.TestCase):
             cwd=ROOT,
             check=True,
         )
+
+    def test_notification_templates_offer_device_context_values(self):
+        push = (ROOT / "code/push.cpp").read_text()
+        modem = (ROOT / "code/modem.cpp").read_text()
+        hints = "\n".join(
+            json.loads((ROOT / f"web/src/lib/locales/{locale}.json").read_text())["templateValuesHint"]
+            for locale in ("en", "zh-TW", "zh-CN")
+        )
+        for token in ("{localNumber}", "{ip}", "{device}", "{hostname}", "{wifi}"):
+            self.assertIn(token, push)
+            self.assertIn(token, hints)
+        self.assertIn('sendATCommand("AT+CNUM", 2000)', modem)
+        self.assertIn("modemGetLocalNumber()", push)
+
+    def test_firmware_version_is_repo_owned_and_published_by_channel(self):
+        version = json.loads((ROOT / "firmware-version.json").read_text())
+        self.assertRegex(version["releaseVersion"], r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$")
+        self.assertGreaterEqual(version["devBuild"], 1)
+        generated = (ROOT / "code/firmware_version_generated.h").read_text()
+        self.assertIn(f'#define FIRMWARE_RELEASE_VERSION "{version["releaseVersion"]}"', generated)
+        self.assertIn(f'#define FIRMWARE_DEV_BUILD {version["devBuild"]}', generated)
+        hook = (ROOT / ".githooks/pre-commit").read_text()
+        self.assertIn('git branch --show-current', hook)
+        self.assertIn('generate-firmware-version.py --bump', hook)
+
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        self.assertIn("branches: [develop, master]", workflow)
+        self.assertIn("tags: ['v*']", workflow)
+        self.assertIn("--prerelease", workflow)
+        self.assertIn("FIRMWARE_DEV_BUILD * 2 + 1", workflow)
+        self.assertNotIn("GITHUB_RUN_NUMBER", workflow)
+        self.assertIn('test "$current_build" -gt "$previous_build"', workflow)
+
+        page = (ROOT / "web/src/routes/+page.svelte").read_text()
+        self.assertIn("snapshot.status.firmwareVersion", page)
 
 
 if __name__ == "__main__":

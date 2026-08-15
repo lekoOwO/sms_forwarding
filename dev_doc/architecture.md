@@ -110,6 +110,21 @@ Hostname 與 Web 帳號。未知的新 schema 會被拒絕，不修改目前設�
 DingTalk/Feishu 有 secret 時每次發送都重新檢查 epoch；時間無效即只跳過該
 signed channel，不降級成 unsigned。
 
+標題、內容與 Custom JSON 模板支援 `{sender}`、`{message}`、`{timestamp}`、
+`{device}`、`{localNumber}`、`{ip}`、`{hostname}` 與 `{wifi}`。本機號碼來自
+啟動時快取的 `AT+CNUM`。SIM 或營運商未提供號碼時，該值為空字串。
+
+## 韌體版號與發佈
+
+`firmware-version.json` 是版號的唯一手寫來源。`devBuild` 是從 1 開始遞增的
+開發版號。`releaseVersion` 使用 `MAJOR.MINOR.PATCH`。Generator 產生韌體
+header，CI 會拒絕來源與 header 不一致的變更。
+
+`develop` 的成功建置會建立 GitHub Pre-release，並附上 USB 燒錄映像。此工作
+不使用正式 OTA 私鑰。`master` 上相符的 `vMAJOR.MINOR.PATCH` tag 會建立含
+簽章 OTA 套件的正式 Release。Dev UI 只顯示 `devBuild`。Release UI 顯示
+`releaseVersion (devBuild)`。
+
 ## HTTP 管理面
 
 所有已註冊 route 都由 handler 執行 HTTP Basic Auth。`/tools` 與 `/sms`

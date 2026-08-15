@@ -650,7 +650,7 @@
 		  "csrfToken": { "type": "string" },
           "status": {
             "type": "object",
-            "required": ["ip", "wifiSsid", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels"],
+            "required": ["ip", "wifiSsid", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels", "firmwareVersion"],
             "additionalProperties": false,
             "properties": {
               "ip": { "type": "string" },
@@ -659,7 +659,8 @@
               "uptimeSeconds": { "type": "integer", "minimum": 0 },
               "modemReady": { "type": "boolean" },
               "emailConfigured": { "type": "boolean" },
-              "enabledPushChannels": { "type": "integer", "minimum": 0, "maximum": 5 }
+              "enabledPushChannels": { "type": "integer", "minimum": 0, "maximum": 5 },
+              "firmwareVersion": { "type": "string", "pattern": "^(?:[0-9]+|[0-9]+\\.[0-9]+\\.[0-9]+ \\([0-9]+\\))$" }
             }
           },
           "config": {

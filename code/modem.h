@@ -28,6 +28,8 @@ String sendATCommandUntil(const char* cmd, const char* terminal,
                           unsigned long timeout);
 ModemDataState modemGetDataState();
 bool modemSetDataActive(bool active, String& response);
+bool modemRefreshLocalNumber();
+const String& modemGetLocalNumber();
 void modemPowerCycle();
 void resetModule();
 void modemInit();

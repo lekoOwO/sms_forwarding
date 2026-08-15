@@ -95,12 +95,15 @@ class RuntimeOtaTest(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("prerelease:\n    if: github.ref == 'refs/heads/develop'", workflow)
         self.assertIn("release:\n    if: startsWith(github.ref, 'refs/tags/v')", workflow)
         self.assertIn("environment: release", workflow)
         self.assertIn("contents: write", workflow[workflow.index("  release:"):])
-        build = workflow[workflow.index("  build:"):workflow.index("  release:")]
+        build = workflow[workflow.index("  build:"):workflow.index("  prerelease:")]
         self.assertNotIn("OTA_SIGNING_PRIVATE_KEY", build)
         self.assertNotIn("contents: write", build)
+        prerelease = workflow[workflow.index("  prerelease:"):workflow.index("  release:")]
+        self.assertNotIn("OTA_SIGNING_PRIVATE_KEY", prerelease)
 
     def test_config_backup_crypto_is_bounded_and_fail_closed(self):
         backup = (ROOT / "code/config_backup.cpp").read_text()

@@ -27,6 +27,7 @@ export type DeviceSnapshot = {
 		modemReady: boolean;
 		emailConfigured: boolean;
 		enabledPushChannels: number;
+		firmwareVersion: string;
 	};
 	config: {
 		deviceName: string;

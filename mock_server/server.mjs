@@ -324,7 +324,8 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 				uptimeSeconds: Math.floor((Date.now() - state.startedAt) / 1000),
 				modemReady: true,
 				emailConfigured: Boolean(config.smtpServer && config.smtpUser && config.smtpPass && config.smtpSendTo),
-				enabledPushChannels: config.pushChannels.filter((channel) => channel.enabled).length
+				enabledPushChannels: config.pushChannels.filter((channel) => channel.enabled).length,
+				firmwareVersion: "1"
 			},
 			config: {
 				...config,

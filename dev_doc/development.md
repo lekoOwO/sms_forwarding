@@ -14,6 +14,26 @@ scripts/dev.sh restart mock-server
 scripts/dev.sh stop mock-server
 ```
 
+## 韌體版號
+
+`firmware-version.json` 保存正式版號和 Dev build。建置只讀取這個檔案。
+
+每個 clone 執行一次此命令：
+
+```sh
+git config core.hooksPath .githooks
+```
+
+在 `develop` 建立 commit 時，pre-commit hook 會增加 `devBuild`。如果版本檔已
+加入 staged diff，hook 只會同步產生的 header，不會重複增加版號。
+
+準備正式版時，先修改 `releaseVersion`。然後把相同 commit 合併到 `master`，
+並建立相符的 `vMAJOR.MINOR.PATCH` tag。Actions 會拒絕其他 tag 或不在
+`master` 上的 tag。
+
+Dev Pre-release 只包含 USB 燒錄映像。正式 Release 包含 USB 映像和已簽章的
+OTA 套件。只有正式 Release job 能讀取 OTA 私鑰。
+
 ## 唯一開發環境
 
 本機只需要 Docker Engine 與 Docker Compose。不要在 host 另外維護一套

@@ -4,6 +4,7 @@
 #include <mbedtls/base64.h>
 #include "config_backup.h"
 #include "config.h"
+#include "firmware_version_generated.h"
 #include "modem.h"
 #include "notification_locale.h"
 #include "ota_update.h"
@@ -670,6 +671,11 @@ void handleConfig() {
   status["modemReady"] = modemReady;
   status["emailConfigured"] = emailOk;
   status["enabledPushChannels"] = pushCount;
+#if FIRMWARE_IS_RELEASE
+  status["firmwareVersion"] = FIRMWARE_RELEASE_LABEL;
+#else
+  status["firmwareVersion"] = FIRMWARE_DEV_BUILD_TEXT;
+#endif
 
   JsonObject configJson = json["config"].to<JsonObject>();
   JsonArray webAccounts = configJson["webAccounts"].to<JsonArray>();
@@ -982,21 +988,11 @@ void handleQuery() {
       if (endIdx > 0) iccid = tmp.substring(0, endIdx);
       iccid.trim();
     }
-    // Query this device's phone number when supported by the SIM card.
-    resp = sendATCommand("AT+CNUM", 2000);
-    String phoneNum = "N/A";
-    if (resp.indexOf("+CNUM:") >= 0) {
-      int idx = resp.indexOf(",\"");
-      if (idx >= 0) {
-        int endIdx = resp.indexOf("\"", idx + 2);
-        if (endIdx > idx) {
-          phoneNum = resp.substring(idx + 2, endIdx);
-        }
-      }
-    }
+    // Query and cache this device's phone number when supported by the SIM card.
+    modemRefreshLocalNumber();
     setStringOrNull(dataObject, "imsi", imsi);
     setStringOrNull(dataObject, "iccid", iccid);
-    setStringOrNull(dataObject, "msisdn", phoneNum);
+    setStringOrNull(dataObject, "msisdn", modemGetLocalNumber());
   }
   else if (type == "network") {
     // Query network status.

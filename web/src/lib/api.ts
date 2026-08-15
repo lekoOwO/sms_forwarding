@@ -24,7 +24,8 @@ function demoSnapshot(): DeviceSnapshot {
 		status: {
 			ip: "192.168.1.50", wifiSsid: "DemoNetwork", freeHeapKb: 247,
 			uptimeSeconds: Math.floor((Date.now() - demoStartedAt) / 1000), modemReady: true,
-			emailConfigured: true, enabledPushChannels: demoConfig.pushChannels.filter((channel) => channel.enabled).length
+			emailConfigured: true, enabledPushChannels: demoConfig.pushChannels.filter((channel) => channel.enabled).length,
+			firmwareVersion: "1"
 		},
 		config: structuredClone(demoConfig)
 	};
