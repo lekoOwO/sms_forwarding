@@ -53,6 +53,7 @@ test("the production UI works with the mock API", async () => {
 			throw new Error(`${error.message}; browser errors: ${browserErrors.join(" | ") || "none"}`);
 		}
 		assert.equal(await page.$eval("h1", (node) => node.textContent), "Device overview");
+		assert.equal(await page.title(), await page.$eval("header p", (node) => node.textContent));
 		assert.equal(await page.$$eval("table", (nodes) => nodes.length), 0);
 		assert.ok(await page.$$eval("dl", (nodes) => nodes.length) >= 2);
 		assert.ok(await page.$eval("header p", (node) => Number.parseFloat(getComputedStyle(node).fontSize)) >= 18);
@@ -66,9 +67,15 @@ test("the production UI works with the mock API", async () => {
 
 		await page.locator('::-p-aria(Notifications)').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("Disabled"));
+		assert.ok(await page.$$eval('button[data-slot="accordion-trigger"]', (nodes) => nodes.every((node) => node.getAttribute("aria-expanded") === "false")));
 		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Push channels")])').click();
+		await page.select("#push-type-0", "7");
+		assert.match(await page.$eval("#push-body-0", (node) => node.value), /\{message\}/);
+		await page.select("#push-type-0", "2");
+		assert.equal(await page.$eval("#push-title-template-0", (node) => node.value), "SMS from {sender}");
+		assert.match(await page.$eval("#push-body-template-0", (node) => node.value), /Device: \{device\}/);
 		await page.locator("#push-enabled-0").click();
-		assert.match(await page.$eval('button[data-slot="tabs-trigger"]', (node) => node.className), /bg-primary/);
+		assert.doesNotMatch(await page.$eval('button[data-slot="tabs-trigger"]', (node) => node.className), /bg-primary/);
 		await page.locator("#push-enabled-0").click();
 		await page.locator('::-p-xpath(//button[@data-slot="accordion-trigger" and starts-with(normalize-space(.),"Email")])').click();
 		await page.locator("#smtp-server").fill("smtp.example.com");
@@ -79,12 +86,15 @@ test("the production UI works with the mock API", async () => {
 		await page.waitForFunction(() => document.body.textContent?.includes("Configuration saved."));
 
 		await page.locator('::-p-aria(Messaging)').click();
+		await page.locator('::-p-aria(Send SMS)').click();
 		await page.locator("#sms-phone").fill("+886900000000");
 		await page.locator("#sms-message").fill("Mock message");
 		await page.locator('button[form="sms-form"]').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("SMS sent."));
 
 		await page.locator('::-p-aria(Device)').click();
+		assert.equal(await page.$$eval('button[data-slot="accordion-trigger"][aria-expanded="true"]', (nodes) => nodes.length), 0);
+		await page.locator('::-p-aria(Diagnostics)').click();
 		await page.locator('::-p-aria(Modem information)').click();
 		await page.waitForFunction(() => document.body.textContent?.includes("Mock LTE-C3"));
 		assert.ok(await page.$eval('[role="status"] dl', (node) => ["Manufacturer", "Model", "Revision"].every((label) => node.textContent?.includes(label))));

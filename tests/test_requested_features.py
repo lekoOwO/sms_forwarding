@@ -1,4 +1,5 @@
 import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -40,6 +41,33 @@ class RequestedFeaturesTest(unittest.TestCase):
         self.assertIn("text-base font-semibold", trigger)
         for component in ("Accordion.Root", "NavigationMenu.Root", "InputGroup.Root"):
             self.assertIn(component, page)
+
+    def test_management_ui_layout_is_grouped_and_collapsed(self):
+        page = (ROOT / "web/src/routes/+page.svelte").read_text()
+        self.assertIn('<title>{snapshot?.config.deviceName || t("appName")}</title>', page)
+        self.assertNotRegex(page, r"<Accordion\.Root[^>]*\svalue=")
+        self.assertIn('data-overview-group="identity"', page)
+        self.assertIn('data-overview-group="details"', page)
+        self.assertIn('value="config-backup"', page)
+        self.assertIn('value="config-restore"', page)
+        self.assertNotIn('class={channel.enabled ? "bg-primary', page)
+
+    def test_provider_change_applies_editable_template_defaults(self):
+        helper = ROOT / "web/src/lib/push-template-defaults.js"
+        self.assertTrue(helper.exists())
+        script = """
+          import { applyProviderTemplateDefaults } from './web/src/lib/push-template-defaults.js';
+          const channel = { type: 1, titleTemplate: 'old', bodyTemplate: 'old', customBody: '' };
+          applyProviderTemplateDefaults(channel, 7, 'title', 'body');
+          if (channel.titleTemplate || channel.bodyTemplate || !channel.customBody.includes('{message}')) process.exit(1);
+          applyProviderTemplateDefaults(channel, 2, 'title', 'body');
+          if (channel.customBody || channel.titleTemplate !== 'title' || channel.bodyTemplate !== 'body') process.exit(2);
+        """
+        subprocess.run(
+            ["node", "--input-type=module", "--eval", script],
+            cwd=ROOT,
+            check=True,
+        )
 
 
 if __name__ == "__main__":
