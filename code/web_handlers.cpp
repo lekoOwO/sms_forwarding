@@ -1,17 +1,156 @@
 #include "web_handlers.h"
 #include <ArduinoJson.h>
-#include <LittleFS.h>
+#include <esp_random.h>
+#include <mbedtls/base64.h>
+#include "config_backup.h"
 #include "config.h"
 #include "modem.h"
+#include "notification_locale.h"
+#include "ota_update.h"
 #include "push.h"
 #include "utf8_validation.h"
+#include "web_bundle.h"
 #include "wifi_config.h"
 
 // ---- Log ring buffer ----
 String logBuffer[LOG_BUF_SIZE];
 int logBufIdx = 0;
 int logBufCount = 0;
+static uint32_t logIds[LOG_BUF_SIZE];
+static size_t logBytes = 0;
+static uint32_t nextLogId = 1;
 static String _logLine;  // logCapture writes here; logCaptureLn commits the complete line.
+static SemaphoreHandle_t logMutex;
+static SemaphoreHandle_t logLineMutex;
+
+enum WebJobState : uint8_t { WEB_JOB_EMPTY, WEB_JOB_QUEUED, WEB_JOB_RUNNING, WEB_JOB_DONE };
+
+struct WebJob {
+  uint32_t id = 0;
+  uint32_t completedAt = 0;
+  WebJobState state = WEB_JOB_EMPTY;
+  bool success = false;
+  bool deferred = false;
+  String type;
+  WebJobHandler handler = nullptr;
+  String argNames[48];
+  String argValues[48];
+  String resultJson;
+};
+
+static constexpr size_t WEB_JOB_SLOTS = 6;
+static constexpr size_t WEB_JOB_ARG_SLOTS = 48;
+static WebJob webJobs[WEB_JOB_SLOTS];
+static SemaphoreHandle_t jobMutex;
+static SemaphoreHandle_t configMutex;
+static volatile int executingJob = -1;
+static TaskHandle_t jobTaskHandle;
+static uint32_t nextJobId = 1;
+static String csrfToken;
+
+struct AuthAttempt {
+  IPAddress ip;
+  uint32_t windowStart = 0;
+  uint32_t blockedUntil = 0;
+  uint8_t failures = 0;
+  bool used = false;
+};
+
+static AuthAttempt authAttempts[4];
+static constexpr uint32_t AUTH_WINDOW_MS = 60000;
+static constexpr uint32_t AUTH_BLOCK_MS = 60000;
+static constexpr uint8_t AUTH_FAILURE_LIMIT = 5;
+
+static bool constantTimeEqual(const String& left, const String& right) {
+  size_t length = left.length() > right.length() ? left.length() : right.length();
+  uint8_t difference = static_cast<uint8_t>(left.length() ^ right.length());
+  for (size_t i = 0; i < length; ++i) {
+    uint8_t a = i < left.length() ? left[i] : 0;
+    uint8_t b = i < right.length() ? right[i] : 0;
+    difference |= a ^ b;
+  }
+  return difference == 0;
+}
+
+void initWebRuntime() {
+  if (!logMutex) logMutex = xSemaphoreCreateMutex();
+  if (!logLineMutex) logLineMutex = xSemaphoreCreateMutex();
+  if (!jobMutex) jobMutex = xSemaphoreCreateMutex();
+  if (!configMutex) configMutex = xSemaphoreCreateMutex();
+  uint8_t random[16];
+  esp_fill_random(random, sizeof(random));
+  static const char hex[] = "0123456789abcdef";
+  csrfToken = "";
+  csrfToken.reserve(sizeof(random) * 2);
+  for (uint8_t byte : random) {
+    csrfToken += hex[byte >> 4];
+    csrfToken += hex[byte & 0x0f];
+  }
+  memset(random, 0, sizeof(random));
+}
+
+void lockRuntimeConfig() {
+  xSemaphoreTake(configMutex, portMAX_DELAY);
+}
+
+void unlockRuntimeConfig() {
+  xSemaphoreGive(configMutex);
+}
+
+static String requestArg(const String& name) {
+  if (webJobExecuting()) {
+    int index = executingJob;
+    for (size_t i = 0; i < WEB_JOB_ARG_SLOTS; ++i) {
+      if (webJobs[index].argNames[i] == name) return webJobs[index].argValues[i];
+    }
+    return "";
+  }
+  return server.arg(name);
+}
+
+String webJobArg(const String& name) {
+  return requestArg(name);
+}
+
+static bool requestHasArg(const String& name) {
+  if (webJobExecuting()) {
+    int index = executingJob;
+    for (size_t i = 0; i < WEB_JOB_ARG_SLOTS; ++i) {
+      if (webJobs[index].argNames[i] == name) return true;
+    }
+    return false;
+  }
+  return server.hasArg(name);
+}
+
+bool webJobExecuting() {
+  return executingJob >= 0 && xTaskGetCurrentTaskHandle() == jobTaskHandle;
+}
+
+bool webJobsActive() {
+  if (!jobMutex) return false;
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  bool active = false;
+  for (const WebJob& job : webJobs) {
+    if (job.state == WEB_JOB_QUEUED || job.state == WEB_JOB_RUNNING) {
+      active = true;
+      break;
+    }
+  }
+  xSemaphoreGive(jobMutex);
+  return active;
+}
+
+static void httpTask(void*) {
+  for (;;) {
+    server.handleClient();
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+}
+
+bool startManagementHttpTask() {
+  return xTaskCreate(httpTask, "management-http", 6144, nullptr, 1, nullptr) == pdPASS;
+}
 
 static void _serialWrite(const char* msg, size_t length, bool newline = false) {
   size_t required = length + (newline ? 2 : 0);
@@ -21,26 +160,46 @@ static void _serialWrite(const char* msg, size_t length, bool newline = false) {
 }
 
 static void _logAppend(const String& line) {
+  if (!logMutex) return;
+  xSemaphoreTake(logMutex, portMAX_DELAY);
+  while (logBufCount > 0 && logBytes + line.length() > LOG_BYTE_BUDGET) {
+    int oldest = (logBufIdx - logBufCount + LOG_BUF_SIZE) % LOG_BUF_SIZE;
+    logBytes -= logBuffer[oldest].length();
+    logBuffer[oldest] = "";
+    logBufCount--;
+  }
+  if (logBufCount == LOG_BUF_SIZE) {
+    logBytes -= logBuffer[logBufIdx].length();
+  } else {
+    logBufCount++;
+  }
   logBuffer[logBufIdx] = line;
+  logIds[logBufIdx] = nextLogId++;
+  if (nextLogId == 0) nextLogId = 1;
+  logBytes += line.length();
   logBufIdx = (logBufIdx + 1) % LOG_BUF_SIZE;
-  if (logBufCount < LOG_BUF_SIZE) logBufCount++;
+  xSemaphoreGive(logMutex);
 }
 
 static void _logCommit() {
-  if (_logLine.length() > 0) {
-    _logAppend(_logLine);
-    _logLine = "";
-  }
+  String line;
+  xSemaphoreTake(logLineMutex, portMAX_DELAY);
+  line = _logLine;
+  _logLine = "";
+  xSemaphoreGive(logLineMutex);
+  if (line.length() > 0) _logAppend(line);
 }
 
 static void _logAppendFragment(const String& msg) {
-  if (_logLine.length() >= LOG_LINE_MAX_LENGTH) return;
-  _logLine += msg.substring(0, LOG_LINE_MAX_LENGTH - _logLine.length());
+  xSemaphoreTake(logLineMutex, portMAX_DELAY);
+  if (_logLine.length() < LOG_LINE_MAX_LENGTH) {
+    _logLine += msg.substring(0, LOG_LINE_MAX_LENGTH - _logLine.length());
+  }
+  xSemaphoreGive(logLineMutex);
 }
 
 static void _logAppendFragment(const char* msg) {
-  if (_logLine.length() >= LOG_LINE_MAX_LENGTH) return;
-  _logLine.concat(msg, LOG_LINE_MAX_LENGTH - _logLine.length());
+  _logAppendFragment(String(msg));
 }
 
 void logCapture(const String& msg) {
@@ -64,37 +223,161 @@ void logCaptureF(const char* fmt, ...) {
   // Commit the line when the formatted string ends with \n.
   size_t len = strlen(buf);
   if (len > 0 && buf[len - 1] == '\n') {
-    _logLine.trim();  // Remove trailing whitespace and any extra \n.
-    _logCommit();
+    String line;
+    xSemaphoreTake(logLineMutex, portMAX_DELAY);
+    _logLine.trim();
+    line = _logLine;
+    _logLine = "";
+    xSemaphoreGive(logLineMutex);
+    if (line.length()) _logAppend(line);
   }
 }
 
 void logCaptureLn(const String& msg) {
   _serialWrite(msg.c_str(), msg.length(), true);
-  _logAppendFragment(msg);
-  _logCommit();
+  String line;
+  xSemaphoreTake(logLineMutex, portMAX_DELAY);
+  if (_logLine.length() < LOG_LINE_MAX_LENGTH) {
+    _logLine += msg.substring(0, LOG_LINE_MAX_LENGTH - _logLine.length());
+  }
+  line = _logLine;
+  _logLine = "";
+  xSemaphoreGive(logLineMutex);
+  if (line.length()) _logAppend(line);
 }
 
 void logCaptureLn(const char* msg) {
-  _serialWrite(msg, strlen(msg), true);
-  _logAppendFragment(msg);
-  _logCommit();
+  logCaptureLn(String(msg));
+}
+
+static void sendActionResult(int status, bool success, const char* code,
+                             const String& detail = "");
+static void sendActionResult(int status, bool success, const char* code,
+                             JsonDocument& data, const String& detail = "");
+
+static String actionResultJson(bool success, const char* code) {
+  JsonDocument result;
+  result["success"] = success;
+  result["code"] = code;
+  result["data"].to<JsonObject>();
+  result["detail"] = "";
+  String json;
+  serializeJson(result, json);
+  return json;
+}
+
+static void clearWebJobArgs(WebJob& job) {
+  for (size_t i = 0; i < WEB_JOB_ARG_SLOTS; ++i) {
+    if (job.argValues[i].length()) {
+      memset(const_cast<char*>(job.argValues[i].c_str()), 0, job.argValues[i].length());
+    }
+    job.argNames[i] = "";
+    job.argValues[i] = "";
+  }
+}
+
+static void cancelQueuedJobsForRestart() {
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  uint32_t completedAt = millis();
+  for (WebJob& job : webJobs) {
+    if (job.state != WEB_JOB_QUEUED) continue;
+    job.success = false;
+    job.deferred = false;
+    job.state = WEB_JOB_DONE;
+    job.completedAt = completedAt;
+    job.handler = nullptr;
+    job.resultJson = actionResultJson(false, "ACTION_BUSY");
+    clearWebJobArgs(job);
+  }
+  xSemaphoreGive(jobMutex);
 }
 
 // Check HTTP Basic authentication.
 bool checkAuth() {
-  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
-    const WebAccount& account = config.webAccounts[i];
-    if (account.username.length() > 0 && account.password.length() > 0 &&
-        server.authenticate(account.username.c_str(), account.password.c_str())) return true;
+  if (webJobExecuting()) return true;
+  IPAddress remote = server.client().remoteIP();
+  uint32_t now = millis();
+  AuthAttempt* attempt = nullptr;
+  AuthAttempt* replacement = &authAttempts[0];
+  for (AuthAttempt& entry : authAttempts) {
+    if (entry.used && entry.ip == remote) attempt = &entry;
+    if (!entry.used || entry.windowStart < replacement->windowStart) replacement = &entry;
   }
+  if (attempt && static_cast<int32_t>(attempt->blockedUntil - now) > 0) {
+    server.sendHeader("Retry-After", String((attempt->blockedUntil - now + 999) / 1000));
+    sendActionResult(429, false, "ACTION_AUTH_THROTTLED");
+    return false;
+  }
+  for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
+    xSemaphoreTake(configMutex, portMAX_DELAY);
+    const WebAccount& account = config.webAccounts[i];
+    bool authenticated = account.username.length() > 0 && account.password.length() > 0 &&
+                         server.authenticate(account.username.c_str(), account.password.c_str());
+    xSemaphoreGive(configMutex);
+    if (authenticated) {
+      if (attempt) *attempt = AuthAttempt{};
+      return true;
+    }
+  }
+  if (!attempt) {
+    attempt = replacement;
+    *attempt = AuthAttempt{};
+    attempt->used = true;
+    attempt->ip = remote;
+    attempt->windowStart = now;
+  }
+  if (now - attempt->windowStart > AUTH_WINDOW_MS) {
+    attempt->windowStart = now;
+    attempt->failures = 0;
+  }
+  if (++attempt->failures >= AUTH_FAILURE_LIMIT) attempt->blockedUntil = now + AUTH_BLOCK_MS;
   server.requestAuthentication(BASIC_AUTH, "SMS Forwarding", "Enter the administrator username and password");
   return false;
+}
+
+bool checkCsrf() {
+  if (webJobExecuting()) return true;
+  if (constantTimeEqual(server.header("X-CSRF-Token"), csrfToken)) return true;
+  server.sendHeader("Cache-Control", "no-store");
+  sendActionResult(403, false, "ACTION_CSRF_INVALID");
+  return false;
+}
+
+bool decodeBase64RequestChunk(size_t capacity, uint8_t*& output, size_t& outputLength) {
+  static uint8_t decoded[MAX_REQUEST_CHUNK_BYTES];
+  const String encoded = server.arg("plain");
+  const size_t encodedLimit = 4 * ((capacity + 2) / 3);
+  if (capacity == 0 || capacity > sizeof(decoded) || encoded.length() == 0 ||
+      encoded.length() > encodedLimit ||
+      (encoded.length() & 3)) return false;
+  bool padding = false;
+  size_t paddingBytes = 0;
+  for (size_t i = 0; i < encoded.length(); ++i) {
+    const char c = encoded[i];
+    if (c == '=') {
+      padding = true;
+      if (++paddingBytes > 2 || i + 2 < encoded.length()) return false;
+    } else if (padding || !(isAlphaNumeric(c) || c == '+' || c == '/')) {
+      return false;
+    }
+  }
+  outputLength = 0;
+  output = decoded;
+  return mbedtls_base64_decode(decoded, capacity, &outputLength,
+                               reinterpret_cast<const uint8_t*>(encoded.c_str()),
+                               encoded.length()) == 0 && outputLength > 0;
 }
 
 static const size_t JSON_RESPONSE_MAX_LENGTH = 128 * 1024;
 
 static void sendJsonFailure() {
+  if (webJobExecuting()) {
+    xSemaphoreTake(jobMutex, portMAX_DELAY);
+    webJobs[executingJob].success = false;
+    webJobs[executingJob].resultJson = actionResultJson(false, "ACTION_JSON_FAILED");
+    xSemaphoreGive(jobMutex);
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
   server.send_P(500, PSTR("application/json"),
                 PSTR("{\"error\":\"JSON serialization failed\"}"));
@@ -109,12 +392,200 @@ static void sendJson(int status, JsonDocument& document) {
     sendJsonFailure();
     return;
   }
+  if (webJobExecuting()) {
+    xSemaphoreTake(jobMutex, portMAX_DELAY);
+    WebJob& job = webJobs[executingJob];
+    job.success = status < 400 && document["success"].as<bool>();
+    job.resultJson = json;
+    xSemaphoreGive(jobMutex);
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
   server.send(status, "application/json", json);
 }
 
+void sendQueuedActionResult(int status, bool success, const char* code,
+                            const String& detail) {
+  sendActionResult(status, success, code, detail);
+}
+
+bool enqueueWebJob(const char* type, WebJobHandler handler,
+                   const String& argName1, const String& argValue1,
+                   const String& argName2, const String& argValue2) {
+  if (!jobMutex || !handler) return false;
+  if (deviceRestartPending()) {
+    sendActionResult(409, false, "ACTION_BUSY");
+    return false;
+  }
+  if ((otaUploadActive() && strcmp(type, "ota") != 0) ||
+      (configTransferActive() && strcmp(type, "config-restore") != 0 &&
+       strcmp(type, "config-export") != 0)) {
+    sendActionResult(409, false, "ACTION_OTA_BUSY");
+    return false;
+  }
+
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  size_t active = 0;
+  int emptySlot = -1;
+  int oldestDoneSlot = -1;
+  uint32_t now = millis();
+  uint32_t oldestAge = 0;
+  for (size_t i = 0; i < WEB_JOB_SLOTS; ++i) {
+    if (webJobs[i].state == WEB_JOB_QUEUED || webJobs[i].state == WEB_JOB_RUNNING) active++;
+    if (webJobs[i].state == WEB_JOB_EMPTY && emptySlot < 0) emptySlot = i;
+    else if (webJobs[i].state == WEB_JOB_DONE) {
+      uint32_t age = now - webJobs[i].completedAt;
+      if (oldestDoneSlot < 0 || age > oldestAge) {
+        oldestAge = age;
+        oldestDoneSlot = i;
+      }
+    }
+  }
+  int slot = emptySlot >= 0 ? emptySlot : oldestDoneSlot;
+  if (active >= MAX_ACTIVE_WEB_JOBS || slot < 0) {
+    xSemaphoreGive(jobMutex);
+    sendActionResult(429, false, "ACTION_JOB_QUEUE_FULL");
+    return false;
+  }
+  WebJob& job = webJobs[slot];
+  job.id = nextJobId++;
+  if (job.id == 0) job.id = nextJobId++;
+  job.completedAt = 0;
+  job.state = WEB_JOB_QUEUED;
+  job.success = false;
+  job.deferred = false;
+  job.type = type;
+  job.handler = handler;
+  if (argName1 == "*") {
+    if (server.args() > WEB_JOB_ARG_SLOTS) {
+      job.state = WEB_JOB_EMPTY;
+      xSemaphoreGive(jobMutex);
+      sendActionResult(400, false, "ACTION_TOO_MANY_FIELDS");
+      return false;
+    }
+    for (int i = 0; i < server.args(); ++i) {
+      job.argNames[i] = server.argName(i);
+      job.argValues[i] = server.arg(i);
+    }
+  } else {
+    job.argNames[0] = argName1;
+    job.argValues[0] = argValue1;
+    job.argNames[1] = argName2;
+    job.argValues[1] = argValue2;
+  }
+  job.resultJson = "";
+  uint32_t id = job.id;
+  xSemaphoreGive(jobMutex);
+
+  JsonDocument data;
+  data["jobId"] = id;
+  sendActionResult(202, true, "ACTION_JOB_ACCEPTED", data);
+  return true;
+}
+
+void processWebJobs() {
+  if (!jobMutex || executingJob >= 0) return;
+  if (deviceRestartPending()) {
+    cancelQueuedJobsForRestart();
+    return;
+  }
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  int slot = -1;
+  for (size_t i = 0; i < WEB_JOB_SLOTS; ++i) {
+    if (webJobs[i].state == WEB_JOB_QUEUED) {
+      slot = i;
+      webJobs[i].state = WEB_JOB_RUNNING;
+      break;
+    }
+  }
+  xSemaphoreGive(jobMutex);
+  if (slot < 0) return;
+
+  executingJob = slot;
+  jobTaskHandle = xTaskGetCurrentTaskHandle();
+  webJobs[slot].handler();
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  WebJob& job = webJobs[slot];
+  if (!job.deferred && job.resultJson.length() == 0) {
+    job.success = false;
+    job.resultJson = actionResultJson(false, "ACTION_JOB_FAILED");
+  }
+  if (!job.deferred) {
+    job.state = WEB_JOB_DONE;
+    job.completedAt = millis();
+  }
+  job.handler = nullptr;
+  clearWebJobArgs(job);
+  executingJob = -1;
+  xSemaphoreGive(jobMutex);
+}
+
+uint32_t deferCurrentWebJob() {
+  if (!webJobExecuting()) return 0;
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  WebJob& job = webJobs[executingJob];
+  job.deferred = true;
+  uint32_t id = job.id;
+  xSemaphoreGive(jobMutex);
+  return id;
+}
+
+void completeDeferredWebJob(uint32_t id, bool success, const String& resultJson) {
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  for (WebJob& job : webJobs) {
+    if (job.id != id || job.state != WEB_JOB_RUNNING || !job.deferred) continue;
+    job.success = success;
+    job.resultJson = resultJson;
+    job.deferred = false;
+    job.state = WEB_JOB_DONE;
+    job.completedAt = millis();
+    break;
+  }
+  xSemaphoreGive(jobMutex);
+}
+
+void resumeDeferredWebJob(uint32_t id, WebJobHandler handler) {
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  for (WebJob& job : webJobs) {
+    if (job.id != id || job.state != WEB_JOB_RUNNING || !job.deferred) continue;
+    job.deferred = false;
+    job.state = WEB_JOB_QUEUED;
+    job.handler = handler;
+    break;
+  }
+  xSemaphoreGive(jobMutex);
+}
+
+void handleJob() {
+  if (!checkAuth()) return;
+  uint32_t id = requestArg("id").toInt();
+  JsonDocument response;
+  bool found = false;
+  xSemaphoreTake(jobMutex, portMAX_DELAY);
+  for (const WebJob& job : webJobs) {
+    if (job.state == WEB_JOB_EMPTY || job.id != id || id == 0) continue;
+    found = true;
+    response["id"] = job.id;
+    response["type"] = job.type;
+    response["state"] = job.state == WEB_JOB_QUEUED ? "queued" :
+                        job.state == WEB_JOB_RUNNING ? "running" :
+                        job.success ? "succeeded" : "failed";
+    if (job.state == WEB_JOB_DONE) {
+      JsonDocument result;
+      if (!deserializeJson(result, job.resultJson)) response["result"].set(result.as<JsonVariantConst>());
+    }
+    break;
+  }
+  xSemaphoreGive(jobMutex);
+  if (!found) {
+    sendActionResult(404, false, "ACTION_JOB_NOT_FOUND");
+    return;
+  }
+  sendJson(200, response);
+}
+
 static void sendActionResult(int status, bool success, const char* code,
-                             const String& detail = "") {
+                             const String& detail) {
   JsonDocument response;
   response["success"] = success;
   response["code"] = code;
@@ -124,7 +595,7 @@ static void sendActionResult(int status, bool success, const char* code,
 }
 
 static void sendActionResult(int status, bool success, const char* code,
-                             JsonDocument& data, const String& detail = "") {
+                             JsonDocument& data, const String& detail) {
   if (data.overflowed()) {
     sendJsonFailure();
     return;
@@ -155,7 +626,7 @@ static bool rejectInvalidOrTooLong(const String& value, size_t maxBytes, const S
 }
 
 static bool rejectArgInvalidOrTooLong(const String& field, size_t maxBytes) {
-  return server.hasArg(field) && rejectInvalidOrTooLong(server.arg(field), maxBytes, field);
+  return requestHasArg(field) && rejectInvalidOrTooLong(requestArg(field), maxBytes, field);
 }
 
 static bool rejectModemBusy() {
@@ -164,25 +635,23 @@ static bool rejectModemBusy() {
   return true;
 }
 
-// Serve the frontend build from LittleFS.
+// Serve the frontend build directly from the application image.
 void handleRoot() {
   if (!checkAuth()) return;
   server.sendHeader("Content-Security-Policy", "frame-ancestors 'none'");
   server.sendHeader("X-Frame-Options", "DENY");
   server.sendHeader("Cache-Control", "no-store");
-  File file = LittleFS.open("/index.html.gz", "r");
-  if (!file) {
-    server.send(503, "text/plain; charset=utf-8", "Web bundle missing. Build and upload LittleFS.");
-    return;
-  }
+  server.sendHeader("Content-Encoding", "gzip");
   server.sendHeader("Vary", "Accept-Encoding");
-  server.streamFile(file, "text/html; charset=utf-8");
-  file.close();
+  server.send_P(200, "text/html; charset=utf-8",
+                reinterpret_cast<const char*>(WEB_BUNDLE), WEB_BUNDLE_SIZE);
 }
 
 // Return the status and configuration needed to initialize the frontend. Passwords are omitted.
 void handleConfig() {
   if (!checkAuth()) return;
+
+  xSemaphoreTake(configMutex, portMAX_DELAY);
 
   bool emailOk = config.smtpServer.length() > 0 && config.smtpUser.length() > 0 &&
                  config.smtpPass.length() > 0 && config.smtpSendTo.length() > 0;
@@ -193,6 +662,7 @@ void handleConfig() {
 
   JsonDocument json;
   JsonObject status = json["status"].to<JsonObject>();
+  json["csrfToken"] = csrfToken;
   status["ip"] = WiFi.localIP().toString();
   status["wifiSsid"] = WiFi.SSID();
   status["freeHeapKb"] = ESP.getFreeHeap() / 1024;
@@ -209,6 +679,9 @@ void handleConfig() {
     account["password"] = "";
   }
   configJson["smtpServer"] = config.smtpServer;
+  configJson["deviceName"] = config.deviceName;
+  configJson["hostname"] = config.hostname;
+  configJson["notificationLocale"] = config.notificationLocale;
   configJson["smtpPort"] = config.smtpPort;
   configJson["smtpUser"] = config.smtpUser;
   configJson["smtpPass"] = "";
@@ -225,16 +698,24 @@ void handleConfig() {
     channelJson["url"] = channel.url;
     channelJson["key1"] = channel.key1;
     channelJson["key2"] = channel.key2;
+    channelJson["titleTemplate"] = channel.titleTemplate;
+    channelJson["bodyTemplate"] = channel.bodyTemplate;
     channelJson["customBody"] = channel.customBody;
   }
+  xSemaphoreGive(configMutex);
   sendJson(200, json);
 }
 
 // Handle flight mode control requests.
 void handleFlightMode() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("flight", handleFlightMode, "*", "");
+    return;
+  }
   
-  String action = server.arg("action");
+  String action = requestArg("action");
   if (rejectInvalidOrTooLong(action, 32, "action")) return;
   if (rejectModemBusy()) return;
   bool success = false;
@@ -329,8 +810,13 @@ void handleFlightMode() {
 // Handle AT command test requests.
 void handleATCommand() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("at", handleATCommand, "*", "");
+    return;
+  }
   
-  String cmd = server.arg("cmd");
+  String cmd = requestArg("cmd");
   if (rejectInvalidOrTooLong(cmd, 256, "cmd")) return;
   if (cmd.length() > 0 && !modemCommandAllowed(cmd)) {
     sendActionResult(400, false, "ACTION_AT_REJECTED");
@@ -363,8 +849,12 @@ void handleATCommand() {
 // Handle modem information queries.
 void handleQuery() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    enqueueWebJob("query", handleQuery, "*", "");
+    return;
+  }
   
-  String type = server.arg("type");
+  String type = requestArg("type");
   if (rejectInvalidOrTooLong(type, 32, "type")) return;
   if (type != "wifi" && rejectModemBusy()) return;
   bool success = false;
@@ -606,9 +1096,14 @@ void handleQuery() {
 // Handle SMS send requests.
 void handleSendSms() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("sms", handleSendSms, "*", "");
+    return;
+  }
   
-  String phone = server.arg("phone");
-  String content = server.arg("content");
+  String phone = requestArg("phone");
+  String content = requestArg("content");
   if (rejectInvalidOrTooLong(phone, 32, "phone") ||
       rejectInvalidOrTooLong(content, 2048, "content")) return;
   if (rejectModemBusy()) return;
@@ -636,6 +1131,11 @@ void handleSendSms() {
 // Handle Ping requests.
 void handlePing() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("ping", handlePing, "*", "");
+    return;
+  }
   if (rejectModemBusy()) return;
 
   String activateResponse;
@@ -699,13 +1199,24 @@ void handlePing() {
 // Handle configuration save requests.
 void handleSave() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("config-save", handleSave, "*", "");
+    return;
+  }
 
+  xSemaphoreTake(configMutex, portMAX_DELAY);
   Config next = config;
+  xSemaphoreGive(configMutex);
+  String previousHostname = next.hostname;
   String previousSmtpServer = next.smtpServer;
   int previousSmtpPort = next.smtpPort;
   String previousSmtpUser = next.smtpUser;
 
-  if (rejectArgInvalidOrTooLong("smtpServer", 253) ||
+  if (rejectArgInvalidOrTooLong("deviceName", MAX_DEVICE_NAME_BYTES) ||
+      rejectArgInvalidOrTooLong("hostname", MAX_HOSTNAME_LENGTH) ||
+      rejectArgInvalidOrTooLong("notificationLocale", MAX_NOTIFICATION_LOCALE_BYTES) ||
+      rejectArgInvalidOrTooLong("smtpServer", 253) ||
       rejectArgInvalidOrTooLong("smtpPort", 32) ||
       rejectArgInvalidOrTooLong("smtpUser", 254) ||
       rejectArgInvalidOrTooLong("smtpPass", 256) ||
@@ -721,6 +1232,8 @@ void handleSave() {
         rejectArgInvalidOrTooLong(prefix + "name", 64) ||
         rejectArgInvalidOrTooLong(prefix + "key1", 256) ||
         rejectArgInvalidOrTooLong(prefix + "key2", 256) ||
+        rejectArgInvalidOrTooLong(prefix + "title", MAX_TITLE_TEMPLATE_BYTES) ||
+        rejectArgInvalidOrTooLong(prefix + "template", MAX_BODY_TEMPLATE_BYTES) ||
         rejectArgInvalidOrTooLong(prefix + "body", 2048)) return;
   }
 
@@ -730,15 +1243,15 @@ void handleSave() {
     String passKey = prefix + "pass";
     if (rejectArgInvalidOrTooLong(userKey, 64) ||
         rejectArgInvalidOrTooLong(passKey, 96)) return;
-    String username = server.hasArg(userKey) ? server.arg(userKey) : next.webAccounts[i].username;
-    String password = server.hasArg(passKey) && server.arg(passKey).length() > 0
-                        ? server.arg(passKey) : next.webAccounts[i].password;
+    String username = requestHasArg(userKey) ? requestArg(userKey) : next.webAccounts[i].username;
+    String password = requestHasArg(passKey) && requestArg(passKey).length() > 0
+                        ? requestArg(passKey) : next.webAccounts[i].password;
     username.trim();
     if (username.length() == 0) password = "";
-    if ((server.hasArg(userKey) || server.hasArg(passKey)) &&
+    if ((requestHasArg(userKey) || requestHasArg(passKey)) &&
         username.length() + password.length() + 1 > 180) {
       sendActionResult(400, false, "ACTION_INPUT_TOO_LONG",
-                       server.hasArg(passKey) ? passKey : userKey);
+                       requestHasArg(passKey) ? passKey : userKey);
       return;
     }
   }
@@ -748,13 +1261,13 @@ void handleSave() {
     String prefix = "account" + String(i);
     String userKey = prefix + "user";
     String passKey = prefix + "pass";
-    if (server.hasArg(userKey)) {
-      next.webAccounts[i].username = server.arg(userKey);
+    if (requestHasArg(userKey)) {
+      next.webAccounts[i].username = requestArg(userKey);
       next.webAccounts[i].username.trim();
       if (next.webAccounts[i].username.length() == 0) next.webAccounts[i].password = "";
     }
-    if (server.hasArg(passKey) && server.arg(passKey).length() > 0) {
-      next.webAccounts[i].password = server.arg(passKey);
+    if (requestHasArg(passKey) && requestArg(passKey).length() > 0) {
+      next.webAccounts[i].password = requestArg(passKey);
     }
     if (next.webAccounts[i].password.length() == 0) next.webAccounts[i].username = "";
   }
@@ -771,33 +1284,36 @@ void handleSave() {
   }
 
   // Email notification form: update only fields present in the request.
-  if (server.hasArg("smtpServer")) {
-    next.smtpServer = server.arg("smtpServer");
+  if (requestHasArg("deviceName")) next.deviceName = requestArg("deviceName");
+  if (requestHasArg("hostname")) next.hostname = requestArg("hostname");
+  if (requestHasArg("notificationLocale")) next.notificationLocale = requestArg("notificationLocale");
+  if (requestHasArg("smtpServer")) {
+    next.smtpServer = requestArg("smtpServer");
   }
-  if (server.hasArg("smtpPort")) {
-    long smtpPort = server.arg("smtpPort").toInt();
+  if (requestHasArg("smtpPort")) {
+    long smtpPort = requestArg("smtpPort").toInt();
     next.smtpPort = smtpPort > 0 && smtpPort <= 65535 ? smtpPort : 465;
   }
-  if (server.hasArg("smtpUser")) {
-    next.smtpUser = server.arg("smtpUser");
+  if (requestHasArg("smtpUser")) {
+    next.smtpUser = requestArg("smtpUser");
   }
-  if (server.hasArg("smtpPass")) {
-    next.smtpPass = server.arg("smtpPass");
+  if (requestHasArg("smtpPass")) {
+    next.smtpPass = requestArg("smtpPass");
   }
-  if (server.hasArg("smtpSendTo")) {
-    next.smtpSendTo = server.arg("smtpSendTo");
+  if (requestHasArg("smtpSendTo")) {
+    next.smtpSendTo = requestArg("smtpSendTo");
   }
-  if (!server.hasArg("smtpPass") &&
+  if (!requestHasArg("smtpPass") &&
       (next.smtpServer != previousSmtpServer || next.smtpPort != previousSmtpPort ||
        next.smtpUser != previousSmtpUser)) {
     next.smtpPass = "";
   }
   // Administrator and blacklist form: update only fields present in the request.
-  if (server.hasArg("adminPhone")) {
-    next.adminPhone = server.arg("adminPhone");
+  if (requestHasArg("adminPhone")) {
+    next.adminPhone = requestArg("adminPhone");
   }
-  if (server.hasArg("numberBlackList")) {
-    next.numberBlackList = server.arg("numberBlackList");
+  if (requestHasArg("numberBlackList")) {
+    next.numberBlackList = requestArg("numberBlackList");
   }
 
   // Push channel configuration: update only when that channel's fields are present.
@@ -809,40 +1325,58 @@ void handleSave() {
     String nameKey = "push" + idx + "name";
     String k1Key = "push" + idx + "key1";
     String k2Key = "push" + idx + "key2";
+    String titleKey = "push" + idx + "title";
+    String templateKey = "push" + idx + "template";
     String bodyKey = "push" + idx + "body";
     // Update the entire channel when any of its fields are present.
-    if (server.hasArg(enKey) || server.hasArg(typeKey) || server.hasArg(urlKey) ||
-        server.hasArg(nameKey) || server.hasArg(k1Key) || server.hasArg(k2Key) ||
-        server.hasArg(bodyKey)) {
-      next.pushChannels[i].enabled = server.arg(enKey) == "on";
-      next.pushChannels[i].type = (PushType)server.arg(typeKey).toInt();
-      next.pushChannels[i].url = server.arg(urlKey);
-      next.pushChannels[i].name = server.arg(nameKey);
-      next.pushChannels[i].key1 = server.arg(k1Key);
-      next.pushChannels[i].key2 = server.arg(k2Key);
-      next.pushChannels[i].customBody = server.arg(bodyKey);
+    if (requestHasArg(enKey) || requestHasArg(typeKey) || requestHasArg(urlKey) ||
+        requestHasArg(nameKey) || requestHasArg(k1Key) || requestHasArg(k2Key) ||
+        requestHasArg(titleKey) || requestHasArg(templateKey) || requestHasArg(bodyKey)) {
+      next.pushChannels[i].enabled = requestArg(enKey) == "on";
+      next.pushChannels[i].type = (PushType)requestArg(typeKey).toInt();
+      next.pushChannels[i].url = requestArg(urlKey);
+      next.pushChannels[i].name = requestArg(nameKey);
+      next.pushChannels[i].key1 = requestArg(k1Key);
+      next.pushChannels[i].key2 = requestArg(k2Key);
+      next.pushChannels[i].titleTemplate = requestArg(titleKey);
+      next.pushChannels[i].bodyTemplate = requestArg(templateKey);
+      next.pushChannels[i].customBody = requestArg(bodyKey);
+      if (next.pushChannels[i].type == PUSH_TYPE_CUSTOM) {
+        next.pushChannels[i].titleTemplate = "";
+        next.pushChannels[i].bodyTemplate = "";
+      } else {
+        next.pushChannels[i].customBody = "";
+      }
       if (next.pushChannels[i].name.length() == 0) {
         next.pushChannels[i].name = "Channel " + String(i + 1);
       }
     }
+  }
+  if (!isConfigSemanticallyValid(next)) {
+    sendActionResult(400, false, "ACTION_CONFIG_INVALID");
+    return;
   }
   
   if (!saveConfig(next)) {
     sendActionResult(500, false, "ACTION_CONFIG_SAVE_FAILED");
     return;
   }
+  xSemaphoreTake(configMutex, portMAX_DELAY);
   config = next;
   configValid = isConfigValid();
+  xSemaphoreGive(configMutex);
   
   sendActionResult(200, true, "ACTION_CONFIG_SAVED");
   
   // Send a startup notification when the configuration is valid.
   if (configValid) {
     logCaptureLn(String("Configuration valid; sending startup notification..."));
-    String subject = "SMS Forwarder Configuration Updated";
-    String body = "Device configuration updated\nDevice URL: " + getDeviceUrl();
+    String subject, body;
+    buildSystemNotificationText(next.notificationLocale, SYSTEM_NOTIFICATION_CONFIG_UPDATED,
+                                next.deviceName, getDeviceUrl(), subject, body);
     sendEmailNotification(subject.c_str(), body.c_str());
   }
+  if (next.hostname != previousHostname) scheduleDeviceRestart();
 }
 
 // Handle log queries by returning the lines in the ring buffer.
@@ -850,24 +1384,54 @@ void handleLog() {
   if (!checkAuth()) return;
 
   JsonDocument json;
-  JsonArray lines = json.to<JsonArray>();
+  uint32_t cursor = requestArg("cursor").toInt();
+  int limit = requestArg("limit").toInt();
+  if (limit < 1 || limit > 50) limit = 50;
+  uint32_t selectedIds[50];
+  String selectedMessages[50];
+  int selected = 0;
+  bool hasMore = false;
+  xSemaphoreTake(logMutex, portMAX_DELAY);
   int total = logBufCount;
-  int start = total < LOG_BUF_SIZE ? 0 : logBufIdx;
-  for (int i = 0; i < total; i++) {
+  int start = (logBufIdx - total + LOG_BUF_SIZE) % LOG_BUF_SIZE;
+  for (int i = total - 1; i >= 0; --i) {
     int pos = (start + i) % LOG_BUF_SIZE;
-    lines.add(JsonString(logBuffer[pos].c_str(), logBuffer[pos].length(), true));
+    if (cursor && logIds[pos] >= cursor) continue;
+    if (selected >= limit) {
+      hasMore = true;
+      break;
+    }
+    selectedIds[selected] = logIds[pos];
+    selectedMessages[selected] = logBuffer[pos];
+    selected++;
   }
+  xSemaphoreGive(logMutex);
+
+  JsonArray entries = json["entries"].to<JsonArray>();
+  for (int i = selected - 1; i >= 0; --i) {
+    JsonObject entry = entries.add<JsonObject>();
+    entry["id"] = selectedIds[i];
+    entry["message"] = selectedMessages[i];
+  }
+  if (hasMore && selected) json["nextCursor"] = selectedIds[selected - 1];
+  else json["nextCursor"] = nullptr;
+  json["hasMore"] = hasMore;
   sendJson(200, json);
 }
 
 // Modem control commands.
 void handleModem() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("modem", handleModem, "*", "");
+    return;
+  }
 
-  if (rejectInvalidOrTooLong(server.arg("action"), 32, "action")) return;
+  if (rejectInvalidOrTooLong(requestArg("action"), 32, "action")) return;
   if (rejectModemBusy()) return;
 
-  String action = server.arg("action");
+  String action = requestArg("action");
   bool success = false;
   JsonDocument data;
   JsonObject dataObject = data.to<JsonObject>();
@@ -968,10 +1532,15 @@ void handleModem() {
 // WiFi restart.
 void handleWifi() {
   if (!checkAuth()) return;
+  if (!webJobExecuting()) {
+    if (!checkCsrf()) return;
+    enqueueWebJob("wifi", handleWifi, "*", "");
+    return;
+  }
 
-  if (rejectInvalidOrTooLong(server.arg("action"), 32, "action")) return;
+  if (rejectInvalidOrTooLong(requestArg("action"), 32, "action")) return;
 
-  String action = server.arg("action");
+  String action = requestArg("action");
   if (action == "restart") {
     logCaptureLn(String("Web UI requested a WiFi restart..."));
     sendActionResult(200, true, "ACTION_WIFI_RESTARTING");

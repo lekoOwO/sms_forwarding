@@ -1,9 +1,48 @@
 import assert from "node:assert/strict";
+import { createCipheriv, createDecipheriv, pbkdf2Sync, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createApp } from "../server.mjs";
 
 const auth = `Basic ${Buffer.from("admin:admin123").toString("base64")}`;
+
+function crc32(bytes) {
+	let crc = 0xffffffff;
+	for (const byte of bytes) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
+
+function decryptBackup(bytes, passphrase) {
+	const buffer = Buffer.from(bytes);
+	assert.equal(buffer.subarray(0, 8).toString(), "SMSCFG01");
+	assert.equal(buffer.readUInt16LE(8), 1);
+	assert.equal(buffer[10], 1);
+	assert.equal(buffer[11], 1);
+	assert.equal(buffer.readUInt32LE(12), 210000);
+	const decipher = createDecipheriv("aes-256-gcm", pbkdf2Sync(passphrase, buffer.subarray(16, 32), 210000, 32, "sha256"), buffer.subarray(32, 44));
+	decipher.setAAD(buffer.subarray(0, 44));
+	decipher.setAuthTag(buffer.subarray(-16));
+	return Buffer.concat([decipher.update(buffer.subarray(44, -16)), decipher.final()]);
+}
+
+function encryptBackup(portable, passphrase) {
+	const salt = randomBytes(16);
+	const iv = randomBytes(12);
+	const header = Buffer.alloc(44);
+	header.write("SMSCFG01");
+	header.writeUInt16LE(1, 8);
+	header[10] = 1;
+	header[11] = 1;
+	header.writeUInt32LE(210000, 12);
+	salt.copy(header, 16);
+	iv.copy(header, 32);
+	const cipher = createCipheriv("aes-256-gcm", pbkdf2Sync(passphrase, salt, 210000, 32, "sha256"), iv);
+	cipher.setAAD(header);
+	return Buffer.concat([header, cipher.update(portable), cipher.final(), cipher.getAuthTag()]);
+}
 
 async function withServer(run, options) {
 	const server = createApp(options).listen(0, "127.0.0.1");
@@ -18,30 +57,80 @@ async function withServer(run, options) {
 function request(baseUrl, path, init = {}) {
 	return fetch(`${baseUrl}${path}`, {
 		...init,
-		headers: { Authorization: auth, ...init.headers }
+		headers: { Authorization: auth, "X-CSRF-Token": "mock-csrf-token", ...init.headers }
 	});
+}
+
+function base64Body(bytes) {
+	return { headers: { "Content-Type": "text/plain" }, body: Buffer.from(bytes).toString("base64") };
+}
+
+async function completedAction(baseUrl, response) {
+	const body = await response.json();
+	if (response.status !== 202 || body.code !== "ACTION_JOB_ACCEPTED") return body;
+	const job = await (await request(baseUrl, `/api/jobs?id=${body.data.jobId}`)).json();
+	return job.result;
 }
 
 test("authentication can be disabled for the LAN development server", async () => {
 	await withServer(async (baseUrl) => {
 		assert.equal((await fetch(`${baseUrl}/api/config`)).status, 200);
+		assert.equal((await fetch(`${baseUrl}/query?type=wifi`)).status, 202);
+		assert.equal((await fetch(`${baseUrl}/flight?action=query`)).status, 202);
+		assert.equal((await fetch(`${baseUrl}/flight?action=toggle`)).status, 403);
+		assert.equal((await fetch(`${baseUrl}/at?cmd=AT`)).status, 403);
+		assert.equal((await fetch(`${baseUrl}/modem?action=restart`)).status, 403);
+		assert.equal((await fetch(`${baseUrl}/wifi?action=restart`)).status, 403);
 	}, { authRequired: false });
+});
+
+test("the configuration envelope golden vector binds the full little-endian header", async () => {
+	const vector = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v1.json", import.meta.url), "utf8"));
+	const encrypted = Buffer.from(vector.smscfgHex, "hex");
+	const plaintext = decryptBackup(encrypted, vector.passphrase);
+	assert.equal(plaintext.toString("hex"), vector.plaintextHex);
+	assert.equal(plaintext.subarray(0, 4).toString(), "CFG2");
+	assert.equal(plaintext.readUInt16LE(4), 2);
+	assert.equal(plaintext.readUInt32LE(16), crc32(plaintext.subarray(20)));
+	const tampered = Buffer.from(encrypted);
+	tampered[43] ^= 1;
+	assert.throws(() => decryptBackup(tampered, vector.passphrase));
+});
+
+test("configuration exports require CSRF and only keep the latest pending file", async () => {
+	await withServer(async (baseUrl) => {
+		async function startExport(passphrase) {
+			const accepted = await request(baseUrl, "/api/config/export", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ passphrase })
+			});
+			const jobId = (await accepted.json()).data.jobId;
+			return (await (await request(baseUrl, `/api/jobs?id=${jobId}`)).json()).result.data.exportId;
+		}
+
+		const firstId = await startExport("first correct horse battery staple");
+		const secondId = await startExport("second correct horse battery staple");
+		assert.equal((await request(baseUrl, `/api/config/export?id=${firstId}`)).status, 404);
+		assert.equal((await fetch(`${baseUrl}/api/config/export?id=${secondId}`, { headers: { Authorization: auth } })).status, 403);
+		assert.equal((await request(baseUrl, `/api/config/export?id=${secondId}`)).status, 200);
+	});
 });
 
 test("clearing all accounts does not restore the default credentials", async () => {
 	await withServer(async (baseUrl) => {
-		const headers = { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" };
+		const headers = { Authorization: auth, "X-CSRF-Token": "mock-csrf-token", "Content-Type": "application/x-www-form-urlencoded" };
 		const changed = await fetch(`${baseUrl}/save`, {
 			method: "POST",
 			headers,
 			body: new URLSearchParams({ account0user: "operator", account0pass: "secret" })
 		});
-		assert.equal(changed.status, 200);
+		assert.equal(changed.status, 202);
 
 		const operatorAuth = `Basic ${Buffer.from("operator:secret").toString("base64")}`;
 		const cleared = await fetch(`${baseUrl}/save`, {
 			method: "POST",
-			headers: { Authorization: operatorAuth, "Content-Type": "application/x-www-form-urlencoded" },
+			headers: { Authorization: operatorAuth, "X-CSRF-Token": "mock-csrf-token", "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ account0user: "", account0pass: "" })
 		});
 		assert.equal(cleared.status, 400);
@@ -88,7 +177,7 @@ test("request and UTF-8 field limits reject before authentication or mutation", 
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ phone: "+886900000000", content: "界".repeat(682) })
 		});
-		assert.equal(accepted.status, 200);
+		assert.equal(accepted.status, 202);
 		const tooLong = await request(baseUrl, "/sendsms", {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -100,6 +189,25 @@ test("request and UTF-8 field limits reject before authentication or mutation", 
 		const rejectedCommand = await request(baseUrl, "/at?cmd=AT%2BCMGS%3D1");
 		assert.equal(rejectedCommand.status, 400);
 		assert.equal((await rejectedCommand.json()).code, "ACTION_AT_REJECTED");
+
+		const oversizedRestore = await request(baseUrl, "/api/config/restore/start", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ size: "32829" })
+		});
+		assert.equal(oversizedRestore.status, 400);
+		const boundedRestore = await request(baseUrl, "/api/config/restore/start", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ size: "60" })
+		});
+		const boundedId = (await boundedRestore.json()).data.uploadId;
+		assert.equal((await request(baseUrl, `/api/config/restore/chunk?id=${boundedId}&offset=0`, {
+			method: "POST", ...base64Body(Buffer.alloc(61))
+		})).status, 400);
+		const oversizedOta = await request(baseUrl, "/api/ota/start", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ manifest: '{"format":1,"size":1966081}', signature: "3000" })
+		});
+		assert.equal(oversizedOta.status, 400);
 	});
 });
 
@@ -112,10 +220,25 @@ test("the mock implements the documented API", async () => {
 		const snapshotResponse = await request(baseUrl, "/api/config");
 		assert.equal(snapshotResponse.status, 200);
 		const snapshot = await snapshotResponse.json();
+		assert.equal(snapshot.config.deviceName, "SMS Forwarder 000001");
+		assert.equal(snapshot.config.hostname, "sms-forwarder-000001");
+		assert.equal(snapshot.config.notificationLocale, "zh-TW");
 		assert.equal(snapshot.config.pushChannels.length, 5);
 		assert.equal(snapshot.config.webAccounts.length, 10);
 		assert.deepEqual(snapshot.config.webAccounts[0], { username: "admin", password: "" });
 		assert.equal(snapshot.config.smtpPass, "");
+		assert.equal(snapshot.csrfToken, "mock-csrf-token");
+		assert.deepEqual(snapshot.config.pushChannels[0], {
+			enabled: false, type: 1, name: "Channel 1", url: "", key1: "", key2: "",
+			customBody: "", titleTemplate: "", bodyTemplate: ""
+		});
+		const invalidSave = await request(baseUrl, "/save", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ hostname: "INVALID_HOST" })
+		});
+		assert.equal(invalidSave.status, 202);
+		assert.equal((await completedAction(baseUrl, invalidSave)).code, "ACTION_CONFIG_INVALID");
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.hostname, "sms-forwarder-000001");
 
 		const form = new URLSearchParams({
 			smtpServer: "smtp.example.com",
@@ -136,7 +259,7 @@ test("the mock implements the documented API", async () => {
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: form
 		});
-		assert.deepEqual(await saved.json(), { success: true, code: "ACTION_CONFIG_SAVED", data: {}, detail: "" });
+		assert.deepEqual(await completedAction(baseUrl, saved), { success: true, code: "ACTION_CONFIG_SAVED", data: {}, detail: "" });
 
 		const changed = await (await request(baseUrl, "/api/config")).json();
 		assert.equal(changed.config.smtpServer, "smtp.example.com");
@@ -148,7 +271,7 @@ test("the mock implements the documented API", async () => {
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ account1user: "operator", account1pass: "secret" })
 		});
-		assert.equal((await accountSaved.json()).success, true);
+		assert.equal((await completedAction(baseUrl, accountSaved)).success, true);
 		const operatorAuth = `Basic ${Buffer.from("operator:secret").toString("base64")}`;
 		assert.equal((await fetch(`${baseUrl}/api/config`, { headers: { Authorization: operatorAuth } })).status, 200);
 
@@ -163,20 +286,20 @@ test("the mock implements the documented API", async () => {
 		];
 		for (const [path, init] of calls) {
 			const response = await request(baseUrl, path, init);
-			assert.equal(response.status, 200, path);
-			const body = await response.json();
+			assert.equal(response.status, 202, path);
+			const body = await completedAction(baseUrl, response);
 			assert.equal(typeof body.success, "boolean", path);
 			assert.match(body.code, /^ACTION_/i, path);
 			assert.equal(typeof body.data, "object", path);
 			assert.equal(typeof body.detail, "string", path);
 		}
 
-		assert.deepEqual((await (await request(baseUrl, "/query?type=signal")).json()).data, {
+		assert.deepEqual((await completedAction(baseUrl, await request(baseUrl, "/query?type=signal"))).data, {
 			rsrpDbm: -82,
 			rsrqDb: -9.5,
 			cesq: "99,99,255,255,20,58"
 		});
-		assert.deepEqual((await (await request(baseUrl, "/query?type=wifi")).json()).data, {
+		assert.deepEqual((await completedAction(baseUrl, await request(baseUrl, "/query?type=wifi"))).data, {
 			wifiStatus: 3,
 			ssid: "MockNetwork",
 			rssiDbm: -54,
@@ -189,9 +312,122 @@ test("the mock implements the documented API", async () => {
 			channel: 6
 		});
 
-		const logs = await (await request(baseUrl, "/log")).json();
-		assert.ok(Array.isArray(logs));
-		assert.ok(logs.length > 2);
+		const logs = await (await request(baseUrl, "/log?limit=2")).json();
+		assert.ok(Array.isArray(logs.entries));
+		assert.equal(logs.entries.length, 2);
+		assert.equal(typeof logs.entries[0].id, "number");
+		assert.equal(typeof logs.entries[0].message, "string");
+		assert.equal(typeof logs.nextCursor, "number");
+		assert.equal(typeof logs.hasMore, "boolean");
+		const olderLogs = await (await request(baseUrl, `/log?limit=2&cursor=${logs.nextCursor}`)).json();
+		assert.ok(olderLogs.entries.every((entry) => entry.id < logs.nextCursor));
+
+		const exportStart = await request(baseUrl, "/api/config/export", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ passphrase: "correct horse battery staple" })
+		});
+		assert.equal(exportStart.status, 202);
+		const acceptedExport = await exportStart.json();
+		const exportJob = await (await request(baseUrl, `/api/jobs?id=${acceptedExport.data.jobId}`)).json();
+		assert.equal(exportJob.state, "succeeded");
+		assert.notEqual(exportJob.result.data.exportId, acceptedExport.data.jobId);
+		const exportPath = `/api/config/export?id=${exportJob.result.data.exportId}`;
+		const exported = new Uint8Array(await (await request(baseUrl, exportPath)).arrayBuffer());
+		assert.equal((await request(baseUrl, exportPath)).status, 404);
+		const portable = decryptBackup(exported, "correct horse battery staple");
+		assert.equal(portable.subarray(0, 4).toString(), "CFG2");
+		assert.equal(portable.readUInt16LE(4), 2);
+		assert.equal(portable.readUInt32LE(8), 0);
+		assert.equal(portable.readUInt32LE(12), portable.length - 20);
+		assert.equal(portable.readUInt32LE(16), crc32(portable.subarray(20)));
+		assert.throws(() => {
+			const tamperedHeader = Buffer.from(exported);
+			tamperedHeader[43] ^= 1;
+			decryptBackup(tamperedHeader, "correct horse battery staple");
+		});
+
+		const targetChanged = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				deviceName: "Target gateway", hostname: "target-gateway",
+				notificationLocale: "en", smtpServer: "changed.example.com"
+			})
+		});
+		assert.equal((await completedAction(baseUrl, targetChanged)).success, true);
+		const invalidPortable = Buffer.from(portable);
+		let localeOffset = 24;
+		for (let field = 0; field < 2; field += 1) localeOffset += 2 + invalidPortable.readUInt16LE(localeOffset);
+		assert.equal(invalidPortable.readUInt16LE(localeOffset), 5);
+		invalidPortable.write("bad!!", localeOffset + 2);
+		invalidPortable.writeUInt32LE(crc32(invalidPortable.subarray(20)), 16);
+		const invalidEncrypted = encryptBackup(invalidPortable, "correct horse battery staple");
+		const invalidStart = await request(baseUrl, "/api/config/restore/start", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ size: String(invalidEncrypted.length) })
+		});
+		const invalidId = (await invalidStart.json()).data.uploadId;
+		assert.equal((await request(baseUrl, `/api/config/restore/chunk?id=${invalidId}&offset=0`, {
+			method: "POST", ...base64Body(invalidEncrypted)
+		})).status, 200);
+		const invalidFinish = await request(baseUrl, `/api/config/restore/finish?id=${invalidId}`, {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ passphrase: "correct horse battery staple" })
+		});
+		assert.equal(invalidFinish.status, 202);
+		const invalidJobId = (await invalidFinish.json()).data.jobId;
+		const invalidJob = await (await request(baseUrl, `/api/jobs?id=${invalidJobId}`)).json();
+		assert.equal(invalidJob.state, "failed");
+		assert.equal(invalidJob.result.code, "ACTION_CONFIG_RESTORE_INVALID");
+		const unchanged = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(unchanged.config.notificationLocale, "en");
+		assert.equal(unchanged.config.smtpServer, "changed.example.com");
+
+		const restoreStart = await request(baseUrl, "/api/config/restore/start", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ size: String(exported.length) })
+		});
+		assert.equal(restoreStart.status, 201);
+		const restoreId = (await restoreStart.json()).data.uploadId;
+		assert.equal((await request(baseUrl, `/api/config/restore/chunk?id=${restoreId}&offset=0`, {
+			method: "POST", ...base64Body(exported)
+		})).status, 200);
+		const restore = await request(baseUrl, `/api/config/restore/finish?id=${restoreId}`, {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ passphrase: "correct horse battery staple" })
+		});
+		assert.equal(restore.status, 202);
+		const acceptedRestore = await restore.json();
+		const restoredJob = await (await request(baseUrl, `/api/jobs?id=${acceptedRestore.data.jobId}`)).json();
+		assert.equal(restoredJob.state, "succeeded");
+		assert.equal(restoredJob.result.code, "ACTION_CONFIG_RESTORED");
+		const restoredSnapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(restoredSnapshot.config.deviceName, "Target gateway");
+		assert.equal(restoredSnapshot.config.hostname, "target-gateway");
+		assert.equal(restoredSnapshot.config.notificationLocale, "zh-TW");
+		assert.equal(restoredSnapshot.config.smtpServer, "smtp.example.com");
+		assert.equal(restoredSnapshot.config.webAccounts[1].username, "operator");
+		assert.equal((await fetch(`${baseUrl}/api/config`, { headers: { Authorization: operatorAuth } })).status, 200);
+
+		const otaStart = await request(baseUrl, "/api/ota/start", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ manifest: '{"format":1,"size":3}', signature: "3000" })
+		});
+		assert.equal(otaStart.status, 201);
+		const otaId = (await otaStart.json()).data.uploadId;
+		await request(baseUrl, `/api/ota/chunk?id=${otaId}&offset=0`, {
+			method: "POST", ...base64Body(new Uint8Array([0, 1, 0]))
+		});
+		const ota = await request(baseUrl, `/api/ota/finish?id=${otaId}`, { method: "POST" });
+		assert.equal(ota.status, 202);
+		const acceptedOta = await ota.json();
+		assert.equal(acceptedOta.code, "ACTION_JOB_ACCEPTED");
+		const otaJob = await (await request(baseUrl, `/api/jobs?id=${acceptedOta.data.jobId}`)).json();
+		assert.equal(otaJob.state, "succeeded");
+		assert.equal(otaJob.result.code, "ACTION_OTA_READY");
 
 		const openApi = await (await request(baseUrl, "/openapi.json")).json();
 		assert.equal(openApi.openapi, "3.1.0");

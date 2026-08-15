@@ -31,6 +31,12 @@
     "bodyBytes": 16384,
     "description": "Limits are enforced before authentication. Rejections use 414, 431, or 413 with Connection: close and Cache-Control: no-store. Fields must contain valid UTF-8 text and stay within their byte limits; rejections leave state unchanged and put only the field name in detail."
   },
+	"x-configSchema": {
+	  "source": "config-schema/manifest.json",
+	  "currentVersion": 2,
+	  "mimeType": "application/vnd.sms-forwarding.config",
+	  "maxEncryptedBytes": 32828
+	},
   "tags": [
     { "name": "UI" },
     { "name": "Configuration" },
@@ -43,16 +49,8 @@
         "tags": ["UI"],
         "summary": "Get the management page",
         "responses": {
-          "200": { "$ref": "#/components/responses/ManagementPage" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "503": {
-            "description": "The LittleFS Web bundle is not available.",
-            "content": {
-              "text/plain": {
-                "schema": { "type": "string" }
-              }
-            }
-          }
+		  "200": { "$ref": "#/components/responses/ManagementPage" },
+		  "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     },
@@ -61,11 +59,8 @@
         "tags": ["UI"],
         "summary": "Get the management page from the tools alias",
         "responses": {
-          "200": { "$ref": "#/components/responses/ManagementPage" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "503": {
-            "description": "The LittleFS Web bundle is not available."
-          }
+		  "200": { "$ref": "#/components/responses/ManagementPage" },
+		  "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     },
@@ -74,11 +69,8 @@
         "tags": ["UI"],
         "summary": "Get the management page from the messaging alias",
         "responses": {
-          "200": { "$ref": "#/components/responses/ManagementPage" },
-          "401": { "$ref": "#/components/responses/Unauthorized" },
-          "503": {
-            "description": "The LittleFS Web bundle is not available."
-          }
+		  "200": { "$ref": "#/components/responses/ManagementPage" },
+		  "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     },
@@ -105,6 +97,7 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Update the configuration",
+		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
         "description": "The request can contain one configuration section. A blank account username disables that account. A blank account password keeps its stored password. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
@@ -115,14 +108,7 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "The configuration was stored.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "413": { "$ref": "#/components/responses/BodyTooLarge" }
@@ -133,6 +119,7 @@
       "post": {
         "tags": ["Messaging"],
         "summary": "Send an SMS",
+		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
         "description": "The device splits long content into multipart SMS messages. One request can contain at most 255 encoded parts.",
         "requestBody": {
           "required": true,
@@ -150,14 +137,7 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "The result from the modem.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "413": { "$ref": "#/components/responses/BodyTooLarge" },
@@ -169,16 +149,10 @@
       "post": {
         "tags": ["Device"],
         "summary": "Ping 8.8.8.8 through the cellular modem",
+		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
         "description": "The device enables the PDP context for this operation. Then the device disables the PDP context.",
         "responses": {
-          "200": {
-            "description": "The ping result.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/ModemBusy" }
         }
@@ -201,14 +175,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The query result. The localized status is selected from code; parsed diagnostic values are returned in data.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/ModemBusy" }
@@ -220,6 +187,7 @@
         "tags": ["Device"],
         "summary": "Query or change flight mode",
         "parameters": [
+		  { "$ref": "#/components/parameters/CsrfToken" },
           {
             "name": "action",
             "in": "query",
@@ -232,14 +200,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The flight-mode result.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/ModemBusy" }
@@ -251,6 +212,7 @@
         "tags": ["Device"],
         "summary": "Send an AT command",
         "parameters": [
+		  { "$ref": "#/components/parameters/CsrfToken" },
           {
             "name": "cmd",
             "in": "query",
@@ -259,14 +221,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The raw modem response.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": { "$ref": "#/components/responses/ModemBusy" }
@@ -277,15 +232,24 @@
       "get": {
         "tags": ["Device"],
         "summary": "Get the device log",
+		"parameters": [
+		  { "name": "cursor", "in": "query", "schema": { "type": "integer", "minimum": 0, "default": 0 }, "description": "Return entries older than this entry id. Omit or use zero for the latest page." },
+		  { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 50 } }
+		],
         "responses": {
           "200": {
-            "description": "Up to 120 log lines in chronological order.",
+			"description": "A cursor page in chronological order.",
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "maxItems": 120,
-                  "items": { "type": "string" }
+				  "type": "object",
+				  "required": ["entries", "nextCursor", "hasMore"],
+				  "additionalProperties": false,
+				  "properties": {
+					"entries": { "type": "array", "maxItems": 50, "items": { "type": "object", "required": ["id", "message"], "additionalProperties": false, "properties": { "id": { "type": "integer" }, "message": { "type": "string" } } } },
+					"nextCursor": { "type": ["integer", "null"] },
+					"hasMore": { "type": "boolean" }
+				  }
                 }
               }
             }
@@ -300,6 +264,7 @@
         "tags": ["Device"],
         "summary": "Control or query the modem",
         "parameters": [
+		  { "$ref": "#/components/parameters/CsrfToken" },
           {
             "name": "action",
             "in": "query",
@@ -312,14 +277,7 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The modem operation result.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "429": {
@@ -338,6 +296,7 @@
         "tags": ["Device"],
         "summary": "Reconnect WiFi",
         "parameters": [
+		  { "$ref": "#/components/parameters/CsrfToken" },
           {
             "name": "action",
             "in": "query",
@@ -350,17 +309,93 @@
           }
         ],
         "responses": {
-          "200": {
-            "description": "The WiFi operation result.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/ActionResult" }
-              }
-            }
-          },
+		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
         }
+      }
+    },
+    "/api/jobs": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Get a bounded background job",
+        "parameters": [{ "name": "id", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+        "responses": {
+          "200": { "description": "The job state and final action result.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Job" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "The job does not exist or expired." }
+        }
+      }
+    },
+    "/api/config/export": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Start an encrypted portable configuration export",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12 } } } } } },
+        "responses": {
+          "202": { "description": "The export job was accepted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Download a completed encrypted configuration export",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "name": "id", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 1 } }],
+        "responses": {
+          "200": { "description": "An opaque versioned PBKDF2-SHA256 and AES-256-GCM .smscfg file.", "content": { "application/vnd.sms-forwarding.config": { "schema": { "type": "string", "contentEncoding": "binary", "maxLength": 32828 } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is missing or invalid." },
+          "404": { "description": "The export does not exist or expired." }
+        }
+      }
+    },
+    "/api/config/restore/start": {
+      "post": {
+        "tags": ["Configuration"], "summary": "Start an encrypted configuration upload",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+		"requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["size"], "properties": { "size": { "type": "integer", "minimum": 60, "maximum": 32828 } } } } } },
+        "responses": { "201": { "$ref": "#/components/responses/UploadStarted" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "Another upload is active." } }
+      }
+    },
+    "/api/config/restore/chunk": {
+      "post": {
+        "tags": ["Configuration"], "summary": "Upload the next encrypted configuration chunk",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }, { "$ref": "#/components/parameters/UploadOffset" }],
+        "requestBody": { "required": true, "content": { "text/plain": { "schema": { "type": "string", "contentEncoding": "base64", "minLength": 4, "maxLength": 10924 } } } },
+        "responses": { "200": { "$ref": "#/components/responses/UploadChunk" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "The session or offset is invalid." } }
+      }
+    },
+    "/api/config/restore/finish": {
+      "post": {
+        "tags": ["Configuration"], "summary": "Validate and restore the uploaded configuration",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12 } } } } } },
+        "responses": { "202": { "$ref": "#/components/responses/JobAccepted" }, "400": { "description": "Decryption, schema validation, or portable merge failed." }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+      }
+    },
+    "/api/ota/start": {
+      "post": {
+        "tags": ["Device"], "summary": "Start a signed firmware upload",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["manifest", "signature"], "properties": { "manifest": { "type": "string" }, "signature": { "type": "string", "pattern": "^[0-9a-f]+$" } } } } } },
+        "responses": { "201": { "$ref": "#/components/responses/UploadStarted" }, "400": { "description": "The package metadata or signature is invalid." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "Another upload is active." } }
+      }
+    },
+    "/api/ota/chunk": {
+      "post": {
+        "tags": ["Device"], "summary": "Upload the next firmware chunk",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }, { "$ref": "#/components/parameters/UploadOffset" }],
+        "requestBody": { "required": true, "content": { "text/plain": { "schema": { "type": "string", "contentEncoding": "base64", "minLength": 4, "maxLength": 10924 } } } },
+        "responses": { "200": { "$ref": "#/components/responses/UploadChunk" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "The session or offset is invalid." } }
+      }
+    },
+    "/api/ota/finish": {
+      "post": {
+        "tags": ["Device"], "summary": "Validate and activate the uploaded firmware",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }],
+        "responses": { "202": { "$ref": "#/components/responses/JobAccepted" }, "400": { "description": "The firmware hash or image validation failed." }, "401": { "$ref": "#/components/responses/Unauthorized" } }
       }
     }
   },
@@ -370,6 +405,11 @@
         "type": "http",
         "scheme": "basic"
       }
+    },
+    "parameters": {
+      "CsrfToken": { "name": "X-CSRF-Token", "in": "header", "required": true, "schema": { "type": "string" }, "description": "The token from GET /api/config. Required for state-changing requests." },
+      "UploadId": { "name": "id", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 1 } },
+      "UploadOffset": { "name": "offset", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0 } }
     },
     "responses": {
       "ManagementPage": {
@@ -428,7 +468,10 @@
             }
           }
         }
-      }
+      },
+      "UploadStarted": { "description": "The upload session started. The response contains uploadId, chunkSize, and nextOffset.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+      "UploadChunk": { "description": "The chunk was accepted. The response contains nextOffset.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+      "JobAccepted": { "description": "The bounded background job was accepted. The response contains jobId.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } }
     },
     "schemas": {
       "ActionResult": {
@@ -474,7 +517,43 @@
               "ACTION_MODEM_HARD_RESTARTING",
               "ACTION_MODEM_OK",
               "ACTION_MODEM_FAILED",
-              "ACTION_WIFI_RESTARTING"
+              "ACTION_WIFI_RESTARTING",
+              "ACTION_CSRF_INVALID",
+              "ACTION_JOB_ACCEPTED",
+              "ACTION_JOB_NOT_FOUND",
+			  "ACTION_CONFIG_EXPORT_READY",
+              "ACTION_CONFIG_RESTORED",
+              "ACTION_OTA_UPLOAD_STARTED",
+              "ACTION_OTA_CHUNK_OK",
+			  "ACTION_OTA_READY",
+			  "ACTION_AUTH_THROTTLED",
+			  "ACTION_BUSY",
+			  "ACTION_CONFIG_EXPORT_FAILED",
+			  "ACTION_CONFIG_EXPORT_NOT_FOUND",
+			  "ACTION_CONFIG_INVALID",
+			  "ACTION_CONFIG_PASSPHRASE_INVALID",
+			  "ACTION_CONFIG_RESTORE_CHUNK_INVALID",
+			  "ACTION_CONFIG_RESTORE_CHUNK_OK",
+			  "ACTION_CONFIG_RESTORE_FAILED",
+			  "ACTION_CONFIG_RESTORE_FINISH_INVALID",
+			  "ACTION_CONFIG_RESTORE_INVALID",
+			  "ACTION_CONFIG_RESTORE_SAVE_FAILED",
+			  "ACTION_CONFIG_RESTORE_STARTED",
+			  "ACTION_CONFIG_RESTORE_START_FAILED",
+			  "ACTION_JOB_FAILED",
+			  "ACTION_JOB_QUEUE_FULL",
+			  "ACTION_JSON_FAILED",
+			  "ACTION_OTA_BEGIN_FAILED",
+			  "ACTION_OTA_BUSY",
+			  "ACTION_OTA_CHUNK_INVALID",
+			  "ACTION_OTA_FINALIZE_FAILED",
+			  "ACTION_OTA_HASH_INVALID",
+			  "ACTION_OTA_MANIFEST_INVALID",
+			  "ACTION_OTA_METADATA_FAILED",
+			  "ACTION_OTA_SESSION_INVALID",
+			  "ACTION_OTA_SIGNATURE_INVALID",
+			  "ACTION_OTA_WRITE_FAILED",
+			  "ACTION_TOO_MANY_FIELDS"
             ]
           },
           "data": { "$ref": "#/components/schemas/ActionData" },
@@ -520,6 +599,22 @@
           "rssi": { "type": "integer" },
           "ber": { "type": "integer" },
           "imei": { "type": "string" }
+		  ,"jobId": { "type": "integer" },
+		  "uploadId": { "type": "integer" },
+		  "exportId": { "type": "integer" },
+		  "chunkSize": { "type": "integer", "maximum": 8192 },
+		  "nextOffset": { "type": "integer" }
+        }
+      },
+      "Job": {
+        "type": "object",
+        "required": ["id", "type", "state"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "type": { "type": "string" },
+          "state": { "type": "string", "enum": ["queued", "running", "succeeded", "failed"] },
+          "result": { "$ref": "#/components/schemas/ActionResult" }
         }
       },
       "WebAccount": {
@@ -533,7 +628,7 @@
       },
       "PushChannel": {
         "type": "object",
-        "required": ["enabled", "type", "name", "url", "key1", "key2", "customBody"],
+		"required": ["enabled", "type", "name", "url", "key1", "key2", "customBody", "titleTemplate", "bodyTemplate"],
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean" },
@@ -542,14 +637,17 @@
           "url": { "type": "string" },
           "key1": { "type": "string" },
           "key2": { "type": "string" },
-          "customBody": { "type": "string" }
+		  "customBody": { "type": "string" },
+		  "titleTemplate": { "type": "string" },
+		  "bodyTemplate": { "type": "string" }
         }
       },
       "DeviceSnapshot": {
         "type": "object",
-        "required": ["status", "config"],
+		"required": ["csrfToken", "status", "config"],
         "additionalProperties": false,
         "properties": {
+		  "csrfToken": { "type": "string" },
           "status": {
             "type": "object",
             "required": ["ip", "wifiSsid", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels"],
@@ -566,9 +664,12 @@
           },
           "config": {
             "type": "object",
-            "required": ["webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "pushChannels"],
+			"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "pushChannels"],
             "additionalProperties": false,
             "properties": {
+			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
+			  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
+			  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"] },
               "webAccounts": {
                 "type": "array",
                 "minItems": 10,
@@ -597,6 +698,9 @@
         "minProperties": 1,
         "additionalProperties": false,
         "properties": {
+		  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
+		  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
+		  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"], "x-maxUtf8Bytes": 16 },
           "smtpServer": { "type": "string", "x-maxUtf8Bytes": 253 },
           "smtpPort": { "type": "integer", "minimum": 0, "maximum": 65535, "x-maxUtf8Bytes": 32 },
           "smtpUser": { "type": "string", "x-maxUtf8Bytes": 254 },
@@ -613,7 +717,9 @@
           "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
           "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512 },
           "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256 },
-          "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048 }
+		  "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048 },
+		  "^push[0-4]title$": { "type": "string", "x-maxUtf8Bytes": 256 },
+		  "^push[0-4]template$": { "type": "string", "x-maxUtf8Bytes": 2048 }
         }
       }
     }

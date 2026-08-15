@@ -2,11 +2,10 @@
 
 ## 執行模型
 
-韌體使用標準 Arduino 單執行緒事件迴圈。HTTP、UART、長簡訊逾時、SMTP
-與推送沒有獨立工作執行緒；任何阻塞操作都會推遲其他工作。`modem.cpp` 的
-同步 dispatcher 是 `Serial1` 唯一 reader；一次只執行一個 transaction，並在
-等待期間分流完整 URC。等待迴圈不可遞迴呼叫 `server.handleClient()`，以免
-覆寫 WebServer 的目前 request 狀態。
+韌體以 Arduino `loop()` 處理 UART、長簡訊逾時與有界工作佇列。HTTP 在獨立
+FreeRTOS task 執行，但所有 `WebServer` 存取仍由該 task 串行處理。設定加密在
+獨立 crypto task 執行，避免 PBKDF2 阻塞 UART。`modem.cpp` 的同步 dispatcher
+仍是 `Serial1` 唯一 reader；一次只執行一個 transaction，並分流完整 URC。
 
 核心全域服務由 `globals.cpp` 建立：`WebServer(80)`、NVS `Preferences`、
 `PDU(4096)`、`WiFiClientSecure` 與 `SMTPClient`。
@@ -21,7 +20,7 @@
    `configValid`。兩槽皆壞或 NVS 開啟失敗時管理 HTTP 不啟動，必須用 USB
    重刷或復原。
 4. 連接 WiFi；20 秒未連上就重新啟動 ESP32。
-5. 掛載 LittleFS；只有設定儲存載入成功才註冊並啟動 HTTP server。
+5. 從 firmware 內嵌 gzip bundle 提供管理頁，註冊 HTTP route 與 CSRF header。
 6. 嘗試 NTP 同步，然後將 SMTP 使用的 TLS client 設為不驗證憑證。
 7. 設定有效時寄出啟動通知。
 8. 執行 `modemInit()`：AT 握手、讀取型號、停用 PDP、設定簡訊 URC 與
@@ -35,7 +34,7 @@ AT 握手、`CNMI`、`CMGF` 與網路註冊都使用有限重試；失敗後保�
 
 `loop()` 每輪依序：
 
-1. 處理一輪 HTTP client。
+1. 執行一個有界 Web job，並處理 OTA 與設定傳輸逾時。
 2. 設定無效時，每秒輸出管理頁位址提示。
 3. 轉發超過 30 秒仍不完整的長簡訊。
 4. 由 modem dispatcher 讀取並處理模組 UART。
@@ -83,6 +82,11 @@ Web 帳密、管理員號碼和黑名單不影響 `configValid`。舊版單一�
 任何 NVS 欄位變更都必須同時處理：型別、load、save、舊設備預設值、Web
 表單，以及必要的相容遷移。
 
+`dev_doc/config-schema/manifest.json` 與版本化 JSON Schema 是設定格式的唯一
+手寫來源。Generator 產生 firmware 常數與 Web limits。CI 會拒絕生成結果漂移。
+備份檔以 PBKDF2-SHA256 與 AES-256-GCM 加密；還原會保留目標機的裝置名稱、
+Hostname 與 Web 帳號。未知的新 schema 會被拒絕，不修改目前設定。
+
 ## 推送 provider
 
 裝置最多啟用五個通道；provider enum 共十種：
@@ -118,22 +122,26 @@ Machine-readable contract 位於 [`openapi.json`](openapi.json)。Route 或 payl
 `detail`。前端依 `code` 顯示本地化狀態，並直接呈現 `data` 欄位；只有無法
 安全解析的失敗回應才放入 `detail`，不應再從顯示字串反向解析資料。
 
-管理頁原始碼在 `web/`。SvelteKit static build 把 JavaScript 與 CSS 全部 inline
-進單一 HTML，再以 deterministic gzip 產生 `code/data/index.html.gz`。韌體不把
-頁面編入 app partition，而是從 LittleFS 串流檔案；瀏覽器載入後透過 JSON
-route 讀取狀態與執行操作。密碼內容不會由設定 API 回傳。
+管理頁原始碼在 `web/`。SvelteKit static build 把 JavaScript 與 CSS inline
+進單一 HTML，再以 deterministic gzip 產生 `code/web_bundle.h`。管理頁與
+firmware 使用同一個 OTA image。瀏覽器透過 JSON route 讀取狀態與執行操作。
+密碼內容不會由設定 API 回傳。
 
 | Method | Route | 用途與副作用 |
 |---|---|---|
-| GET | `/`、`/tools`、`/sms` | 從 LittleFS 串流 gzip 管理頁 |
-| GET | `/api/config` | 回傳裝置狀態與不含密碼內容的設定 JSON |
+| GET | `/`、`/tools`、`/sms` | 從 firmware 串流 gzip 管理頁 |
+| GET | `/api/config` | 回傳狀態、CSRF token 與不含密碼內容的設定 |
+| POST/GET | `/api/config/export` | 建立並下載加密 `.smscfg` |
+| POST | `/api/config/restore/start|chunk|finish` | 以不超過 8 KiB 區塊還原設定 |
+| GET | `/api/jobs?id=...` | 查詢 queued、running 或完成結果 |
+| POST | `/api/ota/start|chunk|finish` | 上傳並驗證已簽署 `.smsota` |
 | POST | `/save` | 寫入 NVS、回傳 JSON；設定有效時寄通知信 |
 | POST | `/sendsms` | 由模組發送簡訊並回傳 JSON |
 | POST | `/ping` | 暫時啟用 PDP、Ping 8.8.8.8、再停用 PDP |
 | GET | `/query?type=...` | 查 `ati`、`signal`、`siminfo`、`network`、`wifi` |
 | GET | `/flight?action=...` | 查詢或變更 `CFUN` |
 | GET | `/at?cmd=...` | bounded、單行 expert AT；不支援 prompt/data mode |
-| GET | `/log` | 回傳最多 120 行裝置日誌 |
+| GET | `/log?cursor=...&limit=...` | 依遞增 entry id 分頁讀取日誌 |
 | GET | `/modem?action=...` | 重啟模組或查信號、營運商、IMEI |
 | GET | `/wifi?action=restart` | 重新連接 WiFi |
 
@@ -145,6 +153,12 @@ patched WebServer 在配置 body/auth handler 之前限制 request line 2 KiB、
 合計 8 KiB、body 16 KiB，超限分別回 414、431、413 並關閉連線。欄位另外
 以 UTF-8 bytes 驗證；超限回 `ACTION_INPUT_TOO_LONG`，不截斷。推送頁每次只
 送目前通道，避免同時提交五個大型 custom body。
+
+所有修改狀態的 request 都必須帶 `/api/config` 取得的 `X-CSRF-Token`。大型
+設定與 OTA 檔案使用單一 120 秒 upload session；每個 raw 區塊上限為 8 KiB，
+HTTP body 以 Base64 傳輸，避免同步 WebServer 截斷二進位 NUL。Web job
+同時最多三個 queued 或 running 項目。OTA package 以內建 P-256 public key
+驗證 manifest，完成後由 bootloader 的 pending-verify 狀態決定確認或 rollback。
 
 ## 重要限制與敏感資料
 

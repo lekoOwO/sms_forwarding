@@ -8,6 +8,8 @@ export type PushChannel = {
 	key1: string;
 	key2: string;
 	customBody: string;
+	titleTemplate: string;
+	bodyTemplate: string;
 };
 
 export type WebAccount = {
@@ -16,6 +18,7 @@ export type WebAccount = {
 };
 
 export type DeviceSnapshot = {
+	csrfToken: string;
 	status: {
 		ip: string;
 		wifiSsid: string;
@@ -26,6 +29,9 @@ export type DeviceSnapshot = {
 		enabledPushChannels: number;
 	};
 	config: {
+		deviceName: string;
+		hostname: string;
+		notificationLocale: Locale;
 		webAccounts: WebAccount[];
 		smtpServer: string;
 		smtpPort: number;
@@ -36,6 +42,21 @@ export type DeviceSnapshot = {
 		numberBlackList: string;
 		pushChannels: PushChannel[];
 	};
+};
+
+export type LogEntry = { id: number; message: string };
+
+export type LogPage = {
+	entries: LogEntry[];
+	nextCursor: number | null;
+	hasMore: boolean;
+};
+
+export type Job = {
+	id: number;
+	type: string;
+	state: "queued" | "running" | "succeeded" | "failed";
+	result?: ActionResult;
 };
 
 export type ActionResult = {

@@ -174,9 +174,13 @@ void processSmsContent(const char* sender, const char* text, const char* timesta
   // Push the notification to all enabled channels.
   sendSMSToServer(sender, text, timestamp);
   // Send the notification by email.
-  String subject = ""; subject+="SMS from ";subject+=sender;subject+=": ";subject+=text;
-  String body = ""; body+="From: ";body+=sender;body+=", Time: ";body+=timestamp;body+=", Message: ";body+=text;
-  sendEmailNotification(subject.c_str(), body.c_str());
+  String subject;
+  String body;
+  if (buildDefaultSmsNotification(sender, text, timestamp, subject, body)) {
+    sendEmailNotification(subject.c_str(), body.c_str());
+  } else {
+    logCaptureLn("Email notification template is invalid or too long; skipping delivery");
+  }
 }
 
 static enum { CMT_IDLE, CMT_WAIT_PDU } cmtState = CMT_IDLE;

@@ -33,7 +33,9 @@ class ApiContractTest(unittest.TestCase):
         for operations in spec["paths"].values():
             for method, operation in operations.items():
                 if method in {"get", "post"}:
-                    self.assertIn("200", operation["responses"])
+                    self.assertTrue(
+                        {"200", "201", "202"} & operation["responses"].keys()
+                    )
                     self.assertIn("401", operation["responses"])
 
     def test_mock_and_development_entrypoint_exist(self):
@@ -69,6 +71,14 @@ class ApiContractTest(unittest.TestCase):
             "/log",
             "/modem",
             "/wifi",
+            "/api/config/export",
+            "/api/config/restore/start",
+            "/api/config/restore/chunk",
+            "/api/config/restore/finish",
+            "/api/jobs",
+            "/api/ota/start",
+            "/api/ota/chunk",
+            "/api/ota/finish",
         }
         for path in frontend:
             self.assertIn(path, spec["paths"])

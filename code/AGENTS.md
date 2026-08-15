@@ -25,10 +25,13 @@ existing owner already fits.
 
 ## Runtime invariants
 
-- This is a single-threaded Arduino loop. Long waits delay HTTP handling and
-  multipart timeout checks. `modem.cpp` is the only `Serial1` reader and must
-  keep routing URCs while a transaction waits. Do not recursively call
-  `server.handleClient()` from a request handler or modem wait.
+- The management `WebServer` runs in its dedicated FreeRTOS task. Handlers put
+  blocking work into the bounded job queue; the Arduino loop is the only job
+  dispatcher and the only `Serial1` owner. Config backup cryptography uses one
+  bounded crypto task. Protect config, logs, jobs, OTA, and backup transfer
+  state with their existing mutexes, and never hold a mutex while sending an
+  HTTP response. Do not recursively call `server.handleClient()` from a request
+  handler, job, or modem wait.
 - Keep `Serial1.begin(115200, SERIAL_8N1, RXD, TXD)` aligned with GPIO 4 RX and
   GPIO 3 TX. `MODEM_EN_PIN` is GPIO 5.
 - Preserve the versioned config codec and legacy migration. Adding a persisted
@@ -66,7 +69,7 @@ patterns already present.
   behavior. Prefer a small host-side pure-logic check when hardware is not
   required.
 - Keep using the same Compose container: `docker compose up -d dev`, then
-  `docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code`.
+  `docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs ./code`.
   Do not use throwaway `docker compose run --rm` builds.
 - Modem, UART, PDU, SMS, network registration, and flash behavior are not proven
   by compilation. Run the relevant hardware check and record board, modem,

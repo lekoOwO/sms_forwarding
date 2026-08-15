@@ -28,7 +28,7 @@ content is an independent object that needs its own container.
 Run in the persistent container:
 
 ```sh
-docker compose exec dev sh -lc 'cd web && npm run check && npm run filesystem'
+docker compose exec dev sh -lc 'cd web && npm run check && npm run build'
 python3 -m unittest tests/test_web_bundle.py
 ```
 

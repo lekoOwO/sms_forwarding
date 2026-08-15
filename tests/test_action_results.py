@@ -17,7 +17,16 @@ class ActionResultsTest(unittest.TestCase):
         documented = set(schema["properties"]["code"]["enum"])
 
         pattern = r'"(ACTION_[A-Z0-9_]+)"'
-        firmware = set(re.findall(pattern, (ROOT / "code/web_handlers.cpp").read_text()))
+        # Every ActionResult producer participates in the public contract.
+        runtime_sources = "\n".join(
+            (ROOT / path).read_text()
+            for path in (
+                "code/web_handlers.cpp",
+                "code/config_backup.cpp",
+                "code/ota_update.cpp",
+            )
+        )
+        firmware = set(re.findall(pattern, runtime_sources))
         mock = set(re.findall(pattern, (ROOT / "mock_server/server.mjs").read_text()))
         self.assertEqual(firmware, documented)
         self.assertEqual(mock, documented)
@@ -34,15 +43,19 @@ class ActionResultsTest(unittest.TestCase):
             "imsi", "iccid", "msisdn", "registration", "operator", "pdpActive",
             "apn", "wifiStatus", "ssid", "rssiDbm", "ip", "gateway", "netmask",
             "dns", "mac", "bssid", "channel", "mode", "raw", "latencyMs", "ttl",
-            "signalDbm", "rssi", "ber", "imei",
+            "signalDbm", "rssi", "ber", "imei", "jobId", "uploadId", "exportId",
+            "chunkSize", "nextOffset",
         })
 
-        firmware = (ROOT / "code/web_handlers.cpp").read_text()
+        firmware = "\n".join(
+            (ROOT / path).read_text()
+            for path in ("code/web_handlers.cpp", "code/config_backup.cpp", "code/ota_update.cpp")
+        )
         self.assertIn('setStringOrNull(dataObject, "manufacturer", manufacturer)', firmware)
         mock = (ROOT / "mock_server/server.mjs").read_text()
         for field in fields:
             self.assertIn(f'"{field}"', firmware, field)
-            self.assertRegex(mock, rf"\b{field}\s*:", field)
+            self.assertRegex(mock, rf"\b{field}\b", field)
 
         component = (ROOT / "web/src/lib/components/ActionResult.svelte").read_text()
         self.assertIn("Object.entries(result.data)", component)

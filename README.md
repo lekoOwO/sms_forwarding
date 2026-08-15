@@ -1,120 +1,57 @@
-# 低成本短信转发器
+# 低成本簡訊轉發器
 
-> 当前分支为新方案，2022年的老方案请前往[luatos分支](https://github.com/chenxuuu/sms_forwarding/tree/old-luatos)。  
-本项目**仅用于接收短信**与进行保号相关功能。  
-多卡控制、通话、拨号、开放接口、自动化等功能，永远不会考虑支持，请勿提出相关需求。
+[繁體中文](README.md) | [简体中文](README.zh-CN.md) | [English](README.en.md)
 
-[后台页面演示](https://sms.j2.cx/)
+使用 ESP32-C3 與 ML307 系列 4G 模組接收簡訊，並自動轉寄到電子郵件或推送服務。
 
-本项目旨在使用低成本的硬件设备，实现短信的自动转发功能，支持多种推送方式同时启用。
+[管理頁 Demo](https://lekoowo.github.io/sms_forwarding/) · [影片教學](https://www.bilibili.com/video/BV1cSmABYEiX) · [舊版 LuatOS 分支](https://github.com/chenxuuu/sms_forwarding/tree/old-luatos)
 
-> 视频教程：[B站视频](https://www.bilibili.com/video/BV1cSmABYEiX)
+> Demo 不會連接真實裝置，且停用備份、還原與 OTA 操作。
 
-<img src="assets/photo.png" width="200" />
+<img src="assets/photo.png" width="200" alt="ESP32-C3 與 ML307R-DC 簡訊轉發器" />
 
-## 功能
+## 主要功能
 
-- 支持使用通用AT指令与模块进行通信
-- 开启后支持通过WEB界面配置短信转发参数、查询当前状态
-- **支持多达5个推送通道同时启用**，每个通道可独立配置
-- 支持将收到的短信转发到指定的邮箱
-- 支持通过WEB界面主动发送短信，以便消耗余额
-- 支持通过WEB界面进行Ping测试，以极低的成本消耗余额
-- 支持长短信自动合并（30秒超时）
-- 收到的短信只用于通知转发，不执行短信中的远程控制命令
+- 透過 Web 管理頁設定及查看裝置狀態，支援繁中、簡中與英文。
+- 將簡訊轉寄到電子郵件，或同時啟用最多五個推送通道。
+- 每個推送通道可設定獨立名稱、標題模板與內文模板。
+- 支援長簡訊合併、黑名單、Web 傳送簡訊及網路診斷。
+- 可設定裝置名稱與 hostname，方便管理多台裝置。
+- 可匯出加密設定備份，並還原到另一台裝置。
+- 可從管理頁安裝已簽章的 OTA 更新，並在啟動失敗時回復舊版。
+- 日誌只保留在 RAM 並採分頁載入，不會磨耗 flash。
 
-## 推送通道支持
+裝置只將收到的簡訊用於通知轉寄，不會執行簡訊中的遠端控制指令。
 
-支持以下7种推送方式，可同时启用多个通道：
+## 推送服務
 
-| 推送方式 | 说明 | 需要配置 |
-|---------|------|---------|
-| **POST JSON** | 通用HTTP POST | URL |
-| **Bark** | iOS推送服务 | Bark服务器URL |
-| **GET请求** | URL参数方式 | URL |
-| **钉钉机器人** | 企业群通知 | Webhook URL，可选Secret加签 |
-| **PushPlus** | 微信公众号推送 | Token |
-| **Server酱** | 微信推送服务 | SendKey |
-| **自定义模板** | 灵活的JSON模板 | URL + 请求体模板 |
-| **飞书机器人** | 自定义通知 | Webhook URL |
+支援 POST JSON、Bark、GET、DingTalk、PushPlus、ServerChan、Custom JSON、Feishu、Gotify 與 Telegram。
 
-### 推送格式说明
+一般服務可使用 `{device}`、`{sender}`、`{message}` 與 `{timestamp}` 自訂標題或內文。Custom JSON 可自訂完整 request body。
 
-- **POST JSON**: `{"sender":"发送者号码","message":"短信内容","timestamp":"时间戳"}`
-- **Bark**: `{"title":"发送者号码","body":"短信内容"}`
-- **GET请求**: `URL?sender=xxx&message=xxx&timestamp=xxx`（自动URL编码；号码和内容会出现在 URL 与中间设备日志中，只应连接可信端点）
-- **钉钉机器人**: 文本消息格式，支持加签验证
-- **PushPlus**: 使用Token推送，支持HTML格式
-- **Server酱**: 使用SendKey推送，支持Markdown格式
-- **自定义模板**: 使用`{sender}`、`{message}`、`{timestamp}`占位符。占位符只适合放在 JSON 字符串值中；模板结构与其他转义由管理员负责
-- **飞书机器人**: 文本消息格式，支持加签验证
+| 狀態資訊 | 主動 Ping |
+|---|---|
+| ![](assets/status.png) | ![](assets/ping.png) |
 
-|状态信息|主动ping|
-|-|-|
-|![](assets/status.png)|![](assets/ping.png)|
+## 硬體與接線
 
-## 硬件搭配
+已驗證的組合為 ESP32-C3 Super Mini 與 ML307R-DC。裝置需要 4 MB flash、Nano SIM，以及適合當地電信網路的天線。
 
-若没有焊接能力，希望直接使用成品，可选直接购以下套件（我看过了，和自己做的成本一样）  
-支持**移动/联通/电信卡**：
+| ESP32-C3 | ML307R-DC |
+|---|---|
+| GPIO 3 (TX) | RX |
+| GPIO 4 (RX) | TX |
+| GPIO 5 | EN |
+| GND | GND |
+| 5V | VCC (5V) |
 
-- [小蓝鲸WIFI短信宝](https://item.taobao.com/item.htm?id=1003711355912)（找客服问）
-- [4G FPC天线](https://item.taobao.com/item.htm?id=1003711355912&skuId=6162872574943)，与开发板同购
+## 使用提醒
 
-如果希望自行焊接硬件，参考下面的硬件搭配，总成本约¥27.8（会有浮动，可按实际自行组合搭配）  
-仅支持**移动/联通卡**：
+- 第一次從舊版分區升級時，請先備份設定，再透過 USB 完整清除並重刷。
+- 預設管理帳號為 `admin`，密碼為 `admin123`。首次登入後請立即修改密碼。
+- 管理頁使用明文 HTTP，僅適合受信任的區域網路。請勿直接公開到 Internet。
+- 設定備份可能包含通知服務的 secret。請妥善保存備份檔與 passphrase。
 
-- ESP32C3开发板，实测选用[ESP32C3 Super Mini](https://item.taobao.com/item.htm?id=852057780489&skuId=5813710390565)，¥9.5包邮
-- ML307R-DC开发板，实测选用[小蓝鲸ML307R-DC核心板](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥16.3包邮
-- [4G FPC天线](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥2，与核心板同购
+## 開發文件
 
-
-## 硬件连接
-
-ESP32C3 与 ML307R-DC 通过串口（UART）连接，接线如下：
-
-```
-┌───────────────────────────────────────────────┐
-|                                               |
-|   ESP32C3 Super Mini      ML307R-DC核心板     |
-| ┌───────────────────┐    ┌─────────────────┐ |
-└─┼─ GPIO5 (MODEM_EN) │    │                 │ |
-  │       GPIO3 (TX) ─┼───►│ RX              │ |
-  │                   │    │             EN ─┼─┘
-  │       GPIO4 (RX) ◄┼────┤ TX              │ 
-  │                   │    │                 │ 
-  │              GND ─┼────┤ GND             │ 
-  │                   │    │                 │ 
-  │               5V ─┼────┤ VCC (5V)        |
-  │                   │    │                 │
-  └───────────────────┘    └─────────────────┘
-                           │                 │
-                           │  SIM卡槽        │
-                           │  (插入Nano SIM) │
-                           │                 │
-                           │  天线接口       │
-                           │  (连接4G天线)   │
-                           └─────────────────┘
-```
-
-可通过USB连接ESP32C3进行编程和供电，正常工作时，可通过网页与模组进行AT通信，方便调试。
-
-## 软件组成
-
-- ESP32C3运行自己的`Arduino`固件，负责连接WiFi和接收ML307R-DC发送过来的短信数据，然后转发到指定HTTP接口或邮箱
-- ML307R-DC运行默认的AT固件，不用动
-
-`pdulib 0.5.11` 已随源码固定在 `code/src/pdulib/`，不应再安装另一份。需要在
-`Arduino IDE`中单独安装：
-
-- **ReadyMail** by Mobizt
-- **ArduinoJson 7.4.3** by Benoit Blanchon
-
-需要在`Arduino IDE`中安装ESP32开发板支持，参考[官方文档](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)，版型选`MakerGO ESP32 C3 SuperMini`。
-
-当前固件使用项目自带的 4 MB、无 OTA 分区表。第一次从旧分区升级必须通过
-USB 完整擦除后重刷固件与 LittleFS；设备不支持远端 OTA 回滚。
-
-## 开发文档
-
-开发环境、架构、验证方式与维护约定统一放在 [dev_doc/](dev_doc/README.md)。
+建置、燒錄、OTA 發佈、設定格式、API、架構與驗證流程請見 [`dev_doc/`](dev_doc/README.md)。

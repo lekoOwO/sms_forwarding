@@ -16,8 +16,9 @@ class RequestedFeaturesTest(unittest.TestCase):
 
     def test_firmware_supports_ten_accounts_and_multipart_sms(self):
         types = (ROOT / "code/config_types.h").read_text()
+        generated = (ROOT / "code/config_schema_generated.h").read_text()
         modem = (ROOT / "code/modem.cpp").read_text()
-        self.assertIn("#define MAX_WEB_ACCOUNTS 10", types)
+        self.assertIn("#define MAX_WEB_ACCOUNTS 10", generated)
         self.assertIn("WebAccount webAccounts[MAX_WEB_ACCOUNTS]", types)
         self.assertIn("encodePDU(phoneNumber, part.c_str(), reference", modem)
 

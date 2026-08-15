@@ -26,10 +26,13 @@
 | `code/sms_process*` | URC/PDU 接收、長簡訊、黑名單、管理員命令 |
 | `code/push*` | SMTP 與十種推送 provider |
 | `code/web_handlers*` | Basic Auth、HTTP handler、日誌環形緩衝 |
+| `code/config_backup*` | 加密設定備份、還原與可攜式合併 |
+| `code/ota_update*` | 已簽署 OTA 上傳、驗證與 rollback 狀態 |
 | `web/` | shadcn-svelte 管理頁、三語字典、單檔 bundle builder |
 | `mock_server/` | Express Mock Server、API 與瀏覽器驗證 |
 | `scripts/dev.sh` | 前端、韌體與 Mock Server 的統一操作入口 |
-| `code/data/index.html.gz` | Web production build，由 LittleFS 提供 |
+| `code/web_bundle.h` | Web production build，gzip 後編入 firmware |
+| `dev_doc/config-schema/` | 版本化設定 schema 與 binary codec 唯一來源 |
 | `Dockerfile`、`compose.yaml` | 固定版本的 Alpine 開發環境 |
 | `.github/workflows/build.yml` | CI 的 Arduino CLI 編譯基線 |
 

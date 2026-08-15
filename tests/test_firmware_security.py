@@ -11,6 +11,8 @@ class FirmwareSecurityTest(unittest.TestCase):
     def test_firmware_sources_use_english_text(self):
         for suffix in ("*.ino", "*.cpp", "*.h"):
             for path in (ROOT / "code").rglob(suffix):
+                if path.name == "notification_locale.cpp":
+                    continue
                 text = path.read_text()
                 self.assertNotRegex(text, r"[\u3400-\u9fff]", str(path))
 
@@ -120,12 +122,13 @@ int main() {
     def test_management_responses_apply_small_security_headers(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
         self.assertIn('server.sendHeader("Content-Security-Policy", "frame-ancestors \'none\'")', handlers)
-        self.assertNotIn('server.sendHeader("Content-Encoding", "gzip")', handlers)
+        self.assertIn('server.sendHeader("Content-Encoding", "gzip")', handlers)
         self.assertGreaterEqual(handlers.count('server.sendHeader("Cache-Control", "no-store")'), 3)
         self.assertIn("static void sendJson(", handlers)
         self.assertIn("static void sendJsonFailure()", handlers)
         self.assertIn("if (rejectModemBusy()) return;", handlers)
-        self.assertNotIn("server.handleClient()", handlers)
+        self.assertEqual(1, handlers.count("server.handleClient()"))
+        self.assertIn("static void httpTask", handlers)
 
     def test_wifi_restart_allows_response_to_leave_before_disconnect(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()

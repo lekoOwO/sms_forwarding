@@ -15,6 +15,10 @@ test("the production UI works with the mock API", async () => {
 
 	try {
 		const page = await browser.newPage();
+		page.setDefaultTimeout(60_000);
+		const browserErrors = [];
+		page.on("pageerror", (error) => browserErrors.push(error.message));
+		page.on("requestfailed", (request) => browserErrors.push(`${request.url()}: ${request.failure()?.errorText ?? "request failed"}`));
 		const baseUrl = `http://127.0.0.1:${server.address().port}`;
 		const html = await readFile(process.env.WEB_ROOT + "/index.html", "utf8");
 		await page.setRequestInterception(true);
@@ -27,7 +31,10 @@ test("the production UI works with the mock API", async () => {
 				}
 				const upstream = await fetch(`${baseUrl}${url.pathname}${url.search}`, {
 					method: request.method(),
-					headers: { "content-type": request.headers()["content-type"] ?? "application/json" },
+					headers: {
+						"content-type": request.headers()["content-type"] ?? "application/json",
+						"x-csrf-token": request.headers()["x-csrf-token"] ?? ""
+					},
 					body: request.postData()
 				});
 				await request.respond({
@@ -39,8 +46,12 @@ test("the production UI works with the mock API", async () => {
 				await request.abort();
 			}
 		})());
-		await page.goto("http://sms-forwarding.test/", { waitUntil: "domcontentloaded" });
-		await page.waitForSelector("h1");
+		await page.goto("http://sms-forwarding.test/", { waitUntil: "domcontentloaded", timeout: 90_000 });
+		try {
+			await page.waitForSelector("h1");
+		} catch (error) {
+			throw new Error(`${error.message}; browser errors: ${browserErrors.join(" | ") || "none"}`);
+		}
 		assert.equal(await page.$eval("h1", (node) => node.textContent), "Device overview");
 		assert.equal(await page.$$eval("table", (nodes) => nodes.length), 0);
 		assert.ok(await page.$$eval("dl", (nodes) => nodes.length) >= 2);

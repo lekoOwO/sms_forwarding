@@ -1,6 +1,7 @@
 #include "push.h"
 #include "web_handlers.h"
 #include "config.h"
+#include "notification_locale.h"
 #include "utf8_validation.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
@@ -69,6 +70,71 @@ static bool serializeJsonStringContent(const String& value, String& output) {
   output.remove(output.length() - 1);
   output.remove(0, 1);
   return true;
+}
+
+static bool renderTemplate(const String& source, const String& sender, const String& message,
+                           const String& timestamp, const String& device, size_t maxBytes,
+                           bool title, String& output) {
+  output = "";
+  size_t estimate = source.length() + sender.length() + message.length() +
+                    timestamp.length() + device.length();
+  if (!output.reserve(static_cast<unsigned int>(min(maxBytes, estimate)))) return false;
+  for (size_t i = 0; i < source.length();) {
+    const String* replacement = nullptr;
+    size_t placeholderLength = 0;
+    if (source.startsWith("{sender}", i)) {
+      replacement = &sender;
+      placeholderLength = 8;
+    } else if (source.startsWith("{message}", i)) {
+      replacement = &message;
+      placeholderLength = 9;
+    } else if (source.startsWith("{timestamp}", i)) {
+      replacement = &timestamp;
+      placeholderLength = 11;
+    } else if (source.startsWith("{device}", i)) {
+      replacement = &device;
+      placeholderLength = 8;
+    }
+    if (replacement) {
+      if (replacement->length() > maxBytes - output.length()) return false;
+      if (!output.concat(*replacement)) return false;
+      i += placeholderLength;
+    } else {
+      if (output.length() == maxBytes) return false;
+      if (!output.concat(source[i++])) return false;
+    }
+  }
+  return isValidUtf8(output.c_str()) &&
+         (!title || (output.indexOf('\r') < 0 && output.indexOf('\n') < 0));
+}
+
+static bool renderTypedNotification(const PushChannel& channel, const String& sender,
+                                    const String& message, const String& timestamp,
+                                    String& title, String& body) {
+  String defaultTitle;
+  String defaultBody;
+  getDefaultSmsTemplates(config.notificationLocale, defaultTitle, defaultBody);
+  const String& titleSource = channel.titleTemplate.length() > 0 ? channel.titleTemplate : defaultTitle;
+  const String& bodySource = channel.bodyTemplate.length() > 0 ? channel.bodyTemplate : defaultBody;
+  if (!renderTemplate(titleSource, sender, message, timestamp, config.deviceName,
+                      MAX_RENDERED_TITLE_BYTES, true, title) ||
+      !renderTemplate(bodySource, sender, message, timestamp, config.deviceName,
+                      MAX_RENDERED_BODY_BYTES, false, body)) {
+    logCaptureLn("Rendered push template is invalid or too long; skipping delivery");
+    return false;
+  }
+  return true;
+}
+
+bool buildDefaultSmsNotification(const char* sender, const char* message, const char* timestamp,
+                                 String& title, String& body) {
+  String titleTemplate;
+  String bodyTemplate;
+  getDefaultSmsTemplates(config.notificationLocale, titleTemplate, bodyTemplate);
+  return renderTemplate(titleTemplate, String(sender), String(message), String(timestamp),
+                        config.deviceName, MAX_RENDERED_TITLE_BYTES, true, title) &&
+         renderTemplate(bodyTemplate, String(sender), String(message), String(timestamp),
+                        config.deviceName, MAX_RENDERED_BODY_BYTES, false, body);
 }
 
 // Send an email notification
@@ -182,6 +248,11 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   const String senderValue(sender);
   const String messageValue(message);
   const String timestampValue(timestamp);
+  String notificationTitle;
+  String notificationBody;
+  if (channel.type != PUSH_TYPE_CUSTOM &&
+      !renderTypedNotification(channel, senderValue, messageValue, timestampValue,
+                               notificationTitle, notificationBody)) return;
   
   switch (channel.type) {
     case PUSH_TYPE_POST_JSON: {
@@ -190,6 +261,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["sender"] = senderValue;
       json["message"] = messageValue;
       json["timestamp"] = timestampValue;
+      json["title"] = notificationTitle;
+      json["body"] = notificationBody;
       if (!postJson(http, channel.url, json, httpCode)) return;
       break;
     }
@@ -197,8 +270,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
     case PUSH_TYPE_BARK: {
       // Bark push format
       JsonDocument json;
-      json["title"] = senderValue;
-      json["body"] = messageValue;
+      json["title"] = notificationTitle;
+      json["body"] = notificationBody;
       if (!postJson(http, channel.url, json, httpCode)) return;
       break;
     }
@@ -214,6 +287,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       getUrl += "sender=" + urlEncode(String(sender));
       getUrl += "&message=" + urlEncode(String(message));
       getUrl += "&timestamp=" + urlEncode(String(timestamp));
+      getUrl += "&title=" + urlEncode(notificationTitle);
+      getUrl += "&body=" + urlEncode(notificationBody);
       http.begin(getUrl);
       httpCode = http.GET();
       break;
@@ -246,8 +321,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       JsonDocument json;
       json["msgtype"] = "text";
       JsonObject text = json["text"].to<JsonObject>();
-      text["content"] = "📱 SMS notification\nSender: " + senderValue +
-                        "\nMessage: " + messageValue + "\nTime: " + timestampValue;
+      text["content"] = notificationTitle + "\n" + notificationBody;
       if (!postJson(http, webhookUrl, json, httpCode)) return;
       break;
     }
@@ -265,14 +339,13 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
               logCaptureLn(String("Invalid PushPlus channel '" + channel.key2 + "'. Using default 'wechat'."));
           }
       }
-      String senderHtml = htmlEscape(senderValue);
-      String messageHtml = htmlEscape(messageValue);
-      String timestampHtml = htmlEscape(timestampValue);
+      String titleHtml = htmlEscape(notificationTitle);
+      String bodyHtml = htmlEscape(notificationBody);
+      bodyHtml.replace("\n", "<br>");
       JsonDocument json;
       json["token"] = channel.key1;
-      json["title"] = "SMS from: " + senderHtml;
-      json["content"] = "<b>Sender:</b> " + senderHtml + "<br><b>Time:</b> " + timestampHtml +
-                        "<br><b>Message:</b><br>" + messageHtml;
+      json["title"] = titleHtml;
+      json["content"] = bodyHtml;
       json["channel"] = channelValue;
       if (!postJson(http, pushUrl, json, httpCode)) return;
       break;
@@ -283,8 +356,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       String scUrl = channel.url.length() > 0 ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
       http.begin(scUrl);
       http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-      String postData = "title=" + urlEncode("SMS from: " + String(sender));
-      postData += "&desp=" + urlEncode("**Sender:** " + String(sender) + "\n\n**Time:** " + String(timestamp) + "\n\n**Message:**\n\n" + String(message));
+      String postData = "title=" + urlEncode(notificationTitle);
+      postData += "&desp=" + urlEncode(notificationBody);
       httpCode = http.POST(postData);
       break;
     }
@@ -298,15 +371,19 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       String senderContent;
       String messageContent;
       String timestampContent;
+      String deviceContent;
       if (!serializeJsonStringContent(senderValue, senderContent) ||
           !serializeJsonStringContent(messageValue, messageContent) ||
-          !serializeJsonStringContent(timestampValue, timestampContent)) return;
+          !serializeJsonStringContent(timestampValue, timestampContent) ||
+          !serializeJsonStringContent(config.deviceName, deviceContent)) return;
       http.begin(channel.url);
       http.addHeader("Content-Type", "application/json");
-      String body = channel.customBody;
-      body.replace("{sender}", senderContent);
-      body.replace("{message}", messageContent);
-      body.replace("{timestamp}", timestampContent);
+      String body;
+      if (!renderTemplate(channel.customBody, senderContent, messageContent, timestampContent,
+                          deviceContent, MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
+        logCaptureLn("Rendered custom push body is invalid or too long; skipping delivery");
+        return;
+      }
       httpCode = http.POST(body);
       break;
     }
@@ -336,8 +413,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       // Feishu message body
       json["msg_type"] = "text";
       JsonObject content = json["content"].to<JsonObject>();
-      content["text"] = "📱 SMS notification\nSender: " + senderValue +
-                        "\nMessage: " + messageValue + "\nTime: " + timestampValue;
+      content["text"] = notificationTitle + "\n" + notificationBody;
       if (!postJson(http, webhookUrl, json, httpCode)) return;
       break;
     }
@@ -350,8 +426,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       gotifyUrl += "message?token=" + channel.key1;
       
       JsonDocument json;
-      json["title"] = "SMS from: " + senderValue;
-      json["message"] = messageValue + "\n\nTime: " + timestampValue;
+      json["title"] = notificationTitle;
+      json["message"] = notificationBody;
       json["priority"] = 5;
       if (!postJson(http, gotifyUrl, json, httpCode)) return;
       break;
@@ -364,8 +440,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       if (tgBaseUrl.endsWith("/")) tgBaseUrl.remove(tgBaseUrl.length() - 1);
       
       String tgUrl = tgBaseUrl + "/bot" + channel.key2 + "/sendMessage";
-      String text = "📱 SMS notification\nSender: " + String(sender) +
-                    "\nMessage: " + String(message) + "\nTime: " + String(timestamp);
+      String text = notificationTitle + "\n" + notificationBody;
       JsonDocument json;
       json["chat_id"] = channel.key1;
       json["text"] = text;

@@ -37,7 +37,7 @@ docker compose start dev
 
 ```sh
 docker compose exec dev sh
-docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
+docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs ./code
 ```
 
 停止時用 `docker compose stop dev`，不要用 `docker compose run --rm` 建立一次
@@ -119,17 +119,24 @@ docker compose exec dev sh -lc 'cd web && npm ci'
 docker compose exec -e DEVICE_URL=http://192.168.1.50 dev sh -lc 'cd web && npm run dev'
 ```
 
-Production build、型別檢查與 LittleFS image：
+Production build 與型別檢查：
 
 ```sh
-docker compose exec dev sh -lc 'cd web && npm run check && npm run filesystem'
+docker compose exec dev sh -lc 'cd web && npm run check && npm run build'
 python3 -m unittest tests/test_web_bundle.py
 ```
 
-`npm run build` 會更新 `code/data/index.html.gz`；`npm run filesystem` 另外產生
-`web/build/littlefs.bin`。目前 gzip 約 112 KiB，build 設有 256 KiB 的失敗
-上限；專案分區提供 `0x1C0000` bytes，因此仍保有充足餘裕。
-`web/build/` 是可重建輸出，不應提交。
+`npm run build` 會更新 `code/data/index.html.gz` 與 `code/web_bundle.h`。Firmware
+使用 header 內的 gzip bytes；舊 gzip 檔只保留供 bundle reproducibility test。
+Build 設有 256 KiB 上限。`web/build/` 是可重建輸出，不應提交。
+
+GitHub Pages Demo 使用 build-time in-memory API。Demo 會停用備份、還原與 OTA：
+
+```sh
+docker compose exec -e VITE_DEMO_MODE=1 dev sh -lc 'cd web && npm run build'
+```
+
+完成 Demo artifact 後，重新執行一般 production build，避免把 Demo 編入 firmware。
 
 ### Mock Server
 
@@ -156,7 +163,7 @@ API 與 production UI 的自動驗證在同一個 Mock container 執行：
 
 ```sh
 docker compose exec -T mock-server npm test
-python3 -m unittest tests/test_api_contract.py
+python3 -m unittest tests/test_api_contract.py tests/test_config_schema.py tests/test_runtime_ota.py
 ```
 
 ### Firmware
@@ -164,11 +171,11 @@ python3 -m unittest tests/test_api_contract.py
 CI 的唯一基線命令是：
 
 ```sh
-docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota ./code
+docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs ./code
 ```
 
-目前鎖定版本的基線結果為 Flash `1320871 / 2097152 bytes`（62%）、全域變數
-`44276 / 327680 bytes`（13%）。這只證明編譯與靜態配置，不代表實機 heap
+目前鎖定版本的基線結果為 Flash `1461447 / 1966080 bytes`（74%）、全域變數
+`63300 / 327680 bytes`（19%）。這只證明編譯與靜態配置，不代表實機 heap
 尖峰、UART 時序或 modem 相容性已驗證。
 
 這證明 generic ESP32-C3 編譯通過。實際 MakerGO ESP32 C3 SuperMini 若已由
@@ -180,6 +187,26 @@ docker compose exec dev sh -lc "arduino-cli board listall | grep -E 'ESP32.*C3|M
 
 不要把 `esp32:esp32:makergo_c3_supermini` 當成所有 core 版本都保證存在的
 CI 事實。
+
+### OTA release
+
+GitHub `release` environment 的 secret `OTA_SIGNING_PRIVATE_KEY` 必須包含完整
+PEM private key，並為該 environment 設定 required reviewer。一般 build job 只有
+read 權限且接觸不到 private key；`v` tag 的 firmware artifact 會交給隔離的
+release job 驗證 signer、簽署 `.smsota`，再建立 GitHub Release。裝置只保存
+public key。不要把 private key 或未遮蔽 secret 寫入檔案。
+
+本機只需驗證 package builder 時，可使用測試 key 與下列命令。`counter` 必須
+大於裝置已接受的 release counter：
+
+```sh
+python3 scripts/sign-ota-release.py build/firmware/code.ino.bin build/firmware/test.smsota \
+  --private-key /path/to/test-private.pem --version v1.0.0 --counter 1
+```
+
+PBKDF2 目前使用 210,000 iterations。這個值來自 schema manifest，不代表
+ESP32-C3 實機延遲已達標。Release 前必須記錄 crypto task 時間、free heap、
+stack high-water mark，以及 OTA 期間的 UART 接收結果。
 
 ## 燒錄與 Serial
 
@@ -210,21 +237,20 @@ docker compose up -d --force-recreate dev
 docker compose exec dev arduino-cli board list
 ```
 
-管理頁不在 firmware binary 內，所以實機需要分別燒錄 sketch 與 LittleFS。
-`code/partitions.csv` 是 4 MB、no-OTA layout：2 MiB app、128 KiB `appcfg`
-NVS、`0x1C0000` LittleFS 與 64 KiB coredump。它不提供 OTA slot 或 rollback。
+管理頁已編入 firmware。`code/partitions.csv` 是 4 MB OTA layout：兩個
+`0x1E0000` app slot、128 KiB `appcfg` NVS 與 64 KiB coredump。它不使用
+LittleFS，並由 bootloader 提供 app rollback。
 
 第一次從舊 layout 升級必須先匯出需要保留的設定，再用 USB 完整擦除並重刷
-firmware 與 filesystem。改分區會移動 LittleFS，不能沿用舊 image 位址：
+firmware。改分區會移動 app 與 NVS，不能透過舊版 OTA 安全遷移：
 
 ```sh
 docker compose exec dev /opt/esptool-venv/bin/esptool --chip esp32c3 --port /dev/ttyACM0 erase-flash
-docker compose exec dev arduino-cli compile --upload --fqbn esp32:esp32:esp32c3:PartitionScheme=no_ota --port /dev/ttyACM0 ./code
-docker compose exec dev /opt/esptool-venv/bin/esptool --chip esp32c3 --port /dev/ttyACM0 write-flash 0x230000 web/build/littlefs.bin
+docker compose exec dev arduino-cli compile --upload --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs --port /dev/ttyACM0 ./code
 ```
 
 改用其他 FQBN、flash size 或 partition scheme 前，先讀對應 partition CSV，
-重新確認 filesystem offset 與 size；不可沿用 `0x230000` 猜測燒錄。
+重新確認兩個 OTA slot、`otadata`、`appcfg` 與 coredump 的 offset 和 size。
 
 下面只是一個 Linux + MakerGO FQBN 範例；請把 FQBN 與 serial
 device 換成實際查到的值：
@@ -233,6 +259,29 @@ device 換成實際查到的值：
 docker compose exec dev arduino-cli compile --upload --fqbn esp32:esp32:makergo_c3_supermini --port /dev/ttyACM0 ./code
 docker compose exec dev arduino-cli monitor --port /dev/ttyACM0 --config baudrate=115200
 ```
+
+## 實機驗證紀錄
+
+2026-08-16 以 ESP32-C3 rev 0.4、4 MB XMC flash、USB ID `303a:1001`、未插 SIM
+驗證目前 `develop` 工作樹：
+
+- 完整擦除舊 layout 後，新雙 OTA slot partition、內嵌 UI、首次開機帳號與
+  management HTTP task 正常；未認證 401、缺 CSRF 403、超過 body cap 413。
+- 無 SIM 時 `modemReady=false`，管理 API 仍可用；modem query job 有界失敗，
+  不會卡住 HTTP。RAM log 的 cursor pagination 可連續取頁，重開即清空，
+  沒有 NVS/flash 寫入。
+- 210,000 次 PBKDF2 在 crypto task priority 0 時超過 5 分鐘；調整為與 loop
+  同級後，加密匯出為 22.746 秒，期間 HTTP poll 約 38 ms。錯誤密碼不寫入，
+  正確還原會原子保存並重啟，identity 與管理帳號保留。
+- 實機發現同步 WebServer 的 raw body 會在 binary NUL 截斷；chunk 改為
+  Base64 後，302-byte 含 NUL 備份完整收到 `nextOffset=302`。decode 使用單一
+  8 KiB static buffer，避免 6 KiB HTTP task stack overflow。
+- 1,461,584-byte 正簽 OTA 在 19.562 秒完成、切換 slot 並健康開機；錯誤簽章
+  在 flash write 前拒絕，同一 release counter 重播亦拒絕。開機後 free heap
+  約 141--149 KiB。
+
+尚未在此板執行強制 crash/power-cut rollback、最大 32 KiB 設定檔、滿載三個
+worker job，以及有訊號或可收簡訊的 SIM 測試。
 
 Linux 連接埠通常是 `/dev/ttyACM*` 或 `/dev/ttyUSB*`。Docker Desktop 對 USB
 serial 的支援依 host 平台而異；無法安全映射時，容器只負責編譯，燒錄列為
@@ -281,11 +330,9 @@ fixture 與 CI compile 通過後 commit/push 或放入 draft PR，但在實機 s
 
 ## CI 行為
 
-`.github/workflows/build.yml` 在所有 pull request、手動觸發，以及 push 中
-相關程式、contract 或開發入口變更時建置 Web bundle，執行 route parity、
-Mock API 與 production UI browser test，再編譯 generic ESP32-C3。一般文件的
-push 不會觸發，但 OpenAPI 變更會觸發。所有文件 PR 仍會觸發，因
-`pull_request` 沒有 path filter。
+`.github/workflows/build.yml` 在所有 push、pull request 與手動觸發時建置 Web
+bundle，執行 schema、route parity、Mock API 與 production UI browser test，
+再編譯 generic ESP32-C3。`v` 開頭的 tag 會另外簽署 OTA package 並建立 Release。
 
 本機無 `arduino-cli` 或依賴下載失敗時，不能把「未執行」寫成「通過」；
 交付時列出缺少的工具或網路限制即可。

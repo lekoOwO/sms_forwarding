@@ -15,13 +15,18 @@ class WebBundleContractTest(unittest.TestCase):
         self.assertFalse((ROOT / "code/web_html.cpp").exists())
         self.assertFalse((ROOT / "code/web_html.h").exists())
 
-    def test_firmware_serves_the_littlefs_bundle(self):
+    def test_firmware_embeds_the_gzip_bundle(self):
         sketch = (ROOT / "code/code.ino").read_text()
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
-        self.assertIn("LittleFS.begin", sketch)
+        package = (ROOT / "web/scripts/package.mjs").read_text()
+        self.assertNotIn("LittleFS", sketch)
         self.assertIn('server.on("/api/config"', sketch)
-        self.assertIn('LittleFS.open("/index.html.gz"', handlers)
+        self.assertIn('#include "web_bundle.h"', handlers)
+        self.assertIn("WEB_BUNDLE_SIZE", handlers)
+        self.assertIn("web_bundle.h", package)
         self.assertNotIn('#include "web_html.h"', handlers)
+        self.assertNotIn("filesystem", (ROOT / "web/package.json").read_text())
+        self.assertFalse((ROOT / "web/scripts/filesystem.sh").exists())
 
     def test_bundle_is_self_contained_and_bounded(self):
         bundle = ROOT / "code/data/index.html.gz"

@@ -1,0 +1,28 @@
+{
+  "format": "sms-forwarding-config",
+  "mimeType": "application/vnd.sms-forwarding.config",
+  "maxBinaryBytes": 32768,
+  "backupEnvelope": {
+    "magic": "SMSCFG01",
+    "version": 1,
+    "byteOrder": "little-endian",
+    "kdf": "PBKDF2-HMAC-SHA256",
+    "kdfId": 1,
+    "iterations": 210000,
+    "saltBytes": 16,
+    "cipher": "AES-256-GCM",
+    "cipherId": 1,
+    "ivBytes": 12,
+    "tagBytes": 16,
+    "headerBytes": 44,
+    "aad": "header",
+    "aadBytes": 44,
+    "maxEncryptedBytes": 32828,
+    "header": ["magic:8", "version:u16", "kdfId:u8", "cipherId:u8", "iterations:u32", "salt:16", "iv:12"]
+  },
+  "currentVersion": 2,
+  "versions": {
+    "1": "v1.json",
+    "2": "v2.json"
+  }
+}

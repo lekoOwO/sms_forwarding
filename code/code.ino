@@ -1,18 +1,28 @@
 #include "globals.h"
-#include <LittleFS.h>
+#include <esp_ota_ops.h>
 #include "wifi_config.h"
 #include "config.h"
+#include "config_backup.h"
 #include "web_handlers.h"
 #include "modem.h"
+#include "notification_locale.h"
+#include "ota_update.h"
 #include "push.h"
 #include "sms_process.h"
 
-static bool managementHttpEnabled = false;
+static volatile bool managementHttpEnabled = false;
+
+extern "C" bool verifyRollbackLater() {
+  return true;
+}
 
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
   Serial.begin(115200);
+  initWebRuntime();
+  initConfigBackup();
+  initOtaUpdate();
   // Keep startup delay short; the WiFi connection has its own timeout.
   delay(200);
   Serial1.begin(115200, SERIAL_8N1, RXD, TXD);
@@ -27,6 +37,9 @@ void setup() {
 
   // ---- WiFi connection tuning ----
   WiFi.mode(WIFI_STA);
+  if (!WiFi.setHostname(config.hostname.c_str())) {
+    logCaptureLn("Failed to apply WiFi hostname");
+  }
   WiFi.setSleep(false);                    // Disable modem sleep for faster connection response.
   WiFi.setAutoReconnect(true);             // Reconnect automatically after disconnection.
   // Use a fast scan instead of scanning every channel, which waits too long on empty channels.
@@ -55,13 +68,20 @@ void setup() {
     ESP.restart();
   }
 
-  if (!LittleFS.begin(false)) {
-    logCaptureLn(String("LittleFS mount failed; management page unavailable"));
-  }
-
   if (configStorageAvailable) {
+    const char* collectedHeaders[] = {"X-CSRF-Token"};
+    server.collectHeaders(collectedHeaders, 1);
     server.on("/", handleRoot);
     server.on("/api/config", handleConfig);
+    server.on("/api/config/export", HTTP_POST, handleConfigExportStart);
+    server.on("/api/config/export", HTTP_GET, handleConfigExportDownload);
+    server.on("/api/config/restore/start", HTTP_POST, handleConfigRestoreStart);
+    server.on("/api/config/restore/chunk", HTTP_POST, handleConfigRestoreChunk);
+    server.on("/api/config/restore/finish", HTTP_POST, handleConfigRestoreFinish);
+    server.on("/api/jobs", HTTP_GET, handleJob);
+    server.on("/api/ota/start", HTTP_POST, handleOtaStart);
+    server.on("/api/ota/chunk", HTTP_POST, handleOtaChunk);
+    server.on("/api/ota/finish", HTTP_POST, handleOtaFinish);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/tools", handleRoot);
     server.on("/sms", handleRoot);
@@ -74,8 +94,8 @@ void setup() {
     server.on("/modem", handleModem);
     server.on("/wifi", handleWifi);
     server.begin();
-    managementHttpEnabled = true;
-    logCaptureLn("HTTP server started");
+    managementHttpEnabled = startManagementHttpTask();
+    logCaptureLn(managementHttpEnabled ? "HTTP server started" : "HTTP task failed to start");
   } else {
     logCaptureLn("Configuration storage failure: management HTTP disabled; recover via USB");
   }
@@ -86,7 +106,6 @@ void setup() {
   int ntpRetry = 0;
   while (time(nullptr) < 100000 && ntpRetry < 100) {
     delay(1);
-    if (managementHttpEnabled) server.handleClient();
     ntpRetry++;
   }
   if (time(nullptr) >= 100000) {
@@ -105,17 +124,21 @@ void setup() {
   // ---- Startup notification (the web UI is ready before email is sent) ----
   if (configValid) {
     logCaptureLn(String("Configuration valid; sending startup notification..."));
-    String subject = "SMS Forwarder Started";
-    String body = "Device started\nDevice URL: " + getDeviceUrl();
+    String subject, body;
+    buildSystemNotificationText(config.notificationLocale, SYSTEM_NOTIFICATION_STARTED,
+                                config.deviceName, getDeviceUrl(), subject, body);
     sendEmailNotification(subject.c_str(), body.c_str());
   }
 
   // ---- Modem initialization (slow, but the web UI is already available) ----
   modemInit();
+  otaConfirmHealthy(configStorageAvailable && WiFi.status() == WL_CONNECTED && managementHttpEnabled);
 }
 
 void loop() {
-  if (managementHttpEnabled) server.handleClient();
+  processWebJobs();
+  otaTick();
+  configBackupTick();
   if (managementHttpEnabled && !configValid) {
     if (millis() - lastPrintTime >= 1000) {
       lastPrintTime = millis();
