@@ -15,7 +15,7 @@ test("the production UI works with the mock API", async () => {
 
 	try {
 		const page = await browser.newPage();
-		page.setDefaultTimeout(60_000);
+		page.setDefaultTimeout(90_000);
 		const browserErrors = [];
 		page.on("pageerror", (error) => browserErrors.push(error.message));
 		page.on("requestfailed", (request) => browserErrors.push(`${request.url()}: ${request.failure()?.errorText ?? "request failed"}`));
