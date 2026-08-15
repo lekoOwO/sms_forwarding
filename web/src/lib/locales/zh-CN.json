@@ -172,6 +172,7 @@
 	"resultFieldBer": "误码率",
 	"resultFieldImei": "IMEI",
 	"ACTION_CONFIG_SAVED": "设置已保存。",
+	"ACTION_CONFIG_SAVE_FAILED": "设置无法保存。请重试，并在设备重启后确认。",
 	"ACTION_SMS_PHONE_REQUIRED": "请输入目标号码。",
 	"ACTION_SMS_CONTENT_REQUIRED": "请输入短信内容。",
 	"ACTION_SMS_SENT": "短信已发送。",

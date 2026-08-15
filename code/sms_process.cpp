@@ -319,12 +319,13 @@ void checkSerial1URC() {
       logCaptureLn(String("PDU长度: " + String(line.length()) + " 字符"));
       
       // 解析PDU
+      int* concatInfo = pdu.getConcatInfo();
+      concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;
       if (!pdu.decodePDU(line.c_str())) {
         logCaptureLn(String("❌ PDU解析失败！"));
       } else {
         logCaptureLn(String("✓ PDU解析成功"));
         // 获取长短信信息
-        int* concatInfo = pdu.getConcatInfo();
         int refNumber = concatInfo[0];
         int partNumber = concatInfo[1];
         int totalParts = concatInfo[2];

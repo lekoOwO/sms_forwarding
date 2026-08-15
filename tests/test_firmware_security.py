@@ -60,6 +60,8 @@ int main() {
         self.assertIn("str.length() % 2 != 0", sms)
         self.assertIn("bool allowAdminCommands", header)
         self.assertIn("timestamp.c_str(), false", sms)
+        reset = sms.index("concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;")
+        self.assertLess(reset, sms.index("pdu.decodePDU"))
 
     def test_push_output_is_bounded_and_context_escaped(self):
         push = (ROOT / "code/push.cpp").read_text()

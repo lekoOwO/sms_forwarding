@@ -46,6 +46,7 @@ function initialState() {
 
 const actionCodes = new Set([
 	"ACTION_CONFIG_SAVED",
+	"ACTION_CONFIG_SAVE_FAILED",
 	"ACTION_SMS_PHONE_REQUIRED",
 	"ACTION_SMS_CONTENT_REQUIRED",
 	"ACTION_SMS_SENT",

@@ -1,38 +1,50 @@
 #include "config.h"
 #include "web_handlers.h"
 
+static bool putStringChecked(const char* key, const String& value) {
+  size_t written = preferences.putString(key, value);
+  if (value.length() > 0) return written == value.length();
+  return preferences.getType(key) == PT_STR && preferences.getString(key) == value;
+}
+
 // 保存配置到NVS
-void saveConfig() {
-  preferences.begin("sms_config", false);
-  preferences.putString("smtpServer", config.smtpServer);
-  preferences.putInt("smtpPort", config.smtpPort);
-  preferences.putString("smtpUser", config.smtpUser);
-  preferences.putString("smtpPass", config.smtpPass);
-  preferences.putString("smtpSendTo", config.smtpSendTo);
-  preferences.putString("adminPhone", config.adminPhone);
+bool saveConfig() {
+  if (!preferences.begin("sms_config", false)) {
+    logCaptureLn(String("配置保存失败：无法打开NVS"));
+    return false;
+  }
+
+  bool ok = true;
+  ok &= putStringChecked("smtpServer", config.smtpServer);
+  ok &= preferences.putInt("smtpPort", config.smtpPort) == sizeof(int32_t);
+  ok &= putStringChecked("smtpUser", config.smtpUser);
+  ok &= putStringChecked("smtpPass", config.smtpPass);
+  ok &= putStringChecked("smtpSendTo", config.smtpSendTo);
+  ok &= putStringChecked("adminPhone", config.adminPhone);
   for (int i = 0; i < MAX_WEB_ACCOUNTS; i++) {
     String prefix = "account" + String(i);
-    preferences.putString((prefix + "user").c_str(), config.webAccounts[i].username);
-    preferences.putString((prefix + "pass").c_str(), config.webAccounts[i].password);
+    ok &= putStringChecked((prefix + "user").c_str(), config.webAccounts[i].username);
+    ok &= putStringChecked((prefix + "pass").c_str(), config.webAccounts[i].password);
   }
-  preferences.putString("webUser", config.webAccounts[0].username);
-  preferences.putString("webPass", config.webAccounts[0].password);
-  preferences.putString("numBlkList", config.numberBlackList);
+  ok &= putStringChecked("webUser", config.webAccounts[0].username);
+  ok &= putStringChecked("webPass", config.webAccounts[0].password);
+  ok &= putStringChecked("numBlkList", config.numberBlackList);
   
   // 保存推送通道配置
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String prefix = "push" + String(i);
-    preferences.putBool((prefix + "en").c_str(), config.pushChannels[i].enabled);
-    preferences.putUChar((prefix + "type").c_str(), (uint8_t)config.pushChannels[i].type);
-    preferences.putString((prefix + "url").c_str(), config.pushChannels[i].url);
-    preferences.putString((prefix + "name").c_str(), config.pushChannels[i].name);
-    preferences.putString((prefix + "k1").c_str(), config.pushChannels[i].key1);
-    preferences.putString((prefix + "k2").c_str(), config.pushChannels[i].key2);
-    preferences.putString((prefix + "body").c_str(), config.pushChannels[i].customBody);
+    ok &= preferences.putBool((prefix + "en").c_str(), config.pushChannels[i].enabled) == 1;
+    ok &= preferences.putUChar((prefix + "type").c_str(), (uint8_t)config.pushChannels[i].type) == 1;
+    ok &= putStringChecked((prefix + "url").c_str(), config.pushChannels[i].url);
+    ok &= putStringChecked((prefix + "name").c_str(), config.pushChannels[i].name);
+    ok &= putStringChecked((prefix + "k1").c_str(), config.pushChannels[i].key1);
+    ok &= putStringChecked((prefix + "k2").c_str(), config.pushChannels[i].key2);
+    ok &= putStringChecked((prefix + "body").c_str(), config.pushChannels[i].customBody);
   }
   
   preferences.end();
-  logCaptureLn(String("配置已保存"));
+  logCaptureLn(String(ok ? "配置已保存" : "配置保存失败：部分字段未持久化"));
+  return ok;
 }
 
 // 从NVS加载配置

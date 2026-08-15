@@ -809,7 +809,10 @@ void handleSave() {
     }
   }
   
-  saveConfig();
+  if (!saveConfig()) {
+    sendActionResult(500, false, "ACTION_CONFIG_SAVE_FAILED");
+    return;
+  }
   configValid = isConfigValid();
   
   sendActionResult(200, true, "ACTION_CONFIG_SAVED");

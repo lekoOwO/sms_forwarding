@@ -3,7 +3,7 @@
 
 #include "globals.h"
 
-void saveConfig();
+bool saveConfig();
 void loadConfig();
 bool isPushChannelValid(const PushChannel& ch);
 bool isConfigValid();
