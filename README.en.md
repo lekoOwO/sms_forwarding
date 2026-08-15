@@ -27,11 +27,11 @@ The device only uses received SMS messages for notification forwarding. It does 
 
 The firmware supports POST JSON, Bark, GET, DingTalk, PushPlus, ServerChan, Custom JSON, Feishu, Gotify, and Telegram.
 
-Standard services support `{device}`, `{sender}`, `{message}`, and `{timestamp}` in title and body templates. Custom JSON provides a complete request-body template.
+Templates can include the sender, message, timestamp, device name, local number, IP address, hostname, and WiFi name. Custom JSON provides a complete request-body template.
 
-| Status | Ping |
+| Device overview | Push channels and templates |
 |---|---|
-| ![](assets/status.png) | ![](assets/ping.png) |
+| ![](assets/status.png) | ![](assets/notifications.png) |
 
 ## Hardware and wiring
 

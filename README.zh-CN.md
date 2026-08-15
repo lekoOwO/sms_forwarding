@@ -27,11 +27,11 @@
 
 支持 POST JSON、Bark、GET、DingTalk、PushPlus、ServerChan、Custom JSON、Feishu、Gotify 和 Telegram。
 
-普通服务可使用 `{device}`、`{sender}`、`{message}` 和 `{timestamp}` 自定义标题或正文。Custom JSON 可自定义完整 request body。
+模板可使用发送者、消息、时间、设备名称、本机号码、IP、hostname 和 WiFi 名称。Custom JSON 可自定义完整 request body。
 
-| 状态信息 | 主动 Ping |
+| 设备概览 | 推送通道与模板 |
 |---|---|
-| ![](assets/status.png) | ![](assets/ping.png) |
+| ![](assets/status.png) | ![](assets/notifications.png) |
 
 ## 硬件与接线
 
