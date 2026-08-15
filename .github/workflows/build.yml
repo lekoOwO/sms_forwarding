@@ -113,6 +113,7 @@ jobs:
     - name: Publish GitHub prerelease
       env:
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
       run: |
         FIRMWARE_DEV_BUILD=$(jq -r .devBuild release-input/firmware-version.json)
         DEV_TAG="dev-${FIRMWARE_DEV_BUILD}"
@@ -166,6 +167,7 @@ jobs:
     - name: Publish GitHub release
       env:
         GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
         ASSET_NAME: ${{ steps.sign.outputs.asset }}
         FULL_IMAGE_NAME: ${{ steps.sign.outputs.full_image }}
       run: |
