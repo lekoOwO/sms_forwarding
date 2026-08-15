@@ -262,10 +262,31 @@ bool sendATandWaitOK(const char* cmd, unsigned long timeout) {
 
 // 检测网络注册状态（LTE/4G）
 // CEREG状态: 1=已注册本地, 5=已注册漫游
+int modemParseCeregQueryStatus(const String& response) {
+  int prefix = response.indexOf("+CEREG:");
+  if (prefix < 0) return -1;
+  int lineEnd = response.indexOf('\n', prefix);
+  int comma = response.indexOf(',', prefix + 7);
+  if (comma < 0 || (lineEnd >= 0 && comma > lineEnd)) return -1;
+
+  int cursor = comma + 1;
+  while (cursor < (int)response.length() && response[cursor] == ' ') cursor++;
+  if (cursor >= (int)response.length() || response[cursor] < '0' ||
+      response[cursor] > '9') return -1;
+
+  int status = 0;
+  while (cursor < (int)response.length() && response[cursor] >= '0' &&
+         response[cursor] <= '9') {
+    status = status * 10 + response[cursor++] - '0';
+    if (status > 255) return -1;
+  }
+  return status;
+}
+
 bool waitCEREG() {
   String resp = sendATCommand("AT+CEREG?", 2000);
-  if (resp.indexOf("+CEREG:") < 0) return false;
-  return resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0;
+  int status = modemParseCeregQueryStatus(resp);
+  return status == 1 || status == 5;
 }
 
 static bool isGsm7Extension(unsigned short value) {

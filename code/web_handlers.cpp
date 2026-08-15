@@ -467,16 +467,7 @@ void handleQuery() {
     
     // 查询网络注册状态
     String resp = sendATCommand("AT+CEREG?", 2000);
-    String regStatus = "N/A";
-    if (resp.indexOf("+CEREG:") >= 0) {
-      int idx = resp.indexOf("+CEREG:");
-      String tmp = resp.substring(idx + 7);
-      int commaIdx = tmp.indexOf(',');
-      if (commaIdx >= 0) {
-        String stat = tmp.substring(commaIdx + 1, commaIdx + 2);
-        regStatus = stat;
-      }
-    }
+    int regStatus = modemParseCeregQueryStatus(resp);
     // 查询运营商
     resp = sendATCommand("AT+COPS?", 2000);
     String oper = "N/A";
@@ -531,7 +522,7 @@ void handleQuery() {
         }
       }
     }
-    data = "{\"registration\":" + (regStatus == "N/A" ? String("null") : String(regStatus.toInt())) +
+    data = "{\"registration\":" + (regStatus < 0 ? String("null") : String(regStatus)) +
            ",\"operator\":" + jsonStringOrNull(oper) +
            ",\"pdpActive\":" + pdpStatus +
            ",\"apn\":" + jsonStringOrNull(apn) + "}";

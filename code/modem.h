@@ -32,6 +32,7 @@ void modemPowerCycle();
 void resetModule();
 void modemInit();
 bool sendATandWaitOK(const char* cmd, unsigned long timeout);
+int modemParseCeregQueryStatus(const String& response);
 bool waitCEREG();
 void blink_short(unsigned long gap_time = 500);
 bool sendSMS(const char* phoneNumber, const char* message);

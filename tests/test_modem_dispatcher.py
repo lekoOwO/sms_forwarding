@@ -30,6 +30,15 @@ class ModemDispatcherTest(unittest.TestCase):
         self.assertNotIn('while (!sendATandWaitOK("AT+CNMI', modem)
         self.assertNotIn('while (!sendATandWaitOK("AT+CMGF', modem)
 
+    def test_cereg_status_is_not_matched_as_a_prefix(self):
+        modem = (ROOT / "code/modem.cpp").read_text()
+        handlers = (ROOT / "code/web_handlers.cpp").read_text()
+        self.assertNotIn('resp.indexOf(",1")', modem)
+        self.assertNotIn('resp.indexOf(",5")', modem)
+        self.assertIn("status == 1 || status == 5", modem)
+        self.assertIn("modemParseCeregQueryStatus(resp)", handlers)
+        self.assertNotIn("substring(commaIdx + 1, commaIdx + 2)", handlers)
+
 
 if __name__ == "__main__":
     unittest.main()
