@@ -5,10 +5,10 @@ from pathlib import Path
 
 
 def rejects(command: list[str], source: str, suffix: str) -> None:
-    with tempfile.TemporaryDirectory(dir=".") as directory:
+    with tempfile.TemporaryDirectory() as directory:
         path = Path(directory, f"bad{suffix}")
         path.write_text(source)
-        result = subprocess.run([*command, str(path)], capture_output=True, text=True)
+        result = subprocess.run([*command, path.name], cwd=directory, capture_output=True, text=True)
         if result.returncode == 0:
             raise SystemExit(f"{' '.join(command)} accepted an invalid fixture")
 
