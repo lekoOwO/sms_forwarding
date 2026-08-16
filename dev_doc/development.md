@@ -314,10 +314,19 @@ docker compose exec dev arduino-cli monitor --port /dev/ttyACM0 --config baudrat
   certificate time check 與 TLS 1.2，但公開正向 fixture 仍無法完成 handshake，
   因此無法證明 hostname 驗證；未嘗試 `auth=0`，也未傳送真實 provider token，
   shipping firmware 繼續 fail-closed。
+- 同日後續以同板 ML307A、臨時私有 CA relay fixture 重跑嚴格 TLS 1.2
+  MHTTP probe；NTP 已同步（log 的 UTC epoch `1786884318`，即
+  `2026-08-16 12:45:18 UTC`），OpenSSL server 收到完整 `Finished`，私有 CA
+  正向 handshake 成功。錯誤憑證 fixture 曾回 MHTTP error 2，但 probe 中斷且
+  server 沒有收到連線，未形成可信的負向驗證，不能據此宣稱憑證拒絕已證實。
 - 此 SIM 在 LTE 註冊後會自動 attach 並讓 context 1 保持 active；即使
   `CGACT=0,1` 回覆 `OK`，讀回仍為 active。`CGATT=0` 才能得到
   `CGATT=0`、`CGACT: 1,0`，但同時變成 `CEREG=11`、無法接收 LTE 簡訊。
-  所以測試後以 packet detach 收尾；正式執行時依靠 cellular delivery
+  本次收尾另對 `MHTTPDEL=0..3` 與 `MHTTPTERM` 逐一取得 `OK`，再以
+  `AT+CGATT=0` 收尾，讀回 `+CGATT: 0`、`+CGACT: 1,0`（context 8 亦為 0）、
+  `+CEREG: 0,11`。NAT-PMP gateway `192.168.10.1` 對 TCP `18443` 的
+  lifetime=0 request 回 result 0、public port 0、lifetime 0；relay server
+  與 listener 均已停止。正式執行時依靠 cellular delivery
   fail-closed，不能把 bearer active 誤報成韌體已產生流量。
 - 可收簡訊的 SIM 只向 `10010` 發送 `HFMX`。實機回覆的單段 PDU 為約
   326--330 個 hex 字元，揭露舊 300 字元上限會誤判合法 UCS-2 multipart。

@@ -192,6 +192,11 @@ HTTP body 以 Base64 傳輸，避免同步 WebServer 截斷二進位 NUL。Web j
   自動 attach 並重新啟用 default bearer；這不代表韌體會送出資料。以
   `CGATT=0` 強制停用 packet service 也會讓實測 ML307A 離開 LTE 註冊，因而
   無法收簡訊。ML307Y 則因已知相容性分支跳過 `AT+CGACT=0,1`。
+- 2026-08-16 的同板 ML307A 私有 CA fixture 驗證顯示：NTP 同步後，嚴格
+  TLS 1.2 MHTTP probe 可完成 server-auth handshake；錯誤憑證 probe 因中斷且
+  沒有 server-side connection evidence，仍不得視為已驗證的拒絕路徑。測試後
+  清除所有 MHTTP clients，並以 `CGATT=0` 確認 `CGACT: 1,0`；production
+  firmware 仍維持 4G delivery fail-closed。
 
 ## 變更定位
 
