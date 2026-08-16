@@ -50,6 +50,9 @@ struct IdfCellularHttpConfig {
     std::string apn;
 };
 
+// 固定命令槽已满时立即返回；与已入队但等待超时的 ESP_ERR_TIMEOUT 明确区分。
+static constexpr esp_err_t IDF_MODEM_ERR_BUSY = static_cast<esp_err_t>(0x7201);
+
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);

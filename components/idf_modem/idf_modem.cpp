@@ -47,10 +47,41 @@ static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
+static constexpr size_t OWNER_COMMAND_SLOTS = 4;
+// HTTPS 失败后允许完整 HTTP fallback：两次 90s 下载、两轮配置/清理及 PDP 等待。
+static constexpr uint32_t CELLULAR_HTTP_CALL_TIMEOUT_MS = 360000UL;
 
-static SemaphoreHandle_t s_at_mutex = nullptr;
+enum class OwnerCommandKind : uint8_t { at, until, pdu, cellular_http };
+enum class OwnerCommandState : uint8_t { free, queued, running, done, abandoned };
+
+struct OwnerCommand {
+    OwnerCommandKind kind = OwnerCommandKind::at;
+    std::string command;
+    std::string token;
+    std::string pdu;
+    std::string url;
+    IdfCellularHttpConfig cellular_config;
+    uint32_t timeout_ms = 0;
+};
+
+struct OwnerCommandSlot {
+    OwnerCommandState state = OwnerCommandState::free;
+    OwnerCommand request;
+    std::string response;
+    IdfCellularHttpResult cellular_result;
+    esp_err_t result = ESP_FAIL;
+    SemaphoreHandle_t completed = nullptr;
+};
+
+// session_mutex 保留 eSIM 多命令会话的独占语义；命令槽永远不保存 caller 指针。
+static SemaphoreHandle_t s_session_mutex = nullptr;
+static SemaphoreHandle_t s_command_mutex = nullptr;
 static SemaphoreHandle_t s_status_mutex = nullptr;
 static SemaphoreHandle_t s_urc_mutex = nullptr;
+static QueueHandle_t s_command_queue = nullptr;
+static QueueHandle_t s_priority_command_queue = nullptr;
+static OwnerCommandSlot s_command_slots[OWNER_COMMAND_SLOTS];
+static TaskHandle_t s_owner_task = nullptr;
 // UART 驱动事件队列：URC 一到就唤醒模组任务抓取，替代固定 500ms 轮询延时
 static QueueHandle_t s_uart_evt_queue = nullptr;
 // 模组事件信号：新 URC 入缓冲/网页短信入队时唤醒短信任务，消除轮询等待
@@ -63,6 +94,8 @@ static std::string s_uart_line_carry;
 static bool s_uart_wait_cmt_pdu = false;
 static int64_t s_uart_wait_cmt_until_us = 0;
 static bool s_started = false;
+// 启动握手/注册期间 owner 尚未进入普通队列调度；此时只接收短信直推确认。
+static std::atomic<bool> s_runtime_queue_ready{false};
 static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
 static bool s_data_mode_retry_pending = false;
 static uint8_t s_data_mode_retry_count = 0;
@@ -78,11 +111,52 @@ static std::string s_last_pin_attempt_key;
 
 void idf_modem_signal_event(void);
 
+static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
+static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
+                                     uint32_t timeout_ms, std::string& response);
+static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
+                                uint32_t timeout_ms, std::string& response);
+static esp_err_t owner_cellular_http_get(const std::string& url,
+                                         const IdfCellularHttpConfig& config,
+                                         IdfCellularHttpResult& result);
+static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
+                                      IdfCellularHttpResult* cellular_result, bool priority);
+static bool owner_process_one_command(bool priority);
+static void owner_drain_priority_commands();
+
+static void assert_owner_task()
+{
+    configASSERT(s_owner_task != nullptr);
+    configASSERT(xTaskGetCurrentTaskHandle() == s_owner_task);
+}
+
+static int owner_uart_read(uint8_t* data, size_t size, TickType_t wait)
+{
+    assert_owner_task();
+    return uart_read_bytes(MODEM_UART, data, size, wait);
+}
+
+static int owner_uart_write(const void* data, size_t size)
+{
+    assert_owner_task();
+    return uart_write_bytes(MODEM_UART, data, size);
+}
+
+static void owner_uart_flush()
+{
+    assert_owner_task();
+    uart_flush_input(MODEM_UART);
+}
+
 static void cleanup_start_resources()
 {
-    if (s_at_mutex) {
-        vSemaphoreDelete(s_at_mutex);
-        s_at_mutex = nullptr;
+    if (s_session_mutex) {
+        vSemaphoreDelete(s_session_mutex);
+        s_session_mutex = nullptr;
+    }
+    if (s_command_mutex) {
+        vSemaphoreDelete(s_command_mutex);
+        s_command_mutex = nullptr;
     }
     if (s_status_mutex) {
         vSemaphoreDelete(s_status_mutex);
@@ -96,6 +170,20 @@ static void cleanup_start_resources()
         vSemaphoreDelete(s_event_sem);
         s_event_sem = nullptr;
     }
+    if (s_command_queue) {
+        vQueueDelete(s_command_queue);
+        s_command_queue = nullptr;
+    }
+    if (s_priority_command_queue) {
+        vQueueDelete(s_priority_command_queue);
+        s_priority_command_queue = nullptr;
+    }
+    for (auto& slot : s_command_slots) {
+        if (slot.completed) vSemaphoreDelete(slot.completed);
+        slot = OwnerCommandSlot();
+    }
+    s_owner_task = nullptr;
+    s_runtime_queue_ready.store(false, std::memory_order_release);
     s_urc_buffer.clear();
     s_uart_line_carry.clear();
     s_uart_wait_cmt_pdu = false;
@@ -501,6 +589,7 @@ static void preserve_uart_urcs(const uint8_t* data, size_t len)
 
 static void capture_pending_uart_locked(uint32_t max_ms)
 {
+    assert_owner_task();
     // RX 缓冲为空时立即返回：该函数在每条 AT 命令前都会执行，
     // 空转等待 20ms×2 会拖慢所有 AT 操作(健康探测/补收批量删除/身份采样)
     size_t buffered = 0;
@@ -513,7 +602,7 @@ static void capture_pending_uart_locked(uint32_t max_ms)
     TickDeadline hard_deadline(std::max<uint32_t>(max_ms, 1000));
     TickDeadline quiet(max_ms);
     do {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(20));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(20));
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
             quiet.restart(40);
@@ -521,13 +610,10 @@ static void capture_pending_uart_locked(uint32_t max_ms)
     } while (!quiet.expired() && !hard_deadline.expired());
 }
 
-// 返回是否成功抢到 AT 通道锁并完成抓取；false=通道正被长任务占用
 static bool poll_unsolicited_uart(uint32_t max_ms)
 {
-    if (!s_at_mutex) return false;
-    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
+    assert_owner_task();
     capture_pending_uart_locked(max_ms);
-    xSemaphoreGiveRecursive(s_at_mutex);
     return true;
 }
 
@@ -547,10 +633,21 @@ static void handle_uart_event_error(const uart_event_t& evt)
 static bool at_channel_idle_now(void)
 {
     if (idf_modem_esim_operation_active()) return false;
-    if (!s_at_mutex) return false;
-    if (xSemaphoreTakeRecursive(s_at_mutex, 0) != pdTRUE) return false;
-    xSemaphoreGiveRecursive(s_at_mutex);
-    return true;
+    if (!s_session_mutex || !s_command_mutex) return false;
+    if (xSemaphoreTakeRecursive(s_session_mutex, 0) != pdTRUE) return false;
+    bool idle = false;
+    if (xSemaphoreTake(s_command_mutex, 0) == pdTRUE) {
+        idle = true;
+        for (const auto& slot : s_command_slots) {
+            if (slot.state != OwnerCommandState::free) {
+                idle = false;
+                break;
+            }
+        }
+        xSemaphoreGive(s_command_mutex);
+    }
+    xSemaphoreGiveRecursive(s_session_mutex);
+    return idle;
 }
 
 static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap)
@@ -565,15 +662,14 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     out.append(reinterpret_cast<const char*>(data), len);
 }
 
-esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
+static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
 {
-    if (!s_started) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    assert_owner_task();
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
     wire += "\r\n";
-    uart_write_bytes(MODEM_UART, wire.data(), wire.size());
+    owner_uart_write(wire.data(), wire.size());
 
     response.clear();
     response.reserve(512);
@@ -585,7 +681,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
     std::string scan;  // 跨块重叠扫描窗口，保证被截断/跨块的终结符也能被识别
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
             size_t room = MAX_RESPONSE > response.size() ? MAX_RESPONSE - response.size() : 0;
@@ -599,19 +695,19 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
-    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
-esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response)
+static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
+                                     uint32_t timeout_ms, std::string& response)
 {
-    if (!s_started || !token || !*token) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 500)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    assert_owner_task();
+    if (!token || !*token) return ESP_ERR_INVALID_ARG;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
     wire += "\r\n";
-    uart_write_bytes(MODEM_UART, wire.data(), wire.size());
+    owner_uart_write(wire.data(), wire.size());
 
     response.clear();
     response.reserve(512);
@@ -621,7 +717,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
     std::string scan;
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(100));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(100));
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
             append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
@@ -637,19 +733,19 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
         }
     }
-    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
 }
 
-esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response)
+static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
+                                uint32_t timeout_ms, std::string& response)
 {
-    if (!s_started || !pdu) return ESP_ERR_INVALID_STATE;
-    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(timeout_ms + 2000)) != pdTRUE) return ESP_ERR_TIMEOUT;
+    assert_owner_task();
+    if (!pdu) return ESP_ERR_INVALID_ARG;
 
     capture_pending_uart_locked(30);
     std::string wire = cmgs_cmd;
     wire += "\r\n";
-    uart_write_bytes(MODEM_UART, wire.data(), wire.size());
+    owner_uart_write(wire.data(), wire.size());
 
     response.clear();
     response.reserve(512);
@@ -660,7 +756,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
     esp_err_t ret = ESP_ERR_TIMEOUT;
     std::string scan;
     while (!prompt_deadline.expired()) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
             append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
@@ -679,17 +775,17 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
 
     if (got_prompt) {
         size_t pdu_len = strlen(pdu);
-        uart_write_bytes(MODEM_UART, pdu, pdu_len);
+        owner_uart_write(pdu, pdu_len);
         // Ctrl+Z 提交 PDU；encodePDU 生成的缓冲已自带 0x1A 结尾，
         // 避免重复发送在命令模式下多注入一个孤立控制字符
         if (pdu_len == 0 || static_cast<uint8_t>(pdu[pdu_len - 1]) != 0x1A) {
             const uint8_t end = 0x1A;
-            uart_write_bytes(MODEM_UART, &end, 1);
+            owner_uart_write(&end, 1);
         }
         TickDeadline deadline(timeout_ms);
         scan.clear();
         while (!deadline.expired()) {
-            int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
+            int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(120));
             if (got > 0) {
                 preserve_uart_urcs(buf, static_cast<size_t>(got));
                 append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
@@ -710,8 +806,162 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
         }
     }
 
-    xSemaphoreGiveRecursive(s_at_mutex);
     return ret;
+}
+
+esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
+{
+    OwnerCommand request;
+    request.kind = OwnerCommandKind::at;
+    request.command = cmd;
+    request.timeout_ms = timeout_ms;
+    bool priority = cmd.rfind("AT+CNMA", 0) == 0;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        esp_err_t result = owner_send_at(cmd, timeout_ms, response);
+        // 启动握手、注册及采样同样会在每条普通 AT 的安全边界确认直推短信。
+        // CNMA 自身不再递归 drain，避免连续确认形成嵌套调用链。
+        if (!priority) owner_drain_priority_commands();
+        return result;
+    }
+    return submit_owner_command(request, &response, nullptr, priority);
+}
+
+esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token,
+                                  uint32_t timeout_ms, std::string& response)
+{
+    if (!token || !*token) return ESP_ERR_INVALID_ARG;
+    OwnerCommand request;
+    request.kind = OwnerCommandKind::until;
+    request.command = cmd;
+    request.token = token;
+    request.timeout_ms = timeout_ms;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        return owner_send_at_until(cmd, token, timeout_ms, response);
+    }
+    return submit_owner_command(request, &response, nullptr, false);
+}
+
+esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu,
+                             uint32_t timeout_ms, std::string& response)
+{
+    if (!pdu) return ESP_ERR_INVALID_ARG;
+    OwnerCommand request;
+    request.kind = OwnerCommandKind::pdu;
+    request.command = cmgs_cmd;
+    request.pdu = pdu;
+    request.timeout_ms = timeout_ms;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        return owner_send_pdu(cmgs_cmd, pdu, timeout_ms, response);
+    }
+    return submit_owner_command(request, &response, nullptr, false);
+}
+
+static void reset_owner_slot(OwnerCommandSlot& slot)
+{
+    slot.request = OwnerCommand();
+    slot.response.clear();
+    slot.cellular_result = IdfCellularHttpResult();
+    slot.result = ESP_FAIL;
+    slot.state = OwnerCommandState::free;
+}
+
+static bool owner_request_bounded(const OwnerCommand& request)
+{
+    return request.command.size() <= 4096 && request.pdu.size() <= 4096 &&
+           request.token.size() <= 256 && request.url.size() <= 240 &&
+           request.cellular_config.apn.size() <= 96;
+}
+
+static void wake_owner_task()
+{
+    // owner 空闲时阻塞在 UART 事件队列；注入无载荷 DATA 事件只负责提前唤醒。
+    // 若队列已满，真实 UART 事件本身也会立即唤醒 owner。
+    if (!s_uart_evt_queue) return;
+    uart_event_t wake = {};
+    wake.type = UART_DATA;
+    xQueueSend(s_uart_evt_queue, &wake, 0);
+}
+
+static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
+                                      IdfCellularHttpResult* cellular_result, bool priority)
+{
+    if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!priority && !s_runtime_queue_ready.load(std::memory_order_acquire)) {
+        return IDF_MODEM_ERR_BUSY;
+    }
+    if (!owner_request_bounded(request)) return ESP_ERR_INVALID_SIZE;
+
+    bool session_held = false;
+    uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
+    uint32_t wait_ms = request.kind == OwnerCommandKind::cellular_http
+                           ? CELLULAR_HTTP_CALL_TIMEOUT_MS
+                           : request.timeout_ms + wait_margin_ms;
+    if (!priority) {
+        if (!s_session_mutex ||
+            xSemaphoreTakeRecursive(s_session_mutex, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+        session_held = true;
+    }
+
+    if (xSemaphoreTake(s_command_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        return IDF_MODEM_ERR_BUSY;
+    }
+    int slot_index = -1;
+    for (size_t i = 0; i < OWNER_COMMAND_SLOTS; ++i) {
+        if (s_command_slots[i].state == OwnerCommandState::free) {
+            slot_index = static_cast<int>(i);
+            break;
+        }
+    }
+    if (slot_index < 0) {
+        xSemaphoreGive(s_command_mutex);
+        if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        return IDF_MODEM_ERR_BUSY;
+    }
+
+    OwnerCommandSlot& slot = s_command_slots[slot_index];
+    while (xSemaphoreTake(slot.completed, 0) == pdTRUE) {}
+    slot.request = request;
+    slot.response.clear();
+    slot.cellular_result = IdfCellularHttpResult();
+    slot.result = ESP_FAIL;
+    slot.state = OwnerCommandState::queued;
+    QueueHandle_t queue = priority ? s_priority_command_queue : s_command_queue;
+    if (xQueueSend(queue, &slot_index, 0) != pdTRUE) {
+        reset_owner_slot(slot);
+        xSemaphoreGive(s_command_mutex);
+        if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        return IDF_MODEM_ERR_BUSY;
+    }
+    xSemaphoreGive(s_command_mutex);
+    wake_owner_task();
+
+    BaseType_t completed = xSemaphoreTake(slot.completed, pdMS_TO_TICKS(wait_ms));
+    esp_err_t result = ESP_ERR_TIMEOUT;
+    if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) == pdTRUE) {
+        if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
+            result = slot.result;
+            if (response) *response = slot.response;
+            if (cellular_result) *cellular_result = slot.cellular_result;
+            reset_owner_slot(slot);
+        } else if (slot.state == OwnerCommandState::done) {
+            // 完成信号与 caller 超时同时发生时，完成结果优先，避免误报超时。
+            result = slot.result;
+            if (response) *response = slot.response;
+            if (cellular_result) *cellular_result = slot.cellular_result;
+            reset_owner_slot(slot);
+            xSemaphoreTake(slot.completed, 0);
+        } else {
+            slot.state = OwnerCommandState::abandoned;
+        }
+        xSemaphoreGive(s_command_mutex);
+    }
+    if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+    return result;
 }
 
 static bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* out = nullptr)
@@ -1101,10 +1351,11 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
                                 std::string& response, size_t max_capture = 1400,
                                 uint32_t extra_read_ms = 50)
 {
+    assert_owner_task();
     capture_pending_uart_locked(30);
     std::string wire = cmd;
     wire += "\r\n";
-    uart_write_bytes(MODEM_UART, wire.data(), wire.size());
+    owner_uart_write(wire.data(), wire.size());
 
     response.clear();
     response.reserve(std::min<size_t>(max_capture, 512));
@@ -1112,7 +1363,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
     uint8_t buf[128];
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(80));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
             size_t room = max_capture > response.size() ? max_capture - response.size() : 0;
@@ -1125,7 +1376,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
                 TickDeadline extra_hard(extra_read_ms * 4 + 200);
                 TickDeadline extra_deadline(extra_read_ms);
                 while (!extra_deadline.expired() && !extra_hard.expired()) {
-                    int more = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(15));
+                    int more = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(15));
                     if (more <= 0) continue;
                     preserve_uart_urcs(buf, static_cast<size_t>(more));
                     room = max_capture > response.size() ? max_capture - response.size() : 0;
@@ -1229,7 +1480,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
     uint8_t buf[128];
 
     while (!deadline.expired() && !complete) {
-        int got = uart_read_bytes(MODEM_UART, buf, sizeof(buf), pdMS_TO_TICKS(120));
+        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(120));
         if (got <= 0) continue;
         for (int i = 0; i < got && !complete; ++i) {
             char ch = static_cast<char>(buf[i]);
@@ -1640,14 +1891,12 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     return ok;
 }
 
-esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config,
-                                      IdfCellularHttpResult& result)
+static esp_err_t owner_cellular_http_get(const std::string& url,
+                                         const IdfCellularHttpConfig& config,
+                                         IdfCellularHttpResult& result)
 {
+    assert_owner_task();
     result = IdfCellularHttpResult();
-    if (!s_started) {
-        result.message = "模组尚未启动";
-        return ESP_ERR_INVALID_STATE;
-    }
 
     std::string protocol;
     std::string host;
@@ -1657,11 +1906,6 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
     }
     normalize_keepalive_payload_size(host, path);
     append_no_cache_query(path);
-
-    if (xSemaphoreTakeRecursive(s_at_mutex, pdMS_TO_TICKS(CELLULAR_HTTP_TIMEOUT_MS + 45000UL)) != pdTRUE) {
-        result.message = "模组串口忙，蜂窝HTTP未执行";
-        return ESP_ERR_TIMEOUT;
-    }
 
     idf_logf("准备通过蜂窝HTTP下载payload: %s://%s%s",
              protocol.c_str(), host.c_str(), path.c_str());
@@ -1689,7 +1933,6 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
             idf_log_line("关闭PDP上下文(CGACT=0)...");
             send_at_locked("AT+CGACT=0,1", 5000, resp);
         }
-        xSemaphoreGiveRecursive(s_at_mutex);
         result.message = "蜂窝PDP未取得有效IP，请查看日志";
         return ESP_FAIL;
     }
@@ -1714,8 +1957,86 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularH
         result.message = ok ? "蜂窝HTTP payload 下载完成" : "蜂窝HTTP payload 下载失败，请查看日志";
     }
     result.ok = ok;
-    xSemaphoreGiveRecursive(s_at_mutex);
     return ok ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t idf_modem_cellular_http_get(const std::string& url,
+                                      const IdfCellularHttpConfig& config,
+                                      IdfCellularHttpResult& result)
+{
+    OwnerCommand request;
+    request.kind = OwnerCommandKind::cellular_http;
+    request.url = url;
+    request.cellular_config = config;
+    request.timeout_ms = CELLULAR_HTTP_CALL_TIMEOUT_MS;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        return owner_cellular_http_get(url, config, result);
+    }
+    esp_err_t err = submit_owner_command(request, nullptr, &result, false);
+    if (err == IDF_MODEM_ERR_BUSY) result.message = "模组命令队列已满，蜂窝HTTP未执行";
+    if (err == ESP_ERR_TIMEOUT) result.message = "模组命令等待超时，蜂窝HTTP未完成";
+    if (err == ESP_ERR_INVALID_STATE) result.message = "模组尚未启动";
+    return err;
+}
+
+static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
+{
+    assert_owner_task();
+    switch (slot.request.kind) {
+        case OwnerCommandKind::at:
+            return owner_send_at(slot.request.command, slot.request.timeout_ms, slot.response);
+        case OwnerCommandKind::until:
+            return owner_send_at_until(slot.request.command, slot.request.token.c_str(),
+                                       slot.request.timeout_ms, slot.response);
+        case OwnerCommandKind::pdu:
+            return owner_send_pdu(slot.request.command, slot.request.pdu.c_str(),
+                                  slot.request.timeout_ms, slot.response);
+        case OwnerCommandKind::cellular_http:
+            return owner_cellular_http_get(slot.request.url, slot.request.cellular_config,
+                                           slot.cellular_result);
+    }
+    return ESP_ERR_INVALID_ARG;
+}
+
+static bool owner_process_one_command(bool priority)
+{
+    assert_owner_task();
+    int slot_index = -1;
+    QueueHandle_t queue = priority ? s_priority_command_queue : s_command_queue;
+    if (!queue || xQueueReceive(queue, &slot_index, 0) != pdTRUE) return false;
+    if (slot_index < 0 || slot_index >= static_cast<int>(OWNER_COMMAND_SLOTS)) return true;
+
+    if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return true;
+    OwnerCommandSlot& slot = s_command_slots[slot_index];
+    if (slot.state == OwnerCommandState::abandoned) {
+        reset_owner_slot(slot);
+        xSemaphoreGive(s_command_mutex);
+        return true;
+    }
+    if (slot.state != OwnerCommandState::queued) {
+        xSemaphoreGive(s_command_mutex);
+        return true;
+    }
+    slot.state = OwnerCommandState::running;
+    xSemaphoreGive(s_command_mutex);
+
+    esp_err_t result = execute_owner_command(slot);
+    if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return true;
+    if (slot.state == OwnerCommandState::abandoned) {
+        reset_owner_slot(slot);
+    } else {
+        slot.result = result;
+        slot.state = OwnerCommandState::done;
+        xSemaphoreGive(slot.completed);
+    }
+    xSemaphoreGive(s_command_mutex);
+    return true;
+}
+
+static void owner_drain_priority_commands()
+{
+    assert_owner_task();
+    while (owner_process_one_command(true)) {}
 }
 
 static void sample_signal_once(void)
@@ -2160,6 +2481,8 @@ static void run_pending_reinit_if_recovered(void)
 
 static void modem_task(void*)
 {
+    s_owner_task = xTaskGetCurrentTaskHandle();
+    owner_uart_flush();
     IdfModemStatus patch;
     patch.started = true;
     patch.phase = "powering";
@@ -2267,7 +2590,12 @@ static void modem_task(void*)
     int64_t sim_check_not_before_us = 0;  // 模组重启后给 SIM/CPIN 充分上电时间，避免误判二次拔插
     int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
     bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
+    s_runtime_queue_ready.store(true, std::memory_order_release);
     while (true) {
+        // 短信直推确认永远先于普通 caller 命令；普通命令每轮至多执行一个，
+        // 让 owner 回到 URC/复位/健康状态机，不被 caller 队列长期独占。
+        while (owner_process_one_command(true)) {}
+        if (owner_process_one_command(false)) continue;
         bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
         if (!sim_ready && idf_modem_get_status().simState == "ready") sim_ready = true;
@@ -2456,6 +2784,8 @@ static void modem_task(void*)
             } else {
                 vTaskDelay(pdMS_TO_TICKS(500));
             }
+            while (owner_process_one_command(true)) {}
+            if (owner_process_one_command(false)) break;
             // AT 通道被长任务(保号下载/大批量 CMGL)占用时抢不到锁：小睡再试，
             // 避免下载期间每个 RX 块事件都空转唤醒(数据由持锁方消费，URC 也由其转存)
             if (!poll_unsolicited_uart(20)) vTaskDelay(pdMS_TO_TICKS(100));
@@ -2473,12 +2803,19 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     cleanup_start_resources();
     s_sim_unlock_request.store(0, std::memory_order_relaxed);
     s_last_pin_attempt_key.clear();
-    // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 AT 通道，同任务内的单条 AT 再递归取锁。
-    s_at_mutex = xSemaphoreCreateRecursiveMutex();
+    // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 caller 提交顺序；UART 始终只由 owner task 操作。
+    s_session_mutex = xSemaphoreCreateRecursiveMutex();
+    s_command_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
     s_urc_mutex = xSemaphoreCreateMutex();
+    s_command_queue = xQueueCreate(OWNER_COMMAND_SLOTS, sizeof(int));
+    s_priority_command_queue = xQueueCreate(OWNER_COMMAND_SLOTS, sizeof(int));
+    for (auto& slot : s_command_slots) slot.completed = xSemaphoreCreateBinary();
     if (!s_event_sem) s_event_sem = xSemaphoreCreateBinary();
-    if (!s_at_mutex || !s_status_mutex || !s_urc_mutex || !s_event_sem) {
+    bool slots_ready = true;
+    for (const auto& slot : s_command_slots) slots_ready = slots_ready && slot.completed;
+    if (!s_session_mutex || !s_command_mutex || !s_status_mutex || !s_urc_mutex ||
+        !s_command_queue || !s_priority_command_queue || !slots_ready || !s_event_sem) {
         cleanup_start_resources();
         return ESP_ERR_NO_MEM;
     }
@@ -2518,10 +2855,9 @@ esp_err_t idf_modem_start(const IdfConfig& config)
         cleanup_start_resources();
         return err;
     }
-    uart_flush_input(MODEM_UART);
     s_started = true;
 
-    BaseType_t ok = xTaskCreate(modem_task, "idf_modem", 8192, nullptr, 4, nullptr);
+    BaseType_t ok = xTaskCreate(modem_task, "idf_modem", 8192, nullptr, 4, &s_owner_task);
     if (ok != pdPASS) {
         s_started = false;
         uart_driver_delete(MODEM_UART);
@@ -2572,12 +2908,12 @@ void idf_modem_request_status_sample(void)
 void idf_modem_begin_esim_operation(void)
 {
     s_esim_operation_depth.fetch_add(1, std::memory_order_relaxed);
-    if (s_at_mutex) xSemaphoreTakeRecursive(s_at_mutex, portMAX_DELAY);
+    if (s_session_mutex) xSemaphoreTakeRecursive(s_session_mutex, portMAX_DELAY);
 }
 
 void idf_modem_end_esim_operation(void)
 {
-    if (s_at_mutex) xSemaphoreGiveRecursive(s_at_mutex);
+    if (s_session_mutex) xSemaphoreGiveRecursive(s_session_mutex);
     s_esim_operation_depth.fetch_sub(1, std::memory_order_relaxed);
 }
 
