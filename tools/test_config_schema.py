@@ -48,7 +48,7 @@ class ConfigSchemaTest(unittest.TestCase):
             "heartbeatInterval", "wifiTxPowerQuarterDbm", "webAccounts",
             "emailEnabled", "pushEnabled", "forwardRules", "kaEnabled", "kaIntervalDays",
             "kaAction", "kaTarget", "kaUrl", "kaProfile", "kaLastTime", "tzOffsetMin",
-            "ntpServer", "mdnsHost", "rebootEnabled", "rebootHour", "hbEnabled", "hbHour",
+            "ntpServer", "rebootEnabled", "rebootHour",
             "smsHealthEnabled", "smsHealthHour", "smsHealthNotify", "netLedEnabled",
             "callNotifyEnabled", "dataEnabled", "roamingEnabled", "apn", "operatorPlmn",
             "phoneNumber", "simCredentials", "pushChannels", "schedTasks",
@@ -56,6 +56,28 @@ class ConfigSchemaTest(unittest.TestCase):
             self.assertIn(field, config)
         self.assertNotIn("webUser", config)
         self.assertNotIn("webPass", config)
+        self.assertNotIn("mdnsHost", config)
+        self.assertNotIn("hbEnabled", config)
+        self.assertNotIn("hbHour", config)
+        self.assertEqual(
+            schema["x-legacyMigration"],
+            {
+                "mdnsHost": {
+                    "target": "hostname",
+                    "policy": "copy-if-target-default",
+                },
+                "hbEnabled": {
+                    "target": "heartbeatEnable",
+                    "policy": "copy-if-target-default",
+                },
+                "hbHour": {
+                    "target": "heartbeatInterval",
+                    "policy": "ignore-use-default",
+                    "default": 6,
+                    "reason": "daily clock hour has no interval equivalent",
+                },
+            },
+        )
         self.assertEqual(
             config["webAccounts"]["x-legacyMigration"],
             {"from": ["webUser", "webPass"], "target": "webAccounts[0]"},
@@ -68,14 +90,16 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(config["pushChannels"]["items"]["properties"]["titleTemplate"]["x-maxUtf8Bytes"], 256)
         self.assertEqual(config["pushChannels"]["items"]["properties"]["bodyTemplate"]["x-maxUtf8Bytes"], 2048)
         for field in (
-            "deviceName", "hostname", "webAccounts", "wifiProfiles", "networkMode",
-            "heartbeatEnable", "heartbeatInterval", "phoneNumber",
+            "deviceName", "hostname", "webAccounts",
+            "phoneNumber",
             "simCredentials", "kaProfile", "kaLastTime",
         ):
             self.assertFalse(config[field]["x-portableRestore"])
+        for field in ("wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval"):
+            self.assertTrue(config[field]["x-portableRestore"])
         wifi = config["wifiProfiles"]["items"]["properties"]
-        self.assertFalse(wifi["ssid"]["x-portableRestore"])
-        self.assertFalse(wifi["password"]["x-portableRestore"])
+        self.assertTrue(wifi["ssid"].get("x-portableRestore", True))
+        self.assertTrue(wifi["password"].get("x-portableRestore", True))
         sim = config["simCredentials"]["items"]["properties"]
         for field in ("iccid", "pin", "puk", "pinMaxAttempts", "pukMaxAttempts", "pinFailedAttempts", "pukFailedAttempts"):
             self.assertFalse(sim[field]["x-portableRestore"])
@@ -97,6 +121,14 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIsNone(password_pattern.fullmatch("password\n"))
         self.assertEqual(config["phoneNumber"]["maxLength"], 32)
         self.assertEqual(config["phoneNumber"]["x-maxUtf8Bytes"], 32)
+        self.assertFalse(config["roamingEnabled"]["default"])
+        self.assertFalse(config["roamingEnabled"]["x-portableRestore"])
+        self.assertEqual(config["smtpServer"]["maxLength"], 253)
+        self.assertEqual(config["smtpUser"]["maxLength"], 254)
+        self.assertEqual(
+            config["wifiTxPowerQuarterDbm"]["enum"],
+            [8, 20, 28, 34, 44, 52, 56, 60, 66, 72, 80],
+        )
         self.assertEqual(
             config["pushChannels"]["items"]["properties"]["key2"]["x-maxUtf8Bytes"], 256
         )
@@ -109,8 +141,8 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(wire["stringLengthPrefixBytes"], 2)
         self.assertEqual(wire["arrayCountBytes"], 1)
         self.assertEqual(wire["scalarBytes"], {"boolean": 1, "integer": 4})
-        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 26540)
-        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 26520)
+        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 26752)
+        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 26732)
         self.assertEqual(
             schema["x-wireWorstCase"]["headroomBytes"],
             manifest["maxBinaryBytes"] - schema["x-wireWorstCase"]["binaryBytes"],
@@ -131,8 +163,9 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIn("PUSH_TYPE_NTFY = 12", header)
         self.assertNotIn("MAX_WEB_USER_BYTES", header)
         self.assertNotIn("MAX_WEB_PASS_BYTES", header)
-        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26540", header)
-        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6228", header)
+        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26752", header)
+        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6016", header)
+        self.assertNotIn("MAX_MDNS_HOST_BYTES", header)
 
 
 if __name__ == "__main__":

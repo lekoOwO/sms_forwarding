@@ -126,6 +126,29 @@ def render_firmware(schema: dict, manifest: dict) -> str:
         raise ValueError("push type mapping must cover 0..12")
     network_modes = config["networkMode"]["x-enumMapping"]
     tx_powers = config["wifiTxPowerQuarterDbm"]["x-enumMapping"]
+    if config["wifiTxPowerQuarterDbm"].get("enum") != [
+        8,
+        20,
+        28,
+        34,
+        44,
+        52,
+        56,
+        60,
+        66,
+        72,
+        80,
+    ]:
+        raise ValueError("WiFi TX power enum is part of the storage ABI")
+    legacy = schema.get("x-legacyMigration", {})
+    if legacy.get("mdnsHost", {}).get("target") != "hostname":
+        raise ValueError("legacy mdnsHost must migrate to hostname")
+    if legacy.get("hbEnabled", {}).get("target") != "heartbeatEnable":
+        raise ValueError("legacy hbEnabled must migrate to heartbeatEnable")
+    if legacy.get("hbHour", {}).get("target") != "heartbeatInterval":
+        raise ValueError("legacy hbHour migration target must be explicit")
+    if legacy.get("hbHour", {}).get("default") != config["heartbeatInterval"]["default"]:
+        raise ValueError("legacy hbHour conversion default must match heartbeat interval default")
     locales = config["notificationLocale"]["enum"]
     if locales != ["zh-TW", "zh-CN", "en"]:
         raise ValueError("notification locale order is part of the generated ABI")
@@ -197,7 +220,6 @@ constexpr size_t MAX_KEEPALIVE_TARGET_BYTES = {config['kaTarget']['x-maxUtf8Byte
 constexpr size_t MAX_KEEPALIVE_URL_BYTES = {config['kaUrl']['x-maxUtf8Bytes']};
 constexpr size_t MAX_KEEPALIVE_PROFILE_BYTES = {config['kaProfile']['x-maxUtf8Bytes']};
 constexpr size_t MAX_NTP_SERVER_BYTES = {config['ntpServer']['x-maxUtf8Bytes']};
-constexpr size_t MAX_MDNS_HOST_BYTES = {config['mdnsHost']['x-maxUtf8Bytes']};
 constexpr size_t MAX_APN_BYTES = {config['apn']['x-maxUtf8Bytes']};
 constexpr size_t MAX_OPERATOR_PLMN_BYTES = {config['operatorPlmn']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PHONE_NUMBER_BYTES = {config['phoneNumber']['x-maxUtf8Bytes']};

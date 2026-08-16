@@ -24,9 +24,25 @@
     }
   },
   "x-wireWorstCase": {
-    "payloadBytes": 26520,
-    "binaryBytes": 26540,
-    "headroomBytes": 6228
+    "payloadBytes": 26732,
+    "binaryBytes": 26752,
+    "headroomBytes": 6016
+  },
+  "x-legacyMigration": {
+    "mdnsHost": {
+      "target": "hostname",
+      "policy": "copy-if-target-default"
+    },
+    "hbEnabled": {
+      "target": "heartbeatEnable",
+      "policy": "copy-if-target-default"
+    },
+    "hbHour": {
+      "target": "heartbeatInterval",
+      "policy": "ignore-use-default",
+      "default": 6,
+      "reason": "daily clock hour has no interval equivalent"
+    }
   },
   "type": "object",
   "additionalProperties": false,
@@ -75,11 +91,8 @@
         "kaLastTime",
         "tzOffsetMin",
         "ntpServer",
-        "mdnsHost",
         "rebootEnabled",
         "rebootHour",
-        "hbEnabled",
-        "hbHour",
         "smsHealthEnabled",
         "smsHealthHour",
         "smsHealthNotify",
@@ -131,14 +144,14 @@
         },
         "smtpServer": {
           "type": "string",
-          "maxLength": 128,
-          "x-maxUtf8Bytes": 128,
+          "maxLength": 253,
+          "x-maxUtf8Bytes": 253,
           "x-codecOrder": 4
         },
         "smtpUser": {
           "type": "string",
-          "maxLength": 128,
-          "x-maxUtf8Bytes": 128,
+          "maxLength": 254,
+          "x-maxUtf8Bytes": 254,
           "x-codecOrder": 5
         },
         "smtpPass": {
@@ -343,8 +356,7 @@
           "maxItems": 5,
           "x-itemCount": 5,
           "x-codecOrder": 12,
-          "x-portableRestore": false,
-          "x-portableValue": "target-local",
+          "x-portableRestore": true,
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -357,9 +369,7 @@
                 "type": "string",
                 "maxLength": 31,
                 "x-maxUtf8Bytes": 31,
-                "x-codecOrder": 0,
-                "x-portableRestore": false,
-                "x-portableValue": ""
+                "x-codecOrder": 0
               },
               "password": {
                 "type": "string",
@@ -367,9 +377,7 @@
                 "pattern": "^(?:|[ -~]{8,63})$",
                 "x-maxUtf8Bytes": 63,
                 "x-codecOrder": 1,
-                "x-sensitive": true,
-                "x-portableRestore": false,
-                "x-portableValue": ""
+                "x-sensitive": true
               }
             }
           }
@@ -380,8 +388,7 @@
           "maximum": 2,
           "default": 0,
           "x-codecOrder": 13,
-          "x-portableRestore": false,
-          "x-portableValue": 0,
+          "x-portableRestore": true,
           "x-enumMapping": {
             "NETWORK_MODE_WIFI_ONLY": 0,
             "NETWORK_MODE_4G_ONLY": 1,
@@ -392,8 +399,7 @@
           "type": "boolean",
           "default": true,
           "x-codecOrder": 14,
-          "x-portableRestore": false,
-          "x-portableValue": true
+          "x-portableRestore": true
         },
         "heartbeatInterval": {
           "type": "integer",
@@ -401,13 +407,11 @@
           "maximum": 240,
           "default": 6,
           "x-codecOrder": 15,
-          "x-portableRestore": false,
-          "x-portableValue": 6
+          "x-portableRestore": true
         },
         "wifiTxPowerQuarterDbm": {
           "type": "integer",
-          "minimum": 0,
-          "maximum": 80,
+          "enum": [8, 20, 28, 34, 44, 52, 56, 60, 66, 72, 80],
           "default": 34,
           "x-codecOrder": 16,
           "x-portableRestore": false,
@@ -504,94 +508,75 @@
           "x-codecOrder": 28,
           "default": "ntp.aliyun.com"
         },
-        "mdnsHost": {
-          "type": "string",
-          "maxLength": 32,
-          "x-maxUtf8Bytes": 32,
-          "x-codecOrder": 29,
-          "default": "sms",
-          "x-portableRestore": false,
-          "x-portableValue": "sms"
-        },
         "rebootEnabled": {
           "type": "boolean",
-          "x-codecOrder": 30,
+          "x-codecOrder": 29,
           "default": false
         },
         "rebootHour": {
           "type": "integer",
           "minimum": 0,
           "maximum": 23,
-          "x-codecOrder": 31,
+          "x-codecOrder": 30,
           "default": 4
-        },
-        "hbEnabled": {
-          "type": "boolean",
-          "x-codecOrder": 32,
-          "default": false
-        },
-        "hbHour": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 23,
-          "x-codecOrder": 33,
-          "default": 9
         },
         "smsHealthEnabled": {
           "type": "boolean",
-          "x-codecOrder": 34,
+          "x-codecOrder": 31,
           "default": false
         },
         "smsHealthHour": {
           "type": "integer",
           "minimum": 0,
           "maximum": 23,
-          "x-codecOrder": 35,
+          "x-codecOrder": 32,
           "default": 10
         },
         "smsHealthNotify": {
           "type": "boolean",
-          "x-codecOrder": 36,
+          "x-codecOrder": 33,
           "default": true
         },
         "netLedEnabled": {
           "type": "boolean",
-          "x-codecOrder": 37,
+          "x-codecOrder": 34,
           "default": true
         },
         "callNotifyEnabled": {
           "type": "boolean",
-          "x-codecOrder": 38,
+          "x-codecOrder": 35,
           "default": true
         },
         "dataEnabled": {
           "type": "boolean",
-          "x-codecOrder": 39,
+          "x-codecOrder": 36,
           "default": false
         },
         "roamingEnabled": {
           "type": "boolean",
-          "x-codecOrder": 40,
-          "default": true
+          "x-codecOrder": 37,
+          "default": false,
+          "x-portableRestore": false,
+          "x-portableValue": false
         },
         "apn": {
           "type": "string",
           "maxLength": 96,
           "x-maxUtf8Bytes": 96,
-          "x-codecOrder": 41,
+          "x-codecOrder": 38,
           "x-sensitive": true
         },
         "operatorPlmn": {
           "type": "string",
           "maxLength": 16,
           "x-maxUtf8Bytes": 16,
-          "x-codecOrder": 42
+          "x-codecOrder": 39
         },
         "phoneNumber": {
           "type": "string",
           "maxLength": 32,
           "x-maxUtf8Bytes": 32,
-          "x-codecOrder": 43,
+          "x-codecOrder": 40,
           "x-sensitive": true,
           "x-portableRestore": false,
           "x-portableValue": ""
@@ -601,7 +586,7 @@
           "minItems": 5,
           "maxItems": 5,
           "x-itemCount": 5,
-          "x-codecOrder": 44,
+          "x-codecOrder": 41,
           "x-portableRestore": false,
           "x-portableValue": "target-local",
           "items": {
@@ -686,7 +671,7 @@
           "minItems": 6,
           "maxItems": 6,
           "x-itemCount": 6,
-          "x-codecOrder": 45,
+          "x-codecOrder": 42,
           "items": {
             "type": "object",
             "additionalProperties": false,
