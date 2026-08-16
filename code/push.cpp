@@ -373,7 +373,7 @@ static void deliverToChannel(const PushChannel& channel, const char* sender, con
         }
         // Format the int64_t explicitly before appending it.
         char tsBuf[21];
-        snprintf(tsBuf, sizeof(tsBuf), "%lld", ts);
+        snprintf(tsBuf, sizeof(tsBuf), "%lld", static_cast<long long>(ts));
         webhookUrl += "timestamp=" + String(tsBuf) + "&sign=" + sign;
       }
       
