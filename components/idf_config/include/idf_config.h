@@ -9,6 +9,7 @@
 #include "esp_err.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
+static constexpr int IDF_MAX_WEB_ACCOUNTS = 10;
 static constexpr const char* IDF_FW_VERSION = "1.1.4";
 static constexpr const char* IDF_DEFAULT_WEB_USER = "admin";
 static constexpr const char* IDF_DEFAULT_WEB_PASS = "admin123";
@@ -36,6 +37,11 @@ struct IdfWifiNetwork {
     std::string pass;
 };
 
+struct IdfWebAccount {
+    std::string username;
+    std::string password;
+};
+
 // 进阶定时任务：可选定目标 eSIM Profile，每 N 天执行一个动作，完成后可切回原卡
 struct IdfSchedTask {
     bool enabled = false;
@@ -56,15 +62,27 @@ struct IdfPushChannel {
     std::string url;
     std::string key1;
     std::string key2;
+    std::string titleTemplate;
+    std::string bodyTemplate;
     std::string customBody;
 };
 
 struct IdfConfig {
+    // v5 本地身份与通知语言；webUser/webPass 仅保留为旧调用方的 account0 镜像，不落盘。
+    std::string deviceName = "SMS Forwarder";
+    std::string hostname = "sms";
+    std::string notificationLocale = "zh-TW";
+
     // 槽位 0 持久化在旧键 wifiSsid/wifiPass 上，其余在 wifiNSsid/wifiNPass，
     // OTA 回滚到旧固件仍能读到最近配网的网络
     IdfWifiNetwork wifiNetworks[IDF_MAX_WIFI_NETWORKS];
     bool wifiFromFallback = false;
     uint8_t wifiTxPowerQuarterDbm = 34;  // ESP-IDF 单位为 0.25dBm；34=8.5dBm
+
+    IdfWebAccount webAccounts[IDF_MAX_WEB_ACCOUNTS];
+    int networkMode = 0;
+    bool heartbeatEnable = true;
+    int heartbeatInterval = 6;
 
     std::string smtpServer;
     int smtpPort = 465;
@@ -102,7 +120,7 @@ struct IdfConfig {
     bool netLedEnabled = true;  // 模组 NET 指示灯(AT+MNETLIGHT)，关闭后重启依然保持
     bool callNotifyEnabled = true;  // 来电通知：有来电时把主叫号码按短信相同的通道推送
     bool dataEnabled = false;
-    bool roamingEnabled = true;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
+    bool roamingEnabled = false;  // 允许数据漫游(同手机"数据漫游")：关闭后漫游中不激活蜂窝数据
     std::string apn;
     std::string operatorPlmn;
     std::string phoneNumber;
@@ -114,17 +132,43 @@ struct IdfConfig {
 
 using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
 
+enum class IdfConfigLoadStatus : uint8_t {
+    Unknown = 0,
+    Loaded = 1,
+    Migrated = 2,
+    FirstBoot = 3,
+    StorageError = 4,
+    UnsupportedSchema = 5,
+};
+
 esp_err_t idf_config_load(void);
+IdfConfigLoadStatus idf_config_last_load_status(void);
 // 配网保存：同名更新密码并提到槽位 0，新网络插入槽位 0，满员挤掉最旧一组
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
 // 网页整表保存历史 WiFi 列表；preserve_blank_pass=true 时已存网络密码留空表示不修改
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
                                         bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm);
+// Atomically update one Web-managed slot without reordering the list.  Empty
+// SSID clears the slot; open networks clear the password; a blank retained
+// password is valid only when the SSID is unchanged.
+esp_err_t idf_config_save_wifi_profile(int index, const std::string& ssid,
+                                       const std::string& password, bool open,
+                                       bool retain_password);
 // 类手机行为：STA 连接成功后记住当前网络并维持"最近使用"序(LRU)：
 // 已在首位直接返回(常驻网络重连零开销)；在列表但不在首位提到首位；
 // 新网络/密码变更上位插入，满员挤掉末位(最久未用)的一组
 esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass);
 esp_err_t idf_config_save_account(const std::string& user, const std::string& pass);
+// Atomically replace all ten web accounts.  An empty username disables that
+// slot; when preserve_blank_password is true, an empty password retains the
+// slot's current password for a non-empty username.  At least one complete
+// account must remain usable.
+esp_err_t idf_config_save_accounts(const IdfWebAccount accounts[IDF_MAX_WEB_ACCOUNTS],
+                                   bool preserve_blank_password);
+esp_err_t idf_config_save_identity(const std::string& device_name, const std::string& hostname);
+esp_err_t idf_config_save_notification_locale(const std::string& locale);
+esp_err_t idf_config_save_network_mode(int network_mode);
+esp_err_t idf_config_save_heartbeat(bool enabled, int interval_hours);
 esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server);
 esp_err_t idf_config_save_mdns_host(const std::string& host);
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
@@ -176,6 +220,11 @@ struct IdfWifiNetworkView {
     bool passSet = false;
 };
 
+struct IdfWebAccountView {
+    std::string username;
+    bool passwordSet = false;
+};
+
 struct IdfSimCredentialView {
     std::string iccid;
     bool pinSet = false;
@@ -188,6 +237,9 @@ struct IdfSimCredentialView {
 
 // /config.json 专用快照：不带定时任务数组，避免面板切换/保存后刷新时全量深拷贝
 struct IdfConfigWebView {
+    std::string deviceName;
+    std::string hostname;
+    std::string notificationLocale;
     std::string webUser = IDF_DEFAULT_WEB_USER;
     std::string webPass = IDF_DEFAULT_WEB_PASS;
     std::string smtpServer;
@@ -202,6 +254,9 @@ struct IdfConfigWebView {
     bool emailConfigured = false;
     bool pushEnabled = true;
     int pushEnabledCount = 0;
+    int networkMode = 0;
+    bool heartbeatEnable = true;
+    int heartbeatInterval = 6;
     std::string ntpServer = "ntp.aliyun.com";
     std::string mdnsHost = "sms";
     int tzOffsetMin = 480;
@@ -213,7 +268,7 @@ struct IdfConfigWebView {
     int smsHealthHour = 10;
     bool smsHealthNotify = true;
     bool dataEnabled = false;
-    bool roamingEnabled = true;
+    bool roamingEnabled = false;
     std::string apn;
     std::string phoneNumber;
     std::string operatorPlmn;
@@ -222,8 +277,16 @@ struct IdfConfigWebView {
     bool callNotifyEnabled = true;
     uint8_t wifiTxPowerQuarterDbm = 34;
     IdfWifiNetworkView wifiNetworks[IDF_MAX_WIFI_NETWORKS];
+    IdfWebAccountView webAccounts[IDF_MAX_WEB_ACCOUNTS];
     IdfSimCredentialView simCredentials[IDF_MAX_SIM_CREDENTIALS];
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
+    // Secret-bearing members above remain for the legacy form parser; API
+    // responses must use these presence bits and blank the corresponding
+    // values before serialization.
+    bool pushUrlSet[IDF_MAX_PUSH_CHANNELS] = {};
+    bool pushCustomBodySet[IDF_MAX_PUSH_CHANNELS] = {};
+    bool pushKey1Set[IDF_MAX_PUSH_CHANNELS] = {};
+    bool pushKey2Set[IDF_MAX_PUSH_CHANNELS] = {};
 };
 
 // 保号执行任务专用快照：只带动作所需字段，避免把整份配置拷进后台任务参数
@@ -255,7 +318,7 @@ struct IdfSchedRunView {
 
 struct IdfSimSettingsView {
     bool dataEnabled = false;
-    bool roamingEnabled = true;
+    bool roamingEnabled = false;
     std::string apn;
     std::string operatorPlmn;
     IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS];
@@ -273,6 +336,12 @@ struct IdfSmsProcessView {
 };
 
 struct IdfPushForwardView {
+    std::string deviceName;
+    std::string hostname;
+    std::string notificationLocale;
+    int networkMode = 0;
+    bool heartbeatEnable = true;
+    int heartbeatInterval = 6;
     std::string forwardRules;
     bool pushEnabled = true;
     bool emailEnabled = true;
@@ -281,6 +350,12 @@ struct IdfPushForwardView {
 };
 
 struct IdfPushNotifyView {
+    std::string deviceName;
+    std::string hostname;
+    std::string notificationLocale;
+    int networkMode = 0;
+    bool heartbeatEnable = true;
+    int heartbeatInterval = 6;
     bool pushEnabled = true;
     int tzOffsetMin = 480;
     IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
