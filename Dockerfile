@@ -5,6 +5,8 @@ ARG ARDUINO_CLI_VERSION=1.5.1
 ARG ESP32_CORE_VERSION=3.3.10
 ARG READYMAIL_VERSION=0.4.2
 ARG ARDUINOJSON_VERSION=7.4.3
+ARG CPPCHECK_VERSION=2.14.2-r1
+ARG RUFF_VERSION=0.16.0
 ARG TARGETARCH
 ARG USER_ID=1000
 ARG GROUP_ID=1000
@@ -24,6 +26,7 @@ RUN apk add --no-cache \
         bash \
         ca-certificates \
         curl \
+        cppcheck="${CPPCHECK_VERSION}" \
         git \
         gcompat \
         libstdc++ \
@@ -67,14 +70,23 @@ RUN apk add --no-cache \
     && adduser -D -u "${USER_ID}" -G developer developer \
     && chown -R developer:developer /opt/arduino
 
-RUN apk add --no-cache nodejs npm
+ARG SHELLCHECK_VERSION=0.10.0-r2
+RUN apk add --no-cache nodejs npm shellcheck="${SHELLCHECK_VERSION}"
+
+COPY web/package.json web/package-lock.json /opt/web/
+RUN npm ci --prefix /opt/web --ignore-scripts
 
 ARG ESPTOOL_VERSION=5.3.0
 RUN apk add --no-cache py3-pip \
     && python3 -m venv /opt/esptool-venv \
     && /opt/esptool-venv/bin/pip install --no-cache-dir "esptool==${ESPTOOL_VERSION}" \
+    && python3 -m venv /opt/lint-venv \
+    && /opt/lint-venv/bin/pip install --no-cache-dir "ruff==${RUFF_VERSION}" \
     && rm "/opt/arduino/data/packages/esp32/tools/esptool_py/${ESPTOOL_VERSION}/esptool" \
     && ln -s /opt/esptool-venv/bin/esptool "/opt/arduino/data/packages/esp32/tools/esptool_py/${ESPTOOL_VERSION}/esptool"
+
+ENV LINT_NODE_MODULES=/opt/web \
+    PATH=/opt/web/node_modules/.bin:/opt/lint-venv/bin:$PATH
 
 USER developer
 WORKDIR /workspace

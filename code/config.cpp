@@ -10,6 +10,7 @@ namespace {
 
 constexpr uint32_t CONFIG_MAGIC = 0x32474643;  // CFG2
 constexpr uint16_t CONFIG_SCHEMA_VERSION_V1 = 1;
+constexpr uint16_t CONFIG_SCHEMA_VERSION_V2 = 2;
 constexpr uint32_t MARKER_MAGIC = 0x324B524D;  // MRK2
 constexpr size_t CONFIG_HEADER_SIZE = 20;
 constexpr size_t CONFIG_MARKER_SIZE = 20;
@@ -172,7 +173,7 @@ bool storageSemanticsValid(const Config& value) {
   for (int i = 0; i < MAX_PUSH_CHANNELS; ++i) {
     const PushChannel& channel = value.pushChannels[i];
     int type = static_cast<int>(channel.type);
-    if (type < PUSH_TYPE_NONE || type > PUSH_TYPE_TELEGRAM) return false;
+    if (type < PUSH_TYPE_NONE || type > PUSH_TYPE_NTFY) return false;
     if (!boundedUtf8(channel.name, MAX_PUSH_NAME_BYTES) ||
         !boundedUtf8(channel.url, MAX_PUSH_URL_BYTES) ||
         !boundedUtf8(channel.key1, MAX_PUSH_KEY1_BYTES) ||
@@ -280,7 +281,8 @@ bool decodeConfigV1Payload(const uint8_t*& cursor, const uint8_t* end, Config& v
   return true;
 }
 
-bool decodeConfigV2Payload(const uint8_t*& cursor, const uint8_t* end, Config& value) {
+bool decodeConfigV2Payload(const uint8_t*& cursor, const uint8_t* end, Config& value,
+                           PushType maxPushType) {
   setDefaults(value);
   if (end - cursor < 4) return false;
   value.smtpPort = readU32(cursor);
@@ -297,7 +299,7 @@ bool decodeConfigV2Payload(const uint8_t*& cursor, const uint8_t* end, Config& v
     if (end - cursor < 2) return false;
     uint8_t enabled = *cursor++;
     uint8_t type = *cursor++;
-    if (enabled > 1 || type > PUSH_TYPE_TELEGRAM) return false;
+    if (enabled > 1 || type > maxPushType) return false;
     PushChannel& channel = value.pushChannels[i];
     channel.enabled = enabled == 1;
     channel.type = static_cast<PushType>(type);
@@ -336,7 +338,10 @@ bool decodeConfig(const uint8_t* bytes, size_t length, Config& value, uint32_t& 
   if (decodedSchema) *decodedSchema = schema;
   bool decoded = schema == CONFIG_SCHEMA_VERSION_V1
                    ? decodeConfigV1Payload(cursor, end, value)
-                   : schema == CONFIG_SCHEMA_VERSION && decodeConfigV2Payload(cursor, end, value);
+                   : schema == CONFIG_SCHEMA_VERSION_V2
+                       ? decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_TELEGRAM)
+                       : schema == CONFIG_SCHEMA_VERSION &&
+                           decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_NTFY);
   return decoded && cursor == end && storageSemanticsValid(value);
 }
 
@@ -596,6 +601,8 @@ bool isPushChannelValid(const PushChannel& ch) {
     case PUSH_TYPE_DINGTALK:
     case PUSH_TYPE_FEISHU:
     case PUSH_TYPE_CUSTOM:
+    case PUSH_TYPE_DISCORD:
+    case PUSH_TYPE_NTFY:
       return ch.url.length() > 0;
     case PUSH_TYPE_PUSHPLUS:
     case PUSH_TYPE_SERVERCHAN:
@@ -632,7 +639,8 @@ PortableConfigStatus decodePortableConfig(const uint8_t* bytes, size_t length,
   uint32_t generation = 0;
   Config decoded;
   if (!decodeConfig(bytes, length, decoded, generation, &schema)) {
-    return schema != 0 && schema != CONFIG_SCHEMA_VERSION_V1 && schema != CONFIG_SCHEMA_VERSION
+    return schema != 0 && schema != CONFIG_SCHEMA_VERSION_V1 &&
+                   schema != CONFIG_SCHEMA_VERSION_V2 && schema != CONFIG_SCHEMA_VERSION
              ? PORTABLE_CONFIG_UNSUPPORTED_VERSION : PORTABLE_CONFIG_INVALID;
   }
   if (generation != 0) return PORTABLE_CONFIG_INVALID;

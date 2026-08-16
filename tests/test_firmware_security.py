@@ -32,6 +32,12 @@ int main() {
   const char truncated[] = {char(0xe2), char(0x82), 0};
   const char control[] = {char(0x01), 0};
   const char multiline[] = {'a', '\n', '\t', 'b', 0};
+  char exactDiscordLimit[2001];
+  char overDiscordLimit[2002];
+  for (int i = 0; i < 2000; ++i) exactDiscordLimit[i] = overDiscordLimit[i] = 'a';
+  exactDiscordLimit[2000] = 0;
+  overDiscordLimit[2000] = 'a';
+  overDiscordLimit[2001] = 0;
   return validUtf8CharLength(ascii) == 1 &&
          validUtf8CharLength(euro) == 3 &&
          validUtf8CharLength(maxCodePoint) == 4 &&
@@ -44,6 +50,10 @@ int main() {
          !isValidUtf8(stray) && !isValidUtf8(overlong) &&
          !isValidUtf8(surrogate) && !isValidUtf8(tooHigh) &&
          !isValidUtf8(truncated) && isValidUtf8(control) &&
+         utf8CodePointCount(exactDiscordLimit, 2000) == 2000 &&
+         utf8CodePointCount(overDiscordLimit, 2000) == 2001 &&
+         utf8CodePointCount(euro, 2000) == 1 &&
+         utf8CodePointCount(stray, 2000) == 2001 &&
          !isValidUtf8Text(control) && isValidUtf8Text(multiline) &&
          !hasValidJsonEncoding(control) && hasValidJsonEncoding(ascii) &&
          hasValidJsonEncoding(euro) ? 0 : 1;

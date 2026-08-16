@@ -632,7 +632,7 @@
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean" },
-          "type": { "type": "integer", "minimum": 0, "maximum": 10 },
+          "type": { "type": "integer", "minimum": 0, "maximum": 12 },
           "name": { "type": "string" },
           "url": { "type": "string" },
           "key1": { "type": "string" },
@@ -714,7 +714,7 @@
           "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },
           "^account[0-9]pass$": { "type": "string", "x-maxUtf8Bytes": 96, "x-maxBasicPairUtf8Bytes": 180 },
           "^push[0-4]en$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
-          "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 10, "x-maxUtf8Bytes": 32 },
+          "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 12, "x-maxUtf8Bytes": 32 },
           "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
           "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512 },
           "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256 },

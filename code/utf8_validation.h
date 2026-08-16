@@ -1,6 +1,7 @@
 #ifndef UTF8_VALIDATION_H
 #define UTF8_VALIDATION_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 inline int validUtf8CharLength(const char* text) {
@@ -36,6 +37,17 @@ inline bool isValidUtf8(const char* text) {
     text += length;
   }
   return true;
+}
+
+inline size_t utf8CodePointCount(const char* text, size_t maxCount) {
+  if (!text) return maxCount + 1;
+  size_t count = 0;
+  while (*text) {
+    int length = validUtf8CharLength(text);
+    if (length == 0 || ++count > maxCount) return maxCount + 1;
+    text += length;
+  }
+  return count;
 }
 
 inline bool isValidUtf8Text(const char* text) {

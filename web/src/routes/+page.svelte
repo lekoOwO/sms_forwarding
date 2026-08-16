@@ -42,7 +42,9 @@
 		"Custom JSON",
 		"Feishu",
 		"Gotify",
-		"Telegram"
+		"Telegram",
+		"Discord Webhook",
+		"ntfy"
 	];
 	const navigation: { value: MainTab; label: TranslationKey }[] = [
 		{ value: "overview", label: "navOverview" },

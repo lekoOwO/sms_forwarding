@@ -43,11 +43,13 @@ class ConfigSchemaTest(unittest.TestCase):
         manifest = json.loads((schema_dir / "manifest.json").read_text())
         v1 = json.loads((schema_dir / manifest["versions"]["1"]).read_text())
         v2 = json.loads((schema_dir / manifest["versions"]["2"]).read_text())
+        v3 = json.loads((schema_dir / manifest["versions"]["3"]).read_text())
 
-        self.assertEqual(manifest["currentVersion"], 2)
+        self.assertEqual(manifest["currentVersion"], 3)
         self.assertEqual(v1["properties"]["schemaVersion"]["const"], 1)
         self.assertEqual(v2["properties"]["schemaVersion"]["const"], 2)
-        config = v2["properties"]["config"]
+        self.assertEqual(v3["properties"]["schemaVersion"]["const"], 3)
+        config = v3["properties"]["config"]
         self.assertEqual(config["properties"]["deviceName"]["x-maxUtf8Bytes"], 64)
         self.assertEqual(config["properties"]["hostname"]["maxLength"], 32)
         self.assertEqual(
@@ -95,7 +97,7 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_schema_owns_binary_security_and_field_metadata(self):
         schema_dir = ROOT / "dev_doc/config-schema"
         manifest = json.loads((schema_dir / "manifest.json").read_text())
-        schema = json.loads((schema_dir / manifest["versions"]["2"]).read_text())
+        schema = json.loads((schema_dir / manifest["versions"][str(manifest["currentVersion"])]).read_text())
         config = schema["properties"]["config"]["properties"]
         channel = config["pushChannels"]["items"]["properties"]
 
@@ -115,7 +117,8 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(config["webAccounts"]["x-itemCount"], 10)
         self.assertEqual(config["pushChannels"]["x-itemCount"], 5)
         self.assertTrue(config["smtpPass"]["x-sensitive"])
-        self.assertEqual(channel["type"]["x-enumMapping"]["PUSH_TYPE_TELEGRAM"], 10)
+        self.assertEqual(channel["type"]["x-enumMapping"]["PUSH_TYPE_DISCORD"], 11)
+        self.assertEqual(channel["type"]["x-enumMapping"]["PUSH_TYPE_NTFY"], 12)
         self.assertEqual(channel["bodyTemplate"]["x-maxRenderedUtf8Bytes"], 8192)
 
     def test_notification_catalog_is_the_only_new_runtime_cjk_source(self):

@@ -1,0 +1,27 @@
+{
+  "mock_server/server.mjs": {
+    "no-control-regex": {
+      "count": 1
+    }
+  },
+  "mock_server/test/ui.test.mjs": {
+    "preserve-caught-error": {
+      "count": 1
+    }
+  },
+  "web/src/lib/components/ActionResult.svelte": {
+    "svelte/require-each-key": {
+      "count": 1
+    }
+  },
+  "web/src/lib/components/ui/button/button.svelte": {
+    "svelte/no-navigation-without-resolve": {
+      "count": 1
+    }
+  },
+  "web/src/routes/+page.svelte": {
+    "svelte/require-each-key": {
+      "count": 8
+    }
+  }
+}

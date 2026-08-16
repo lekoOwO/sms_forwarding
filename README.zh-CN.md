@@ -25,7 +25,7 @@
 
 ## 推送服务
 
-支持 POST JSON、Bark、GET、DingTalk、PushPlus、ServerChan、Custom JSON、Feishu、Gotify 和 Telegram。
+支持 POST JSON、Bark、GET、DingTalk、PushPlus、ServerChan、Custom JSON、Feishu、Gotify、Telegram、Discord Webhook 和 ntfy。
 
 模板可使用发送者、消息、时间、设备名称、本机号码、IP、hostname 和 WiFi 名称。Custom JSON 可自定义完整 request body。
 

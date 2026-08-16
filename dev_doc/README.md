@@ -9,6 +9,9 @@
 - 要理解啟動、資料流、模組邊界或 HTTP 路由：讀
   [architecture.md](architecture.md)。
 - 要查 HTTP request、response 與狀態碼：讀 [openapi.json](openapi.json)。
+- 要維護文件語言與等價版本：讀
+  [document-languages.json](document-languages.json)，並執行
+  `python3 -m unittest tests/test_document_languages.py`。
 - 要修改韌體：再讀 [`../code/AGENTS.md`](../code/AGENTS.md)。
 - 要維護文件：再讀 [`AGENTS.md`](AGENTS.md)。
 

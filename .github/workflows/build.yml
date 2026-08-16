@@ -21,6 +21,9 @@ jobs:
         persist-credentials: false
         fetch-depth: 0
 
+    - name: Lint source
+      run: scripts/dev.sh lint all
+
     - name: Verify firmware version source
       run: python3 scripts/generate-firmware-version.py --check
 

@@ -65,6 +65,12 @@ function base64Body(bytes) {
 	return { headers: { "Content-Type": "text/plain" }, body: Buffer.from(bytes).toString("base64") };
 }
 
+function firstPushTypeOffset(portable) {
+	let offset = 24;
+	for (let index = 0; index < 29; index += 1) offset += 2 + portable.readUInt16LE(offset);
+	return offset + 1;
+}
+
 async function completedAction(baseUrl, response) {
 	const body = await response.json();
 	if (response.status !== 202 || body.code !== "ACTION_JOB_ACCEPTED") return body;
@@ -82,6 +88,73 @@ test("authentication can be disabled for the LAN development server", async () =
 		assert.equal((await fetch(`${baseUrl}/modem?action=restart`)).status, 403);
 		assert.equal((await fetch(`${baseUrl}/wifi?action=restart`)).status, 403);
 	}, { authRequired: false });
+});
+
+test("Discord and ntfy provider types round-trip through the management contract", async () => {
+	await withServer(async (baseUrl) => {
+		for (const [index, type, name, url] of [
+			[0, 11, "Discord", "https://discord.com/api/webhooks/id/token"],
+			[1, 12, "ntfy", "https://ntfy.sh/example-topic"]
+		]) {
+			const response = await request(baseUrl, "/save", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({
+					[`push${index}en`]: "on",
+					[`push${index}type`]: String(type),
+					[`push${index}name`]: name,
+					[`push${index}url`]: url,
+					[`push${index}key1`]: "",
+					[`push${index}key2`]: "",
+					[`push${index}body`]: "",
+					[`push${index}title`]: "Alert from {sender}",
+					[`push${index}template`]: "{message}"
+				})
+			});
+			assert.equal((await completedAction(baseUrl, response)).code, "ACTION_CONFIG_SAVED");
+		}
+
+		const channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
+		assert.deepEqual(channels.slice(0, 2).map(({ type, url, key1, key2 }) => ({ type, url, key1, key2 })), [
+			{ type: 11, url: "https://discord.com/api/webhooks/id/token", key1: "", key2: "" },
+			{ type: 12, url: "https://ntfy.sh/example-topic", key1: "", key2: "" }
+		]);
+
+		const invalid = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ push0type: "13" })
+		});
+		assert.equal((await completedAction(baseUrl, invalid)).code, "ACTION_CONFIG_INVALID");
+	});
+});
+
+test("schema v2 portable configs still reject provider values added in v3", async () => {
+	const vector = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v1.json", import.meta.url), "utf8"));
+	const portable = decryptBackup(Buffer.from(vector.smscfgHex, "hex"), vector.passphrase);
+	assert.equal(portable.readUInt16LE(4), 2);
+	portable[firstPushTypeOffset(portable)] = 11;
+	portable.writeUInt32LE(crc32(portable.subarray(20)), 16);
+	const passphrase = "correct horse battery staple";
+	const encrypted = encryptBackup(portable, passphrase);
+
+	await withServer(async (baseUrl) => {
+		const started = await request(baseUrl, "/api/config/restore/start", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ size: String(encrypted.length) })
+		});
+		const uploadId = (await started.json()).data.uploadId;
+		assert.equal((await request(baseUrl, `/api/config/restore/chunk?id=${uploadId}&offset=0`, {
+			method: "POST", ...base64Body(encrypted)
+		})).status, 200);
+		const finished = await request(baseUrl, `/api/config/restore/finish?id=${uploadId}`, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ passphrase })
+		});
+		assert.equal((await completedAction(baseUrl, finished)).code, "ACTION_CONFIG_RESTORE_INVALID");
+	});
 });
 
 test("the configuration envelope golden vector binds the full little-endian header", async () => {
@@ -337,7 +410,7 @@ test("the mock implements the documented API", async () => {
 		assert.equal((await request(baseUrl, exportPath)).status, 404);
 		const portable = decryptBackup(exported, "correct horse battery staple");
 		assert.equal(portable.subarray(0, 4).toString(), "CFG2");
-		assert.equal(portable.readUInt16LE(4), 2);
+		assert.equal(portable.readUInt16LE(4), 3);
 		assert.equal(portable.readUInt32LE(8), 0);
 		assert.equal(portable.readUInt32LE(12), portable.length - 20);
 		assert.equal(portable.readUInt32LE(16), crc32(portable.subarray(20)));

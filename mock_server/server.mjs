@@ -59,12 +59,13 @@ function portableConfig(config) {
 	}
 	const payload = Buffer.concat(parts);
 	const header = Buffer.alloc(20);
-	header.write("CFG2"); header.writeUInt16LE(2, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
+	header.write("CFG2"); header.writeUInt16LE(3, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
 	return Buffer.concat([header, payload]);
 }
 
 function decodePortableConfig(bytes, target) {
-	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || bytes.readUInt16LE(4) !== 2 ||
+	const schemaVersion = bytes.length >= 6 ? bytes.readUInt16LE(4) : 0;
+	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || ![2, 3].includes(schemaVersion) ||
 		bytes.readUInt16LE(6) !== 0 || bytes.readUInt32LE(8) !== 0 || bytes.readUInt32LE(12) !== bytes.length - 20 ||
 		bytes.readUInt32LE(16) !== crc32(bytes.subarray(20))) throw new Error("portable");
 	let offset = 20;
@@ -100,7 +101,8 @@ function decodePortableConfig(bytes, target) {
 		return { enabled, type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
 	});
 	if (offset !== bytes.length || decoded.deviceName !== "Portable backup" || decoded.hostname !== "portable-backup" ||
-		decoded.webAccounts.some((account) => account.username || account.password)) throw new Error("portable");
+		decoded.webAccounts.some((account) => account.username || account.password) ||
+		(schemaVersion === 2 && decoded.pushChannels.some((channel) => channel.type > 10))) throw new Error("portable");
 	decoded.deviceName = target.deviceName;
 	decoded.hostname = target.hostname;
 	decoded.webAccounts = structuredClone(target.webAccounts);
@@ -124,7 +126,7 @@ function configSemanticallyValid(config) {
 		!bounded(config.adminPhone, 32) || !bounded(config.numberBlackList, 1024) ||
 		config.webAccounts.length !== 10 || config.webAccounts.some((account) => !bounded(account.username, 64) || !bounded(account.password, 96)) ||
 		config.pushChannels.length !== 5) return false;
-	return config.pushChannels.every((channel) => Number.isInteger(channel.type) && channel.type >= 0 && channel.type <= 10 &&
+	return config.pushChannels.every((channel) => Number.isInteger(channel.type) && channel.type >= 0 && channel.type <= 12 &&
 		typeof channel.enabled === "boolean" && bounded(channel.name, 64) && bounded(channel.url, 512) &&
 		bounded(channel.key1, 256) && bounded(channel.key2, 256) && bounded(channel.titleTemplate, 256) &&
 		bounded(channel.bodyTemplate, 2048) && bounded(channel.customBody, 2048) && !/[\r\n]/.test(channel.titleTemplate) &&

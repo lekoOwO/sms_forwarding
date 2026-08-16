@@ -9,6 +9,7 @@
 ```sh
 scripts/dev.sh build frontend
 scripts/dev.sh build firmware
+scripts/dev.sh lint all
 scripts/dev.sh start mock-server
 scripts/dev.sh restart mock-server
 scripts/dev.sh stop mock-server

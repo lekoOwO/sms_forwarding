@@ -168,6 +168,8 @@
 	"providerHint8": "Enter a Feishu webhook. The Secret is optional.",
 	"providerHint9": "Enter a Gotify server URL and application Token.",
 	"providerHint10": "Enter a Telegram Chat ID and Bot Token.",
+	"providerHint11": "POST the rendered title and body to a Discord webhook.",
+	"providerHint12": "POST the rendered body to an ntfy topic URL with the rendered Title header.",
 	"keySecret": "Secret",
 	"keyToken": "Token",
 	"keyChannel": "Delivery channel",

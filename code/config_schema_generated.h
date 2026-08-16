@@ -7,7 +7,7 @@
 
 constexpr const char CONFIG_FORMAT[] = "sms-forwarding-config";
 constexpr const char CONFIG_MIME_TYPE[] = "application/vnd.sms-forwarding.config";
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 2;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 3;
 constexpr size_t MAX_CONFIG_BLOB_SIZE = 32768;
 constexpr const char BACKUP_ENVELOPE_MAGIC[] = "SMSCFG01";
 constexpr uint16_t BACKUP_ENVELOPE_VERSION = 1;
@@ -36,6 +36,8 @@ enum PushType {
   PUSH_TYPE_FEISHU = 8,
   PUSH_TYPE_GOTIFY = 9,
   PUSH_TYPE_TELEGRAM = 10,
+  PUSH_TYPE_DISCORD = 11,
+  PUSH_TYPE_NTFY = 12,
 };
 
 constexpr size_t MAX_DEVICE_NAME_BYTES = 64;

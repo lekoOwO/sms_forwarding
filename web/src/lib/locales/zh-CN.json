@@ -168,6 +168,8 @@
 	"providerHint8": "填写 Feishu Webhook，Secret 可选。",
 	"providerHint9": "填写 Gotify 服务器 URL 和应用 Token。",
 	"providerHint10": "填写 Telegram Chat ID 和 Bot Token。",
+	"providerHint11": "将套用模板后的标题与内容 POST 到 Discord Webhook。",
+	"providerHint12": "将套用模板后的内容 POST 到 ntfy topic URL，并以 Title header 发送标题。",
 	"keySecret": "Secret",
 	"keyToken": "Token",
 	"keyChannel": "发送渠道",

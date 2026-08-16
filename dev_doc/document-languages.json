@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "documents": [
+    {
+      "path": "AGENTS.md",
+      "language": "en"
+    },
+    {
+      "path": "README.md",
+      "language": "zh-TW",
+      "equivalenceGroup": "project-readme"
+    },
+    {
+      "path": "README.zh-CN.md",
+      "language": "zh-CN",
+      "equivalenceGroup": "project-readme"
+    },
+    {
+      "path": "README.en.md",
+      "language": "en",
+      "equivalenceGroup": "project-readme"
+    },
+    {
+      "path": "code/AGENTS.md",
+      "language": "en"
+    },
+    {
+      "path": "dev_doc/AGENTS.md",
+      "language": "en"
+    },
+    {
+      "path": "dev_doc/README.md",
+      "language": "zh-TW"
+    },
+    {
+      "path": "dev_doc/architecture.md",
+      "language": "zh-TW"
+    },
+    {
+      "path": "dev_doc/development.md",
+      "language": "zh-TW"
+    },
+    {
+      "path": "mock_server/AGENTS.md",
+      "language": "en"
+    },
+    {
+      "path": "web/AGENTS.md",
+      "language": "en"
+    }
+  ],
+  "excluded": [
+    {
+      "path": "cppcheck-suppressions.txt",
+      "reason": "Machine-readable lint baseline; not prose documentation."
+    },
+    {
+      "path": "LICENSE",
+      "reason": "Project license text; preserve it verbatim."
+    },
+    {
+      "path": "code/src/pdulib/LICENSE.txt",
+      "reason": "Vendored dependency license text; preserve it verbatim."
+    }
+  ]
+}

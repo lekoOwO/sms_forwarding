@@ -253,7 +253,8 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   // Some providers can use a default URL.
   bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK || 
                   channel.type == PUSH_TYPE_GET || channel.type == PUSH_TYPE_DINGTALK || 
-                  channel.type == PUSH_TYPE_CUSTOM);
+                  channel.type == PUSH_TYPE_CUSTOM || channel.type == PUSH_TYPE_DISCORD ||
+                  channel.type == PUSH_TYPE_NTFY);
   if (needUrl && channel.url.length() == 0) return;
   
   HTTPClient http;
@@ -471,6 +472,26 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["chat_id"] = channel.key1;
       json["text"] = text;
       if (!postJson(http, tgUrl, json, httpCode)) return;
+      break;
+    }
+
+    case PUSH_TYPE_DISCORD: {
+      String content = notificationTitle + "\n" + notificationBody;
+      if (utf8CodePointCount(content.c_str(), 2000) > 2000) {
+        logCaptureLn("Discord content exceeds 2000 characters; skipping delivery");
+        return;
+      }
+      JsonDocument json;
+      json["content"] = content;
+      json["allowed_mentions"]["parse"].to<JsonArray>();
+      if (!postJson(http, channel.url, json, httpCode)) return;
+      break;
+    }
+
+    case PUSH_TYPE_NTFY: {
+      http.begin(channel.url);
+      http.addHeader("Title", notificationTitle);
+      httpCode = http.POST(notificationBody);
       break;
     }
     
