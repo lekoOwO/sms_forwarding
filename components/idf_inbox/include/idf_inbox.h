@@ -22,6 +22,7 @@ struct IdfSentEntry {
     bool ok = false;
 };
 
+// 收发件箱均为有界 RAM 环，重启清空，不持久化号码或短信正文。
 void idf_inbox_init(void);
 uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts);
 void idf_inbox_mark_forwarded(uint32_t id);

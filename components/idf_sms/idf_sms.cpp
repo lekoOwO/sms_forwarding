@@ -10,12 +10,9 @@
 #include <array>
 #include <atomic>
 #include <functional>
-#include <new>
 #include <string>
 #include <vector>
 
-#include "esp_log.h"
-#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -31,6 +28,7 @@
 static constexpr size_t MAX_PDU_HEX_CHARS = 600;
 static constexpr size_t INDEX_QUEUE_MAX = 8;
 static constexpr size_t OUT_SMS_QUEUE_MAX = 3;
+static constexpr size_t PENDING_FORWARD_MAX = 3;
 static constexpr size_t SEEN_RING_MAX = 32;
 static constexpr size_t CONCAT_SLOTS = 5;
 static constexpr size_t CONCAT_PARTS = 10;
@@ -71,6 +69,13 @@ struct OutgoingSmsJob {
     std::string text;
 };
 
+struct PendingForwardJob {
+    std::string sender;
+    std::string text;
+    std::string timestamp;
+    uint32_t inbox_id = 0;
+};
+
 struct DecodedSms {
     std::string sender;
     std::string text;
@@ -89,6 +94,9 @@ static size_t s_index_count = 0;
 static std::array<OutgoingSmsJob, OUT_SMS_QUEUE_MAX> s_out_queue = {};
 static size_t s_out_head = 0;
 static size_t s_out_count = 0;
+static std::array<PendingForwardJob, PENDING_FORWARD_MAX> s_pending_forwards = {};
+static size_t s_pending_forward_head = 0;
+static size_t s_pending_forward_count = 0;
 static std::array<uint32_t, SEEN_RING_MAX> s_seen = {};
 static size_t s_seen_next = 0;
 static size_t s_seen_filled = 0;
@@ -98,8 +106,6 @@ static bool s_wait_pdu = false;
 static int64_t s_wait_pdu_until_us = 0;   // +CMT 后等 PDU 行的窗口截止(3s，对齐 Arduino)
 static bool s_backfill_pending = false;   // 索引队列溢出/CMGR 失败时，请求一次近期 CMGL 兜底
 static bool s_cnma_error_logged = false;  // 避免异常固件每条直推短信都刷同一条确认失败日志
-static std::atomic<bool> s_admin_sms_busy{false};
-static std::atomic<bool> s_admin_reset_pending{false};
 
 static void cleanup_start_resources()
 {
@@ -115,8 +121,9 @@ static void cleanup_start_resources()
         vSemaphoreDelete(s_out_mutex);
         s_out_mutex = nullptr;
     }
-    s_admin_sms_busy.store(false, std::memory_order_relaxed);
-    s_admin_reset_pending.store(false, std::memory_order_relaxed);
+    s_pending_forwards = {};
+    s_pending_forward_head = 0;
+    s_pending_forward_count = 0;
 }
 
 // SIM 存储索引 0 是合法值；必须严格解析，不能让乱码被宽松转换成 0。
@@ -153,16 +160,49 @@ static uint32_t hash32(const std::string& text)
     return static_cast<uint32_t>(std::hash<std::string>{}(text));
 }
 
-static bool seen_recently(uint32_t hash)
+static bool was_seen(uint32_t hash)
 {
-    // 用 filled 计数而不是排除 0 值：hash 恰为 0 的短信也要参与去重(对齐 Arduino)
     for (size_t i = 0; i < s_seen_filled; ++i) {
         if (s_seen[i] == hash) return true;
     }
+    return false;
+}
+
+static void remember_seen(uint32_t hash)
+{
+    // 只有转发入口已接收或策略明确丢弃后才登记；queue full 必须允许 SIM 记录重试。
     s_seen[s_seen_next] = hash;
     s_seen_next = (s_seen_next + 1) % SEEN_RING_MAX;
     if (s_seen_filled < SEEN_RING_MAX) ++s_seen_filled;
-    return false;
+}
+
+static bool enqueue_pending_forward(const std::string& sender, const std::string& text,
+                                    const std::string& timestamp, uint32_t inbox_id)
+{
+    if (s_pending_forward_count >= PENDING_FORWARD_MAX) return false;
+    size_t tail = (s_pending_forward_head + s_pending_forward_count) % PENDING_FORWARD_MAX;
+    PendingForwardJob& job = s_pending_forwards[tail];
+    job.sender = sender;
+    job.text = text;
+    job.timestamp = timestamp;
+    job.inbox_id = inbox_id;
+    ++s_pending_forward_count;
+    return true;
+}
+
+static bool retry_pending_forward()
+{
+    if (s_pending_forward_count == 0) return false;
+    PendingForwardJob& job = s_pending_forwards[s_pending_forward_head];
+    if (!idf_push_enqueue_forward(job.sender.c_str(), job.text.c_str(),
+                                  job.timestamp.c_str(), job.inbox_id)) {
+        return false;
+    }
+    idf_logf("短信 RAM 重试已进入转发队列 id=%u", static_cast<unsigned>(job.inbox_id));
+    job = PendingForwardJob();
+    s_pending_forward_head = (s_pending_forward_head + 1) % PENDING_FORWARD_MAX;
+    --s_pending_forward_count;
+    return true;
 }
 
 static std::string canonical_phone(const std::string& num)
@@ -181,6 +221,14 @@ static std::string canonical_phone(const std::string& num)
         return out.substr(2);
     }
     return out;
+}
+
+static std::string masked_phone(const std::string& number)
+{
+    std::string digits = canonical_phone(number);
+    if (digits.empty()) return "未知号码";
+    if (digits.size() <= 4) return "***";
+    return "***" + digits.substr(digits.size() - 4);
 }
 
 static bool number_blacklisted(const std::string& list, const std::string& sender)
@@ -209,131 +257,6 @@ static bool is_valid_phone_number(const std::string& phone)
         char ch = phone[i];
         if (i == 0 && ch == '+') continue;
         if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
-}
-
-static bool is_admin_sender(const std::string& sender, const IdfSmsProcessView& cfg)
-{
-    if (cfg.adminPhone.empty()) return false;
-    std::string admin = canonical_phone(cfg.adminPhone);
-    return !admin.empty() && canonical_phone(sender) == admin;
-}
-
-struct AdminSmsTaskArg {
-    std::string target;
-    std::string content;
-    std::string command;
-};
-
-static void admin_sms_task(void* raw)
-{
-    AdminSmsTaskArg* arg = static_cast<AdminSmsTaskArg*>(raw);
-    if (!arg) {
-        s_admin_sms_busy.store(false, std::memory_order_relaxed);
-        vTaskDelete(nullptr);
-        return;
-    }
-    vTaskDelay(pdMS_TO_TICKS(250));
-    std::string send_message;
-    esp_err_t err = idf_sms_send_text(arg->target, arg->content, send_message);
-    bool ok = (err == ESP_OK);
-    std::string subject = ok ? "短信发送成功" : "短信发送失败";
-    std::string body = "管理员命令执行结果:\n命令: " + arg->command +
-                       "\n目标号码: " + arg->target +
-                       "\n短信内容: " + arg->content +
-                       "\n执行结果: " + (ok ? "成功" : "失败") +
-                       "\n详情: " + send_message;
-    idf_push_enqueue_email(subject.c_str(), body.c_str());
-    delete arg;
-    s_admin_sms_busy.store(false, std::memory_order_relaxed);
-    vTaskDelete(nullptr);
-}
-
-static void admin_reset_task(void*)
-{
-    int64_t deadline = esp_timer_get_time() + 5LL * 1000LL * 1000LL;
-    while ((idf_push_email_queue_depth() > 0 || idf_push_busy()) && esp_timer_get_time() < deadline) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    idf_modem_request_reset(true);
-    vTaskDelay(pdMS_TO_TICKS(1500));
-    idf_log_line("正在重启ESP32...");
-    // RESET 命令语义是"模组+ESP32 都彻底重启"：确保模组断电后再重启 ESP，
-    // 避免热启动快路径把它当健康模组沿用
-    idf_modem_power_off_for_restart();
-    esp_restart();
-}
-
-static bool process_admin_command(const std::string& sender, const std::string& text)
-{
-    std::string cmd = idf_util_trim_copy(text);
-    if (!(starts_with(cmd, "SMS:") || cmd == "RESET")) return false;
-
-    idf_logf("处理管理员命令 from=%s", sender.c_str());
-    if (starts_with(cmd, "SMS:")) {
-        size_t first = cmd.find(':');
-        size_t second = first == std::string::npos ? std::string::npos : cmd.find(':', first + 1);
-        if (second == std::string::npos || second <= first + 1) {
-            idf_log_line("SMS命令格式错误");
-            idf_push_enqueue_email("命令执行失败", "SMS命令格式错误，正确格式: SMS:号码:内容");
-            return true;
-        }
-        std::string target = idf_util_trim_copy(cmd.substr(first + 1, second - first - 1));
-        std::string content = idf_util_trim_copy(cmd.substr(second + 1));
-        idf_logf("管理员命令目标号码: %s", target.c_str());
-        if (!is_valid_phone_number(target)) {
-            idf_log_line("目标号码非法，拒绝执行");
-            idf_push_enqueue_email("命令执行失败", "SMS命令目标号码非法（应为 3-20 位数字，可带 + 前缀）");
-            return true;
-        }
-        if (content.empty() || content.size() > 300) {
-            idf_log_line("短信内容为空或超长，拒绝执行");
-            idf_push_enqueue_email("命令执行失败", "SMS命令内容为空或超过 300 字符");
-            return true;
-        }
-        bool expected = false;
-        if (!s_admin_sms_busy.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            idf_log_line("已有管理员短信任务在执行，拒绝新的 SMS 命令");
-            idf_push_enqueue_email("命令执行失败", "已有管理员短信任务在执行，请稍后重试");
-            return true;
-        }
-
-        AdminSmsTaskArg* arg = new (std::nothrow) AdminSmsTaskArg();
-        if (!arg) {
-            s_admin_sms_busy.store(false, std::memory_order_release);
-            idf_log_line("管理员短信任务创建失败：内存不足");
-            idf_push_enqueue_email("命令执行失败", "管理员短信任务创建失败：内存不足");
-            return true;
-        }
-        arg->target = target;
-        arg->content = content;
-        arg->command = cmd;
-        if (xTaskCreate(admin_sms_task, "admin_sms", 4096, arg, 3, nullptr) != pdPASS) {
-            delete arg;
-            s_admin_sms_busy.store(false, std::memory_order_release);
-            idf_log_line("管理员短信任务创建失败");
-            idf_push_enqueue_email("命令执行失败", "管理员短信任务创建失败");
-        }
-        return true;
-    }
-
-    if (esp_timer_get_time() < 60LL * 1000LL * 1000LL) {
-        idf_log_line("设备刚启动，忽略RESET命令（防重启风暴）");
-        idf_push_enqueue_email("RESET已忽略", "设备启动不足60秒，已忽略RESET命令以防重启风暴。请稍后重试。");
-        return true;
-    }
-    bool expected = false;
-    if (!s_admin_reset_pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        idf_log_line("RESET任务已在执行，忽略重复命令");
-        idf_push_enqueue_email("RESET已忽略", "RESET任务已在执行，已忽略重复命令。");
-        return true;
-    }
-    idf_log_line("执行RESET命令");
-    idf_push_enqueue_email("重启命令已执行", "收到RESET命令，即将重启模组和ESP32...");
-    if (xTaskCreate(admin_reset_task, "admin_reset", 3072, nullptr, 3, nullptr) != pdPASS) {
-        idf_log_line("RESET任务创建失败，直接重启ESP32");
-        esp_restart();
     }
     return true;
 }
@@ -451,7 +374,13 @@ static std::string assemble_concat(const ConcatSlot& slot)
     return text;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw);
+struct SmsProcessResult {
+    bool retained = false;
+    bool admitted = false;
+};
+
+static SmsProcessResult process_sms_content(const char* sender_raw, const char* text_raw,
+                                            const char* timestamp_raw, bool allow_ram_retry);
 
 // 已成功合并的长短信登记环：SIM 满时部分分段被拒收，SMSC 会整条重投(同 ref)。
 // 槽位合并完成后迟到的重复分段若不识别，会重新开槽并在超时后拼出一条
@@ -503,11 +432,25 @@ static void record_concat_done(const ConcatSlot& slot)
     d.doneUs = esp_timer_get_time();
 }
 
-static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int total)
+// 已确认的直推分段可能不会再由 SMSC 重投。任何要清空/复用 concat slot 的路径，
+// 必须先把当前可组装内容交给 push 或 SMS 自有 RAM fallback；失败时保留原槽。
+static SmsProcessResult retain_concat_before_clear(ConcatSlot& slot, bool allow_ram_retry)
+{
+    std::string partial = assemble_concat(slot);
+    SmsProcessResult result = process_sms_content(
+        slot.sender.c_str(), partial.c_str(), slot.timestamp.c_str(), allow_ram_retry);
+    if (result.retained) record_concat_done(slot);
+    return result;
+}
+
+static ConcatSlot* find_concat_slot(int ref, const std::string& sender, int total,
+                                    bool allow_ram_retry, bool allow_admission,
+                                    bool& admission_blocked, bool& deferred,
+                                    bool& eviction_admitted)
 {
     int64_t now = esp_timer_get_time();
     for (auto& slot : s_concat) {
-        if (slot.active && slot.ref == ref && slot.sender == sender && slot.total == total) return slot;
+        if (slot.active && slot.ref == ref && slot.sender == sender && slot.total == total) return &slot;
     }
     for (auto& slot : s_concat) {
         if (!slot.active || now - slot.lastUs > CONCAT_TIMEOUT_US) {
@@ -517,20 +460,26 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
             slot.total = total;
             slot.sender = sender;
             slot.lastUs = now;
-            return slot;
+            return &slot;
         }
+    }
+    if (!allow_admission) {
+        deferred = true;
+        return nullptr;
     }
     auto oldest = std::min_element(s_concat.begin(), s_concat.end(),
         [](const ConcatSlot& a, const ConcatSlot& b) { return a.lastUs < b.lastUs; });
     // 槽位全忙被挤占：已收到的分段不能悄悄扔掉——分段可能已从 SIM 删除，丢了
     // 就再也拿不回。与超时路径一致，先按现状合并转发(缺口有"[缺失分段]"标记)
     {
-        std::string partial = assemble_concat(*oldest);
-        if (!partial.empty()) {
-            idf_logf("长短信槽位耗尽，先合并已收 %d/%d 段再复用槽位",
-                     oldest->received, oldest->total);
-            process_sms_content(oldest->sender.c_str(), partial.c_str(), oldest->timestamp.c_str());
+        idf_logf("长短信槽位耗尽，先合并已收 %d/%d 段再复用槽位",
+                 oldest->received, oldest->total);
+        SmsProcessResult result = retain_concat_before_clear(*oldest, allow_ram_retry);
+        if (!result.retained) {
+            admission_blocked = true;
+            return nullptr;
         }
+        eviction_admitted = result.admitted;
     }
     clear_concat_slot(*oldest);
     oldest->active = true;
@@ -538,10 +487,11 @@ static ConcatSlot& find_concat_slot(int ref, const std::string& sender, int tota
     oldest->total = total;
     oldest->sender = sender;
     oldest->lastUs = now;
-    return *oldest;
+    return &*oldest;
 }
 
-static void process_sms_content(const char* sender_raw, const char* text_raw, const char* timestamp_raw)
+static SmsProcessResult process_sms_content(const char* sender_raw, const char* text_raw,
+                                            const char* timestamp_raw, bool allow_ram_retry)
 {
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
@@ -549,39 +499,53 @@ static void process_sms_content(const char* sender_raw, const char* text_raw, co
     const IdfSmsProcessView cfg = idf_config_get_sms_process_view();
 
     if (number_blacklisted(cfg.numberBlackList, sender)) {
-        idf_logf("短信发件人 %s 在黑名单中，已忽略", sender.c_str());
-        return;
+        idf_logf("短信发件人 %s 在黑名单中，已忽略", masked_phone(sender).c_str());
+        return {true, false};
     }
 
     // 去重键用 PDU 原始时间戳(双通道 URC+CMGL 收到的是同一原始值)；
     // 展示/转发用本地可读时间，未同步时才退回原始数字串
     uint32_t hash = hash32(sender + "|" + timestamp + "|" + text);
-    if (seen_recently(hash)) {
-        idf_logf("重复短信 %s 已忽略", sender.c_str());
-        return;
-    }
-
-    if (is_admin_sender(sender, cfg)) {
-        idf_log_line("收到管理员短信，检查命令...");
-        if (process_admin_command(sender, text)) {
-            update_status(true, true);
-            return;
-        }
+    if (was_seen(hash)) {
+        idf_logf("重复短信 %s 已忽略", masked_phone(sender).c_str());
+        return {true, false};
     }
 
     std::string display_ts = idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)), cfg.tzOffsetMin);
     if (display_ts.empty()) display_ts = timestamp;
 
     uint32_t id = idf_inbox_add(sender.c_str(), text.c_str(), display_ts.c_str());
-    update_status(true, true);
-    // 默认日志展示完整发件人(便于确认是谁)，正文仍不落盘(在收发短信页查看)
-    idf_logf("收到短信 id=%u 来自 %s，入队转发中", static_cast<unsigned>(id), sender.c_str());
+    idf_logf("收到短信 id=%u 来自 %s，入队转发中",
+             static_cast<unsigned>(id), masked_phone(sender).c_str());
     if (!idf_push_enqueue_forward(sender.c_str(), text.c_str(), display_ts.c_str(), id)) {
-        idf_logf("转发入口队列已满，短信 id=%u 保持未转发，可稍后手动重发", static_cast<unsigned>(id));
+        if (allow_ram_retry &&
+            enqueue_pending_forward(sender, text, display_ts, id)) {
+            update_status(true, true);
+            remember_seen(hash);
+            idf_logf("转发入口队列已满，短信 id=%u 已进入 RAM 重试队列",
+                     static_cast<unsigned>(id));
+            return {true, true};
+        }
+        idf_inbox_delete(id);
+        idf_logf("转发入口队列已满，短信 id=%u 等待存储补收重试",
+                 static_cast<unsigned>(id));
+        return {false, false};
     }
+    update_status(true, true);
+    remember_seen(hash);
+    return {true, true};
 }
 
-static void handle_decoded_pdu(const DecodedSms& sms)
+struct PduDecodeOutcome {
+    bool decoded = false;
+    bool safe_to_delete = false;
+    bool admission_blocked = false;
+    bool admitted = false;
+    bool deferred = false;
+};
+
+static PduDecodeOutcome handle_decoded_pdu(const DecodedSms& sms, bool allow_ram_retry,
+                                           bool allow_admission)
 {
     const char* sender = sms.sender.c_str();
     const char* text = sms.text.c_str();
@@ -593,20 +557,45 @@ static void handle_decoded_pdu(const DecodedSms& sms)
     if (total > 1 && part > 0) {
         if (total > static_cast<int>(CONCAT_PARTS) || part > total) {
             idf_logf("长短信分段参数超限 part=%d total=%d，按单条处理", part, total);
-            process_sms_content(sender, text, ts);
-            return;
+            if (!allow_admission) return {true, false, false, false, true};
+            SmsProcessResult result = process_sms_content(sender, text, ts, allow_ram_retry);
+            return {true, result.retained, !result.retained, result.admitted, false};
         }
         if (concat_recently_done(ref, sender ? sender : "", total, part,
                                  text ? text : "", ts ? ts : "")) {
             idf_logf("长短信分段 ref=%d %d/%d 与近期已合并消息重复，忽略", ref, part, total);
-            return;
+            return {true, true, false, false, false};
         }
-        ConcatSlot& slot = find_concat_slot(ref, sender ? sender : "", total);
+        bool lookup_blocked = false;
+        bool lookup_deferred = false;
+        bool eviction_admitted = false;
+        ConcatSlot* slot_ptr = find_concat_slot(ref, sender ? sender : "", total,
+                                                allow_ram_retry, allow_admission,
+                                                lookup_blocked, lookup_deferred,
+                                                eviction_admitted);
+        if (!slot_ptr) {
+            return {true, false, lookup_blocked, eviction_admitted, lookup_deferred};
+        }
+        ConcatSlot& slot = *slot_ptr;
         int idx = part - 1;
-        if (slot.parts[idx].valid && slot.parts[idx].text != (text ? text : "")) {
-            // 8 位引用号可能被运营商快速复用；同一分段号正文已变化时不能继续混拼旧消息。
-            idf_logf("长短信引用号 ref=%d 已复用，丢弃旧的不完整 %d/%d 段并重新归组",
+        const std::string incoming_text = text ? text : "";
+        const std::string incoming_timestamp = ts ? ts : "";
+        bool same_part = slot.parts[idx].valid &&
+                         slot.parts[idx].text == incoming_text &&
+                         slot.parts[idx].timestamp == incoming_timestamp;
+        if (slot.parts[idx].valid && !same_part) {
+            // 相同正文也可能是新短信；timestamp 是分段身份的一部分。旧直推分段可能已被
+            // CNMA，引用号复用前必须先安全移交旧槽，否则拒绝新分段且不确认。
+            if (!allow_admission || eviction_admitted) {
+                return {true, false, false, eviction_admitted, true};
+            }
+            idf_logf("长短信引用号 ref=%d 已复用，先保留旧的不完整 %d/%d 段再重新归组",
                      ref, slot.received, slot.total);
+            SmsProcessResult result = retain_concat_before_clear(slot, allow_ram_retry);
+            if (!result.retained) {
+                return {true, false, true, eviction_admitted, false};
+            }
+            eviction_admitted = result.admitted;
             clear_concat_slot(slot);
             slot.active = true;
             slot.ref = ref;
@@ -624,21 +613,28 @@ static void handle_decoded_pdu(const DecodedSms& sms)
             idf_logf("收到长短信分段 ref=%d %d/%d", ref, part, total);
         }
         if (slot.received >= slot.total) {
-            record_concat_done(slot);
-            std::string full = assemble_concat(slot);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str());
-            clear_concat_slot(slot);
+            if (!allow_admission || eviction_admitted) {
+                return {true, false, false, eviction_admitted, true};
+            }
+            SmsProcessResult result = retain_concat_before_clear(slot, allow_ram_retry);
+            if (result.retained) {
+                clear_concat_slot(slot);
+            }
+            return {true, result.retained, !result.retained, result.admitted, false};
         }
-        return;
+        return {true, false, false, eviction_admitted, false};
     }
 
-    process_sms_content(sender, text, ts);
+    if (!allow_admission) return {true, false, false, false, true};
+    SmsProcessResult result = process_sms_content(sender, text, ts, allow_ram_retry);
+    return {true, result.retained, !result.retained, result.admitted, false};
 }
 
-static bool decode_pdu_line(const std::string& line)
+static PduDecodeOutcome decode_pdu_line(const std::string& line, bool allow_ram_retry,
+                                        bool allow_admission = true)
 {
-    if (!is_hex_string(line)) return false;
-    if (!s_pdu_mutex) return false;
+    if (!is_hex_string(line)) return {};
+    if (!s_pdu_mutex) return {};
     // 解码器忙(网页发短信正在编码)时重试而不是放弃：返回 false 会被调用方
     // 当成"PDU 损坏"——直推短信直接丢失，存储短信还会被误删
     bool locked = false;
@@ -646,12 +642,12 @@ static bool decode_pdu_line(const std::string& line)
         locked = xSemaphoreTake(s_pdu_mutex, pdMS_TO_TICKS(2000)) == pdTRUE;
         if (!locked) idf_log_line("PDU 解码器忙，等待重试...");
     }
-    if (!locked) return false;
+    if (!locked) return {};
     DecodedSms decoded;
     if (!s_pdu.decodePDU(line.c_str())) {
         xSemaphoreGive(s_pdu_mutex);
         idf_logf("PDU 解析失败(hex=%u)", static_cast<unsigned>(line.size()));
-        return false;
+        return {};
     }
     decoded.sender = s_pdu.getSender();
     decoded.text = s_pdu.getText();
@@ -664,8 +660,7 @@ static bool decode_pdu_line(const std::string& line)
     }
     xSemaphoreGive(s_pdu_mutex);
     // PDU 解码器是全局复用对象；业务处理放到锁外，避免入库/转发时阻塞网页发短信编码。
-    handle_decoded_pdu(decoded);
-    return true;
+    return handle_decoded_pdu(decoded, allow_ram_retry, allow_admission);
 }
 
 // 是否有等待补齐的长短信槽位(仅 sms_task 内访问，无需加锁)
@@ -685,9 +680,15 @@ static void expire_concat_slots()
         std::string full = assemble_concat(slot);
         if (!full.empty()) {
             idf_logf("长短信等待超时，已合并现有 %d/%d 段", slot.received, slot.total);
-            process_sms_content(slot.sender.c_str(), full.c_str(), slot.timestamp.c_str());
+            SmsProcessResult result = retain_concat_before_clear(slot, true);
+            if (result.retained) {
+                clear_concat_slot(slot);
+            } else {
+                // 直推分段已经逐段 CNMA；若转发队列与 SMS RAM fallback 都满，
+                // 保留原槽并延后重试，不能丢掉已经确认、SMSC 不一定再投的分段。
+                slot.lastUs = now;
+            }
         }
-        clear_concat_slot(slot);
     }
 }
 
@@ -717,7 +718,7 @@ static void notify_incoming_call(const std::string& number)
     if (!number.empty()) {
         const IdfSmsProcessView cfg = idf_config_get_sms_process_view();
         if (number_blacklisted(cfg.numberBlackList, number)) {
-            idf_logf("来电 %s 在黑名单中，已忽略", number.c_str());
+            idf_logf("来电 %s 在黑名单中，已忽略", masked_phone(number).c_str());
             return;
         }
     }
@@ -725,7 +726,7 @@ static void notify_incoming_call(const std::string& number)
     std::string body = "来电：" + num;
     std::string display_ts = idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)),
                                                          idf_config_get_tz_offset());
-    idf_logf("来电通知：%s，入队转发中", num.c_str());
+    idf_logf("来电通知：%s，入队转发中", masked_phone(num).c_str());
     // 复用短信转发通道：发件人=来电号码，正文=来电提示，走与短信相同的推送+邮件
     if (!idf_push_enqueue_forward(num.c_str(), body.c_str(), display_ts.c_str(), 0)) {
         idf_log_line("转发入口队列已满，来电通知未能入队");
@@ -790,8 +791,14 @@ static void process_urc_line(const std::string& raw)
             enqueue_index(parse_cmti_index(line));
             return;
         }
-        if (decode_pdu_line(line)) {
+        PduDecodeOutcome outcome = decode_pdu_line(line, true);
+        if (outcome.decoded) {
             s_wait_pdu = false;
+            if (!outcome.safe_to_delete) s_backfill_pending = true;
+            if (outcome.admission_blocked) {
+                idf_log_line("直推短信无可用 RAM 转发槽，暂不确认并等待模组重投");
+                return;
+            }
             // ML307R 的 +CNMI 文档要求直推短信通过 +CNMA 确认，确认后模组才会可靠地
             // 继续上报同一条长短信的后续分段。存储读取(CMGR/CMGL)不走此分支。
             std::string ack_resp;
@@ -872,6 +879,18 @@ static bool extract_first_stored_pdu(const std::string& resp, const char* header
     return false;
 }
 
+static bool delete_stored_sms(int idx)
+{
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
+    std::string ignored;
+    esp_err_t delete_err = idf_modem_send_at(cmd, 2000, ignored);
+    if (delete_err == ESP_OK) return true;
+    idf_logf("SIM 短信索引=%d 删除失败，将在后续补收重试", idx);
+    s_backfill_pending = true;
+    return false;
+}
+
 static void fetch_stored_sms_by_index(int idx)
 {
     if (idx < 0) return;
@@ -882,12 +901,17 @@ static void fetch_stored_sms_by_index(int idx)
     bool has_header = resp.find("+CMGR:") != std::string::npos;
     std::string pdu_line;
     bool has_pdu_line = extract_first_stored_pdu(resp, "+CMGR:", pdu_line);
-    bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
+    PduDecodeOutcome outcome = has_pdu_line ? decode_pdu_line(pdu_line, false) : PduDecodeOutcome();
+    bool decoded = outcome.decoded;
     if (has_header) {
-        if (decoded) {
-            snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
-            std::string ignored;
-            idf_modem_send_at(cmd, 2000, ignored);
+        if (decoded && outcome.safe_to_delete) {
+            delete_stored_sms(idx);
+        } else if (decoded) {
+            idf_logf(outcome.admission_blocked
+                         ? "索引=%d 的短信尚未进入转发队列，保留 SIM 记录重试"
+                         : "索引=%d 的长短信尚未收齐，保留 SIM 分段",
+                     idx);
+            if (outcome.admission_blocked) s_backfill_pending = true;
         } else if (has_pdu_line) {
             idf_logf("PDU 无法解析(索引=%d)，保留 SIM 记录等待后续重试", idx);
             s_backfill_pending = true;
@@ -924,7 +948,9 @@ static void backfill_stored_sms(bool announce)
     int decode_fail_count = 0;
     int processed = 0;
     int handled = 0;
+    int admissions = 0;
     bool more_left = false;
+    bool admission_blocked = false;
     size_t pos = 0;
     while (pos < resp.size()) {
         size_t nl = resp.find('\n', pos);
@@ -932,11 +958,6 @@ static void backfill_stored_sms(bool announce)
         std::string line = idf_util_trim_copy(resp.substr(pos, nl - pos));
         pos = nl + 1;
         if (!starts_with(line, "+CMGL:")) continue;
-        if (handled >= BATCH_MAX) {
-            more_left = true;
-            break;
-        }
-
         int idx = parse_cmgl_index(line);
         std::string pdu_line;
         bool has_pdu_line = false;
@@ -957,14 +978,28 @@ static void backfill_stored_sms(bool announce)
             }
         }
 
-        bool decoded = has_pdu_line && decode_pdu_line(pdu_line);
-        if (decoded) ++processed;
-        if (idx >= 0 && decoded) {
-            char cmd[24];
-            snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", idx);
-            std::string ignored;
-            idf_modem_send_at(cmd, 2000, ignored);
-            ++handled;
+        PduDecodeOutcome outcome = has_pdu_line
+                                       ? decode_pdu_line(pdu_line, false, admissions < BATCH_MAX)
+                                       : PduDecodeOutcome();
+        if (outcome.admitted) ++admissions;
+        bool decoded = outcome.decoded;
+        if (idx >= 0 && decoded && outcome.safe_to_delete && handled < BATCH_MAX) {
+            if (delete_stored_sms(idx)) {
+                ++handled;
+                ++processed;
+            } else {
+                more_left = true;
+            }
+        } else if (idx >= 0 && decoded && outcome.safe_to_delete) {
+            more_left = true;
+        } else if (idx >= 0 && decoded) {
+            if (outcome.admission_blocked) {
+                s_backfill_pending = true;
+                idf_logf("索引=%d 的短信尚未进入转发队列，保留 SIM 记录重试", idx);
+                admission_blocked = true;
+                break;
+            }
+            if (outcome.deferred) more_left = true;
         } else if (idx >= 0 && has_pdu_line) {
             idf_logf("PDU 无法解析(索引=%d)，保留 SIM 记录等待后续重试", idx);
             if (decode_fail_count < BATCH_MAX) decode_fail_idx[decode_fail_count++] = idx;
@@ -979,18 +1014,22 @@ static void backfill_stored_sms(bool announce)
             // 本轮有进展：缺行大概率是 8KB 响应截断，删掉已处理的条目后下轮自然恢复
             s_nopdu_stall_rounds = 0;
             s_backfill_pending = true;
-        } else if (++s_nopdu_stall_rounds >= 3) {
+        } else {
+            if (s_nopdu_stall_rounds < 3) ++s_nopdu_stall_rounds;
+        }
+        if (handled == 0 && processed == 0 && s_nopdu_stall_rounds >= 3) {
             // 连续 3 轮原地踏步 = 记录本身损坏，删除释放存储，终结轮询死循环
+            bool all_deleted = true;
             for (int i = 0; i < nopdu_count; ++i) {
                 idf_logf("索引=%d 连续多轮缺少 PDU 行(记录损坏)，删除以恢复正常轮询", nopdu_idx[i]);
-                char cmd[24];
-                snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", nopdu_idx[i]);
-                std::string ignored;
-                idf_modem_send_at(cmd, 2000, ignored);
+                if (delete_stored_sms(nopdu_idx[i])) {
+                    ++handled;
+                } else {
+                    all_deleted = false;
+                }
             }
-            s_nopdu_stall_rounds = 0;
-        } else {
-            s_backfill_pending = true;
+            if (all_deleted) s_nopdu_stall_rounds = 0;
+            else s_backfill_pending = true;
         }
     } else {
         s_nopdu_stall_rounds = 0;
@@ -1000,23 +1039,27 @@ static void backfill_stored_sms(bool announce)
         if (handled > 0 || processed > 0) {
             s_decode_stall_rounds = 0;
             s_backfill_pending = true;
-        } else if (++s_decode_stall_rounds >= 3) {
+        } else {
+            if (s_decode_stall_rounds < 3) ++s_decode_stall_rounds;
+        }
+        if (handled == 0 && processed == 0 && s_decode_stall_rounds >= 3) {
+            bool all_deleted = true;
             for (int i = 0; i < decode_fail_count; ++i) {
                 idf_logf("索引=%d 连续多轮 PDU 解析失败(记录损坏)，删除以恢复正常轮询", decode_fail_idx[i]);
-                char cmd[24];
-                snprintf(cmd, sizeof(cmd), "AT+CMGD=%d", decode_fail_idx[i]);
-                std::string ignored;
-                idf_modem_send_at(cmd, 2000, ignored);
+                if (delete_stored_sms(decode_fail_idx[i])) {
+                    ++handled;
+                } else {
+                    all_deleted = false;
+                }
             }
-            s_decode_stall_rounds = 0;
-        } else {
-            s_backfill_pending = true;
+            if (all_deleted) s_decode_stall_rounds = 0;
+            else s_backfill_pending = true;
         }
     } else {
         s_decode_stall_rounds = 0;
     }
 
-    if (more_left) s_backfill_pending = true;
+    if (more_left || admission_blocked) s_backfill_pending = true;
     if (processed > 0) idf_logf("SIM 暂存短信处理并删除 %d 条", processed);
 }
 
@@ -1036,6 +1079,13 @@ static void sms_task(void*)
         expire_wait_pdu_window();
         flush_pending_call_notify();
         expire_concat_slots();
+
+        // RAM fallback 不依赖模组注册状态；尽早腾出槽位，避免网络恢复前收到的
+        // 直推短信因本地边界耗尽而无法确认。
+        if (retry_pending_forward()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         // eSIM 逻辑通道期间只收 URC，不插入 CPMS、CMGL 或短信发送 AT。
         if (idf_modem_esim_operation_active()) {
@@ -1096,7 +1146,7 @@ static void sms_task(void*)
             if (pop_outgoing_sms(out)) {
                 std::string send_message;
                 idf_logf("网页短信出队发送: %s len=%u",
-                         out.phone.c_str(), static_cast<unsigned>(out.text.size()));
+                         masked_phone(out.phone).c_str(), static_cast<unsigned>(out.text.size()));
                 idf_sms_send_text(out.phone, out.text, send_message);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
@@ -1345,7 +1395,7 @@ esp_err_t idf_sms_send_text(const std::string& phone_raw, const std::string& tex
     } else {
         message = "短信发送成功";
     }
-    idf_logf("网页发送短信成功: %s len=%u parts=%u", phone.c_str(),
+    idf_logf("网页发送短信成功: %s len=%u parts=%u", masked_phone(phone).c_str(),
              static_cast<unsigned>(text.size()), static_cast<unsigned>(parts.size()));
     return ESP_OK;
 }

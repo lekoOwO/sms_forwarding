@@ -4,5 +4,4 @@ idf_component_register(
   REQUIRES
     freertos
     idf_logbuf
-    nvs_flash
 )
