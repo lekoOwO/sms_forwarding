@@ -194,8 +194,8 @@ CI 的唯一基線命令是：
 docker compose exec dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs ./code
 ```
 
-目前鎖定版本的基線結果為 Flash `1461447 / 1966080 bytes`（74%）、全域變數
-`63300 / 327680 bytes`（19%）。這只證明編譯與靜態配置，不代表實機 heap
+目前鎖定版本的基線結果為 Flash `1462019 / 1966080 bytes`（74%）、全域變數
+`63316 / 327680 bytes`（19%）。這只證明編譯與靜態配置，不代表實機 heap
 尖峰、UART 時序或 modem 相容性已驗證。
 
 這證明 generic ESP32-C3 編譯通過。實際 MakerGO ESP32 C3 SuperMini 若已由
@@ -294,14 +294,29 @@ docker compose exec dev arduino-cli monitor --port /dev/ttyACM0 --config baudrat
   同級後，加密匯出為 22.746 秒，期間 HTTP poll 約 38 ms。錯誤密碼不寫入，
   正確還原會原子保存並重啟，identity 與管理帳號保留。
 - 實機發現同步 WebServer 的 raw body 會在 binary NUL 截斷；chunk 改為
-  Base64 後，302-byte 含 NUL 備份完整收到 `nextOffset=302`。decode 使用單一
-  8 KiB static buffer，避免 6 KiB HTTP task stack overflow。
+  Base64 後，302-byte 含 NUL 備份完整收到 `nextOffset=302`。最大合法
+  32,828-byte restore 另發現 6 KiB management HTTP task stack overflow；改為
+  12 KiB 後連續六次安全失敗且 coredump 維持空白。
+- Crypto task 原本在 `vTaskDelete(nullptr)` 前仍持有 C++ owner，失敗 restore
+  每次會遺失約 36 KiB heap。讓 owner 在刪除 task 前正常解構後，六次最大
+  restore 未再出現相同累積下降。
 - 1,461,584-byte 正簽 OTA 在 19.562 秒完成、切換 slot 並健康開機；錯誤簽章
-  在 flash write 前拒絕，同一 release counter 重播亦拒絕。開機後 free heap
-  約 141--149 KiB。
+  在 flash write 前拒絕，同一 release counter 重播亦拒絕。另以一次性測試
+  key 驗證 healthy counter 2 後，counter 3 在健康確認前重啟會被 bootloader
+  標為 aborted 並回到 counter 2；accepted floor 保持 2，pending 已清除。
+- 有訊號但無流量的 SIM 可識別、註冊、切換飛航模式並在 modem soft restart
+  後恢復；無流量 ping 於 30 秒內以 unreachable 結束，隨後 AT dispatcher
+  仍可用。測試未撥號或啟用漫遊資料。
+- 可收簡訊的 SIM 只向 `10010` 發送 `HFMX`。實機回覆的單段 PDU 為約
+  326--330 個 hex 字元，揭露舊 300 字元上限會誤判合法 UCS-2 multipart。
+  上限改為 400 後，完整多段回信成功重組並經 WiFi POST 到臨時本地接收器；
+  接收器與通道在驗證後停用並清空。
+- 最大設定檔、三個 active Web jobs、job queue overflow、RAM log pagination、
+  healthy OTA 與 forced rollback 均已在同一板上驗證。開機後 free heap 約
+  130--149 KiB。
 
-尚未在此板執行強制 crash/power-cut rollback、最大 32 KiB 設定檔、滿載三個
-worker job，以及有訊號或可收簡訊的 SIM 測試。
+尚未在此板執行實際斷電發生於 flash/config commit 中間的 power-cut campaign；
+軟體重啟只能覆蓋 OTA pending-verify rollback，不能取代真實斷電測試。
 
 Linux 連接埠通常是 `/dev/ttyACM*` 或 `/dev/ttyUSB*`。Docker Desktop 對 USB
 serial 的支援依 host 平台而異；無法安全映射時，容器只負責編譯，燒錄列為

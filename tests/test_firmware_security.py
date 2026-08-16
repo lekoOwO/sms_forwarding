@@ -1,3 +1,4 @@
+import re
 import subprocess
 import tempfile
 import unittest
@@ -70,6 +71,9 @@ int main() {
     def test_sms_parser_enforces_fixed_buffer_invariants(self):
         sms = (ROOT / "code/sms_process.cpp").read_text()
         header = (ROOT / "code/sms_process.h").read_text()
+        globals_header = (ROOT / "code/globals.h").read_text()
+        serial_buffer_size = int(re.search(r"#define SERIAL_BUFFER_SIZE (\d+)", globals_header).group(1))
+        max_pdu_length = int(re.search(r"#define MAX_PDU_LENGTH (\d+)", globals_header).group(1))
         self.assertIn("isValidConcatMetadata(partNumber, totalParts)", sms)
         self.assertIn("concatBuffer[i].totalParts != totalParts", sms)
         self.assertIn("return -1;", sms)
@@ -79,6 +83,9 @@ int main() {
         self.assertNotIn('startsWith("SMS:")', sms)
         self.assertNotIn('equals("RESET")', sms)
         self.assertIn("Incomplete administrator multipart SMS discarded", sms)
+        self.assertGreaterEqual(max_pdu_length, 350)
+        self.assertEqual(max_pdu_length % 2, 0)
+        self.assertLess(max_pdu_length, serial_buffer_size)
         reset = sms.index("concatInfo[0] = concatInfo[1] = concatInfo[2] = 0;")
         self.assertLess(reset, sms.index("pdu.decodePDU"))
 

@@ -212,8 +212,8 @@ static void applyRestoredConfig() {
   scheduleDeviceRestart();
 }
 
-static void cryptoTask(void* parameter) {
-  std::unique_ptr<CryptoWork> work(static_cast<CryptoWork*>(parameter));
+static void runCryptoWork(CryptoWork* parameter) {
+  std::unique_ptr<CryptoWork> work(parameter);
   uint32_t started = millis();
   bool ok = false;
   if (work->restore) {
@@ -255,6 +255,10 @@ static void cryptoTask(void* parameter) {
   if (!work->restore || !ok) {
     clearCryptoBusy();
   }
+}
+
+static void cryptoTask(void* parameter) {
+  runCryptoWork(static_cast<CryptoWork*>(parameter));
   vTaskDelete(nullptr);
 }
 

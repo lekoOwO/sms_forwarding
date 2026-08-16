@@ -23,7 +23,8 @@
 #endif
 
 #define SERIAL_BUFFER_SIZE 500
-#define MAX_PDU_LENGTH 300
+// Standard SMSC + SMS-DELIVER needs at most 350 hex characters; keep vendor headroom.
+#define MAX_PDU_LENGTH 400
 #define PDU_WAIT_TIMEOUT_MS 5000
 #define MODEM_RESPONSE_MAX_LENGTH 1024
 #define MAX_AT_COMMAND_LENGTH 256
