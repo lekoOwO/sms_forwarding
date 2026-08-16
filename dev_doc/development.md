@@ -308,6 +308,17 @@ docker compose exec dev arduino-cli monitor --port /dev/ttyACM0 --config baudrat
 - 有訊號但無流量的 SIM 可識別、註冊、切換飛航模式並在 modem soft restart
   後恢復；無流量 ping 於 30 秒內以 unreachable 結束，隨後 AT dispatcher
   仍可用。測試未撥號或啟用漫遊資料。
+- 同板 ML307A 搭配可上網 SIM 在本地網路註冊（`CEREG=1`，營運商代碼
+  `46697`），取得 IPv4/IPv6 並以單一 ICMP request 驗證資料可達；未撥號、
+  未傳簡訊、未啟用漫遊。嚴格 MHTTP HTTPS probe 使用 CA、server auth、
+  certificate time check 與 TLS 1.2，但公開正向 fixture 仍無法完成 handshake，
+  因此無法證明 hostname 驗證；未嘗試 `auth=0`，也未傳送真實 provider token，
+  shipping firmware 繼續 fail-closed。
+- 此 SIM 在 LTE 註冊後會自動 attach 並讓 context 1 保持 active；即使
+  `CGACT=0,1` 回覆 `OK`，讀回仍為 active。`CGATT=0` 才能得到
+  `CGATT=0`、`CGACT: 1,0`，但同時變成 `CEREG=11`、無法接收 LTE 簡訊。
+  所以測試後以 packet detach 收尾；正式執行時依靠 cellular delivery
+  fail-closed，不能把 bearer active 誤報成韌體已產生流量。
 - 可收簡訊的 SIM 只向 `10010` 發送 `HFMX`。實機回覆的單段 PDU 為約
   326--330 個 hex 字元，揭露舊 300 字元上限會誤判合法 UCS-2 multipart。
   上限改為 400 後，完整多段回信成功重組並經 WiFi POST 到臨時本地接收器；

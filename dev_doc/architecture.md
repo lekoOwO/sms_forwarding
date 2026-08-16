@@ -23,7 +23,7 @@ FreeRTOS task 執行，但所有 `WebServer` 存取仍由該 task 串行處理�
 5. 從 firmware 內嵌 gzip bundle 提供管理頁，註冊 HTTP route 與 CSRF header。
 6. 嘗試 NTP 同步，然後將 SMTP 使用的 TLS client 設為不驗證憑證。
 7. 設定有效時寄出啟動通知。
-8. 執行 `modemInit()`：AT 握手、讀取型號、停用 PDP、設定簡訊 URC 與
+8. 執行 `modemInit()`：AT 握手、讀取型號、嘗試停用 PDP、設定簡訊 URC 與
    PDU 模式，最後等待 LTE 註冊。
 
 AT 握手、`CNMI`、`CMGF` 與網路註冊都使用有限重試；失敗後保留管理頁並把
@@ -188,8 +188,10 @@ HTTP body 以 Base64 傳輸，避免同步 WebServer 截斷二進位 NUL。Web j
 - 日誌與部分 HTTP delivery debug 會包含電話號碼和簡訊內容。將 Web 日誌
   與 Serial output 視為敏感資料。
 - `SERIAL_BUFFER_SIZE` 是 500 bytes；超長行會整行丟棄，不保留截斷尾端。
-- 模組資料面預設停用，但 ML307Y 因已知相容性分支會跳過啟動時的
-  `AT+CGACT=0,1`。
+- 韌體的 4G HTTP delivery 預設 fail-closed。部分 SIM／營運商會在 LTE 註冊後
+  自動 attach 並重新啟用 default bearer；這不代表韌體會送出資料。以
+  `CGATT=0` 強制停用 packet service 也會讓實測 ML307A 離開 LTE 註冊，因而
+  無法收簡訊。ML307Y 則因已知相容性分支跳過 `AT+CGACT=0,1`。
 
 ## 變更定位
 
