@@ -21,12 +21,23 @@ struct IdfWifiStatus {
     std::string apIp;
 };
 
+struct IdfWifiScanSnapshot {
+    std::string json = "[]";
+    bool ready = false;
+    bool busy = false;
+    esp_err_t error = ESP_OK;
+};
+
 esp_err_t idf_wifi_start(const IdfConfig& config);
 esp_err_t idf_wifi_reconnect(void);
 // ESP-IDF 原始单位为 0.25dBm；仅应传入驱动支持的离散档位。
 esp_err_t idf_wifi_set_tx_power(uint8_t quarter_dbm);
 // 手动强制立即 NTP 校时(网页"立即校时"按钮)；未联网返回 ESP_ERR_INVALID_STATE
 esp_err_t idf_wifi_resync_ntp(void);
+// 发起一次异步扫描；已有扫描时合并请求，不等待射频扫描完成。
+esp_err_t idf_wifi_scan_request(void);
+IdfWifiScanSnapshot idf_wifi_scan_get_snapshot(void);
+// 兼容旧调用方：发起异步刷新并立即返回最近缓存，首次尚未完成时返回 []。
 esp_err_t idf_wifi_scan_json(std::string& out_json);
 IdfWifiStatus idf_wifi_get_status(void);
 // 是否处于配网热点(AP/APSTA)模式的轻量查询——只读内部状态快照，不触发

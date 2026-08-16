@@ -7,7 +7,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <utility>
 #include <vector>
 
 #include "driver/gpio.h"
@@ -23,16 +25,20 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "config_schema_generated.h"
 #include "idf_log.h"
 #include "idf_util.h"
+#include "idf_wifi_core.h"
 #include "apps/esp_sntp.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
 static const char* TAG = "idf_wifi";
 static constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
+static constexpr EventBits_t WIFI_DISCONNECTED_BIT = BIT1;
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr const char* AP_SSID_PREFIX = "SMS-Forwarder-";
+static constexpr const char* AP_PASSWORD = "sms-forwarder-setup";
 static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
 static constexpr uint32_t PROVISION_BUTTON_HOLD_MS = 5000;
 static constexpr uint16_t WIFI_SCAN_RECORD_LIMIT = 40;
@@ -52,6 +58,15 @@ static std::atomic<bool> s_mdns_task_started{false};
 static std::atomic<bool> s_button_task_started{false};
 static std::atomic<bool> s_sntp_started{false};
 static std::atomic<bool> s_sta_connected{false};
+static std::atomic<bool> s_current_profile_open{false};
+static std::atomic<bool> s_scan_running{false};
+static std::atomic<bool> s_scan_refresh_pending{false};
+static bool s_scan_cache_ready = false;
+static esp_err_t s_scan_cache_error = ESP_OK;
+static std::string s_scan_cache_json = "[]";
+static std::array<wifi_ap_record_t, WIFI_SCAN_RECORD_LIMIT> s_scan_cache_records = {};
+static uint16_t s_scan_cache_count = 0;
+static std::atomic<uint32_t> s_candidate_attempt{0};
 static std::atomic<int> s_disconnect_streak{0};
 static std::atomic<int64_t> s_last_beacon_log_us{0};
 static std::atomic<uint32_t> s_suppressed_beacon_logs{0};
@@ -67,12 +82,49 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
 static void schedule_ap_close(uint32_t delay_ms);
 static void start_wifi_select_once(void);
 static void wifi_remember_task(void*);
+static void wifi_scan_collect_task(void*);
 
 struct ApState {
     bool mode = false;
     bool manual = false;
     std::string ssid;
 };
+
+struct ProvisioningTarget {
+    bool active = false;
+    uint32_t generation = 0;
+    std::string ssid;
+    bool bssidSet = false;
+    std::array<uint8_t, 6> bssid = {};
+};
+
+static ProvisioningTarget s_provisioning_target;
+static std::atomic<uint32_t> s_provisioning_generation{0};
+
+class WifiScanLease {
+public:
+    WifiScanLease()
+    {
+        bool expected = false;
+        held_ = s_scan_running.compare_exchange_strong(expected, true, std::memory_order_relaxed);
+    }
+
+    ~WifiScanLease()
+    {
+        if (held_) s_scan_running.store(false, std::memory_order_relaxed);
+    }
+
+    explicit operator bool() const { return held_; }
+    void detach() { held_ = false; }
+
+private:
+    bool held_ = false;
+};
+
+static esp_err_t public_scan_error(esp_err_t err)
+{
+    return err == ESP_ERR_WIFI_STATE ? ESP_ERR_INVALID_STATE : err;
+}
 
 static ApState ap_state_snapshot()
 {
@@ -98,9 +150,63 @@ static void set_ap_state(bool mode, bool manual, const std::string& ssid)
     }
 }
 
+static ProvisioningTarget provisioning_target_snapshot()
+{
+    ProvisioningTarget target;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        target = s_provisioning_target;
+        xSemaphoreGive(s_state_mutex);
+    }
+    return target;
+}
+
+static uint32_t replace_provisioning_target(const ProvisioningTarget& target)
+{
+    s_provisioning.store(false, std::memory_order_release);
+    uint32_t generation = s_provisioning_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        s_provisioning_target = target;
+        s_provisioning_target.generation = generation;
+        xSemaphoreGive(s_state_mutex);
+    }
+    s_provisioning.store(target.active, std::memory_order_release);
+    return generation;
+}
+
+static bool complete_provisioning_target(uint32_t generation)
+{
+    bool completed = false;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_provisioning_target.active && s_provisioning_target.generation == generation) {
+            s_provisioning_target = ProvisioningTarget();
+            s_provisioning_target.generation =
+                s_provisioning_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+            s_provisioning.store(false, std::memory_order_release);
+            completed = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    return completed;
+}
+
+static bool bind_provisioning_bssid(uint32_t generation, const uint8_t bssid[6])
+{
+    bool bound = false;
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_provisioning_target.active && s_provisioning_target.generation == generation) {
+            memcpy(s_provisioning_target.bssid.data(), bssid, s_provisioning_target.bssid.size());
+            s_provisioning_target.bssidSet = true;
+            bound = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+    }
+    return bound;
+}
+
 // 配网连接成功后延时关闭热点：给配网页时间显示 IP，再切回纯 STA
 static void ap_close_timer_cb(void*)
 {
+    if (s_provisioning.load(std::memory_order_acquire)) return;
     if (!ap_state_snapshot().mode) return;  // 已经关了
     if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
         set_ap_state(false, false, std::string());
@@ -168,6 +274,9 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
     s_has_sta_credentials.store(false, std::memory_order_relaxed);
     s_sta_configured.store(false, std::memory_order_relaxed);
     s_sta_connected.store(false, std::memory_order_relaxed);
+    s_current_profile_open.store(false, std::memory_order_relaxed);
+    s_scan_running.store(false, std::memory_order_relaxed);
+    s_candidate_attempt.store(0, std::memory_order_relaxed);
 }
 
 static void sntp_sync_cb(timeval*)
@@ -299,8 +408,26 @@ static void log_wifi_disconnect_once(uint8_t reason, int8_t rssi)
     s_suppress_next_connect_log.store(false, std::memory_order_relaxed);
 }
 
+static void finish_scan_refresh_error(esp_err_t err)
+{
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        s_scan_cache_error = err;
+        xSemaphoreGive(s_state_mutex);
+    }
+    s_scan_running.store(false, std::memory_order_release);
+    s_scan_refresh_pending.store(false, std::memory_order_release);
+}
+
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE &&
+        s_scan_refresh_pending.load(std::memory_order_acquire)) {
+        if (xTaskCreate(wifi_scan_collect_task, "idf_wifi_scan", 4096, nullptr, 2, nullptr) != pdPASS) {
+            esp_wifi_clear_ap_list();
+            finish_scan_refresh_error(ESP_ERR_NO_MEM);
+        }
+        return;
+    }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         if (sta_can_connect()) esp_wifi_connect();
         return;
@@ -309,7 +436,10 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         s_sta_connected.store(false, std::memory_order_relaxed);
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+            xEventGroupSetBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
         }
+        // 主动切换凭据时先关闭自动重连；等调用方看到本事件后再应用新配置。
+        if (!s_sta_configured.load(std::memory_order_relaxed)) return;
         // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
         // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
         int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -330,6 +460,7 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         auto* event = static_cast<ip_event_got_ip_t*>(event_data);
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
+        s_candidate_attempt.store(0, std::memory_order_relaxed);
         ESP_LOGI(TAG, "STA 已获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (!s_suppress_next_connect_log.exchange(false, std::memory_order_relaxed)) {
             idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
@@ -341,15 +472,30 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
         }
         if (s_wifi_event_group) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
         ApState ap = ap_state_snapshot();
         if (ap.mode && s_has_sta_credentials.load(std::memory_order_relaxed)) {
-            if (s_provisioning.exchange(false, std::memory_order_relaxed)) {
-                // 配网页触发的连接成功：先留住热点让配网页显示 IP，再延时自动关闭
-                schedule_ap_close(AP_PROVISION_HOLD_MS);
-                idf_logf("配网连接成功，%lu 秒后自动关闭热点",
-                         static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+            if (s_provisioning.load(std::memory_order_acquire)) {
+                const ProvisioningTarget target = provisioning_target_snapshot();
+                wifi_ap_record_t connected_ap = {};
+                std::array<uint8_t, 6> connected_bssid = {};
+                bool matched = false;
+                if (target.active && esp_wifi_sta_get_ap_info(&connected_ap) == ESP_OK) {
+                    memcpy(connected_bssid.data(), connected_ap.bssid, connected_bssid.size());
+                    matched = idf_wifi_provision_target_matches(
+                        target.ssid, target.bssidSet, target.bssid,
+                        reinterpret_cast<const char*>(connected_ap.ssid), connected_bssid);
+                }
+                if (matched && complete_provisioning_target(target.generation)) {
+                    // 只有本次提交的目标真正拿到 IP 才关闭热点；旧配置兜底连上不算配网成功。
+                    schedule_ap_close(AP_PROVISION_HOLD_MS);
+                    idf_logf("配网连接成功，%lu 秒后自动关闭热点",
+                             static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+                } else {
+                    ESP_LOGW(TAG, "忽略非当前配网目标的 GOT_IP，热点保持开启");
+                }
             } else if (!ap.manual) {
                 if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
                     set_ap_state(false, false, std::string());
@@ -389,7 +535,16 @@ static void reconnect_watchdog_cb(void*)
     ++tick;
     // 配网热点开启时降频到 60s：连接尝试会把 STA 拉去跑信道，影响 AP 客户端与扫描
     if (ap_state_snapshot().mode && (tick % 4) != 0) return;
-    if (idf_config_wifi_network_count() > 1) {
+    if (s_provisioning.load(std::memory_order_acquire)) {
+        // 配网期间只重试本次已应用的驱动配置，不能选回历史网络并误判为配网成功。
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGW(TAG, "配网重连发起失败: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+    if (idf_config_wifi_network_count() > 1 ||
+        s_current_profile_open.load(std::memory_order_relaxed)) {
         start_wifi_select_once();  // 扫描(约 2-3s)在独立小任务里做，不阻塞 esp_timer
         return;
     }
@@ -839,7 +994,7 @@ static esp_err_t start_provisioning_ap(bool manual)
         return err;
     }
     char ssid[33];
-    snprintf(ssid, sizeof(ssid), "%s%02X%02X", AP_SSID_PREFIX, mac[4], mac[5]);
+    snprintf(ssid, sizeof(ssid), "%s%02X%02X%02X", AP_SSID_PREFIX, mac[3], mac[4], mac[5]);
     err = configure_ap_netif();
     if (err != ESP_OK) {
         idf_logf("配网热点启动失败: 配置 AP IP 失败 %s", esp_err_to_name(err));
@@ -848,10 +1003,12 @@ static esp_err_t start_provisioning_ap(bool manual)
 
     wifi_config_t ap_config = {};
     strlcpy(reinterpret_cast<char*>(ap_config.ap.ssid), ssid, sizeof(ap_config.ap.ssid));
+    strlcpy(reinterpret_cast<char*>(ap_config.ap.password), AP_PASSWORD, sizeof(ap_config.ap.password));
     ap_config.ap.ssid_len = strlen(ssid);
     ap_config.ap.channel = 1;
     ap_config.ap.max_connection = 4;
-    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_config.ap.pmf_cfg.capable = true;
     ap_config.ap.pmf_cfg.required = false;
 
     err = esp_wifi_set_mode(WIFI_MODE_APSTA);
@@ -903,22 +1060,112 @@ static void provision_button_task(void*)
     }
 }
 
-// 应用凭据并发起 STA 连接(不等待结果)。配网热点开着时保持 APSTA 不踢热点。
-static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass)
+static bool wifi_profile_password_valid(const std::string& pass)
 {
+    if (pass.empty()) return true;
+    if (pass.size() < 8 || pass.size() > 63) return false;
+    for (unsigned char ch : pass) {
+        if (ch < 0x20 || ch > 0x7E) return false;
+    }
+    return true;
+}
+
+// 应用凭据并发起 STA 连接(不等待结果)。开放网络必须绑定扫描命中的开放 BSSID，
+// 加密网络由驱动认证阈值拒绝同名开放热点，避免凭据降级到 evil twin。
+static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass,
+                                        const wifi_ap_record_t* ap = nullptr)
+{
+    if (ssid.empty() || ssid.size() > MAX_WIFI_SSID_BYTES || !wifi_profile_password_valid(pass)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (pass.empty() && !ap) return ESP_ERR_NOT_FOUND;
+    if (ap && !idf_wifi_profile_matches_auth(pass.empty(), ap->authmode)) return ESP_ERR_INVALID_ARG;
+
     wifi_config_t sta_config = {};
     strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), ssid.c_str(), sizeof(sta_config.sta.ssid));
     strlcpy(reinterpret_cast<char*>(sta_config.sta.password), pass.c_str(), sizeof(sta_config.sta.password));
     sta_config.sta.scan_method = WIFI_FAST_SCAN;
     sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta_config.sta.threshold.authmode = pass.empty() ? WIFI_AUTH_OPEN : WIFI_AUTH_WPA2_PSK;
+    if (ap) {
+        sta_config.sta.bssid_set = true;
+        memcpy(sta_config.sta.bssid, ap->bssid, sizeof(sta_config.sta.bssid));
+        sta_config.sta.channel = ap->primary;
+    }
 
     esp_err_t err = esp_wifi_set_mode(ap_state_snapshot().mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (err != ESP_OK) return err;
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK) return err;
+    s_current_profile_open.store(pass.empty(), std::memory_order_relaxed);
     s_sta_configured.store(true, std::memory_order_relaxed);
     return esp_wifi_connect();
+}
+
+static esp_err_t wifi_disconnect_quietly()
+{
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    if (s_wifi_event_group) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT);
+    }
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK) {
+        // 已经离线时没有事件可等；连接态仍报告失败则保留旧配置交给调用方恢复。
+        return s_sta_connected.load(std::memory_order_relaxed) ? err : ESP_OK;
+    }
+    if (!s_wifi_event_group) return ESP_ERR_INVALID_STATE;
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group, WIFI_DISCONNECTED_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(1500));
+    return (bits & WIFI_DISCONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t wifi_scan_candidates(
+    const std::vector<IdfWifiNetwork>& nets,
+    std::vector<IdfWifiCandidate>& candidates,
+    std::array<wifi_ap_record_t, IDF_MAX_WIFI_NETWORKS>& best_by_profile)
+{
+    wifi_scan_config_t scan_cfg = {};
+    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) return public_scan_error(err);
+
+    uint16_t total = 0;
+    err = esp_wifi_scan_get_ap_num(&total);
+    if (err != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        return err;
+    }
+    std::array<bool, IDF_MAX_WIFI_NETWORKS> matched = {};
+    wifi_ap_record_t rec = {};
+    for (uint16_t r = 0; r < total; ++r) {
+        err = esp_wifi_scan_get_ap_record(&rec);
+        if (err != ESP_OK) {
+            esp_wifi_clear_ap_list();
+            return err;
+        }
+        const char* seen = reinterpret_cast<const char*>(rec.ssid);
+        for (size_t i = 0; i < nets.size(); ++i) {
+            if (nets[i].ssid == seen && wifi_profile_password_valid(nets[i].pass) &&
+                idf_wifi_profile_matches_auth(nets[i].pass.empty(), rec.authmode) &&
+                (!matched[i] || rec.rssi > best_by_profile[i].rssi)) {
+                matched[i] = true;
+                best_by_profile[i] = rec;
+            }
+        }
+    }
+    esp_wifi_clear_ap_list();
+
+    candidates.clear();
+    candidates.reserve(nets.size());
+    for (size_t i = 0; i < nets.size(); ++i) {
+        if (matched[i]) {
+            candidates.push_back({i, best_by_profile[i].rssi, true});
+        } else if (!nets[i].pass.empty() && wifi_profile_password_valid(nets[i].pass)) {
+            // 未广播 SSID 的加密网络可依靠 WPA2+ 阈值安全盲连；开放网络必须扫描命中后绑定 BSSID。
+            candidates.push_back({i, -128, false});
+        }
+    }
+    idf_wifi_order_candidates(candidates);
+    return ESP_OK;
 }
 
 // —— 历史 WiFi 扫描选网(取代固定顺序盲试，见 issue #9 讨论) ——
@@ -926,44 +1173,47 @@ static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::stri
 // 在场且信号最好的一组；扫描不到任何已存网络(隐藏 SSID 或全部不在场)时按轮转
 // 索引逐组兜底，避免每组各吃 20s 连接超时的顺序盲等。
 static std::atomic<bool> s_select_running{false};
-static std::atomic<uint32_t> s_fallback_rotation{0};
-
 static void wifi_select_task(void*)
 {
     do {
+        WifiScanLease lease;
+        if (!lease) break;
+        uint32_t generation = s_provisioning_generation.load(std::memory_order_acquire);
+        if (!idf_wifi_selector_can_apply(
+                generation, s_provisioning_generation.load(std::memory_order_acquire),
+                s_provisioning.load(std::memory_order_acquire))) {
+            break;
+        }
         std::vector<IdfWifiNetwork> nets = idf_config_get_wifi_networks();
         if (nets.empty()) break;
-        int chosen = -1;
-        int best_rssi = -128;
-        if (nets.size() > 1) {
-            wifi_scan_config_t scan_cfg = {};  // 全信道主动扫描；隐藏 AP 不带 SSID，无法按名匹配
-            if (esp_wifi_scan_start(&scan_cfg, true) == ESP_OK) {
-                // 逐条取记录：只需每个已存网络的最好 RSSI，不用整块拷 40 条(约 3KB)进堆
-                uint16_t total = 0;
-                esp_wifi_scan_get_ap_num(&total);
-                wifi_ap_record_t rec;
-                for (uint16_t r = 0; r < total; ++r) {
-                    if (esp_wifi_scan_get_ap_record(&rec) != ESP_OK) break;
-                    const char* seen = reinterpret_cast<const char*>(rec.ssid);
-                    for (size_t i = 0; i < nets.size(); ++i) {
-                        if (nets[i].ssid == seen && rec.rssi > best_rssi) {
-                            best_rssi = rec.rssi;
-                            chosen = static_cast<int>(i);
-                        }
-                    }
-                }
-                esp_wifi_clear_ap_list();  // 释放驱动侧未取完的扫描记录
-            }
+        std::vector<IdfWifiCandidate> candidates;
+        std::array<wifi_ap_record_t, IDF_MAX_WIFI_NETWORKS> best_by_profile = {};
+        esp_err_t scan_err = wifi_scan_candidates(nets, candidates, best_by_profile);
+        if (scan_err != ESP_OK) {
+            ESP_LOGW(TAG, "选网扫描失败: %s", esp_err_to_name(scan_err));
+            break;
         }
-        if (chosen >= 0) {
-            idf_logf("扫描命中已存 WiFi: %s (RSSI %d)，直接连接", nets[chosen].ssid.c_str(), best_rssi);
-        } else if (nets.size() == 1) {
-            chosen = 0;
+        if (candidates.empty()) {
+            idf_log_line("扫描未见匹配安全类型的已存 WiFi，跳过连接");
+            break;
+        }
+        uint32_t attempt = s_candidate_attempt.fetch_add(1, std::memory_order_relaxed);
+        const IdfWifiCandidate& candidate =
+            candidates[idf_wifi_candidate_position(candidates.size(), attempt)];
+        const IdfWifiNetwork& net = nets[candidate.profileIndex];
+        if (candidate.scanned) {
+            idf_logf("扫描命中已存 WiFi: %s (RSSI %d)，尝试连接", net.ssid.c_str(), candidate.rssi);
         } else {
-            chosen = static_cast<int>(s_fallback_rotation.fetch_add(1, std::memory_order_relaxed) % nets.size());
-            idf_logf("扫描未见已存 WiFi，轮流尝试: %s", nets[chosen].ssid.c_str());
+            idf_logf("扫描未见该加密 WiFi，按隐藏网络尝试: %s", net.ssid.c_str());
         }
-        esp_err_t err = wifi_apply_and_connect(nets[chosen].ssid, nets[chosen].pass);
+        if (!idf_wifi_selector_can_apply(
+                generation, s_provisioning_generation.load(std::memory_order_acquire),
+                s_provisioning.load(std::memory_order_acquire))) {
+            break;
+        }
+        esp_err_t err = wifi_apply_and_connect(
+            net.ssid, net.pass,
+            candidate.scanned ? &best_by_profile[candidate.profileIndex] : nullptr);
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(TAG, "选网后连接发起失败: %s", esp_err_to_name(err));
         }
@@ -986,14 +1236,14 @@ static void start_wifi_select_once(void)
 
 // 只发起 STA 连接不等待结果；首连成败由 sta_connect_watch_task 后台判定。
 // 这样 app_main 不再被首连(最长 20s)阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
-// 单组网络直连(免扫描且兼容隐藏 SSID)；多组网络走扫描选网任务。
+// 单组加密网络直连(免扫描且兼容隐藏 SSID)；多组或开放网络走扫描选网任务。
 static esp_err_t connect_sta_begin(const IdfConfig& config)
 {
     int count = 0;
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
         if (!config.wifiNetworks[i].ssid.empty()) ++count;
     }
-    if (count > 1) {
+    if (count > 1 || config.wifiNetworks[0].pass.empty()) {
         idf_logf("已存 %d 组 WiFi，扫描选择在场信号最好的网络…", count);
         start_wifi_select_once();
         return ESP_OK;
@@ -1048,14 +1298,10 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return ESP_ERR_NO_MEM;
     }
 
-    // DHCP 主机名附带 STA MAC 后六位，多台设备在路由器客户端列表中可直接区分。
-    uint8_t sta_mac[6] = {};
-    if (esp_read_mac(sta_mac, ESP_MAC_WIFI_STA) == ESP_OK) {
-        char hostname[16];
-        snprintf(hostname, sizeof(hostname), "sms-%02x%02x%02x", sta_mac[3], sta_mac[4], sta_mac[5]);
-        esp_err_t hostname_err = esp_netif_set_hostname(s_sta_netif, hostname);
-        if (hostname_err != ESP_OK) idf_logf("设置 DHCP 主机名失败: %s", esp_err_to_name(hostname_err));
-    }
+    // hostname 已由配置层校验；空值只可能来自旧调用方，沿用既有 sms fallback。
+    const std::string& hostname = config.hostname.empty() ? std::string("sms") : config.hostname;
+    esp_err_t hostname_err = esp_netif_set_hostname(s_sta_netif, hostname.c_str());
+    if (hostname_err != ESP_OK) idf_logf("设置 DHCP 主机名失败: %s", esp_err_to_name(hostname_err));
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     bool wifi_inited = false;
@@ -1181,7 +1427,14 @@ esp_err_t idf_wifi_reconnect(void)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    esp_err_t err = wifi_disconnect_quietly();
+    s_sta_configured.store(true, std::memory_order_relaxed);
+    if (err != ESP_OK) return err;
+    s_disconnect_streak.store(0, std::memory_order_relaxed);
+    if (s_current_profile_open.load(std::memory_order_relaxed)) {
+        start_wifi_select_once();
+        return ESP_OK;
+    }
     return esp_wifi_connect();
 }
 
@@ -1195,62 +1448,115 @@ esp_err_t idf_wifi_set_tx_power(uint8_t quarter_dbm)
 esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
-    wifi_config_t sta_config = {};
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.ssid), ssid.c_str(), sizeof(sta_config.sta.ssid));
-    strlcpy(reinterpret_cast<char*>(sta_config.sta.password), pass.c_str(), sizeof(sta_config.sta.password));
-    sta_config.sta.scan_method = WIFI_FAST_SCAN;
-    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    if (ssid.empty() || ssid.size() > MAX_WIFI_SSID_BYTES || !wifi_profile_password_valid(pass)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    WifiScanLease lease;
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    if (s_ap_close_timer) esp_timer_stop(s_ap_close_timer);
+
     // 保持 APSTA：配网页仍连在热点上，连上后由 IP 事件调度延时关热点(见 wifi_event_handler)
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) return err;
-    esp_wifi_disconnect();  // 断开可能存在的旧 STA 连接，确保按新凭据重连
-    err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
-    if (err != ESP_OK) return err;
-    s_has_sta_credentials.store(!ssid.empty(), std::memory_order_relaxed);
-    s_sta_configured.store(true, std::memory_order_relaxed);
-    s_provisioning.store(true, std::memory_order_relaxed);
-    if (s_wifi_event_group) xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    err = esp_wifi_connect();
+
+    wifi_ap_record_t ap = {};
+    const wifi_ap_record_t* selected = nullptr;
+    if (pass.empty()) {
+        std::vector<wifi_ap_record_t> cached_records;
+        bool cache_ready = false;
+        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+            cached_records.assign(s_scan_cache_records.begin(),
+                                  s_scan_cache_records.begin() + s_scan_cache_count);
+            cache_ready = s_scan_cache_ready;
+            xSemaphoreGive(s_state_mutex);
+        }
+        std::vector<IdfWifiScannedAp> scanned;
+        scanned.reserve(cached_records.size());
+        for (const wifi_ap_record_t& record : cached_records) {
+            IdfWifiScannedAp item;
+            item.ssid = reinterpret_cast<const char*>(record.ssid);
+            item.rssi = record.rssi;
+            item.authmode = record.authmode;
+            memcpy(item.bssid.data(), record.bssid, item.bssid.size());
+            scanned.push_back(std::move(item));
+        }
+        std::array<uint8_t, 6> selected_bssid = {};
+        if (!cache_ready || !idf_wifi_find_cached_open_ap(scanned, ssid, selected_bssid)) {
+            return cache_ready ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_STATE;
+        }
+        for (const wifi_ap_record_t& record : cached_records) {
+            if (memcmp(record.bssid, selected_bssid.data(), selected_bssid.size()) == 0) {
+                ap = record;
+                selected = &ap;
+                break;
+            }
+        }
+        if (!selected) return ESP_ERR_NOT_FOUND;
+    }
+
+    wifi_config_t previous_config = {};
+    bool previous_config_valid =
+        esp_wifi_get_config(WIFI_IF_STA, &previous_config) == ESP_OK && previous_config.sta.ssid[0];
+    bool previous_has_credentials = s_has_sta_credentials.load(std::memory_order_relaxed);
+    bool previous_configured = s_sta_configured.load(std::memory_order_relaxed);
+    bool previous_open = s_current_profile_open.load(std::memory_order_relaxed);
+    ProvisioningTarget previous_target = provisioning_target_snapshot();
+
+    auto restore_previous = [&]() {
+        if (previous_config_valid) esp_wifi_set_config(WIFI_IF_STA, &previous_config);
+        s_has_sta_credentials.store(previous_has_credentials, std::memory_order_relaxed);
+        s_sta_configured.store(previous_configured, std::memory_order_relaxed);
+        s_current_profile_open.store(previous_open, std::memory_order_relaxed);
+        replace_provisioning_target(previous_target);
+        if (previous_has_credentials && previous_configured) esp_wifi_connect();
+    };
+
+    // 先让旧配网代次失效，再断开；这样排队中的旧 GOT_IP 不会关闭当前热点。
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    replace_provisioning_target(ProvisioningTarget());
+    err = wifi_disconnect_quietly();
+    if (err != ESP_OK) {
+        restore_previous();
+        return err;
+    }
+
+    ProvisioningTarget target;
+    target.active = true;
+    target.ssid = ssid;
+    uint32_t generation = replace_provisioning_target(target);
+
+    if (pass.empty()) {
+        if (!bind_provisioning_bssid(generation, ap.bssid)) {
+            restore_previous();
+            return ESP_ERR_INVALID_STATE;
+        }
+        selected = &ap;  // 开放网络只有扫描命中并绑定 BSSID 后才允许连接
+    }
+
+    s_has_sta_credentials.store(true, std::memory_order_relaxed);
+    s_disconnect_streak.store(0, std::memory_order_relaxed);
+    s_candidate_attempt.store(0, std::memory_order_relaxed);
+    err = wifi_apply_and_connect(ssid, pass, selected);
+    if (err != ESP_OK) {
+        restore_previous();
+        return err;
+    }
     ESP_LOGI(TAG, "配网：保存并连接 %s", ssid.c_str());
     idf_logf("配网热点内保存 WiFi 并尝试连接: %s", ssid.c_str());
     return err;
 }
 
-esp_err_t idf_wifi_scan_json(std::string& out_json)
+static std::string wifi_scan_records_json(const std::vector<wifi_ap_record_t>& records)
 {
-    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
-    wifi_mode_t mode = WIFI_MODE_NULL;
-    esp_err_t err = esp_wifi_get_mode(&mode);
-    if (err != ESP_OK) return err;
-    if (mode == WIFI_MODE_AP) {
-        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-        if (err != ESP_OK) return err;
-    }
-
-    wifi_scan_config_t scan_cfg = {};
-    err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) return err;
-
-    uint16_t total = 0;
-    err = esp_wifi_scan_get_ap_num(&total);
-    if (err != ESP_OK) return err;
-    uint16_t count = std::min<uint16_t>(total, WIFI_SCAN_RECORD_LIMIT);
-    std::vector<wifi_ap_record_t> records(count);
-    if (count) {
-        err = esp_wifi_scan_get_ap_records(&count, records.data());
-        if (err != ESP_OK) return err;
-    }
-
-    out_json.clear();
-    out_json.reserve(1024);
-    out_json += "[";
+    std::string json;
+    json.reserve(1024);
+    json += "[";
     bool first = true;
-    for (uint16_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < records.size(); ++i) {
         const char* ssid = reinterpret_cast<const char*>(records[i].ssid);
         if (!ssid[0]) continue;
         bool duplicate = false;
-        for (uint16_t k = 0; k < count; ++k) {
+        for (size_t k = 0; k < records.size(); ++k) {
             if (k == i) continue;
             const char* other = reinterpret_cast<const char*>(records[k].ssid);
             if (strcmp(ssid, other) != 0) continue;
@@ -1261,17 +1567,98 @@ esp_err_t idf_wifi_scan_json(std::string& out_json)
             }
         }
         if (duplicate) continue;
-        if (!first) out_json += ",";
+        if (!first) json += ",";
         first = false;
-        out_json += "{\"ssid\":\"";
-        idf_util_json_escape_append(out_json, ssid);
+        json += "{\"ssid\":\"";
+        idf_util_json_escape_append(json, ssid);
         char tail[96];
         snprintf(tail, sizeof(tail), "\",\"rssi\":%d,\"enc\":%d}",
                  records[i].rssi,
                  records[i].authmode == WIFI_AUTH_OPEN ? 0 : 1);
-        out_json += tail;
+        json += tail;
     }
-    out_json += "]";
+    json += "]";
+    return json;
+}
+
+static void wifi_scan_collect_task(void*)
+{
+    uint16_t total = 0;
+    esp_err_t err = esp_wifi_scan_get_ap_num(&total);
+    uint16_t count = std::min<uint16_t>(total, WIFI_SCAN_RECORD_LIMIT);
+    std::vector<wifi_ap_record_t> records(count);
+    if (err == ESP_OK && count) err = esp_wifi_scan_get_ap_records(&count, records.data());
+    if (err != ESP_OK || count == 0) esp_wifi_clear_ap_list();
+
+    if (err == ESP_OK) {
+        records.resize(count);
+        std::string json = wifi_scan_records_json(records);
+        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+            s_scan_cache_records = {};
+            std::copy(records.begin(), records.end(), s_scan_cache_records.begin());
+            s_scan_cache_count = count;
+            s_scan_cache_json = std::move(json);
+            s_scan_cache_ready = true;
+            s_scan_cache_error = ESP_OK;
+            xSemaphoreGive(s_state_mutex);
+        }
+        s_scan_running.store(false, std::memory_order_release);
+        s_scan_refresh_pending.store(false, std::memory_order_release);
+    } else {
+        finish_scan_refresh_error(err);
+    }
+    vTaskDelete(nullptr);
+}
+
+esp_err_t idf_wifi_scan_request(void)
+{
+    if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
+    if (s_scan_refresh_pending.load(std::memory_order_acquire)) return ESP_OK;
+
+    WifiScanLease lease;
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    esp_err_t err = esp_wifi_get_mode(&mode);
+    if (err != ESP_OK) return err;
+    if (mode == WIFI_MODE_AP) {
+        err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+        if (err != ESP_OK) return err;
+    }
+
+    s_scan_refresh_pending.store(true, std::memory_order_release);
+    wifi_scan_config_t scan_cfg = {};
+    err = esp_wifi_scan_start(&scan_cfg, false);
+    if (err != ESP_OK) {
+        s_scan_refresh_pending.store(false, std::memory_order_release);
+        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+            s_scan_cache_error = public_scan_error(err);
+            xSemaphoreGive(s_state_mutex);
+        }
+        return public_scan_error(err);
+    }
+    lease.detach();  // SCAN_DONE 收集任务释放跨任务持有的扫描/连接操作权
+    return ESP_OK;
+}
+
+IdfWifiScanSnapshot idf_wifi_scan_get_snapshot(void)
+{
+    IdfWifiScanSnapshot snapshot;
+    snapshot.busy = s_scan_refresh_pending.load(std::memory_order_acquire);
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        snapshot.json = s_scan_cache_json;
+        snapshot.ready = s_scan_cache_ready;
+        snapshot.error = s_scan_cache_error;
+        xSemaphoreGive(s_state_mutex);
+    }
+    return snapshot;
+}
+
+esp_err_t idf_wifi_scan_json(std::string& out_json)
+{
+    esp_err_t request_err = idf_wifi_scan_request();
+    IdfWifiScanSnapshot snapshot = idf_wifi_scan_get_snapshot();
+    out_json = std::move(snapshot.json);
+    if (request_err != ESP_OK && !snapshot.ready && !snapshot.busy) return request_err;
     return ESP_OK;
 }
 
