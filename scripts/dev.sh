@@ -33,11 +33,12 @@ lint_all() {
 	docker compose up -d --build dev
 	docker compose exec -T dev python3 tests/lint_gate_smoke.py
 	docker compose exec -T dev npm run lint --prefix web
-	docker compose exec -T dev ruff check --config ruff.toml scripts tests
-	docker compose exec -T dev sh -lc "git ls-files -z '*.sh' | xargs -0 shellcheck"
-	docker compose exec -T dev sh -lc "git ls-files -z -- 'code/*.ino' 'code/*.cpp' 'code/*.h' \
-		':!code/src/pdulib/**' ':!code/web_bundle.h' ':!code/config_schema_generated.h' \
-		':!code/firmware_version_generated.h' | xargs -0 cppcheck --quiet --error-exitcode=1 \
+	docker compose exec -T dev ruff check --no-cache --config ruff.toml scripts tests
+	docker compose exec -T dev sh -lc "find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck"
+	docker compose exec -T dev sh -lc "find code -maxdepth 1 -type f \
+		\( -name '*.ino' -o -name '*.cpp' -o -name '*.h' \) \
+		! -name web_bundle.h ! -name config_schema_generated.h \
+		! -name firmware_version_generated.h -print0 | xargs -0 cppcheck --quiet --error-exitcode=1 \
 		--enable=warning,style,performance,portability --check-level=exhaustive \
 		--std=c++11 --language=c++ --inline-suppr --suppress=missingIncludeSystem \
 		--suppressions-list=cppcheck-suppressions.txt"
