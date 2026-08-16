@@ -11,6 +11,8 @@ esp_err_t idf_push_start(void);
 bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id);
 int idf_push_enqueue_notify(const char* title, const char* body, const char* timestamp);
 bool idf_push_enqueue_email(const char* subject, const char* body);
+bool idf_push_enqueue_startup_notification(void);
+bool idf_push_heartbeat_tick(void);
 int idf_push_forward_queue_depth(void);
 int idf_push_retry_queue_depth(void);
 int idf_push_email_queue_depth(void);

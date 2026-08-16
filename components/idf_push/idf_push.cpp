@@ -1,4 +1,5 @@
 #include "idf_push.h"
+#include "idf_push_core.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -68,20 +69,6 @@ static constexpr size_t TLS_MIN_FREE_HEAP = 50000;
 static constexpr uint32_t CHANNEL_COOL_STEP_SEC = 30;
 static constexpr uint32_t CHANNEL_COOL_MAX_SEC = 300;
 
-enum : uint8_t {
-    PUSH_TYPE_NONE = 0,
-    PUSH_TYPE_POST_JSON = 1,
-    PUSH_TYPE_BARK = 2,
-    PUSH_TYPE_GET = 3,
-    PUSH_TYPE_DINGTALK = 4,
-    PUSH_TYPE_PUSHPLUS = 5,
-    PUSH_TYPE_SERVERCHAN = 6,
-    PUSH_TYPE_CUSTOM = 7,
-    PUSH_TYPE_FEISHU = 8,
-    PUSH_TYPE_GOTIFY = 9,
-    PUSH_TYPE_TELEGRAM = 10,
-};
-
 struct PushJob {
     bool used = false;
     uint8_t channel = 0;
@@ -128,6 +115,7 @@ struct TestJob {
     bool running = false;
     bool done = false;
     bool success = false;
+    int64_t nextUs = 0;
     std::string message;
 };
 
@@ -149,6 +137,10 @@ static std::array<ForwardCompletion, PUSH_QUEUE_MAX + EMAIL_QUEUE_MAX> s_forward
 static bool s_started = false;
 static uint32_t s_next_completion_id = 0;
 static std::atomic<bool> s_busy{false};
+static bool s_heartbeat_clock_started = false;
+static int64_t s_last_heartbeat_us = 0;
+static bool s_startup_email_pending = false;
+static bool s_startup_email_done = false;
 // 通道连续失败冷却状态（仅推送 worker 单任务读写，无需加锁）
 static uint8_t s_channel_fails[IDF_MAX_PUSH_CHANNELS] = {};
 static int64_t s_channel_cool_until_us[IDF_MAX_PUSH_CHANNELS] = {};
@@ -182,6 +174,10 @@ static void cleanup_start_resources()
     s_test_jobs = {};
     s_forward_completions = {};
     s_next_completion_id = 0;
+    s_heartbeat_clock_started = false;
+    s_last_heartbeat_us = 0;
+    s_startup_email_pending = false;
+    s_startup_email_done = false;
     memset(s_channel_fails, 0, sizeof(s_channel_fails));
     memset(s_channel_cool_until_us, 0, sizeof(s_channel_cool_until_us));
     s_busy.store(false, std::memory_order_relaxed);
@@ -280,6 +276,59 @@ static std::string format_local_time(int tz_offset_min)
     return idf_util_format_epoch_local(static_cast<uint32_t>(time(nullptr)), tz_offset_min);
 }
 
+static std::string format_utc_time(time_t epoch)
+{
+    struct tm utc = {};
+    gmtime_r(&epoch, &utc);
+    char text[24];
+    strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S UTC", &utc);
+    return text;
+}
+
+static std::string device_url(const IdfWifiStatus& wifi)
+{
+    const std::string& ip = wifi.staConnected ? wifi.ip : wifi.apIp;
+    return ip.empty() ? std::string() : ("http://" + ip + "/");
+}
+
+static void build_startup_text(const IdfPushNotifyView& cfg, const std::string& url,
+                               std::string& title, std::string& body)
+{
+    if (cfg.notificationLocale == NOTIFICATION_LOCALE_EN) {
+        title = "SMS Forwarder started";
+        body = "Device: " + cfg.deviceName + "\nStatus: Started\nDevice URL: " + url;
+    } else if (cfg.notificationLocale == NOTIFICATION_LOCALE_ZH_CN) {
+        title = "短信转发器已启动";
+        body = "设备：" + cfg.deviceName + "\n状态：已启动\n设备网址：" + url;
+    } else {
+        title = "簡訊轉發器已啟動";
+        body = "裝置：" + cfg.deviceName + "\n狀態：已啟動\n裝置網址：" + url;
+    }
+}
+
+static void build_heartbeat_text(const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
+                                 const std::string& local_number, const std::string& event_time,
+                                 std::string& title, std::string& body)
+{
+    const std::string url = device_url(wifi);
+    if (cfg.notificationLocale == NOTIFICATION_LOCALE_EN) {
+        title = "SMS Forwarder heartbeat";
+        body = "Device: " + cfg.deviceName + "\nHostname: " + cfg.hostname +
+               "\nLocal number: " + local_number + "\nNetwork address: " + wifi.ip +
+               "\nDevice URL: " + url + "\nEvent: Device online\nTime: " + event_time;
+    } else if (cfg.notificationLocale == NOTIFICATION_LOCALE_ZH_CN) {
+        title = "短信转发器心跳";
+        body = "设备：" + cfg.deviceName + "\n主机名：" + cfg.hostname +
+               "\n本机号码：" + local_number + "\n网络地址：" + wifi.ip +
+               "\n设备网址：" + url + "\n事件：设备在线\n时间：" + event_time;
+    } else {
+        title = "簡訊轉發器心跳";
+        body = "裝置：" + cfg.deviceName + "\n主機名稱：" + cfg.hostname +
+               "\n本機號碼：" + local_number + "\n網路位址：" + wifi.ip +
+               "\n裝置網址：" + url + "\n事件：設備在線\n時間：" + event_time;
+    }
+}
+
 // 在 UTF-8 字符边界截断，避免推送/邮件主题里出现半个汉字
 static std::string utf8_truncate(const std::string& value, size_t max_bytes)
 {
@@ -364,14 +413,11 @@ static std::string url_encode(const std::string& value)
 static std::string hmac_sha256_base64(const std::string& data, const std::string& key)
 {
     unsigned char hmac[32] = {};
-    mbedtls_md_context_t ctx;
-    mbedtls_md_init(&ctx);
     const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
-    mbedtls_md_setup(&ctx, info, 1);
-    mbedtls_md_hmac_starts(&ctx, reinterpret_cast<const unsigned char*>(key.data()), key.size());
-    mbedtls_md_hmac_update(&ctx, reinterpret_cast<const unsigned char*>(data.data()), data.size());
-    mbedtls_md_hmac_finish(&ctx, hmac);
-    mbedtls_md_free(&ctx);
+    if (!info || mbedtls_md_hmac(info,
+                                 reinterpret_cast<const unsigned char*>(key.data()), key.size(),
+                                 reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+                                 hmac) != 0) return {};
 
     unsigned char out[64] = {};
     size_t out_len = 0;
@@ -386,213 +432,40 @@ static int64_t utc_millis()
     return static_cast<int64_t>(time(nullptr)) * 1000LL;
 }
 
-static bool is_url_like(const std::string& value)
-{
-    return value.rfind("http://", 0) == 0 || value.rfind("https://", 0) == 0;
-}
-
-static size_t url_path_start(const std::string& url)
-{
-    size_t scheme = url.find("://");
-    size_t host = scheme == std::string::npos ? 0 : scheme + 3;
-    return url.find('/', host);
-}
-
-static std::string url_path_without_query(const std::string& url)
-{
-    size_t start = url_path_start(url);
-    if (start == std::string::npos) return {};
-    size_t end = url.find_first_of("?#", start);
-    return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
-}
-
-static bool bark_url_path_is_push(const std::string& url)
-{
-    std::string path = url_path_without_query(url);
-    while (path.size() > 1 && path.back() == '/') path.pop_back();
-    return path == "/push" || (path.size() > 5 && path.compare(path.size() - 5, 5, "/push") == 0);
-}
-
-static bool bark_url_has_key_path(const std::string& url)
-{
-    std::string path = url_path_without_query(url);
-    while (path.size() > 1 && path.back() == '/') path.pop_back();
-    return !path.empty() && path != "/" && !bark_url_path_is_push(url);
-}
-
-static std::string bark_push_endpoint(std::string base)
-{
-    size_t suffix_pos = base.find_first_of("?#");
-    std::string suffix;
-    if (suffix_pos != std::string::npos) {
-        suffix = base.substr(suffix_pos);
-        base.erase(suffix_pos);
-    }
-    while (!base.empty() && base.back() == '/') base.pop_back();
-    return base + "/push" + suffix;
-}
-
-struct BarkTarget {
-    bool ok = false;
-    std::string url;
-    std::string device_key;
-};
-
-static BarkTarget bark_target_from_channel(const IdfPushChannel& ch)
-{
-    BarkTarget target;
-    std::string key = idf_util_trim_copy(ch.key1);
-    std::string raw_url = idf_util_trim_copy(ch.url);
-    if (!key.empty()) {
-        if (raw_url.empty()) raw_url = "https://api.day.app";
-        if (!is_url_like(raw_url)) return target;
-        target.url = bark_url_path_is_push(raw_url) ? raw_url : bark_push_endpoint(raw_url);
-        target.device_key = key;
-        target.ok = true;
-        return target;
-    }
-
-    // 兼容旧配置：URL 框里直接填 https://api.day.app/<key> 时仍按原端点发送。
-    if (raw_url.empty() || !is_url_like(raw_url) || !bark_url_has_key_path(raw_url)) return target;
-    target.url = raw_url;
-    target.ok = true;
-    return target;
-}
-
-static int hex_value(char ch)
-{
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
-    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
-    return -1;
-}
-
-static std::string url_decode_component(const std::string& value)
-{
-    std::string out;
-    out.reserve(value.size());
-    for (size_t i = 0; i < value.size(); ++i) {
-        char ch = value[i];
-        if (ch == '+') {
-            out += ' ';
-        } else if (ch == '%' && i + 2 < value.size()) {
-            int hi = hex_value(value[i + 1]);
-            int lo = hex_value(value[i + 2]);
-            if (hi >= 0 && lo >= 0) {
-                out += static_cast<char>((hi << 4) | lo);
-                i += 2;
-            } else {
-                out += ch;
-            }
-        } else {
-            out += ch;
-        }
-    }
-    return out;
-}
-
-static bool is_integer_literal(const std::string& value)
-{
-    if (value.empty()) return false;
-    size_t i = (value[0] == '-' || value[0] == '+') ? 1 : 0;
-    if (i >= value.size()) return false;
-    for (; i < value.size(); ++i) {
-        if (!isdigit(static_cast<unsigned char>(value[i]))) return false;
-    }
-    return true;
-}
-
-static bool bark_numeric_param(const std::string& key)
-{
-    return key == "badge" || key == "volume" || key == "ttl";
-}
-
-static bool bark_reserved_param(const std::string& key)
-{
-    return key == "title" || key == "body" || key == "device_key" || key == "device_keys";
-}
-
-static std::string apply_push_placeholders(const std::string& value, const std::string& sender,
-                                           const std::string& text, const std::string& timestamp,
-                                           const std::string& receiver)
-{
-    // 单次扫描替换，避免发送者/内容里出现的 {message} 等字面量被二次展开
-    std::string out;
-    out.reserve(value.size() + text.size() + receiver.size());
-    size_t pos = 0;
-    while (pos < value.size()) {
-        size_t brace = value.find('{', pos);
-        if (brace == std::string::npos) {
-            out.append(value, pos, std::string::npos);
-            break;
-        }
-        out.append(value, pos, brace - pos);
-        if (value.compare(brace, 8, "{sender}") == 0) { out += sender; pos = brace + 8; }
-        else if (value.compare(brace, 9, "{message}") == 0) { out += text; pos = brace + 9; }
-        else if (value.compare(brace, 11, "{timestamp}") == 0) { out += timestamp; pos = brace + 11; }
-        else if (value.compare(brace, 10, "{receiver}") == 0) { out += receiver; pos = brace + 10; }
-        else if (value.compare(brace, 14, "{local_number}") == 0) { out += receiver; pos = brace + 14; }
-        else { out += '{'; pos = brace + 1; }
-    }
-    return out;
-}
-
-static void append_bark_params(std::string& json, const std::string& params,
-                               const std::string& sender, const std::string& text,
-                               const std::string& timestamp, const std::string& receiver)
-{
-    std::string spec = idf_util_trim_copy(params);
-    if (!spec.empty() && spec[0] == '?') spec.erase(0, 1);
-    size_t pos = 0;
-    while (pos <= spec.size()) {
-        size_t end = spec.find_first_of("&\n", pos);
-        if (end == std::string::npos) end = spec.size();
-        std::string item = idf_util_trim_copy(spec.substr(pos, end - pos));
-        pos = end + (end < spec.size() ? 1 : 0);
-        if (item.empty()) {
-            if (end == spec.size()) break;
-            continue;
-        }
-
-        size_t eq = item.find('=');
-        std::string key = idf_util_trim_copy(url_decode_component(eq == std::string::npos ? item : item.substr(0, eq)));
-        if (key.empty() || bark_reserved_param(key)) {
-            if (end == spec.size()) break;
-            continue;
-        }
-
-        std::string value = eq == std::string::npos ? "1" : url_decode_component(item.substr(eq + 1));
-        value = apply_push_placeholders(idf_util_trim_copy(value), sender, text, timestamp, receiver);
-        json += ",";
-        json += "\"";
-        idf_util_json_escape_append(json, key);
-        if (bark_numeric_param(key) && is_integer_literal(value)) {
-            json += "\":";
-            json += value;
-        } else {
-            json += "\":\"";
-            idf_util_json_escape_append(json, value);
-            json += "\"";
-        }
-
-        if (end == spec.size()) break;
-    }
-}
-
 static bool channel_valid(const IdfPushChannel& ch)
 {
-    if (!ch.enabled || ch.type == PUSH_TYPE_NONE) return false;
-    if (ch.type == PUSH_TYPE_BARK) return bark_target_from_channel(ch).ok;
-    bool needs_url = ch.type == PUSH_TYPE_POST_JSON || ch.type == PUSH_TYPE_GET || ch.type == PUSH_TYPE_DINGTALK ||
-                     ch.type == PUSH_TYPE_CUSTOM || ch.type == PUSH_TYPE_FEISHU ||
-                     ch.type == PUSH_TYPE_GOTIFY;
-    if (needs_url && ch.url.empty()) return false;
-    if (ch.type == PUSH_TYPE_CUSTOM && ch.customBody.empty()) return false;
-    if (ch.type == PUSH_TYPE_PUSHPLUS && ch.key1.empty()) return false;
-    if (ch.type == PUSH_TYPE_SERVERCHAN && ch.key1.empty() && ch.url.empty()) return false;
-    if (ch.type == PUSH_TYPE_GOTIFY && ch.key1.empty()) return false;
-    if (ch.type == PUSH_TYPE_TELEGRAM && (ch.key1.empty() || ch.key2.empty())) return false;
-    return true;
+    if (!ch.enabled || ch.type < PUSH_TYPE_POST_JSON || ch.type > PUSH_TYPE_NTFY ||
+        !idf_push_utf8_valid(ch.name) || !idf_push_utf8_valid(ch.url) ||
+        !idf_push_utf8_valid(ch.key1) || !idf_push_utf8_valid(ch.key2) ||
+        !idf_push_utf8_valid(ch.titleTemplate) || !idf_push_utf8_valid(ch.bodyTemplate) ||
+        !idf_push_utf8_valid(ch.customBody) || ch.url.find_first_of("\r\n") != std::string::npos ||
+        ch.key1.find_first_of("\r\n") != std::string::npos ||
+        ch.key2.find_first_of("\r\n") != std::string::npos) return false;
+    if (ch.type == PUSH_TYPE_CUSTOM) {
+        if (ch.customBody.empty() || !ch.titleTemplate.empty() || !ch.bodyTemplate.empty()) return false;
+    } else if (!ch.customBody.empty()) {
+        return false;
+    }
+    switch (ch.type) {
+        case PUSH_TYPE_POST_JSON:
+        case PUSH_TYPE_BARK:
+        case PUSH_TYPE_GET:
+        case PUSH_TYPE_DINGTALK:
+        case PUSH_TYPE_CUSTOM:
+        case PUSH_TYPE_FEISHU:
+        case PUSH_TYPE_DISCORD:
+        case PUSH_TYPE_NTFY:
+            return !ch.url.empty();
+        case PUSH_TYPE_PUSHPLUS:
+        case PUSH_TYPE_SERVERCHAN:
+            return !ch.key1.empty();
+        case PUSH_TYPE_GOTIFY:
+            return !ch.url.empty() && !ch.key1.empty();
+        case PUSH_TYPE_TELEGRAM:
+            return !ch.key1.empty() && !ch.key2.empty();
+        default:
+            return false;
+    }
 }
 
 static bool regex_search_case_insensitive(const std::string& pattern, const std::string& text)
@@ -663,7 +536,8 @@ static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
 }
 
 static esp_err_t http_request(const std::string& url, const char* method,
-                              const char* content_type, const std::string& body,
+                              const char* content_type, const char* extra_header_name,
+                              const std::string& extra_header_value, const std::string& body,
                               int& status_code)
 {
     esp_http_client_config_t cfg = {};
@@ -681,6 +555,14 @@ static esp_err_t http_request(const std::string& url, const char* method,
     if (strcmp(method, "POST") == 0) {
         esp_http_client_set_method(client, HTTP_METHOD_POST);
         if (content_type) esp_http_client_set_header(client, "Content-Type", content_type);
+        if (extra_header_name) {
+            esp_err_t header_err = esp_http_client_set_header(client, extra_header_name,
+                                                               extra_header_value.c_str());
+            if (header_err != ESP_OK) {
+                esp_http_client_cleanup(client);
+                return header_err;
+            }
+        }
         esp_http_client_set_post_field(client, body.c_str(), body.size());
     } else {
         esp_http_client_set_method(client, HTTP_METHOD_GET);
@@ -1192,8 +1074,20 @@ static bool send_smtp_email(const IdfEmailSettingsView& cfg, const std::string& 
     return ok;
 }
 
+static void replace_all(std::string& value, const char* from, const char* to)
+{
+    size_t pos = 0;
+    const size_t from_len = strlen(from);
+    const size_t to_len = strlen(to);
+    while ((pos = value.find(from, pos)) != std::string::npos) {
+        value.replace(pos, from_len, to);
+        pos += to_len;
+    }
+}
+
 static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
+                            const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
                             bool notify = false)
 {
     if (!channel_valid(channel)) return false;
@@ -1201,150 +1095,162 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
     std::string timestamp = timestamp_raw ? timestamp_raw : "";
-    std::string receiver = notify ? std::string() : local_phone_number();
-    std::string sender_json = json_escape(sender);
-    std::string text_json = json_escape(text);
-    std::string ts_json = json_escape(timestamp);
-    std::string receiver_json = json_escape(receiver);
-    std::string receiver_line_json = receiver.empty() ? std::string() : ("\\n本机号码: " + receiver_json);
-    std::string receiver_block_json = receiver.empty() ? std::string() : ("\\n\\n本机号码: " + receiver_json);
-    std::string receiver_html_json = receiver.empty() ? std::string() : ("<br><b>本机号码:</b> " + json_escape(html_escape(receiver)));
-    std::string time_line_json = "\\n时间: " + ts_json;
-    std::string time_block_json = "\\n\\n时间: " + ts_json;
-    std::string time_html_json = "<br><b>时间:</b> " + ts_json;
-    // 自定义提醒(notify)：sender 里放的是任务名，直接当标题用，不再套"短信来自/发送者/内容"这些短信味道的模板
-    std::string title = notify ? sender : ("短信来自: " + sender);
-    std::string title_json = json_escape(title);
+    IdfPushTemplateValues values{
+        sender, text, timestamp, cfg.deviceName, notify ? std::string() : local_phone_number(),
+        wifi.ip, cfg.hostname, wifi.ssid,
+    };
+    std::string title;
+    std::string notification_body;
+    if (notify) {
+        if (!idf_push_render_template("{sender}", values, MAX_RENDERED_TITLE_BYTES, true, title) ||
+            !idf_push_render_template("{message}", values, MAX_RENDERED_BODY_BYTES, false,
+                                      notification_body)) {
+            idf_log_line("推送标题/内容不是有效 UTF-8、包含非法标题换行或超过长度限制");
+            return false;
+        }
+    } else if (!idf_push_render_sms_notification(cfg.notificationLocale, channel.titleTemplate,
+                                                  channel.bodyTemplate, values, title,
+                                                  notification_body)) {
+        idf_log_line("推送模板渲染结果不是有效 UTF-8、包含非法标题换行或超过长度限制");
+        return false;
+    }
+
+    const std::string title_json = json_escape(title);
+    const std::string notification_body_json = json_escape(notification_body);
     std::string url;
     std::string body;
     const char* content_type = "application/json";
     const char* method = "POST";
+    const char* extra_header_name = nullptr;
+    std::string extra_header_value;
 
     switch (channel.type) {
-        case PUSH_TYPE_POST_JSON:
+        case PUSH_TYPE_POST_JSON: {
             url = channel.url;
-            body = "{\"sender\":\"" + sender_json + "\",\"receiver\":\"" + receiver_json +
-                   "\",\"message\":\"" + text_json + "\",\"timestamp\":\"" + ts_json + "\"}";
-            break;
-        case PUSH_TYPE_BARK: {
-            BarkTarget bark = bark_target_from_channel(channel);
-            if (!bark.ok) return false;
-            url = bark.url;
-            body = "{";
-            if (!bark.device_key.empty()) {
-                json_prop(body, "device_key", bark.device_key);
-                body += ",";
-            }
-            json_prop(body, "title", title);
-            body += ",";
-            json_prop(body, "body", text + (receiver.empty() ? std::string() : ("\n\n本机号码: " + receiver)) +
-                                   "\n\n时间: " + timestamp);
-            append_bark_params(body, channel.key2, sender, text, timestamp, receiver);
-            body += "}";
+            body = "{\"sender\":\"" + json_escape(sender) + "\",\"message\":\"" +
+                   json_escape(text) + "\",\"timestamp\":\"" + json_escape(timestamp) +
+                   "\",\"title\":\"" + title_json + "\",\"body\":\"" +
+                   notification_body_json + "\"}";
             break;
         }
+        case PUSH_TYPE_BARK:
+            url = channel.url;
+            body = "{\"title\":\"" + title_json + "\",\"body\":\"" +
+                   notification_body_json + "\"}";
+            break;
         case PUSH_TYPE_GET:
             method = "GET";
             url = channel.url + (channel.url.find('?') == std::string::npos ? "?" : "&") +
-                  "sender=" + url_encode(sender) + "&receiver=" + url_encode(receiver) +
-                  "&message=" + url_encode(text) + "&timestamp=" + url_encode(timestamp);
+                  "sender=" + url_encode(sender) + "&message=" + url_encode(text) +
+                  "&timestamp=" + url_encode(timestamp) + "&title=" + url_encode(title) +
+                  "&body=" + url_encode(notification_body);
             break;
         case PUSH_TYPE_DINGTALK: {
             url = channel.url;
             if (!channel.key1.empty()) {
+                if (time(nullptr) < 1700000000) return false;
                 int64_t ts = utc_millis();
                 std::string sign_data = std::to_string(ts) + "\n" + channel.key1;
                 std::string sign = url_encode(hmac_sha256_base64(sign_data, channel.key1));
+                if (sign.empty()) return false;
                 url += (url.find('?') == std::string::npos ? "?" : "&");
                 url += "timestamp=" + std::to_string(ts) + "&sign=" + sign;
             }
-            body = notify
-                ? ("{\"msgtype\":\"text\",\"text\":{\"content\":\"" + title_json + "\\n" +
-                   text_json + time_line_json + "\"}}")
-                : ("{\"msgtype\":\"text\",\"text\":{\"content\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+            body = "{\"msgtype\":\"text\",\"text\":{\"content\":\"" + title_json +
+                   "\\n" + notification_body_json + "\"}}";
             break;
         }
         case PUSH_TYPE_PUSHPLUS: {
             url = channel.url.empty() ? "https://www.pushplus.plus/send" : channel.url;
             std::string push_channel = channel.key2.empty() ? "wechat" : channel.key2;
             if (push_channel != "wechat" && push_channel != "extension" && push_channel != "app") push_channel = "wechat";
-            std::string text_html = json_escape(html_escape(text));
-            std::string sender_html = json_escape(html_escape(sender));
-            std::string pp_content = notify
-                ? (text_html + time_html_json)
-                : ("<b>发送者:</b> " + sender_html + receiver_html_json + time_html_json + "<br><b>内容:</b><br>" + text_html);
-            body = "{\"token\":\"" + json_escape(channel.key1) + "\",\"title\":\"" + title_json +
-                   "\",\"content\":\"" + pp_content + "\",\"channel\":\"" + push_channel + "\"}";
+            std::string title_html = html_escape(title);
+            std::string body_html = html_escape(notification_body);
+            replace_all(body_html, "\n", "<br>");
+            body = "{\"token\":\"" + json_escape(channel.key1) + "\",\"title\":\"" +
+                   json_escape(title_html) + "\",\"content\":\"" + json_escape(body_html) +
+                   "\",\"channel\":\"" + json_escape(push_channel) + "\"}";
             break;
         }
         case PUSH_TYPE_SERVERCHAN: {
-            std::string send_key = idf_util_trim_copy(channel.key1);
-            std::string base = idf_util_trim_copy(channel.url);
-            if (send_key.empty() && !base.empty() && !is_url_like(base)) {
-                send_key = base;
-                base.clear();
-            }
-            if (base.empty()) base = "https://sctapi.ftqq.com";
-            if (is_url_like(send_key)) {
-                base = send_key;
-                send_key.clear();
-            }
-            while (!base.empty() && base.back() == '/') base.pop_back();
-            url = base.find(".send") != std::string::npos ? base : (base + "/" + send_key + ".send");
+            url = channel.url.empty() ? ("https://sctapi.ftqq.com/" + channel.key1 + ".send") : channel.url;
             content_type = "application/x-www-form-urlencoded";
-            std::string sc_desp = notify
-                ? ("**时间:** " + timestamp + "\n\n" + text)
-                : ("**发送者:** " + sender +
-                   (receiver.empty() ? std::string() : ("\n\n**本机号码:** " + receiver)) +
-                   "\n\n**时间:** " + timestamp + "\n\n**内容:**\n\n" + text);
-            body = "title=" + url_encode(title) + "&desp=" + url_encode(sc_desp);
+            body = "title=" + url_encode(title) + "&desp=" + url_encode(notification_body);
             break;
         }
-        case PUSH_TYPE_CUSTOM:
+        case PUSH_TYPE_CUSTOM: {
             url = channel.url;
-            body = apply_push_placeholders(channel.customBody, sender_json, text_json, ts_json, receiver_json);
+            IdfPushTemplateValues escaped = values;
+            escaped.sender = json_escape(escaped.sender);
+            escaped.message = json_escape(escaped.message);
+            escaped.timestamp = json_escape(escaped.timestamp);
+            escaped.device = json_escape(escaped.device);
+            escaped.localNumber = json_escape(escaped.localNumber);
+            escaped.ip = json_escape(escaped.ip);
+            escaped.hostname = json_escape(escaped.hostname);
+            escaped.wifi = json_escape(escaped.wifi);
+            if (!idf_push_render_template(channel.customBody, escaped,
+                                          MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
+                idf_log_line("自定义推送渲染结果不是有效 UTF-8 或超过长度限制");
+                return false;
+            }
             break;
-        case PUSH_TYPE_FEISHU:
+        }
+        case PUSH_TYPE_FEISHU: {
             url = channel.url;
             body = "{";
             if (!channel.key1.empty()) {
+                if (time(nullptr) < 1700000000) return false;
                 int64_t ts = time(nullptr);
-                // 飞书签名与钉钉相反: 以 ts+"\n"+secret 为密钥、空串为消息做 HMAC-SHA256
                 std::string sign = hmac_sha256_base64("", std::to_string(ts) + "\n" + channel.key1);
+                if (sign.empty()) return false;
                 body += "\"timestamp\":\"" + std::to_string(ts) + "\",\"sign\":\"" + sign + "\",";
             }
-            body += notify
-                ? ("\"msg_type\":\"text\",\"content\":{\"text\":\"" + title_json + "\\n" +
-                   text_json + time_line_json + "\"}}")
-                : ("\"msg_type\":\"text\",\"content\":{\"text\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}}");
+            body += "\"msg_type\":\"text\",\"content\":{\"text\":\"" + title_json +
+                    "\\n" + notification_body_json + "\"}}";
             break;
+        }
         case PUSH_TYPE_GOTIFY:
             url = channel.url;
             if (!url.empty() && url.back() != '/') url += "/";
             url += "message?token=" + url_encode(channel.key1);
-            body = "{\"title\":\"" + title_json + "\",\"message\":\"" + text_json +
-                   receiver_block_json + time_block_json + "\",\"priority\":5}";
+            body = "{\"title\":\"" + title_json + "\",\"message\":\"" +
+                   notification_body_json + "\",\"priority\":5}";
             break;
         case PUSH_TYPE_TELEGRAM: {
             std::string base = channel.url.empty() ? "https://api.telegram.org" : channel.url;
             while (!base.empty() && base.back() == '/') base.pop_back();
             url = base + "/bot" + channel.key2 + "/sendMessage";
-            body = notify
-                ? ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"" + title_json + "\\n" +
-                   text_json + time_line_json + "\"}")
-                : ("{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"短信通知\\n发送者: " +
-                   sender_json + receiver_line_json + "\\n内容: " + text_json + time_line_json + "\"}");
+            body = "{\"chat_id\":\"" + json_escape(channel.key1) + "\",\"text\":\"" +
+                   title_json + "\\n" + notification_body_json + "\"}";
             break;
         }
+        case PUSH_TYPE_DISCORD: {
+            const std::string content = title + "\n" + notification_body;
+            if (idf_push_utf8_codepoint_count(content, 2000) > 2000) {
+                idf_log_line("Discord 推送内容超过 2000 个字符");
+                return false;
+            }
+            body = "{\"content\":\"" + json_escape(content) +
+                   "\",\"allowed_mentions\":{\"parse\":[]}}";
+            url = channel.url;
+            break;
+        }
+        case PUSH_TYPE_NTFY:
+            url = channel.url;
+            content_type = "text/plain";
+            extra_header_name = "Title";
+            extra_header_value = title;
+            body = notification_body;
+            break;
         default:
             return false;
     }
 
     std::string name = channel.name.empty() ? ("通道" + std::to_string(channel.type)) : channel.name;
     int code = 0;
-    esp_err_t err = http_request(url, method, content_type, body, code);
+    esp_err_t err = http_request(url, method, content_type, extra_header_name,
+                                 extra_header_value, body, code);
     bool ok = (err == ESP_OK && code >= 200 && code < 300);
     // 发送中+响应码两行合并为一行结果，降噪同时保留通道名与成败
     if (err == ESP_OK) idf_logf("%s 推送%s (HTTP %d)", name.c_str(), ok ? "成功" : "失败", code);
@@ -1646,10 +1552,51 @@ static bool low_heap_defer()
     return true;
 }
 
+static bool channel_waits_for_time(const IdfPushChannel& channel)
+{
+    return !channel.key1.empty() &&
+           (channel.type == PUSH_TYPE_DINGTALK || channel.type == PUSH_TYPE_FEISHU) &&
+           time(nullptr) < 1700000000;
+}
+
+static void fail_push_job_without_retry(const PushJob& job, const char* reason)
+{
+    cancel_forward_completion(job.completionId);
+    if (job.inboxId) idf_inbox_set_forwarded(job.inboxId, false);
+    idf_logf("通道%u %s", static_cast<unsigned>(job.channel + 1), reason);
+}
+
+static bool purge_push_jobs_disabled()
+{
+    std::array<uint32_t, PUSH_QUEUE_MAX> inbox_ids = {};
+    size_t inbox_count = 0;
+    bool purged = false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
+    for (auto& job : s_push_jobs) {
+        if (!job.used) continue;
+        purged = true;
+        cancel_forward_completion_locked(job.completionId);
+        if (job.inboxId && inbox_count < inbox_ids.size()) inbox_ids[inbox_count++] = job.inboxId;
+        job = PushJob();
+    }
+    xSemaphoreGive(s_mutex);
+    if (!purged) return false;
+    for (size_t i = 0; i < inbox_count; ++i) idf_inbox_set_forwarded(inbox_ids[i], false);
+    memset(s_channel_fails, 0, sizeof(s_channel_fails));
+    memset(s_channel_cool_until_us, 0, sizeof(s_channel_cool_until_us));
+    idf_log_line("推送功能已关闭，清空待发推送队列");
+    return true;
+}
+
 static bool process_push_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
-    if (low_heap_defer()) return false;  // 任务留在队列里，等堆恢复再发
+    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    const IdfWifiStatus wifi = idf_wifi_get_status();
+    if (!cfg.pushEnabled) return purge_push_jobs_disabled();
+    const IdfPushNetworkDecision network =
+        idf_push_select_network(static_cast<NetworkMode>(cfg.networkMode), wifi.staConnected);
+    if (network == IdfPushNetworkDecision::Defer) return false;
+    if (network == IdfPushNetworkDecision::Wifi && low_heap_defer()) return false;
     int picked = -1;
     PushJob job;
     int64_t now = esp_timer_get_time();
@@ -1661,8 +1608,17 @@ static bool process_push_one()
         return false;
     }
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
-        if (!s_push_jobs[i].used || s_push_jobs[i].nextUs > now) continue;
-        if (channel_cooling(s_push_jobs[i].channel, now)) continue;  // 连续失败的通道冷却期内跳过
+        if (!s_push_jobs[i].used ||
+            (network == IdfPushNetworkDecision::Wifi && s_push_jobs[i].nextUs > now)) continue;
+        if (network == IdfPushNetworkDecision::Wifi &&
+            channel_cooling(s_push_jobs[i].channel, now)) continue;
+        if (network == IdfPushNetworkDecision::Wifi) {
+            const IdfPushChannel& channel = cfg.pushChannels[s_push_jobs[i].channel];
+            if (channel_valid(channel) && channel_waits_for_time(channel)) {
+                s_push_jobs[i].nextUs = now + 5000000LL;
+                continue;
+            }
+        }
         picked = static_cast<int>(i);
         job = s_push_jobs[i];
         s_push_jobs[i] = PushJob();
@@ -1674,6 +1630,12 @@ static bool process_push_one()
         return false;
     }
 
+    if (network == IdfPushNetworkDecision::Unsupported) {
+        fail_push_job_without_retry(job, "蜂窝推送尚不支持，任务已终止");
+        s_busy.store(false, std::memory_order_relaxed);
+        return true;
+    }
+
     IdfPushChannel channel;
     if (!idf_config_get_push_channel(job.channel, channel) || !channel_valid(channel)) {
         cancel_forward_completion(job.completionId);
@@ -1682,7 +1644,7 @@ static bool process_push_one()
     }
 
     bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
-                              job.timestamp.c_str(), job.notify);
+                              job.timestamp.c_str(), cfg, wifi, job.notify);
     note_channel_result(job.channel, ok);
     if (ok) {
         note_forward_target_success(job.completionId);
@@ -1793,21 +1755,53 @@ static bool process_email_one()
     return true;
 }
 
+static bool fail_pending_tests(const char* message)
+{
+    bool failed = false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    for (auto& job : s_test_jobs) {
+        if (!job.pending && !job.running) continue;
+        failed = true;
+        job.pending = false;
+        job.running = false;
+        job.done = true;
+        job.success = false;
+        job.nextUs = 0;
+        job.message = message;
+    }
+    xSemaphoreGive(s_mutex);
+    return failed;
+}
+
 static bool process_test_one()
 {
-    if (!idf_wifi_get_status().staConnected) return false;
+    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    const IdfWifiStatus wifi = idf_wifi_get_status();
+    if (!cfg.pushEnabled) return fail_pending_tests("推送功能已关闭，测试已取消");
+    const IdfPushNetworkDecision network =
+        idf_push_select_network(static_cast<NetworkMode>(cfg.networkMode), wifi.staConnected);
+    if (network == IdfPushNetworkDecision::Unsupported) {
+        return fail_pending_tests("蜂窝推送尚不支持，测试已终止");
+    }
+    if (network == IdfPushNetworkDecision::Defer) return false;
     if (low_heap_defer()) return false;
     int picked = -1;
     IdfPushChannel channel;
-    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    const int64_t now = esp_timer_get_time();
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-        if (!s_test_jobs[i].pending) continue;
+        if (!s_test_jobs[i].pending || s_test_jobs[i].nextUs > now) continue;
+        if (channel_waits_for_time(cfg.pushChannels[i])) {
+            s_test_jobs[i].nextUs = now + 5000000LL;
+            s_test_jobs[i].message = "等待时间同步后发送测试推送";
+            continue;
+        }
         picked = i;
         s_test_jobs[i].pending = false;
         s_test_jobs[i].running = true;
         s_test_jobs[i].done = false;
         s_test_jobs[i].success = false;
+        s_test_jobs[i].nextUs = 0;
         s_test_jobs[i].message = "测试推送发送中";
         channel = cfg.pushChannels[i];
         break;
@@ -1823,7 +1817,7 @@ static bool process_test_one()
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "测试", "这是一条来自 SMS Forwarder 的测试推送",
-                             ts.empty() ? "时间未同步" : ts.c_str());
+                             ts.empty() ? "时间未同步" : ts.c_str(), cfg, wifi);
         s_busy.store(false, std::memory_order_relaxed);
         result = ok ? "测试推送已发送" : "测试推送失败，请查看日志";
     }
@@ -1839,10 +1833,34 @@ static bool process_test_one()
     return true;
 }
 
+static bool process_startup_notification()
+{
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    const bool pending = s_startup_email_pending;
+    xSemaphoreGive(s_mutex);
+    if (!pending) return false;
+
+    const IdfWifiStatus wifi = idf_wifi_get_status();
+    if (!wifi.staConnected) return false;
+    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    std::string title;
+    std::string body;
+    build_startup_text(cfg, device_url(wifi), title, body);
+    if (!idf_push_enqueue_email(title.c_str(), body.c_str())) return false;
+
+    if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        s_startup_email_pending = false;
+        s_startup_email_done = true;
+        xSemaphoreGive(s_mutex);
+    }
+    return true;
+}
+
 static void push_task(void*)
 {
     while (true) {
         bool did = process_forward_one();
+        if (!did) did = process_startup_notification();
         if (!did) did = process_push_one();
         if (!did) did = process_email_one();
         if (!did) did = process_test_one();
@@ -1927,6 +1945,45 @@ bool idf_push_enqueue_email(const char* subject, const char* body)
     return ok;
 }
 
+bool idf_push_enqueue_startup_notification(void)
+{
+    const IdfEmailSettingsView email = idf_config_get_email_settings_view();
+    if (!email.emailEnabled || !email.emailConfigured || !ensure_init()) return false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (!s_startup_email_done) s_startup_email_pending = true;
+    xSemaphoreGive(s_mutex);
+    wake_worker();
+    return true;
+}
+
+bool idf_push_heartbeat_tick(void)
+{
+    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    const time_t epoch = time(nullptr);
+    if (!cfg.heartbeatEnable || cfg.heartbeatInterval < 1 || epoch < 1700000000) {
+        s_heartbeat_clock_started = false;
+        return false;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if (!s_heartbeat_clock_started) {
+        s_heartbeat_clock_started = true;
+        s_last_heartbeat_us = now;
+        return false;
+    }
+    const int64_t interval_us = static_cast<int64_t>(cfg.heartbeatInterval) * 3600LL * 1000000LL;
+    if (now - s_last_heartbeat_us < interval_us) return false;
+    s_last_heartbeat_us = now;
+
+    const IdfWifiStatus wifi = idf_wifi_get_status();
+    if (!idf_push_network_uses_wifi(static_cast<NetworkMode>(cfg.networkMode), wifi.staConnected)) return false;
+    std::string title;
+    std::string body;
+    const std::string event_time = format_utc_time(epoch);
+    build_heartbeat_text(cfg, wifi, local_phone_number(), event_time, title, body);
+    return idf_push_enqueue_notify(title.c_str(), body.c_str(), event_time.c_str()) > 0;
+}
+
 int idf_push_forward_queue_depth(void)
 {
     if (!ensure_init()) return 0;
@@ -1966,7 +2023,18 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         message = "通道序号无效";
         return false;
     }
-    if (!idf_wifi_get_status().staConnected) {
+    const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
+    if (!cfg.pushEnabled) {
+        message = "推送功能已关闭，暂不能测试推送";
+        return false;
+    }
+    const IdfPushNetworkDecision network = idf_push_select_network(
+        static_cast<NetworkMode>(cfg.networkMode), idf_wifi_get_status().staConnected);
+    if (network == IdfPushNetworkDecision::Unsupported) {
+        message = "蜂窝推送尚不支持，测试未排队";
+        return false;
+    }
+    if (network == IdfPushNetworkDecision::Defer) {
         message = "WiFi 未连接，暂不能测试推送";
         return false;
     }
@@ -1974,8 +2042,7 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         message = "推送队列初始化失败";
         return false;
     }
-    IdfPushChannel push_channel;
-    bool valid = idf_config_get_push_channel(channel, push_channel) && channel_valid(push_channel);
+    bool valid = channel_valid(cfg.pushChannels[channel]);
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         message = "推送队列忙";
         return false;
@@ -1987,6 +2054,7 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         job.running = false;
         job.done = false;
         job.success = false;
+        job.nextUs = 0;
         job.message = "测试推送已排队，可继续刷新网页";
         message = job.message;
     }

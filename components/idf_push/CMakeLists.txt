@@ -1,5 +1,5 @@
 idf_component_register(
-  SRCS "idf_push.cpp"
+  SRCS "idf_push.cpp" "idf_push_core.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
     esp_http_client
