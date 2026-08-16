@@ -44,12 +44,14 @@ class ConfigSchemaTest(unittest.TestCase):
         v1 = json.loads((schema_dir / manifest["versions"]["1"]).read_text())
         v2 = json.loads((schema_dir / manifest["versions"]["2"]).read_text())
         v3 = json.loads((schema_dir / manifest["versions"]["3"]).read_text())
+        v4 = json.loads((schema_dir / manifest["versions"]["4"]).read_text())
 
-        self.assertEqual(manifest["currentVersion"], 3)
+        self.assertEqual(manifest["currentVersion"], 4)
         self.assertEqual(v1["properties"]["schemaVersion"]["const"], 1)
         self.assertEqual(v2["properties"]["schemaVersion"]["const"], 2)
         self.assertEqual(v3["properties"]["schemaVersion"]["const"], 3)
-        config = v3["properties"]["config"]
+        self.assertEqual(v4["properties"]["schemaVersion"]["const"], 4)
+        config = v4["properties"]["config"]
         self.assertEqual(config["properties"]["deviceName"]["x-maxUtf8Bytes"], 64)
         self.assertEqual(config["properties"]["hostname"]["maxLength"], 32)
         self.assertEqual(

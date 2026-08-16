@@ -84,6 +84,41 @@ class ApiContractTest(unittest.TestCase):
             self.assertIn(path, spec["paths"])
             self.assertIn(path, page + api)
 
+    def test_connectivity_configuration_contract_is_explicit(self):
+        spec = json.loads((ROOT / "dev_doc/openapi.json").read_text())
+        self.assertEqual(spec["x-configSchema"]["currentVersion"], 4)
+        schemas = spec["components"]["schemas"]
+        status = schemas["DeviceSnapshot"]["properties"]["status"]
+        self.assertIn("apMode", status["required"])
+        config = schemas["DeviceSnapshot"]["properties"]["config"]
+        for field in (
+            "wifiProfiles",
+            "networkMode",
+            "heartbeatEnable",
+            "heartbeatInterval",
+        ):
+            self.assertIn(field, config["required"])
+        self.assertEqual(config["properties"]["wifiProfiles"]["minItems"], 5)
+        self.assertIn("open", schemas["WifiProfile"]["required"])
+        self.assertEqual(
+            config["properties"]["heartbeatInterval"]["maximum"], 240
+        )
+        update = schemas["ConfigUpdate"]
+        for pattern in ("^wifi[0-4]ssid$", "^wifi[0-4]pass$", "^wifi[0-4]open$"):
+            self.assertIn(pattern, update["patternProperties"])
+
+    def test_push_secrets_are_masked_with_presence_metadata(self):
+        spec = json.loads((ROOT / "dev_doc/openapi.json").read_text())
+        channel = spec["components"]["schemas"]["PushChannel"]
+        for field in ("url", "key1", "key2", "customBody"):
+            self.assertEqual(channel["properties"][field]["const"], "")
+            self.assertIn(f"{field}Set", channel["required"])
+            self.assertEqual(channel["properties"][f"{field}Set"]["type"], "boolean")
+        self.assertIn(
+            "changing the provider type clears all four stored fields",
+            spec["paths"]["/save"]["post"]["description"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,13 +58,28 @@ static bool serializeJsonChecked(const JsonDocument& json, String& output) {
   return true;
 }
 
-static bool postJson(HTTPClient& http, const String& url, const JsonDocument& json, int& httpCode) {
-  String payload;
-  if (!serializeJsonChecked(json, payload)) return false;
+static bool postPayload(HTTPClient& http, bool cellular, const String& url,
+                        const String& contentType, const String& extraHeader,
+                        const String& payload, int& httpCode) {
+  if (cellular) return modemHttpPost(url, contentType, extraHeader, payload, httpCode);
   http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Content-Type", contentType);
+  if (extraHeader.length() > 0) {
+    int separator = extraHeader.indexOf(':');
+    if (separator <= 0) return false;
+    String value = extraHeader.substring(separator + 1);
+    value.trim();
+    http.addHeader(extraHeader.substring(0, separator), value);
+  }
   httpCode = http.POST(payload);
   return true;
+}
+
+static bool postJson(HTTPClient& http, bool cellular, const String& url,
+                     const JsonDocument& json, int& httpCode) {
+  String payload;
+  if (!serializeJsonChecked(json, payload)) return false;
+  return postPayload(http, cellular, url, "application/json", "", payload, httpCode);
 }
 
 static bool serializeJsonStringContent(const String& value, String& output) {
@@ -83,8 +98,8 @@ static bool serializeJsonStringContent(const String& value, String& output) {
 static void collectTemplateValues(const String& sender, const String& message,
                                   const String& timestamp, String& ip, String& wifi,
                                   const String* values[TEMPLATE_VALUE_COUNT]) {
-  ip = WiFi.localIP().toString();
-  wifi = WiFi.SSID();
+  ip = activeNetworkIp();
+  wifi = activeNetworkSsid();
   values[0] = &sender;
   values[1] = &message;
   values[2] = &timestamp;
@@ -163,6 +178,10 @@ bool buildDefaultSmsNotification(const char* sender, const char* message, const 
 
 // Send an email notification
 void sendEmailNotification(const char* subject, const char* body) {
+  if (WiFi.status() != WL_CONNECTED) {
+    logCaptureLn("WiFi is disconnected; skipping email delivery");
+    return;
+  }
   if (config.smtpServer.length() == 0 || config.smtpUser.length() == 0 || 
       config.smtpPass.length() == 0 || config.smtpSendTo.length() == 0) {
     logCaptureLn(String("Email configuration is incomplete; skipping delivery"));
@@ -246,9 +265,21 @@ int64_t getUtcMillis() {
   return (int64_t)time(nullptr) * 1000LL;
 }
 
-// Send to one push channel
-void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp) {
+static void deliverToChannel(const PushChannel& channel, const char* sender, const char* message,
+                             const char* timestamp, const String* renderedTitle = nullptr,
+                             const String* renderedBody = nullptr) {
   if (!channel.enabled) return;
+
+  bool cellular = config.networkMode == NETWORK_MODE_4G_ONLY ||
+                  (config.networkMode == NETWORK_MODE_MIX && WiFi.status() != WL_CONNECTED);
+  if (!cellular && WiFi.status() != WL_CONNECTED) {
+    logCaptureLn("WiFi is disconnected; skipping push channel");
+    return;
+  }
+  if (cellular && channel.type == PUSH_TYPE_GET) {
+    logCaptureLn("Cellular transport does not support GET; skipping push channel");
+    return;
+  }
   
   // Some providers can use a default URL.
   bool needUrl = (channel.type == PUSH_TYPE_POST_JSON || channel.type == PUSH_TYPE_BARK || 
@@ -275,7 +306,10 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   const String timestampValue(timestamp);
   String notificationTitle;
   String notificationBody;
-  if (channel.type != PUSH_TYPE_CUSTOM &&
+  if (renderedTitle && renderedBody) {
+    notificationTitle = *renderedTitle;
+    notificationBody = *renderedBody;
+  } else if (channel.type != PUSH_TYPE_CUSTOM &&
       !renderTypedNotification(channel, senderValue, messageValue, timestampValue,
                                notificationTitle, notificationBody)) return;
   
@@ -288,7 +322,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["timestamp"] = timestampValue;
       json["title"] = notificationTitle;
       json["body"] = notificationBody;
-      if (!postJson(http, channel.url, json, httpCode)) return;
+      if (!postJson(http, cellular, channel.url, json, httpCode)) return;
       break;
     }
     
@@ -297,7 +331,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       JsonDocument json;
       json["title"] = notificationTitle;
       json["body"] = notificationBody;
-      if (!postJson(http, channel.url, json, httpCode)) return;
+      if (!postJson(http, cellular, channel.url, json, httpCode)) return;
       break;
     }
     
@@ -347,7 +381,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["msgtype"] = "text";
       JsonObject text = json["text"].to<JsonObject>();
       text["content"] = notificationTitle + "\n" + notificationBody;
-      if (!postJson(http, webhookUrl, json, httpCode)) return;
+      if (!postJson(http, cellular, webhookUrl, json, httpCode)) return;
       break;
     }
 
@@ -372,18 +406,17 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["title"] = titleHtml;
       json["content"] = bodyHtml;
       json["channel"] = channelValue;
-      if (!postJson(http, pushUrl, json, httpCode)) return;
+      if (!postJson(http, cellular, pushUrl, json, httpCode)) return;
       break;
     }
 
     case PUSH_TYPE_SERVERCHAN: {
       // ServerChan
       String scUrl = channel.url.length() > 0 ? channel.url : ("https://sctapi.ftqq.com/" + channel.key1 + ".send");
-      http.begin(scUrl);
-      http.addHeader("Content-Type", "application/x-www-form-urlencoded");
       String postData = "title=" + urlEncode(notificationTitle);
       postData += "&desp=" + urlEncode(notificationBody);
-      httpCode = http.POST(postData);
+      if (!postPayload(http, cellular, scUrl, "application/x-www-form-urlencoded", "",
+                       postData, httpCode)) return;
       break;
     }
     
@@ -403,15 +436,14 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
         if (!serializeJsonStringContent(*values[i], escapedValues[i])) return;
         escapedValuePointers[i] = &escapedValues[i];
       }
-      http.begin(channel.url);
-      http.addHeader("Content-Type", "application/json");
       String body;
       if (!renderTemplate(channel.customBody, escapedValuePointers,
                           MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
         logCaptureLn("Rendered custom push body is invalid or too long; skipping delivery");
         return;
       }
-      httpCode = http.POST(body);
+      if (!postPayload(http, cellular, channel.url, "application/json", "", body,
+                       httpCode)) return;
       break;
     }
     
@@ -441,7 +473,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["msg_type"] = "text";
       JsonObject content = json["content"].to<JsonObject>();
       content["text"] = notificationTitle + "\n" + notificationBody;
-      if (!postJson(http, webhookUrl, json, httpCode)) return;
+      if (!postJson(http, cellular, webhookUrl, json, httpCode)) return;
       break;
     }
     
@@ -456,7 +488,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       json["title"] = notificationTitle;
       json["message"] = notificationBody;
       json["priority"] = 5;
-      if (!postJson(http, gotifyUrl, json, httpCode)) return;
+      if (!postJson(http, cellular, gotifyUrl, json, httpCode)) return;
       break;
     }
     
@@ -471,7 +503,7 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       JsonDocument json;
       json["chat_id"] = channel.key1;
       json["text"] = text;
-      if (!postJson(http, tgUrl, json, httpCode)) return;
+      if (!postJson(http, cellular, tgUrl, json, httpCode)) return;
       break;
     }
 
@@ -484,14 +516,13 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
       JsonDocument json;
       json["content"] = content;
       json["allowed_mentions"]["parse"].to<JsonArray>();
-      if (!postJson(http, channel.url, json, httpCode)) return;
+      if (!postJson(http, cellular, channel.url, json, httpCode)) return;
       break;
     }
 
     case PUSH_TYPE_NTFY: {
-      http.begin(channel.url);
-      http.addHeader("Title", notificationTitle);
-      httpCode = http.POST(notificationBody);
+      if (!postPayload(http, cellular, channel.url, "text/plain",
+                       "Title: " + notificationTitle, notificationBody, httpCode)) return;
       break;
     }
     
@@ -505,16 +536,17 @@ void sendToChannel(const PushChannel& channel, const char* sender, const char* m
   } else {
     logCaptureF("[%s] HTTP request failed: %d\n", channelName.c_str(), httpCode);
   }
-  http.end();
+  if (!cellular) http.end();
+}
+
+// Send to one push channel
+void sendToChannel(const PushChannel& channel, const char* sender, const char* message,
+                   const char* timestamp) {
+  deliverToChannel(channel, sender, message, timestamp);
 }
 
 // Send an SMS notification to all enabled push channels
 void sendSMSToServer(const char* sender, const char* message, const char* timestamp) {
-  if (WiFi.status() != WL_CONNECTED) {
-    logCaptureLn(String("WiFi is disconnected; skipping push notifications"));
-    return;
-  }
-  
   bool hasEnabledChannel = false;
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     if (isPushChannelValid(config.pushChannels[i])) {
@@ -536,4 +568,15 @@ void sendSMSToServer(const char* sender, const char* message, const char* timest
     }
   }
   logCaptureLn(String("=== Multi-channel push complete ===\n"));
+}
+
+void sendSystemPushNotification(const String& title, const String& body,
+                                const String& timestamp) {
+  for (int i = 0; i < MAX_PUSH_CHANNELS; ++i) {
+    if (isPushChannelValid(config.pushChannels[i])) {
+      deliverToChannel(config.pushChannels[i], "", body.c_str(), timestamp.c_str(),
+                       &title, &body);
+      delay(100);
+    }
+  }
 }

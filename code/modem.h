@@ -30,6 +30,8 @@ ModemDataState modemGetDataState();
 bool modemSetDataActive(bool active, String& response);
 bool modemRefreshLocalNumber();
 const String& modemGetLocalNumber();
+bool modemHttpPost(const String& url, const String& contentType,
+                   const String& extraHeader, const String& body, int& statusCode);
 void modemPowerCycle();
 void resetModule();
 void modemInit();

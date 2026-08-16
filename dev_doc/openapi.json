@@ -33,7 +33,7 @@
   },
 	"x-configSchema": {
 	  "source": "config-schema/manifest.json",
-	  "currentVersion": 2,
+	  "currentVersion": 4,
 	  "mimeType": "application/vnd.sms-forwarding.config",
 	  "maxEncryptedBytes": 32828
 	},
@@ -78,7 +78,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get the device state and configuration",
-        "description": "Password values are empty strings in this response.",
+        "description": "SMTP, management account, and WiFi password values are empty strings in this response.",
         "responses": {
           "200": {
             "description": "The current state and configuration.",
@@ -98,7 +98,7 @@
         "tags": ["Configuration"],
         "summary": "Update the configuration",
 		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "description": "The request can contain one configuration section. A blank account username disables that account. A blank account password keeps its stored password. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
+        "description": "The request can contain one configuration section. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
           "content": {
@@ -518,6 +518,7 @@
               "ACTION_MODEM_OK",
               "ACTION_MODEM_FAILED",
               "ACTION_WIFI_RESTARTING",
+			  "ACTION_WIFI_PASSWORD_REQUIRED",
               "ACTION_CSRF_INVALID",
               "ACTION_JOB_ACCEPTED",
               "ACTION_JOB_NOT_FOUND",
@@ -626,18 +627,32 @@
           "password": { "type": "string", "const": "" }
         }
       },
+	  "WifiProfile": {
+		"type": "object",
+		"required": ["ssid", "password", "open"],
+		"additionalProperties": false,
+		"properties": {
+		  "ssid": { "type": "string", "x-maxUtf8Bytes": 31 },
+		  "password": { "type": "string", "const": "" },
+		  "open": { "type": "boolean", "description": "True when the SSID is enabled and its stored password is empty." }
+		}
+	  },
       "PushChannel": {
         "type": "object",
-		"required": ["enabled", "type", "name", "url", "key1", "key2", "customBody", "titleTemplate", "bodyTemplate"],
+		"required": ["enabled", "type", "name", "url", "urlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"],
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean" },
           "type": { "type": "integer", "minimum": 0, "maximum": 12 },
           "name": { "type": "string" },
-          "url": { "type": "string" },
-          "key1": { "type": "string" },
-          "key2": { "type": "string" },
-		  "customBody": { "type": "string" },
+          "url": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
+		  "urlSet": { "type": "boolean", "description": "True when a URL is stored for the current provider type." },
+		  "key1": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
+		  "key1Set": { "type": "boolean", "description": "True when key1 is stored for the current provider type." },
+		  "key2": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
+		  "key2Set": { "type": "boolean", "description": "True when key2 is stored for the current provider type." },
+		  "customBody": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
+		  "customBodySet": { "type": "boolean", "description": "True when a custom body is stored for the current provider type." },
 		  "titleTemplate": { "type": "string" },
 		  "bodyTemplate": { "type": "string" }
         }
@@ -650,11 +665,12 @@
 		  "csrfToken": { "type": "string" },
           "status": {
             "type": "object",
-            "required": ["ip", "wifiSsid", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels", "firmwareVersion"],
+			"required": ["ip", "wifiSsid", "apMode", "freeHeapKb", "uptimeSeconds", "modemReady", "emailConfigured", "enabledPushChannels", "firmwareVersion"],
             "additionalProperties": false,
             "properties": {
               "ip": { "type": "string" },
               "wifiSsid": { "type": "string" },
+			  "apMode": { "type": "boolean" },
               "freeHeapKb": { "type": "integer", "minimum": 0 },
               "uptimeSeconds": { "type": "integer", "minimum": 0 },
               "modemReady": { "type": "boolean" },
@@ -665,7 +681,7 @@
           },
           "config": {
             "type": "object",
-			"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "pushChannels"],
+			"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "pushChannels"],
             "additionalProperties": false,
             "properties": {
 			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
@@ -684,6 +700,15 @@
               "smtpSendTo": { "type": "string" },
               "adminPhone": { "type": "string" },
               "numberBlackList": { "type": "string" },
+			  "wifiProfiles": {
+				"type": "array",
+				"minItems": 5,
+				"maxItems": 5,
+				"items": { "$ref": "#/components/schemas/WifiProfile" }
+			  },
+			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback when available. The preference is stored, but all cellular delivery currently fails closed until CA provisioning is available. ML307Y cellular transport is disabled, GET and ntfy channels are WiFi-only, and roaming always fails closed." },
+			  "heartbeatEnable": { "type": "boolean" },
+			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
               "pushChannels": {
                 "type": "array",
                 "minItems": 5,
@@ -708,17 +733,23 @@
           "smtpPass": { "type": "string", "x-maxUtf8Bytes": 256 },
           "smtpSendTo": { "type": "string", "x-maxUtf8Bytes": 254 },
           "adminPhone": { "type": "string", "x-maxUtf8Bytes": 32 },
-          "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 }
+		  "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 },
+		  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "x-maxUtf8Bytes": 32 },
+		  "heartbeatEnable": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
+		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 }
         },
         "patternProperties": {
           "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },
           "^account[0-9]pass$": { "type": "string", "x-maxUtf8Bytes": 96, "x-maxBasicPairUtf8Bytes": 180 },
+		  "^wifi[0-4]ssid$": { "type": "string", "x-maxUtf8Bytes": 31 },
+		  "^wifi[0-4]pass$": { "type": "string", "pattern": "^(?:|[ -~]{8,63})$", "x-maxUtf8Bytes": 63 },
+		  "^wifi[0-4]open$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
           "^push[0-4]en$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
           "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 12, "x-maxUtf8Bytes": 32 },
           "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
-          "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512 },
-          "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256 },
-		  "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048 },
+          "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Blank or omitted retains the stored URL when the provider type is unchanged." },
+		  "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256, "description": "Blank or omitted retains the stored key when the provider type is unchanged." },
+		  "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Blank or omitted retains the stored custom body when the provider type is unchanged." },
 		  "^push[0-4]title$": { "type": "string", "x-maxUtf8Bytes": 256 },
 		  "^push[0-4]template$": { "type": "string", "x-maxUtf8Bytes": 2048 }
         }

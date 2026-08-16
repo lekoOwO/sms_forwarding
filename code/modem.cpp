@@ -172,6 +172,17 @@ const String& modemGetLocalNumber() {
   return localNumber;
 }
 
+bool modemHttpPost(const String& url, const String& contentType,
+                   const String& extraHeader, const String& body, int& statusCode) {
+  statusCode = -1;
+  (void)url;
+  (void)contentType;
+  (void)extraHeader;
+  (void)body;
+  logCaptureLn("Cellular delivery is disabled until a CA is provisioned");
+  return false;
+}
+
 // Power-cycle the modem
 void modemPowerCycle() {
   pinMode(MODEM_EN_PIN, OUTPUT);

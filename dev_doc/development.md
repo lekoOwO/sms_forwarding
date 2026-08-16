@@ -315,6 +315,13 @@ docker compose exec dev arduino-cli monitor --port /dev/ttyACM0 --config baudrat
 - 最大設定檔、三個 active Web jobs、job queue overflow、RAM log pagination、
   healthy OTA 與 forced rollback 均已在同一板上驗證。開機後 free heap 約
   130--149 KiB。
+- 同日將一台舊版 ESP32-C3 從舊分區升級至 Dev 11。升級只清除新的 128 KiB
+  `appcfg` 區域，並保留位於 `0x9000` 的舊 NVS。
+- 第一次開機從舊 NVS 遷移兩組 WiFi、管理帳號、Gotify、network mode、
+  heartbeat 與 device name。硬重啟後，所有遷移值仍存在，預設管理帳號回傳
+  `401`。
+- 實機匯出的加密備份為 `SMSCFG01` envelope。離線解密結果為 `CFG2` schema
+  v4。此驗證沒有啟用 CEREG、CGACT、MHTTP 或行動數據。
 
 尚未在此板執行實際斷電發生於 flash/config commit 中間的 power-cut campaign；
 軟體重啟只能覆蓋 OTA pending-verify rollback，不能取代真實斷電測試。

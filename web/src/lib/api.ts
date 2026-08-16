@@ -11,9 +11,12 @@ const demoConfig: DeviceSnapshot["config"] = {
 	webAccounts: Array.from({ length: 10 }, (_, index) => ({ username: index === 0 ? "admin" : "", password: "" })),
 	smtpServer: "smtp.example.com", smtpPort: 465, smtpUser: "gateway@example.com", smtpPass: "", smtpSendTo: "ops@example.com",
 	adminPhone: "+886900000000", numberBlackList: "",
+	wifiProfiles: Array.from({ length: 5 }, (_, index) => ({ ssid: index === 0 ? "DemoNetwork" : "", password: "", open: false })),
+	networkMode: 0, heartbeatEnable: true, heartbeatInterval: 6,
 	pushChannels: Array.from({ length: 5 }, (_, index) => ({
-		enabled: index === 0, type: 1, name: `Channel ${index + 1}`, url: index === 0 ? "https://example.com/webhook" : "",
-		key1: "", key2: "", customBody: "", titleTemplate: "", bodyTemplate: ""
+		enabled: index === 0, type: 1, name: `Channel ${index + 1}`, url: "", urlSet: index === 0,
+		key1: "", key1Set: false, key2: "", key2Set: false, customBody: "", customBodySet: false,
+		titleTemplate: "", bodyTemplate: ""
 	}))
 };
 const demoLogs = ["Demo device started", "WiFi connected: DemoNetwork", "Cellular modem ready"];
@@ -22,7 +25,7 @@ function demoSnapshot(): DeviceSnapshot {
 	return {
 		csrfToken: "demo",
 		status: {
-			ip: "192.168.1.50", wifiSsid: "DemoNetwork", freeHeapKb: 247,
+			ip: "192.168.1.50", wifiSsid: "DemoNetwork", apMode: false, freeHeapKb: 247,
 			uptimeSeconds: Math.floor((Date.now() - demoStartedAt) / 1000), modemReady: true,
 			emailConfigured: true, enabledPushChannels: demoConfig.pushChannels.filter((channel) => channel.enabled).length,
 			firmwareVersion: "1"
@@ -37,8 +40,56 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 		entries: demoLogs.map((message, index) => ({ id: index + 1, message })), nextCursor: 1, hasMore: false
 	} as T;
 	if (path === "/save" && init?.body instanceof URLSearchParams) {
+		const form = init.body;
 		for (const [key, value] of init.body) {
-			if (key in demoConfig && !["webAccounts", "pushChannels"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+		}
+		if (init.body.has("networkMode")) demoConfig.networkMode = Number(init.body.get("networkMode"));
+		if (init.body.has("heartbeatInterval")) {
+			demoConfig.heartbeatEnable = init.body.has("heartbeatEnable");
+			demoConfig.heartbeatInterval = Number(init.body.get("heartbeatInterval"));
+		}
+		for (let index = 0; index < demoConfig.wifiProfiles.length; index += 1) {
+			const ssidKey = `wifi${index}ssid`;
+			const passKey = `wifi${index}pass`;
+			const openKey = `wifi${index}open`;
+			if (!init.body.has(ssidKey) && !init.body.has(passKey) && !init.body.has(openKey)) continue;
+			const profile = demoConfig.wifiProfiles[index];
+			const ssid = init.body.get(ssidKey) ?? profile.ssid;
+			profile.ssid = ssid;
+			if (!ssid || init.body.has(openKey)) {
+				profile.password = "";
+				profile.open = Boolean(ssid);
+			} else if (init.body.get(passKey)) {
+				profile.password = String(init.body.get(passKey));
+				profile.open = false;
+			}
+		}
+		for (let index = 0; index < demoConfig.pushChannels.length; index += 1) {
+			const prefix = `push${index}`;
+			if (!["en", "type", "name", "url", "key1", "key2", "body", "title", "template"].some((suffix) => form.has(`${prefix}${suffix}`))) continue;
+			const channel = demoConfig.pushChannels[index];
+			const type = Number(init.body.get(`${prefix}type`) ?? channel.type);
+			if (type !== channel.type) {
+				channel.url = ""; channel.urlSet = false;
+				channel.key1 = ""; channel.key1Set = false;
+				channel.key2 = ""; channel.key2Set = false;
+				channel.customBody = ""; channel.customBodySet = false;
+			}
+			channel.enabled = init.body.has(`${prefix}en`);
+			channel.type = type;
+			channel.name = init.body.get(`${prefix}name`) || `Channel ${index + 1}`;
+			for (const [suffix, field, setField] of [
+				["url", "url", "urlSet"], ["key1", "key1", "key1Set"],
+				["key2", "key2", "key2Set"], ["body", "customBody", "customBodySet"]
+			] as const) {
+				if (init.body.get(`${prefix}${suffix}`)) {
+					channel[field] = "";
+					channel[setField] = true;
+				}
+			}
+			channel.titleTemplate = init.body.get(`${prefix}title`) ?? "";
+			channel.bodyTemplate = init.body.get(`${prefix}template`) ?? "";
 		}
 	}
 	const data = path.includes("ati") ? { manufacturer: "Demo Telecom", model: "Demo LTE-C3", revision: "1.0.0" }

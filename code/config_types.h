@@ -22,6 +22,11 @@ struct WebAccount {
   String password;
 };
 
+struct WifiProfile {
+  String ssid;
+  String password;
+};
+
 // Configuration values
 struct Config {
   String deviceName;
@@ -36,6 +41,10 @@ struct Config {
   PushChannel pushChannels[MAX_PUSH_CHANNELS];  // Push channels
   WebAccount webAccounts[MAX_WEB_ACCOUNTS];
   String numberBlackList;  // Phone number blacklist, one number per line
+  WifiProfile wifiProfiles[MAX_WIFI_PROFILES];
+  NetworkMode networkMode;
+  bool heartbeatEnable;
+  uint16_t heartbeatInterval;
 };
 
 // Default web management credentials

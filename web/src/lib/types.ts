@@ -5,9 +5,13 @@ export type PushChannel = {
 	type: number;
 	name: string;
 	url: string;
+	urlSet: boolean;
 	key1: string;
+	key1Set: boolean;
 	key2: string;
+	key2Set: boolean;
 	customBody: string;
+	customBodySet: boolean;
 	titleTemplate: string;
 	bodyTemplate: string;
 };
@@ -17,11 +21,18 @@ export type WebAccount = {
 	password: string;
 };
 
+export type WifiProfile = {
+	ssid: string;
+	password: string;
+	open: boolean;
+};
+
 export type DeviceSnapshot = {
 	csrfToken: string;
 	status: {
 		ip: string;
 		wifiSsid: string;
+		apMode: boolean;
 		freeHeapKb: number;
 		uptimeSeconds: number;
 		modemReady: boolean;
@@ -41,6 +52,10 @@ export type DeviceSnapshot = {
 		smtpSendTo: string;
 		adminPhone: string;
 		numberBlackList: string;
+		wifiProfiles: WifiProfile[];
+		networkMode: number;
+		heartbeatEnable: boolean;
+		heartbeatInterval: number;
 		pushChannels: PushChannel[];
 	};
 };

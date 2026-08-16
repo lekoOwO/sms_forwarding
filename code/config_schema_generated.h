@@ -7,7 +7,7 @@
 
 constexpr const char CONFIG_FORMAT[] = "sms-forwarding-config";
 constexpr const char CONFIG_MIME_TYPE[] = "application/vnd.sms-forwarding.config";
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 3;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 4;
 constexpr size_t MAX_CONFIG_BLOB_SIZE = 32768;
 constexpr const char BACKUP_ENVELOPE_MAGIC[] = "SMSCFG01";
 constexpr uint16_t BACKUP_ENVELOPE_VERSION = 1;
@@ -23,6 +23,7 @@ constexpr size_t BACKUP_AAD_BYTES = 44;
 constexpr size_t MAX_ENCRYPTED_CONFIG_BYTES = 32828;
 #define MAX_PUSH_CHANNELS 5
 #define MAX_WEB_ACCOUNTS 10
+#define MAX_WIFI_PROFILES 5
 
 enum PushType {
   PUSH_TYPE_NONE = 0,
@@ -40,6 +41,12 @@ enum PushType {
   PUSH_TYPE_NTFY = 12,
 };
 
+enum NetworkMode {
+  NETWORK_MODE_WIFI_ONLY = 0,
+  NETWORK_MODE_4G_ONLY = 1,
+  NETWORK_MODE_MIX = 2,
+};
+
 constexpr size_t MAX_DEVICE_NAME_BYTES = 64;
 constexpr size_t MAX_HOSTNAME_LENGTH = 32;
 constexpr const char PORTABLE_DEVICE_NAME[] = "Portable backup";
@@ -53,6 +60,11 @@ constexpr size_t MAX_ADMIN_PHONE_BYTES = 32;
 constexpr size_t MAX_BLACKLIST_BYTES = 1024;
 constexpr size_t MAX_WEB_USERNAME_BYTES = 64;
 constexpr size_t MAX_WEB_PASSWORD_BYTES = 96;
+constexpr size_t MAX_WIFI_SSID_BYTES = 31;
+constexpr size_t MAX_WIFI_PASSWORD_BYTES = 63;
+constexpr uint16_t MIN_HEARTBEAT_INTERVAL_HOURS = 1;
+constexpr uint16_t MAX_HEARTBEAT_INTERVAL_HOURS = 240;
+constexpr uint16_t DEFAULT_HEARTBEAT_INTERVAL_HOURS = 6;
 constexpr size_t MAX_PUSH_NAME_BYTES = 64;
 constexpr size_t MAX_PUSH_URL_BYTES = 512;
 constexpr size_t MAX_PUSH_KEY1_BYTES = 256;

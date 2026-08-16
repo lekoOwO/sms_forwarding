@@ -57,15 +57,21 @@ function portableConfig(config) {
 		parts.push(Buffer.from([channel.enabled ? 1 : 0, channel.type]));
 		for (const value of [channel.name, channel.url, channel.key1, channel.key2, channel.titleTemplate, channel.bodyTemplate, channel.customBody]) string(value);
 	}
+	for (const profile of config.wifiProfiles) {
+		string(profile.ssid);
+		string(profile.password);
+	}
+	parts.push(Buffer.from([config.networkMode, config.heartbeatEnable ? 1 : 0]));
+	u32(config.heartbeatInterval);
 	const payload = Buffer.concat(parts);
 	const header = Buffer.alloc(20);
-	header.write("CFG2"); header.writeUInt16LE(3, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
+	header.write("CFG2"); header.writeUInt16LE(4, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
 	return Buffer.concat([header, payload]);
 }
 
 function decodePortableConfig(bytes, target) {
 	const schemaVersion = bytes.length >= 6 ? bytes.readUInt16LE(4) : 0;
-	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || ![2, 3].includes(schemaVersion) ||
+	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || ![1, 2, 3, 4].includes(schemaVersion) ||
 		bytes.readUInt16LE(6) !== 0 || bytes.readUInt32LE(8) !== 0 || bytes.readUInt32LE(12) !== bytes.length - 20 ||
 		bytes.readUInt32LE(16) !== crc32(bytes.subarray(20))) throw new Error("portable");
 	let offset = 20;
@@ -87,9 +93,23 @@ function decodePortableConfig(bytes, target) {
 		if (value.includes("\0")) throw new Error("portable");
 		return value;
 	};
-	const decoded = { smtpPort: u32() };
-	[decoded.deviceName, decoded.hostname, decoded.notificationLocale, decoded.smtpServer, decoded.smtpUser,
-		decoded.smtpPass, decoded.smtpSendTo, decoded.adminPhone, decoded.numberBlackList] = Array.from({ length: 9 }, string);
+	const decoded = {
+		deviceName: target.deviceName,
+		hostname: target.hostname,
+		notificationLocale: "zh-TW",
+		wifiProfiles: Array.from({ length: 5 }, () => ({ ssid: "", password: "" })),
+		networkMode: 0,
+		heartbeatEnable: true,
+		heartbeatInterval: 6,
+		smtpPort: u32()
+	};
+	if (schemaVersion === 1) {
+		[decoded.smtpServer, decoded.smtpUser, decoded.smtpPass, decoded.smtpSendTo,
+			decoded.adminPhone, decoded.numberBlackList] = Array.from({ length: 6 }, string);
+	} else {
+		[decoded.deviceName, decoded.hostname, decoded.notificationLocale, decoded.smtpServer, decoded.smtpUser,
+			decoded.smtpPass, decoded.smtpSendTo, decoded.adminPhone, decoded.numberBlackList] = Array.from({ length: 9 }, string);
+	}
 	decoded.webAccounts = Array.from({ length: 10 }, () => ({ username: string(), password: string() }));
 	decoded.pushChannels = Array.from({ length: 5 }, () => {
 		if (offset + 2 > bytes.length) throw new Error("portable");
@@ -97,12 +117,29 @@ function decodePortableConfig(bytes, target) {
 		if (enabledByte > 1) throw new Error("portable");
 		const enabled = enabledByte === 1;
 		const type = bytes[offset++];
-		const [name, url, key1, key2, titleTemplate, bodyTemplate, customBody] = Array.from({ length: 7 }, string);
+		if (type > (schemaVersion < 3 ? 10 : 12)) throw new Error("portable");
+		const values = Array.from({ length: schemaVersion === 1 ? 5 : 7 }, string);
+		const [name, url, key1, key2] = values;
+		const titleTemplate = schemaVersion === 1 ? "" : values[4];
+		const bodyTemplate = schemaVersion === 1 ? "" : values[5];
+		const customBody = schemaVersion === 1 ? (type === 7 ? values[4] : "") : values[6];
 		return { enabled, type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
 	});
-	if (offset !== bytes.length || decoded.deviceName !== "Portable backup" || decoded.hostname !== "portable-backup" ||
-		decoded.webAccounts.some((account) => account.username || account.password) ||
-		(schemaVersion === 2 && decoded.pushChannels.some((channel) => channel.type > 10))) throw new Error("portable");
+	if (schemaVersion === 4) {
+		decoded.wifiProfiles = Array.from({ length: 5 }, () => ({ ssid: string(), password: string() }));
+		if (offset + 6 > bytes.length) throw new Error("portable");
+		decoded.networkMode = bytes[offset++];
+		const heartbeatEnable = bytes[offset++];
+		if (heartbeatEnable > 1) throw new Error("portable");
+		decoded.heartbeatEnable = heartbeatEnable === 1;
+		decoded.heartbeatInterval = u32();
+	} else {
+		decoded.wifiProfiles = structuredClone(target.wifiProfiles);
+		decoded.networkMode = target.networkMode;
+		decoded.heartbeatEnable = target.heartbeatEnable;
+		decoded.heartbeatInterval = target.heartbeatInterval;
+	}
+	if (offset !== bytes.length) throw new Error("portable");
 	decoded.deviceName = target.deviceName;
 	decoded.hostname = target.hostname;
 	decoded.webAccounts = structuredClone(target.webAccounts);
@@ -113,7 +150,8 @@ function decodePortableConfig(bytes, target) {
 const fieldLimits = {
 	smtpServer: 253, smtpPort: 32, smtpUser: 254, smtpPass: 256, smtpSendTo: 254,
 	adminPhone: 32, numberBlackList: 1024, phone: 32, content: 2048,
-	cmd: 256, action: 32, type: 32, deviceName: 64, hostname: 32, notificationLocale: 16
+	cmd: 256, action: 32, type: 32, deviceName: 64, hostname: 32, notificationLocale: 16,
+	networkMode: 32, heartbeatEnable: 32, heartbeatInterval: 32
 };
 
 function configSemanticallyValid(config) {
@@ -124,8 +162,13 @@ function configSemanticallyValid(config) {
 		config.smtpPort < 1 || config.smtpPort > 65535 || !bounded(config.smtpServer, 253) ||
 		!bounded(config.smtpUser, 254) || !bounded(config.smtpPass, 256) || !bounded(config.smtpSendTo, 254) ||
 		!bounded(config.adminPhone, 32) || !bounded(config.numberBlackList, 1024) ||
-		config.webAccounts.length !== 10 || config.webAccounts.some((account) => !bounded(account.username, 64) || !bounded(account.password, 96)) ||
-		config.pushChannels.length !== 5) return false;
+			config.webAccounts.length !== 10 || config.webAccounts.some((account) => !bounded(account.username, 64) || !bounded(account.password, 96)) ||
+			config.pushChannels.length !== 5 || config.wifiProfiles.length !== 5 ||
+			config.wifiProfiles.some((profile) => !bounded(profile.ssid, 31) || !bounded(profile.password, 63) ||
+				(!profile.ssid && profile.password) || (profile.password && !/^[\x20-\x7e]{8,63}$/.test(profile.password))) ||
+			!Number.isInteger(config.networkMode) || config.networkMode < 0 || config.networkMode > 2 ||
+			typeof config.heartbeatEnable !== "boolean" || !Number.isInteger(config.heartbeatInterval) ||
+			config.heartbeatInterval < 1 || config.heartbeatInterval > 240) return false;
 	return config.pushChannels.every((channel) => Number.isInteger(channel.type) && channel.type >= 0 && channel.type <= 12 &&
 		typeof channel.enabled === "boolean" && bounded(channel.name, 64) && bounded(channel.url, 512) &&
 		bounded(channel.key1, 256) && bounded(channel.key2, 256) && bounded(channel.titleTemplate, 256) &&
@@ -159,8 +202,12 @@ function initialState() {
 			smtpPass: "",
 			smtpSendTo: "",
 			adminPhone: "",
-			numberBlackList: "",
-			pushChannels: Array.from({ length: 5 }, (_, index) => ({
+				numberBlackList: "",
+				wifiProfiles: Array.from({ length: 5 }, () => ({ ssid: "", password: "" })),
+				networkMode: 0,
+				heartbeatEnable: true,
+				heartbeatInterval: 6,
+				pushChannels: Array.from({ length: 5 }, (_, index) => ({
 				enabled: false,
 				type: 1,
 				name: `Channel ${index + 1}`,
@@ -185,6 +232,7 @@ const actionCodes = new Set([
 	"ACTION_SMS_CONTENT_REQUIRED",
 	"ACTION_SMS_SENT",
 	"ACTION_SMS_FAILED",
+	"ACTION_WIFI_PASSWORD_REQUIRED",
 	"ACTION_PING_OK",
 	"ACTION_PING_MODEM_ERROR",
 	"ACTION_PING_UNREACHABLE",
@@ -245,6 +293,12 @@ function rejectField(response, field) {
 
 function overLimit(field, value, limit = fieldLimits[field]) {
 	return limit !== undefined && byteLength(value) > limit;
+}
+
+function boundedUnsigned(value, minimum, maximum) {
+	if (typeof value !== "string" || !/^\d+$/.test(value)) return undefined;
+	const number = Number(value);
+	return Number.isSafeInteger(number) && number >= minimum && number <= maximum ? number : undefined;
 }
 
 function modemCommandAllowed(input) {
@@ -320,8 +374,9 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 		response.json({
 			csrfToken,
 			status: {
-				ip: "192.168.1.50",
-				wifiSsid: "MockNetwork",
+				ip: "192.168.4.1",
+				wifiSsid: "sms-forwarder-000001",
+				apMode: true,
 				freeHeapKb: 247,
 				uptimeSeconds: Math.floor((Date.now() - state.startedAt) / 1000),
 				modemReady: true,
@@ -333,7 +388,14 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 				...config,
 				webAccounts: config.webAccounts.map((account) => ({ username: account.username, password: "" })),
 				smtpPass: "",
-				pushChannels: config.pushChannels.map((channel) => ({ ...channel }))
+				wifiProfiles: config.wifiProfiles.map((profile) => ({ ssid: profile.ssid, password: "", open: Boolean(profile.ssid && !profile.password) })),
+				pushChannels: config.pushChannels.map((channel) => ({
+					...channel,
+					url: "", urlSet: Boolean(channel.url),
+					key1: "", key1Set: Boolean(channel.key1),
+					key2: "", key2Set: Boolean(channel.key2),
+					customBody: "", customBodySet: Boolean(channel.customBody)
+				}))
 			}
 		});
 	});
@@ -356,6 +418,10 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 			}
 		}
 		for (let index = 0; index < 5; index += 1) {
+			for (const [suffix, limit] of [["ssid", 31], ["pass", 63], ["open", 32]]) {
+				const field = `wifi${index}${suffix}`;
+				if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
+			}
 			for (const [suffix, limit] of [["en", 32], ["type", 32], ["name", 64], ["url", 512], ["key1", 256], ["key2", 256], ["body", 2048], ["title", 256], ["template", 2048]]) {
 				const field = `push${index}${suffix}`;
 				if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
@@ -390,21 +456,62 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 		if (Object.hasOwn(body, "deviceName")) config.deviceName = body.deviceName;
 		if (Object.hasOwn(body, "hostname")) config.hostname = body.hostname;
 		if (Object.hasOwn(body, "notificationLocale")) config.notificationLocale = body.notificationLocale;
+		if (Object.hasOwn(body, "networkMode")) {
+			const value = boundedUnsigned(body.networkMode, 0, 2);
+			if (value === undefined) return response.status(400).json(result(false, "ACTION_CONFIG_INVALID", {}, "networkMode"));
+			config.networkMode = value;
+		}
+		if (Object.hasOwn(body, "heartbeatEnable") || Object.hasOwn(body, "heartbeatInterval")) {
+			config.heartbeatEnable = body.heartbeatEnable === "on";
+			if (Object.hasOwn(body, "heartbeatInterval")) {
+				const value = boundedUnsigned(body.heartbeatInterval, 1, 240);
+				if (value === undefined) return response.status(400).json(result(false, "ACTION_CONFIG_INVALID", {}, "heartbeatInterval"));
+				config.heartbeatInterval = value;
+			}
+		}
+		for (let index = 0; index < 5; index += 1) {
+			const prefix = `wifi${index}`;
+			if (!["ssid", "pass", "open"].some((suffix) => Object.hasOwn(body, `${prefix}${suffix}`))) continue;
+			const profile = config.wifiProfiles[index];
+			const ssid = Object.hasOwn(body, `${prefix}ssid`) ? body[`${prefix}ssid`] : profile.ssid;
+			const open = body[`${prefix}open`] === "on";
+			const password = body[`${prefix}pass`] ?? "";
+			if (ssid && !open && !password && (ssid !== profile.ssid || (profile.ssid && !profile.password))) {
+				return response.status(400).json(result(false, "ACTION_WIFI_PASSWORD_REQUIRED", {}, `${prefix}ssid`));
+			}
+			profile.ssid = ssid;
+			if (!ssid || open) profile.password = "";
+			else if (password) profile.password = password;
+		}
 
 		for (let index = 0; index < 5; index += 1) {
 			const prefix = `push${index}`;
 			const suffixes = ["en", "type", "url", "name", "key1", "key2", "body", "title", "template"];
 			if (!suffixes.some((suffix) => Object.hasOwn(body, `${prefix}${suffix}`))) continue;
 			const channel = config.pushChannels[index];
+			const previousType = channel.type;
 			channel.enabled = body[`${prefix}en`] === "on";
-			channel.type = Number.parseInt(body[`${prefix}type`], 10) || 0;
-			channel.url = body[`${prefix}url`] ?? "";
-			channel.name = body[`${prefix}name`] || `Channel ${index + 1}`;
-			channel.key1 = body[`${prefix}key1`] ?? "";
-			channel.key2 = body[`${prefix}key2`] ?? "";
-			channel.customBody = body[`${prefix}body`] ?? "";
-			channel.titleTemplate = body[`${prefix}title`] ?? "";
-			channel.bodyTemplate = body[`${prefix}template`] ?? "";
+			if (Object.hasOwn(body, `${prefix}type`)) channel.type = Number.parseInt(body[`${prefix}type`], 10) || 0;
+			if (channel.type !== previousType) {
+				channel.url = "";
+				channel.key1 = "";
+				channel.key2 = "";
+				channel.customBody = "";
+			}
+			if (Object.hasOwn(body, `${prefix}name`)) channel.name = body[`${prefix}name`];
+			if (body[`${prefix}url`]) channel.url = body[`${prefix}url`];
+			if (body[`${prefix}key1`]) channel.key1 = body[`${prefix}key1`];
+			if (body[`${prefix}key2`]) channel.key2 = body[`${prefix}key2`];
+			if (body[`${prefix}body`]) channel.customBody = body[`${prefix}body`];
+			if (Object.hasOwn(body, `${prefix}title`)) channel.titleTemplate = body[`${prefix}title`];
+			if (Object.hasOwn(body, `${prefix}template`)) channel.bodyTemplate = body[`${prefix}template`];
+			if (channel.type === 7) {
+				channel.titleTemplate = "";
+				channel.bodyTemplate = "";
+			} else {
+				channel.customBody = "";
+			}
+			if (!channel.name) channel.name = `Channel ${index + 1}`;
 		}
 
 		if (!configSemanticallyValid(config)) {
@@ -500,7 +607,7 @@ export function createApp({ webRoot = defaultWebRoot, openApiPath = defaultOpenA
 		if (!item || item.expiresAt < Date.now()) return response.status(404).json(result(false, "ACTION_CONFIG_EXPORT_NOT_FOUND"));
 		return response.set({
 			"Content-Type": "application/vnd.sms-forwarding.config",
-			"X-Config-Schema-Version": "2",
+			"X-Config-Schema-Version": "4",
 			"Content-Disposition": 'attachment; filename="sms-forwarding.smscfg"'
 		}).send(item.bytes);
 	});

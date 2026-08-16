@@ -71,6 +71,27 @@ function firstPushTypeOffset(portable) {
 	return offset + 1;
 }
 
+function portableV1() {
+	const string = (value) => {
+		const bytes = Buffer.from(value);
+		const length = Buffer.alloc(2);
+		length.writeUInt16LE(bytes.length);
+		return Buffer.concat([length, bytes]);
+	};
+	const port = Buffer.alloc(4);
+	port.writeUInt32LE(465);
+	const fields = ["smtp.example.com", "sender@example.com", "smtp-secret", "to@example.com", "", ""].map(string);
+	const accounts = Array.from({ length: 10 }, () => Buffer.concat([string(""), string("")]));
+	const channel = Buffer.concat([Buffer.from([0, 1]), ...["Channel", "", "", "", ""].map(string)]);
+	const payload = Buffer.concat([port, ...fields, ...accounts, ...Array.from({ length: 5 }, () => channel)]);
+	const header = Buffer.alloc(20);
+	header.write("CFG2");
+	header.writeUInt16LE(1, 4);
+	header.writeUInt32LE(payload.length, 12);
+	header.writeUInt32LE(crc32(payload), 16);
+	return Buffer.concat([header, payload]);
+}
+
 async function completedAction(baseUrl, response) {
 	const body = await response.json();
 	if (response.status !== 202 || body.code !== "ACTION_JOB_ACCEPTED") return body;
@@ -90,11 +111,12 @@ test("authentication can be disabled for the LAN development server", async () =
 	}, { authRequired: false });
 });
 
-test("Discord and ntfy provider types round-trip through the management contract", async () => {
+test("push provider secrets stay masked and retained without crossing provider types", async () => {
 	await withServer(async (baseUrl) => {
-		for (const [index, type, name, url] of [
-			[0, 11, "Discord", "https://discord.com/api/webhooks/id/token"],
-			[1, 12, "ntfy", "https://ntfy.sh/example-topic"]
+		for (const [index, type, name, url, key1] of [
+			[0, 9, "Gotify", "https://gotify.example/message", "gotify-token"],
+			[1, 12, "ntfy", "https://ntfy.sh/example-topic", ""],
+			[2, 11, "Discord", "https://discord.com/api/webhooks/id/token", ""]
 		]) {
 			const response = await request(baseUrl, "/save", {
 				method: "POST",
@@ -104,7 +126,7 @@ test("Discord and ntfy provider types round-trip through the management contract
 					[`push${index}type`]: String(type),
 					[`push${index}name`]: name,
 					[`push${index}url`]: url,
-					[`push${index}key1`]: "",
+					[`push${index}key1`]: key1,
 					[`push${index}key2`]: "",
 					[`push${index}body`]: "",
 					[`push${index}title`]: "Alert from {sender}",
@@ -114,11 +136,56 @@ test("Discord and ntfy provider types round-trip through the management contract
 			assert.equal((await completedAction(baseUrl, response)).code, "ACTION_CONFIG_SAVED");
 		}
 
-		const channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
-		assert.deepEqual(channels.slice(0, 2).map(({ type, url, key1, key2 }) => ({ type, url, key1, key2 })), [
-			{ type: 11, url: "https://discord.com/api/webhooks/id/token", key1: "", key2: "" },
-			{ type: 12, url: "https://ntfy.sh/example-topic", key1: "", key2: "" }
+		let channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
+		assert.deepEqual(channels.slice(0, 3).map(({ type, url, urlSet, key1, key1Set, key2, key2Set, customBody, customBodySet }) => (
+			{ type, url, urlSet, key1, key1Set, key2, key2Set, customBody, customBodySet }
+		)), [
+			{ type: 9, url: "", urlSet: true, key1: "", key1Set: true, key2: "", key2Set: false, customBody: "", customBodySet: false },
+			{ type: 12, url: "", urlSet: true, key1: "", key1Set: false, key2: "", key2Set: false, customBody: "", customBodySet: false },
+			{ type: 11, url: "", urlSet: true, key1: "", key1Set: false, key2: "", key2Set: false, customBody: "", customBodySet: false }
 		]);
+
+		const enabledOnly = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ push0en: "on" })
+		});
+		assert.equal((await completedAction(baseUrl, enabledOnly)).code, "ACTION_CONFIG_SAVED");
+		channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
+		assert.deepEqual({
+			type: channels[0].type, name: channels[0].name,
+			titleTemplate: channels[0].titleTemplate, bodyTemplate: channels[0].bodyTemplate,
+			urlSet: channels[0].urlSet, key1Set: channels[0].key1Set
+		}, {
+			type: 9, name: "Gotify", titleTemplate: "Alert from {sender}", bodyTemplate: "{message}",
+			urlSet: true, key1Set: true
+		});
+
+		const ordinarySave = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				push0en: "on", push0name: "Renamed Gotify",
+				push0url: "", push0key1: "", push0key2: "", push0body: "",
+				push0title: "Updated {sender}", push0template: "{message}"
+			})
+		});
+		assert.equal((await completedAction(baseUrl, ordinarySave)).code, "ACTION_CONFIG_SAVED");
+		channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
+		assert.deepEqual({ name: channels[0].name, urlSet: channels[0].urlSet, key1Set: channels[0].key1Set }, {
+			name: "Renamed Gotify", urlSet: true, key1Set: true
+		});
+
+		const changedProvider = await request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ push0en: "on", push0type: "10", push0name: "Telegram", push0title: "{sender}", push0template: "{message}" })
+		});
+		assert.equal((await completedAction(baseUrl, changedProvider)).code, "ACTION_CONFIG_SAVED");
+		channels = (await (await request(baseUrl, "/api/config")).json()).config.pushChannels;
+		assert.deepEqual({ type: channels[0].type, urlSet: channels[0].urlSet, key1Set: channels[0].key1Set, key2Set: channels[0].key2Set }, {
+			type: 10, urlSet: false, key1Set: false, key2Set: false
+		});
 
 		const invalid = await request(baseUrl, "/save", {
 			method: "POST",
@@ -154,6 +221,89 @@ test("schema v2 portable configs still reject provider values added in v3", asyn
 			body: new URLSearchParams({ passphrase })
 		});
 		assert.equal((await completedAction(baseUrl, finished)).code, "ACTION_CONFIG_RESTORE_INVALID");
+	});
+});
+
+test("WiFi profiles and scheduled connectivity settings support partial updates", async () => {
+	await withServer(async (baseUrl) => {
+		const initial = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual(initial.config.wifiProfiles, Array.from({ length: 5 }, () => ({ ssid: "", password: "", open: false })));
+		assert.deepEqual({
+			networkMode: initial.config.networkMode,
+			heartbeatEnable: initial.config.heartbeatEnable,
+			heartbeatInterval: initial.config.heartbeatInterval
+		}, {
+			networkMode: 0,
+			heartbeatEnable: true,
+			heartbeatInterval: 6
+		});
+
+		const save = (body) => request(baseUrl, "/save", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams(body)
+		});
+		assert.equal((await completedAction(baseUrl, await save({
+			wifi0ssid: "Office WiFi", wifi0pass: "first-secret", networkMode: "2",
+			heartbeatEnable: "on", heartbeatInterval: "12"
+		}))).code, "ACTION_CONFIG_SAVED");
+
+		let snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual(snapshot.config.wifiProfiles[0], { ssid: "Office WiFi", password: "", open: false });
+		assert.equal(snapshot.config.networkMode, 2);
+		assert.equal(snapshot.config.heartbeatInterval, 12);
+
+		assert.equal((await completedAction(baseUrl, await save({ wifi0ssid: "Office WiFi" }))).success, true);
+		const missingPassword = await completedAction(baseUrl, await save({ wifi0ssid: "No password" }));
+		assert.deepEqual(missingPassword, {
+			success: false, code: "ACTION_WIFI_PASSWORD_REQUIRED", data: {}, detail: "wifi0ssid"
+		});
+		assert.equal((await completedAction(baseUrl, await save({ wifi1ssid: "Too short", wifi1pass: "1234567" }))).code, "ACTION_CONFIG_INVALID");
+		assert.equal((await completedAction(baseUrl, await save({ wifi0ssid: "Guest", wifi0open: "on" }))).success, true);
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual(snapshot.config.wifiProfiles[0], { ssid: "Guest", password: "", open: true });
+		assert.equal((await completedAction(baseUrl, await save({ wifi0ssid: "Guest" }))).code, "ACTION_WIFI_PASSWORD_REQUIRED");
+		assert.equal((await completedAction(baseUrl, await save({ wifi0ssid: "Guest", wifi0pass: "secured-secret" }))).success, true);
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual(snapshot.config.wifiProfiles[0], { ssid: "Guest", password: "", open: false });
+
+		for (const [field, value] of [["networkMode", "3"], ["networkMode", "2x"], ["heartbeatInterval", "241"], ["heartbeatInterval", "12x"]]) {
+			assert.equal((await completedAction(baseUrl, await save({ [field]: value }))).code, "ACTION_CONFIG_INVALID", field);
+		}
+	});
+});
+
+test("v1 through v3 restores preserve target connectivity settings", async () => {
+	const vector = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v1.json", import.meta.url), "utf8"));
+	const v2 = decryptBackup(Buffer.from(vector.smscfgHex, "hex"), vector.passphrase);
+	const versions = [portableV1(), v2, Buffer.from(v2)];
+	versions[2].writeUInt16LE(3, 4);
+	await withServer(async (baseUrl) => {
+		for (const [index, portable] of versions.entries()) {
+			const passphrase = `legacy restore passphrase ${index + 1}`;
+			const encrypted = encryptBackup(portable, passphrase);
+			const save = await request(baseUrl, "/save", {
+				method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ wifi0ssid: `Before restore ${index + 1}`, wifi0pass: "wifi-secret", networkMode: "2", heartbeatEnable: "on", heartbeatInterval: "24" })
+			});
+			assert.equal((await completedAction(baseUrl, save)).success, true);
+			const started = await request(baseUrl, "/api/config/restore/start", {
+				method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ size: String(encrypted.length) })
+			});
+			const uploadId = (await started.json()).data.uploadId;
+			assert.equal((await request(baseUrl, `/api/config/restore/chunk?id=${uploadId}&offset=0`, {
+				method: "POST", ...base64Body(encrypted)
+			})).status, 200);
+			const restored = await request(baseUrl, `/api/config/restore/finish?id=${uploadId}`, {
+				method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ passphrase })
+			});
+			assert.equal((await completedAction(baseUrl, restored)).success, true);
+			const snapshot = await (await request(baseUrl, "/api/config")).json();
+			assert.deepEqual(snapshot.config.wifiProfiles[0], { ssid: `Before restore ${index + 1}`, password: "", open: false });
+			assert.deepEqual({ mode: snapshot.config.networkMode, enabled: snapshot.config.heartbeatEnable, hours: snapshot.config.heartbeatInterval }, { mode: 2, enabled: true, hours: 24 });
+		}
 	});
 });
 
@@ -295,15 +445,18 @@ test("the mock implements the documented API", async () => {
 		const snapshot = await snapshotResponse.json();
 		assert.equal(snapshot.config.deviceName, "SMS Forwarder 000001");
 		assert.equal(snapshot.config.hostname, "sms-forwarder-000001");
-		assert.equal(snapshot.config.notificationLocale, "zh-TW");
-		assert.equal(snapshot.config.pushChannels.length, 5);
+			assert.equal(snapshot.config.notificationLocale, "zh-TW");
+			assert.equal(snapshot.status.apMode, true);
+			assert.equal(snapshot.status.ip, "192.168.4.1");
+			assert.equal(snapshot.config.pushChannels.length, 5);
 		assert.equal(snapshot.config.webAccounts.length, 10);
 		assert.deepEqual(snapshot.config.webAccounts[0], { username: "admin", password: "" });
 		assert.equal(snapshot.config.smtpPass, "");
 		assert.equal(snapshot.csrfToken, "mock-csrf-token");
 		assert.deepEqual(snapshot.config.pushChannels[0], {
-			enabled: false, type: 1, name: "Channel 1", url: "", key1: "", key2: "",
-			customBody: "", titleTemplate: "", bodyTemplate: ""
+			enabled: false, type: 1, name: "Channel 1", url: "", urlSet: false,
+			key1: "", key1Set: false, key2: "", key2Set: false,
+			customBody: "", customBodySet: false, titleTemplate: "", bodyTemplate: ""
 		});
 		const invalidSave = await request(baseUrl, "/save", {
 			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -317,8 +470,13 @@ test("the mock implements the documented API", async () => {
 			smtpServer: "smtp.example.com",
 			smtpPort: "465",
 			smtpUser: "sender@example.com",
-			smtpPass: "secret",
-			smtpSendTo: "recipient@example.com",
+				smtpPass: "secret",
+				smtpSendTo: "recipient@example.com",
+				wifi0ssid: "Office WiFi",
+				wifi0pass: "wifi-secret",
+				networkMode: "2",
+				heartbeatEnable: "on",
+				heartbeatInterval: "12",
 			push0en: "on",
 			push0type: "1",
 			push0name: "Primary",
@@ -410,7 +568,7 @@ test("the mock implements the documented API", async () => {
 		assert.equal((await request(baseUrl, exportPath)).status, 404);
 		const portable = decryptBackup(exported, "correct horse battery staple");
 		assert.equal(portable.subarray(0, 4).toString(), "CFG2");
-		assert.equal(portable.readUInt16LE(4), 3);
+			assert.equal(portable.readUInt16LE(4), 4);
 		assert.equal(portable.readUInt32LE(8), 0);
 		assert.equal(portable.readUInt32LE(12), portable.length - 20);
 		assert.equal(portable.readUInt32LE(16), crc32(portable.subarray(20)));
@@ -423,9 +581,11 @@ test("the mock implements the documented API", async () => {
 		const targetChanged = await request(baseUrl, "/save", {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
-			body: new URLSearchParams({
-				deviceName: "Target gateway", hostname: "target-gateway",
-				notificationLocale: "en", smtpServer: "changed.example.com"
+				body: new URLSearchParams({
+					deviceName: "Target gateway", hostname: "target-gateway",
+					notificationLocale: "en", smtpServer: "changed.example.com",
+					wifi0ssid: "Target WiFi", wifi0pass: "target-secret", networkMode: "0",
+					heartbeatInterval: "24"
 			})
 		});
 		assert.equal((await completedAction(baseUrl, targetChanged)).success, true);
@@ -479,8 +639,12 @@ test("the mock implements the documented API", async () => {
 		const restoredSnapshot = await (await request(baseUrl, "/api/config")).json();
 		assert.equal(restoredSnapshot.config.deviceName, "Target gateway");
 		assert.equal(restoredSnapshot.config.hostname, "target-gateway");
-		assert.equal(restoredSnapshot.config.notificationLocale, "zh-TW");
-		assert.equal(restoredSnapshot.config.smtpServer, "smtp.example.com");
+			assert.equal(restoredSnapshot.config.notificationLocale, "zh-TW");
+			assert.equal(restoredSnapshot.config.smtpServer, "smtp.example.com");
+			assert.deepEqual(restoredSnapshot.config.wifiProfiles[0], { ssid: "Office WiFi", password: "", open: false });
+			assert.equal(restoredSnapshot.config.networkMode, 2);
+			assert.equal(restoredSnapshot.config.heartbeatEnable, true);
+			assert.equal(restoredSnapshot.config.heartbeatInterval, 12);
 		assert.equal(restoredSnapshot.config.webAccounts[1].username, "operator");
 		assert.equal((await fetch(`${baseUrl}/api/config`, { headers: { Authorization: operatorAuth } })).status, 200);
 

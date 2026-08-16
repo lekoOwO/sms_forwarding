@@ -18,10 +18,5 @@
     "svelte/no-navigation-without-resolve": {
       "count": 1
     }
-  },
-  "web/src/routes/+page.svelte": {
-    "svelte/require-each-key": {
-      "count": 8
-    }
   }
 }

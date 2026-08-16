@@ -47,4 +47,12 @@ extern bool modemReady;
 extern unsigned long lastPrintTime;
 extern ConcatSms concatBuffer[MAX_CONCAT_MESSAGES];
 
+bool connectWifi(uint32_t timeoutMs = 20000);
+bool startProvisioningAp();
+void networkTick();
+bool provisioningApActive();
+bool networkAccessReady();
+String activeNetworkIp();
+String activeNetworkSsid();
+
 #endif

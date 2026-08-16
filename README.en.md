@@ -17,6 +17,7 @@ This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received
 - Gives each push channel a separate name, title template, and body template.
 - Supports multipart SMS messages, a blacklist, web SMS sending, and network diagnostics.
 - Sets a device name and hostname to identify multiple devices.
+- Stores five WiFi profiles, network mode settings, and periodic heartbeat notifications.
 - Exports an encrypted configuration backup and restores it to another device.
 - Installs signed OTA updates from the web UI and rolls back after an unsuccessful boot.
 - Keeps paginated logs in RAM only, without wearing flash.
@@ -47,6 +48,7 @@ The verified combination is an ESP32-C3 Super Mini and an ML307R-DC. The device 
 
 ## Important notes
 
+- If no saved WiFi network is available, join `sms-forwarder-XXXXXX` with password `sms-forwarder-setup`. Then open `http://192.168.4.1` to configure the device.
 - Before the first upgrade from the old partition layout, back up the configuration. Then erase and flash the device through USB.
 - The default username is `admin`. The default password is `admin123`. Change the password after the first login.
 - The management UI uses plain HTTP. Use it only on a trusted LAN. Do not expose it to the Internet.

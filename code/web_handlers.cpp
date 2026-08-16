@@ -630,6 +630,17 @@ static bool rejectArgInvalidOrTooLong(const String& field, size_t maxBytes) {
   return requestHasArg(field) && rejectInvalidOrTooLong(requestArg(field), maxBytes, field);
 }
 
+static bool parseBoundedUnsignedArg(const String& field, uint16_t minimum,
+                                    uint16_t maximum, uint16_t& output) {
+  String text = requestArg(field);
+  if (text.length() == 0) return false;
+  char* end = nullptr;
+  unsigned long value = strtoul(text.c_str(), &end, 10);
+  if (*end != '\0' || value < minimum || value > maximum) return false;
+  output = static_cast<uint16_t>(value);
+  return true;
+}
+
 static bool rejectModemBusy() {
   if (!modemIsBusy()) return false;
   sendActionResult(429, false, "ACTION_MODEM_BUSY");
@@ -664,8 +675,9 @@ void handleConfig() {
   JsonDocument json;
   JsonObject status = json["status"].to<JsonObject>();
   json["csrfToken"] = csrfToken;
-  status["ip"] = WiFi.localIP().toString();
-  status["wifiSsid"] = WiFi.SSID();
+  status["ip"] = activeNetworkIp();
+  status["wifiSsid"] = activeNetworkSsid();
+  status["apMode"] = provisioningApActive();
   status["freeHeapKb"] = ESP.getFreeHeap() / 1024;
   status["uptimeSeconds"] = millis() / 1000;
   status["modemReady"] = modemReady;
@@ -694,6 +706,17 @@ void handleConfig() {
   configJson["smtpSendTo"] = config.smtpSendTo;
   configJson["adminPhone"] = config.adminPhone;
   configJson["numberBlackList"] = config.numberBlackList;
+  JsonArray wifiProfiles = configJson["wifiProfiles"].to<JsonArray>();
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    JsonObject profile = wifiProfiles.add<JsonObject>();
+    profile["ssid"] = config.wifiProfiles[i].ssid;
+    profile["password"] = "";
+    profile["open"] = config.wifiProfiles[i].ssid.length() > 0 &&
+                      config.wifiProfiles[i].password.length() == 0;
+  }
+  configJson["networkMode"] = static_cast<int>(config.networkMode);
+  configJson["heartbeatEnable"] = config.heartbeatEnable;
+  configJson["heartbeatInterval"] = config.heartbeatInterval;
   JsonArray pushChannels = configJson["pushChannels"].to<JsonArray>();
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     const PushChannel& channel = config.pushChannels[i];
@@ -701,12 +724,16 @@ void handleConfig() {
     channelJson["enabled"] = channel.enabled;
     channelJson["type"] = static_cast<int>(channel.type);
     channelJson["name"] = channel.name;
-    channelJson["url"] = channel.url;
-    channelJson["key1"] = channel.key1;
-    channelJson["key2"] = channel.key2;
+    channelJson["url"] = "";
+    channelJson["urlSet"] = channel.url.length() > 0;
+    channelJson["key1"] = "";
+    channelJson["key1Set"] = channel.key1.length() > 0;
+    channelJson["key2"] = "";
+    channelJson["key2Set"] = channel.key2.length() > 0;
     channelJson["titleTemplate"] = channel.titleTemplate;
     channelJson["bodyTemplate"] = channel.bodyTemplate;
-    channelJson["customBody"] = channel.customBody;
+    channelJson["customBody"] = "";
+    channelJson["customBodySet"] = channel.customBody.length() > 0;
   }
   xSemaphoreGive(configMutex);
   sendJson(200, json);
@@ -1205,6 +1232,8 @@ void handleSave() {
   Config next = config;
   xSemaphoreGive(configMutex);
   String previousHostname = next.hostname;
+  WifiProfile previousWifiProfiles[MAX_WIFI_PROFILES];
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) previousWifiProfiles[i] = next.wifiProfiles[i];
   String previousSmtpServer = next.smtpServer;
   int previousSmtpPort = next.smtpPort;
   String previousSmtpUser = next.smtpUser;
@@ -1219,6 +1248,17 @@ void handleSave() {
       rejectArgInvalidOrTooLong("smtpSendTo", 254) ||
       rejectArgInvalidOrTooLong("adminPhone", 32) ||
       rejectArgInvalidOrTooLong("numberBlackList", 1024)) return;
+
+  if (rejectArgInvalidOrTooLong("networkMode", 32) ||
+      rejectArgInvalidOrTooLong("heartbeatEnable", 32) ||
+      rejectArgInvalidOrTooLong("heartbeatInterval", 32)) return;
+
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    String prefix = "wifi" + String(i);
+    if (rejectArgInvalidOrTooLong(prefix + "ssid", MAX_WIFI_SSID_BYTES) ||
+        rejectArgInvalidOrTooLong(prefix + "pass", MAX_WIFI_PASSWORD_BYTES) ||
+        rejectArgInvalidOrTooLong(prefix + "open", 32)) return;
+  }
 
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String prefix = "push" + String(i);
@@ -1312,6 +1352,49 @@ void handleSave() {
     next.numberBlackList = requestArg("numberBlackList");
   }
 
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    String prefix = "wifi" + String(i);
+    String ssidKey = prefix + "ssid";
+    String passKey = prefix + "pass";
+    String openKey = prefix + "open";
+    if (!requestHasArg(ssidKey) && !requestHasArg(passKey) && !requestHasArg(openKey)) continue;
+    String ssid = requestHasArg(ssidKey) ? requestArg(ssidKey) : next.wifiProfiles[i].ssid;
+    String password = requestHasArg(passKey) ? requestArg(passKey) : "";
+    bool open = requestArg(openKey) == "on";
+    if (ssid.length() == 0) {
+      next.wifiProfiles[i].ssid = "";
+      next.wifiProfiles[i].password = "";
+    } else if (open) {
+      next.wifiProfiles[i].ssid = ssid;
+      next.wifiProfiles[i].password = "";
+    } else if (password.length() > 0) {
+      next.wifiProfiles[i].ssid = ssid;
+      next.wifiProfiles[i].password = password;
+    } else if (ssid != next.wifiProfiles[i].ssid ||
+               next.wifiProfiles[i].password.length() == 0) {
+      sendActionResult(400, false, "ACTION_WIFI_PASSWORD_REQUIRED", ssidKey);
+      return;
+    }
+  }
+
+  if (requestHasArg("networkMode")) {
+    uint16_t value;
+    if (!parseBoundedUnsignedArg("networkMode", NETWORK_MODE_WIFI_ONLY, NETWORK_MODE_MIX, value)) {
+      sendActionResult(400, false, "ACTION_CONFIG_INVALID", "networkMode");
+      return;
+    }
+    next.networkMode = static_cast<NetworkMode>(value);
+  }
+  if (requestHasArg("heartbeatEnable") || requestHasArg("heartbeatInterval")) {
+    next.heartbeatEnable = requestArg("heartbeatEnable") == "on";
+    if (requestHasArg("heartbeatInterval") &&
+        !parseBoundedUnsignedArg("heartbeatInterval", MIN_HEARTBEAT_INTERVAL_HOURS,
+                                 MAX_HEARTBEAT_INTERVAL_HOURS, next.heartbeatInterval)) {
+      sendActionResult(400, false, "ACTION_CONFIG_INVALID", "heartbeatInterval");
+      return;
+    }
+  }
+
   // Push channel configuration: update only when that channel's fields are present.
   for (int i = 0; i < MAX_PUSH_CHANNELS; i++) {
     String idx = String(i);
@@ -1328,23 +1411,38 @@ void handleSave() {
     if (requestHasArg(enKey) || requestHasArg(typeKey) || requestHasArg(urlKey) ||
         requestHasArg(nameKey) || requestHasArg(k1Key) || requestHasArg(k2Key) ||
         requestHasArg(titleKey) || requestHasArg(templateKey) || requestHasArg(bodyKey)) {
-      next.pushChannels[i].enabled = requestArg(enKey) == "on";
-      next.pushChannels[i].type = (PushType)requestArg(typeKey).toInt();
-      next.pushChannels[i].url = requestArg(urlKey);
-      next.pushChannels[i].name = requestArg(nameKey);
-      next.pushChannels[i].key1 = requestArg(k1Key);
-      next.pushChannels[i].key2 = requestArg(k2Key);
-      next.pushChannels[i].titleTemplate = requestArg(titleKey);
-      next.pushChannels[i].bodyTemplate = requestArg(templateKey);
-      next.pushChannels[i].customBody = requestArg(bodyKey);
-      if (next.pushChannels[i].type == PUSH_TYPE_CUSTOM) {
-        next.pushChannels[i].titleTemplate = "";
-        next.pushChannels[i].bodyTemplate = "";
-      } else {
-        next.pushChannels[i].customBody = "";
+      PushChannel& channel = next.pushChannels[i];
+      PushType requestedType = requestHasArg(typeKey)
+                                 ? static_cast<PushType>(requestArg(typeKey).toInt())
+                                 : channel.type;
+      bool typeChanged = requestedType != channel.type;
+      if (typeChanged) {
+        channel.url = "";
+        channel.key1 = "";
+        channel.key2 = "";
+        channel.customBody = "";
       }
-      if (next.pushChannels[i].name.length() == 0) {
-        next.pushChannels[i].name = "Channel " + String(i + 1);
+      channel.enabled = requestArg(enKey) == "on";
+      channel.type = requestedType;
+      if (requestHasArg(nameKey)) channel.name = requestArg(nameKey);
+      if (requestHasArg(urlKey) && requestArg(urlKey).length() > 0)
+        channel.url = requestArg(urlKey);
+      if (requestHasArg(k1Key) && requestArg(k1Key).length() > 0)
+        channel.key1 = requestArg(k1Key);
+      if (requestHasArg(k2Key) && requestArg(k2Key).length() > 0)
+        channel.key2 = requestArg(k2Key);
+      if (requestHasArg(titleKey)) channel.titleTemplate = requestArg(titleKey);
+      if (requestHasArg(templateKey)) channel.bodyTemplate = requestArg(templateKey);
+      if (requestHasArg(bodyKey) && requestArg(bodyKey).length() > 0)
+        channel.customBody = requestArg(bodyKey);
+      if (channel.type == PUSH_TYPE_CUSTOM) {
+        channel.titleTemplate = "";
+        channel.bodyTemplate = "";
+      } else {
+        channel.customBody = "";
+      }
+      if (channel.name.length() == 0) {
+        channel.name = "Channel " + String(i + 1);
       }
     }
   }
@@ -1372,7 +1470,15 @@ void handleSave() {
                                 next.deviceName, getDeviceUrl(), subject, body);
     sendEmailNotification(subject.c_str(), body.c_str());
   }
-  if (next.hostname != previousHostname) scheduleDeviceRestart();
+  bool wifiChanged = false;
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    if (next.wifiProfiles[i].ssid != previousWifiProfiles[i].ssid ||
+        next.wifiProfiles[i].password != previousWifiProfiles[i].password) {
+      wifiChanged = true;
+      break;
+    }
+  }
+  if (next.hostname != previousHostname || wifiChanged) scheduleDeviceRestart();
 }
 
 // Handle log queries by returning the lines in the ring buffer.
@@ -1541,17 +1647,7 @@ void handleWifi() {
     logCaptureLn(String("Web UI requested a WiFi restart..."));
     sendActionResult(200, true, "ACTION_WIFI_RESTARTING");
     delay(500);
-    WiFi.disconnect(true);
-    WiFi.setSleep(false);
-    WiFi.setAutoReconnect(true);
-    WiFi.setScanMethod(WIFI_FAST_SCAN);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    logCaptureLn(String("Reconnecting to WiFi: " + String(WIFI_SSID)));
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(50);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
+    if (connectWifi()) {
       logCaptureLn(String("WiFi reconnected, IP: " + WiFi.localIP().toString()));
     } else {
       logCaptureLn(String("WiFi reconnection failed; retrying in the background"));

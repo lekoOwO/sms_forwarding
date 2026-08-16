@@ -11,6 +11,7 @@ namespace {
 constexpr uint32_t CONFIG_MAGIC = 0x32474643;  // CFG2
 constexpr uint16_t CONFIG_SCHEMA_VERSION_V1 = 1;
 constexpr uint16_t CONFIG_SCHEMA_VERSION_V2 = 2;
+constexpr uint16_t CONFIG_SCHEMA_VERSION_V3 = 3;
 constexpr uint32_t MARKER_MAGIC = 0x324B524D;  // MRK2
 constexpr size_t CONFIG_HEADER_SIZE = 20;
 constexpr size_t CONFIG_MARKER_SIZE = 20;
@@ -27,6 +28,7 @@ uint32_t activeGeneration = 0;
 struct SlotState {
   bool present = false;
   bool valid = false;
+  uint16_t schema = 0;
   uint32_t generation = 0;
   Config value;
 };
@@ -100,6 +102,11 @@ bool payloadSize(const Config& value, bool portable, size_t& size) {
         !addStringSize(size, channel.titleTemplate) || !addStringSize(size, channel.bodyTemplate) ||
         !addStringSize(size, channel.customBody)) return false;
   }
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    if (!addStringSize(size, value.wifiProfiles[i].ssid) ||
+        !addStringSize(size, value.wifiProfiles[i].password)) return false;
+  }
+  size += 6;  // network mode, heartbeat enabled, and interval
   return size <= MAX_CONFIG_BLOB_SIZE - CONFIG_HEADER_SIZE;
 }
 
@@ -137,6 +144,16 @@ bool hasNoAsciiControls(const String& value) {
 
 bool boundedUtf8(const String& value, size_t maxLength) {
   return value.length() <= maxLength && isValidUtf8(value.c_str());
+}
+
+bool wifiPasswordValid(const String& value) {
+  if (value.length() == 0) return true;
+  if (value.length() < 8 || value.length() > MAX_WIFI_PASSWORD_BYTES) return false;
+  for (size_t i = 0; i < value.length(); ++i) {
+    uint8_t byte = static_cast<uint8_t>(value[i]);
+    if (byte < 0x20 || byte > 0x7E) return false;
+  }
+  return true;
 }
 
 bool hostnameValid(const String& hostname) {
@@ -188,6 +205,15 @@ bool storageSemanticsValid(const Config& value) {
       return false;
     }
   }
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    const WifiProfile& profile = value.wifiProfiles[i];
+    if (!boundedUtf8(profile.ssid, MAX_WIFI_SSID_BYTES) ||
+        !wifiPasswordValid(profile.password) ||
+        (profile.ssid.length() == 0 && profile.password.length() > 0)) return false;
+  }
+  if (value.networkMode < NETWORK_MODE_WIFI_ONLY || value.networkMode > NETWORK_MODE_MIX ||
+      value.heartbeatInterval < MIN_HEARTBEAT_INTERVAL_HOURS ||
+      value.heartbeatInterval > MAX_HEARTBEAT_INTERVAL_HOURS) return false;
   return true;
 }
 
@@ -242,6 +268,13 @@ bool encodeConfig(const Config& value, uint32_t generation, bool portable,
     writeString(cursor, channel.bodyTemplate);
     writeString(cursor, channel.customBody);
   }
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    writeString(cursor, value.wifiProfiles[i].ssid);
+    writeString(cursor, value.wifiProfiles[i].password);
+  }
+  *cursor++ = static_cast<uint8_t>(value.networkMode);
+  *cursor++ = value.heartbeatEnable ? 1 : 0;
+  writeU32(cursor, value.heartbeatInterval);
   if (cursor != blob.bytes.get() + blob.length) return false;
 
   cursor = blob.bytes.get();
@@ -311,6 +344,23 @@ bool decodeConfigV2Payload(const uint8_t*& cursor, const uint8_t* end, Config& v
   return true;
 }
 
+bool decodeConfigV4Payload(const uint8_t*& cursor, const uint8_t* end, Config& value) {
+  if (!decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_NTFY)) return false;
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    if (!readString(cursor, end, value.wifiProfiles[i].ssid) ||
+        !readString(cursor, end, value.wifiProfiles[i].password)) return false;
+  }
+  if (end - cursor < 6) return false;
+  uint8_t networkMode = *cursor++;
+  uint8_t heartbeatEnable = *cursor++;
+  uint32_t heartbeatInterval = readU32(cursor);
+  if (networkMode > NETWORK_MODE_MIX || heartbeatEnable > 1 || heartbeatInterval > UINT16_MAX) return false;
+  value.networkMode = static_cast<NetworkMode>(networkMode);
+  value.heartbeatEnable = heartbeatEnable == 1;
+  value.heartbeatInterval = heartbeatInterval;
+  return true;
+}
+
 bool readConfigHeader(const uint8_t* bytes, size_t length, uint16_t& schema,
                       uint32_t& generation, const uint8_t*& payload, const uint8_t*& end) {
   if (length < CONFIG_HEADER_SIZE || length > MAX_CONFIG_BLOB_SIZE) return false;
@@ -340,8 +390,10 @@ bool decodeConfig(const uint8_t* bytes, size_t length, Config& value, uint32_t& 
                    ? decodeConfigV1Payload(cursor, end, value)
                    : schema == CONFIG_SCHEMA_VERSION_V2
                        ? decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_TELEGRAM)
-                       : schema == CONFIG_SCHEMA_VERSION &&
-                           decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_NTFY);
+                       : schema == CONFIG_SCHEMA_VERSION_V3
+                           ? decodeConfigV2Payload(cursor, end, value, PUSH_TYPE_NTFY)
+                           : schema == CONFIG_SCHEMA_VERSION &&
+                               decodeConfigV4Payload(cursor, end, value);
   return decoded && cursor == end && storageSemanticsValid(value);
 }
 
@@ -384,7 +436,7 @@ bool readSlot(int slot, SlotState& state) {
   if (!blob.bytes || preferences.getBytes(blobKey, blob.bytes.get(), blobLength) != blobLength ||
       markedCrc != crc32(blob.bytes.get(), blobLength)) return true;
   uint32_t decodedGeneration;
-  if (!decodeConfig(blob.bytes.get(), blobLength, state.value, decodedGeneration) ||
+  if (!decodeConfig(blob.bytes.get(), blobLength, state.value, decodedGeneration, &state.schema) ||
       decodedGeneration != markerGeneration) return true;
   state.generation = decodedGeneration;
   state.valid = true;
@@ -405,6 +457,9 @@ void setDefaults(Config& value) {
   value.hostname = "sms-forwarder-" + String(lower);
   value.notificationLocale = DEFAULT_NOTIFICATION_LOCALE;
   value.smtpPort = 465;
+  value.networkMode = NETWORK_MODE_WIFI_ONLY;
+  value.heartbeatEnable = true;
+  value.heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL_HOURS;
   value.webAccounts[0].username = DEFAULT_WEB_USER;
   value.webAccounts[0].password = DEFAULT_WEB_PASS;
   for (int i = 1; i < MAX_WEB_ACCOUNTS; ++i) {
@@ -419,20 +474,57 @@ void setDefaults(Config& value) {
     value.pushChannels[i].bodyTemplate = "";
     value.pushChannels[i].customBody = "";
   }
+  for (int i = 0; i < MAX_WIFI_PROFILES; ++i) {
+    value.wifiProfiles[i].ssid = "";
+    value.wifiProfiles[i].password = "";
+  }
 }
 
 enum LegacyStatus { LEGACY_OK, LEGACY_ABSENT, LEGACY_ERROR };
 
-LegacyStatus loadLegacyConfig(Config& value) {
-  setDefaults(value);
+LegacyStatus openLegacyPreferences() {
   nvs_handle_t handle;
   esp_err_t openResult = nvs_open("sms_config", NVS_READONLY, &handle);
-  if (openResult == ESP_ERR_NVS_NOT_FOUND) {
-    return LEGACY_ABSENT;
-  }
+  if (openResult == ESP_ERR_NVS_NOT_FOUND) return LEGACY_ABSENT;
   if (openResult != ESP_OK) return LEGACY_ERROR;
   nvs_close(handle);
-  if (!preferences.begin("sms_config", true)) return LEGACY_ERROR;
+  return preferences.begin("sms_config", true) ? LEGACY_OK : LEGACY_ERROR;
+}
+
+bool legacyWifiProfileValid(const WifiProfile& profile) {
+  return boundedUtf8(profile.ssid, MAX_WIFI_SSID_BYTES) &&
+         wifiPasswordValid(profile.password) &&
+         !(profile.ssid.length() == 0 && profile.password.length() > 0);
+}
+
+void overlayLegacyWifiProfile(Config& value, int index,
+                              const char* ssidKey, const char* passwordKey) {
+  if (preferences.getType(ssidKey) != PT_STR ||
+      preferences.getType(passwordKey) != PT_STR) return;
+  WifiProfile candidate;
+  candidate.ssid = preferences.getString(ssidKey, "");
+  candidate.password = preferences.getString(passwordKey, "");
+  if (legacyWifiProfileValid(candidate)) value.wifiProfiles[index] = candidate;
+}
+
+void overlayLegacyConnectivity(Config& value) {
+  overlayLegacyWifiProfile(value, 0, "wifiSSID", "wifiPass");
+  overlayLegacyWifiProfile(value, 1, "wifiSSID2", "wifiPass2");
+  if (preferences.getType("networkMode") == PT_I32) {
+    int32_t mode = preferences.getInt("networkMode", -1);
+    if (mode >= NETWORK_MODE_WIFI_ONLY && mode <= NETWORK_MODE_MIX)
+      value.networkMode = static_cast<NetworkMode>(mode);
+  }
+  if (preferences.getType("heartbeatEnable") == PT_U8) {
+    uint8_t enabled = preferences.getUChar("heartbeatEnable", 2);
+    if (enabled <= 1) value.heartbeatEnable = enabled == 1;
+  }
+}
+
+LegacyStatus loadLegacyConfig(Config& value) {
+  setDefaults(value);
+  LegacyStatus openResult = openLegacyPreferences();
+  if (openResult != LEGACY_OK) return openResult;
 
   value.smtpServer = preferences.getString("smtpServer", "");
   value.smtpPort = preferences.getInt("smtpPort", 465);
@@ -440,6 +532,12 @@ LegacyStatus loadLegacyConfig(Config& value) {
   value.smtpPass = preferences.getString("smtpPass", "");
   value.smtpSendTo = preferences.getString("smtpSendTo", "");
   value.adminPhone = preferences.getString("adminPhone", "");
+  String remark = preferences.getString("remark", "");
+  if (remark.length() > 0 && boundedUtf8(remark, MAX_DEVICE_NAME_BYTES) &&
+      hasNoAsciiControls(remark)) {
+    value.deviceName = remark;
+  }
+  overlayLegacyConnectivity(value);
   bool hasAccountList = preferences.isKey("account0user");
   for (int i = 0; i < MAX_WEB_ACCOUNTS; ++i) {
     String prefix = "account" + String(i);
@@ -555,9 +653,28 @@ ConfigLoadStatus loadConfig() {
     }
     int selected = !slots[0].valid ? 1 : !slots[1].valid ? 0 :
                    (generationNewer(slots[1].generation, slots[0].generation) ? 1 : 0);
-    config = std::move(slots[selected].value);
+    Config selectedConfig = std::move(slots[selected].value);
     activeSlot = selected;
     activeGeneration = slots[selected].generation;
+    if (slots[selected].schema < CONFIG_SCHEMA_VERSION) {
+      LegacyStatus overlayStatus = openLegacyPreferences();
+      if (overlayStatus == LEGACY_ERROR) {
+        logCaptureLn("Failed to upgrade configuration: could not read legacy connectivity");
+        return CONFIG_LOAD_STORAGE_ERROR;
+      }
+      if (overlayStatus == LEGACY_OK) {
+        overlayLegacyConnectivity(selectedConfig);
+        preferences.end();
+      }
+      if (!storageSemanticsValid(selectedConfig) || !saveConfig(selectedConfig)) {
+        logCaptureLn("Failed to upgrade configuration");
+        return CONFIG_LOAD_STORAGE_ERROR;
+      }
+      config = std::move(selectedConfig);
+      logCaptureLn("Configuration upgraded");
+      return CONFIG_LOAD_OK;
+    }
+    config = std::move(selectedConfig);
     logCaptureLn("Configuration loaded");
     return CONFIG_LOAD_OK;
   }
@@ -640,7 +757,8 @@ PortableConfigStatus decodePortableConfig(const uint8_t* bytes, size_t length,
   Config decoded;
   if (!decodeConfig(bytes, length, decoded, generation, &schema)) {
     return schema != 0 && schema != CONFIG_SCHEMA_VERSION_V1 &&
-                   schema != CONFIG_SCHEMA_VERSION_V2 && schema != CONFIG_SCHEMA_VERSION
+                   schema != CONFIG_SCHEMA_VERSION_V2 && schema != CONFIG_SCHEMA_VERSION_V3 &&
+                   schema != CONFIG_SCHEMA_VERSION
              ? PORTABLE_CONFIG_UNSUPPORTED_VERSION : PORTABLE_CONFIG_INVALID;
   }
   if (generation != 0) return PORTABLE_CONFIG_INVALID;
@@ -648,11 +766,17 @@ PortableConfigStatus decodePortableConfig(const uint8_t* bytes, size_t length,
   decoded.deviceName = target.deviceName;
   decoded.hostname = target.hostname;
   for (int i = 0; i < MAX_WEB_ACCOUNTS; ++i) decoded.webAccounts[i] = target.webAccounts[i];
+  if (schema < CONFIG_SCHEMA_VERSION) {
+    for (int i = 0; i < MAX_WIFI_PROFILES; ++i) decoded.wifiProfiles[i] = target.wifiProfiles[i];
+    decoded.networkMode = target.networkMode;
+    decoded.heartbeatEnable = target.heartbeatEnable;
+    decoded.heartbeatInterval = target.heartbeatInterval;
+  }
   if (!storageSemanticsValid(decoded)) return PORTABLE_CONFIG_INVALID;
   output = std::move(decoded);
   return PORTABLE_CONFIG_OK;
 }
 
 String getDeviceUrl() {
-  return "http://" + WiFi.localIP().toString() + "/";
+  return "http://" + activeNetworkIp() + "/";
 }

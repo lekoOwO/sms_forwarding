@@ -12,5 +12,9 @@ void getDefaultSmsTemplates(const String& locale, String& title, String& body);
 void buildSystemNotificationText(const String& locale, SystemNotificationKind kind,
                                  const String& deviceName, const String& deviceUrl,
                                  String& title, String& body);
+void buildHeartbeatNotificationText(const String& locale, const String& deviceName,
+                                    const String& hostname, const String& localNumber,
+                                    const String& networkAddress, const String& deviceUrl,
+                                    const String& eventTime, String& title, String& body);
 
 #endif

@@ -36,3 +36,25 @@ void buildSystemNotificationText(const String& locale, SystemNotificationKind ki
            "\n裝置網址：" + deviceUrl;
   }
 }
+
+void buildHeartbeatNotificationText(const String& locale, const String& deviceName,
+                                    const String& hostname, const String& localNumber,
+                                    const String& networkAddress, const String& deviceUrl,
+                                    const String& eventTime, String& title, String& body) {
+  if (locale == NOTIFICATION_LOCALE_EN) {
+    title = "SMS Forwarder heartbeat";
+    body = "Device: " + deviceName + "\nHostname: " + hostname +
+           "\nLocal number: " + localNumber + "\nNetwork address: " + networkAddress +
+           "\nDevice URL: " + deviceUrl + "\nEvent: Device online\nTime: " + eventTime;
+  } else if (locale == NOTIFICATION_LOCALE_ZH_CN) {
+    title = "短信转发器心跳";
+    body = "设备：" + deviceName + "\n主机名：" + hostname +
+           "\n本机号码：" + localNumber + "\n网络地址：" + networkAddress +
+           "\n设备网址：" + deviceUrl + "\n事件：设备在线\n时间：" + eventTime;
+  } else {
+    title = "簡訊轉發器心跳";
+    body = "裝置：" + deviceName + "\n主機名稱：" + hostname +
+           "\n本機號碼：" + localNumber + "\n網路位址：" + networkAddress +
+           "\n裝置網址：" + deviceUrl + "\n事件：設備在線\n時間：" + eventTime;
+  }
+}

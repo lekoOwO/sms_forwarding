@@ -11,9 +11,40 @@
 #include "sms_process.h"
 
 static volatile bool managementHttpEnabled = false;
+static bool heartbeatClockStarted = false;
+static uint32_t lastHeartbeatTime = 0;
 
 extern "C" bool verifyRollbackLater() {
   return true;
+}
+
+void heartbeatTick() {
+  bool timeValid = time(nullptr) >= 1700000000;
+  if (!config.heartbeatEnable || !timeValid) {
+    heartbeatClockStarted = false;
+    return;
+  }
+  uint32_t now = millis();
+  if (!heartbeatClockStarted) {
+    heartbeatClockStarted = true;
+    lastHeartbeatTime = now;
+    return;
+  }
+  uint32_t interval = static_cast<uint32_t>(config.heartbeatInterval) * 3600000UL;
+  if (now - lastHeartbeatTime < interval) return;
+  lastHeartbeatTime = now;
+
+  time_t epoch = time(nullptr);
+  struct tm utc;
+  gmtime_r(&epoch, &utc);
+  char timeText[24];
+  strftime(timeText, sizeof(timeText), "%Y-%m-%d %H:%M:%S UTC", &utc);
+  String title;
+  String body;
+  buildHeartbeatNotificationText(config.notificationLocale, config.deviceName, config.hostname,
+                                 modemGetLocalNumber(), activeNetworkIp(), getDeviceUrl(),
+                                 timeText, title, body);
+  sendSystemPushNotification(title, body, timeText);
 }
 
 void setup() {
@@ -35,37 +66,15 @@ void setup() {
   bool configStorageAvailable = configLoadStatus != CONFIG_LOAD_STORAGE_ERROR;
   configValid = configStorageAvailable && isConfigValid();
 
-  // ---- WiFi connection tuning ----
-  WiFi.mode(WIFI_STA);
-  if (!WiFi.setHostname(config.hostname.c_str())) {
-    logCaptureLn("Failed to apply WiFi hostname");
-  }
-  WiFi.setSleep(false);                    // Disable modem sleep for faster connection response.
-  WiFi.setAutoReconnect(true);             // Reconnect automatically after disconnection.
-  // Use a fast scan instead of scanning every channel, which waits too long on empty channels.
-  // ESP32 remembers the channel after the first successful connection for faster startup.
-  WiFi.setScanMethod(WIFI_FAST_SCAN);
-  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  logCaptureLn(String("Connecting to WiFi: ") + String(WIFI_SSID));
-
-  // Wait for the connection with a timeout; restart and retry on failure.
-  unsigned long wifiStart = millis();
-  const unsigned long WIFI_TIMEOUT = 20000; // 20-second timeout.
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < WIFI_TIMEOUT) {
-    blink_short(200);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
+  if (connectWifi()) {
     logCaptureLn(String("WiFi connected"));
     logCapture(String("IP address: "));
     logCaptureLn(WiFi.localIP().toString());
     logCapture(String("Signal strength (RSSI): "));
     logCaptureLn(String(WiFi.RSSI()) + " dBm");
   } else {
-    logCaptureLn(String("⚠️ WiFi connection timed out; restarting to retry..."));
-    delay(1000);
-    ESP.restart();
+    logCaptureLn(String("WiFi connection timed out; starting provisioning AP"));
+    if (!startProvisioningAp()) logCaptureLn("Failed to start provisioning AP");
   }
 
   if (configStorageAvailable) {
@@ -132,13 +141,15 @@ void setup() {
 
   // ---- Modem initialization (slow, but the web UI is already available) ----
   modemInit();
-  otaConfirmHealthy(configStorageAvailable && WiFi.status() == WL_CONNECTED && managementHttpEnabled);
+  otaConfirmHealthy(configStorageAvailable && networkAccessReady() && managementHttpEnabled);
 }
 
 void loop() {
+  networkTick();
   processWebJobs();
   otaTick();
   configBackupTick();
+  heartbeatTick();
   if (managementHttpEnabled && !configValid) {
     if (millis() - lastPrintTime >= 1000) {
       lastPrintTime = millis();

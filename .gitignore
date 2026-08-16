@@ -1,4 +1,5 @@
 code/wifi_config.h
+code/wifi_config.local.h
 compose.override.yaml
 .secrets/
 /build/

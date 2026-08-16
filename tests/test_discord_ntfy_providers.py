@@ -13,7 +13,7 @@ class DiscordNtfyProviderTest(unittest.TestCase):
             (ROOT / "dev_doc/config-schema" / manifest["versions"][str(manifest["currentVersion"])]).read_text()
         )
         push_type = schema["properties"]["config"]["properties"]["pushChannels"]["items"]["properties"]["type"]
-        self.assertEqual(manifest["currentVersion"], 3)
+        self.assertEqual(manifest["currentVersion"], 4)
         self.assertEqual(push_type["x-enumMapping"]["PUSH_TYPE_DISCORD"], 11)
         self.assertEqual(push_type["x-enumMapping"]["PUSH_TYPE_NTFY"], 12)
         self.assertEqual(push_type["maximum"], 12)
@@ -36,12 +36,12 @@ class DiscordNtfyProviderTest(unittest.TestCase):
         self.assertIn('json["content"] = content;', discord_body)
         self.assertIn('json["allowed_mentions"]["parse"].to<JsonArray>();', discord_body)
         self.assertIn("utf8CodePointCount(content.c_str(), 2000)", discord_body)
-        self.assertIn("postJson(http, channel.url, json, httpCode)", discord_body)
+        self.assertIn("postJson(http, cellular, channel.url, json, httpCode)", discord_body)
         self.assertNotIn('"{\\"content\\"', discord_body)
 
         ntfy_body = source.split("case PUSH_TYPE_NTFY:", 1)[1].split("default:", 1)[0]
-        self.assertIn('http.addHeader("Title", notificationTitle);', ntfy_body)
-        self.assertIn("httpCode = http.POST(notificationBody);", ntfy_body)
+        self.assertIn('postPayload(http, cellular, channel.url, "text/plain",', ntfy_body)
+        self.assertIn('"Title: " + notificationTitle, notificationBody, httpCode)', ntfy_body)
         self.assertNotIn("priority", ntfy_body.lower())
 
         config = (ROOT / "code/config.cpp").read_text()

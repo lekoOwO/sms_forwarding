@@ -5,6 +5,8 @@
 
 void sendEmailNotification(const char* subject, const char* body);
 void sendSMSToServer(const char* sender, const char* message, const char* timestamp);
+void sendSystemPushNotification(const String& title, const String& body,
+                                const String& timestamp);
 void sendToChannel(const PushChannel& channel, const char* sender, const char* message, const char* timestamp);
 bool buildDefaultSmsNotification(const char* sender, const char* message, const char* timestamp,
                                  String& title, String& body);

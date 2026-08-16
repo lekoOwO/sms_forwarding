@@ -153,9 +153,9 @@ int main() {
         wifi_handler = handlers[start:]
         response = wifi_handler.index('sendActionResult(200, true, "ACTION_WIFI_RESTARTING")')
         grace_period = wifi_handler.index("delay(500);", response)
-        disconnect = wifi_handler.index("WiFi.disconnect(true);", response)
+        reconnect = wifi_handler.index("connectWifi()", response)
         self.assertLess(response, grace_period)
-        self.assertLess(grace_period, disconnect)
+        self.assertLess(grace_period, reconnect)
 
     def test_account_updates_cannot_restore_default_credentials(self):
         handlers = (ROOT / "code/web_handlers.cpp").read_text()
