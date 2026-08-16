@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sms-forwarder.example/config-schema/v3.json",
+  "title": "SMS Forwarder configuration v3",
+  "x-binaryCodec": {
+    "magic": "CFG2",
+    "byteOrder": "little-endian",
+    "header": ["magic:u32", "schemaVersion:u16", "flags:u16", "generation:u32", "payloadLength:u32", "payloadCrc32:u32"]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "schemaVersion", "config"],
+  "properties": {
+    "format": { "const": "sms-forwarding-config" },
+    "schemaVersion": { "const": 3 },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deviceName", "hostname", "notificationLocale", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "webAccounts", "pushChannels"],
+      "properties": {
+        "smtpPort": { "type": "integer", "minimum": 1, "maximum": 65535, "x-codecOrder": 0 },
+        "deviceName": { "type": "string", "minLength": 1, "maxLength": 64, "x-maxUtf8Bytes": 64, "x-codecOrder": 1, "x-portableRestore": false, "x-portableValue": "Portable backup" },
+        "hostname": { "type": "string", "minLength": 1, "maxLength": 32, "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$", "x-codecOrder": 2, "x-portableRestore": false, "x-portableValue": "portable-backup" },
+        "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"], "x-maxUtf8Bytes": 16, "x-codecOrder": 3 },
+        "smtpServer": { "type": "string", "maxLength": 253, "x-maxUtf8Bytes": 253, "x-codecOrder": 4 },
+        "smtpUser": { "type": "string", "maxLength": 254, "x-maxUtf8Bytes": 254, "x-codecOrder": 5 },
+        "smtpPass": { "type": "string", "maxLength": 256, "x-maxUtf8Bytes": 256, "x-codecOrder": 6, "x-sensitive": true },
+        "smtpSendTo": { "type": "string", "maxLength": 254, "x-maxUtf8Bytes": 254, "x-codecOrder": 7 },
+        "adminPhone": { "type": "string", "maxLength": 32, "x-maxUtf8Bytes": 32, "x-codecOrder": 8, "x-sensitive": true },
+        "numberBlackList": { "type": "string", "maxLength": 1024, "x-maxUtf8Bytes": 1024, "x-codecOrder": 9, "x-sensitive": true },
+        "webAccounts": {
+          "type": "array",
+          "minItems": 10,
+          "maxItems": 10,
+          "x-itemCount": 10,
+          "x-codecOrder": 10,
+          "x-portableRestore": false,
+          "x-portableValue": "empty",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["username", "password"],
+            "properties": {
+              "username": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64, "x-codecOrder": 0 },
+              "password": { "type": "string", "maxLength": 96, "x-maxUtf8Bytes": 96, "x-codecOrder": 1, "x-sensitive": true }
+            }
+          }
+        },
+        "pushChannels": {
+          "type": "array",
+          "minItems": 5,
+          "maxItems": 5,
+          "x-itemCount": 5,
+          "x-codecOrder": 11,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["enabled", "type", "name", "url", "key1", "key2", "titleTemplate", "bodyTemplate", "customBody"],
+            "properties": {
+              "enabled": { "type": "boolean", "x-codecOrder": 0 },
+              "type": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 12,
+                "x-codecOrder": 1,
+                "x-enumMapping": {
+                  "PUSH_TYPE_NONE": 0,
+                  "PUSH_TYPE_POST_JSON": 1,
+                  "PUSH_TYPE_BARK": 2,
+                  "PUSH_TYPE_GET": 3,
+                  "PUSH_TYPE_DINGTALK": 4,
+                  "PUSH_TYPE_PUSHPLUS": 5,
+                  "PUSH_TYPE_SERVERCHAN": 6,
+                  "PUSH_TYPE_CUSTOM": 7,
+                  "PUSH_TYPE_FEISHU": 8,
+                  "PUSH_TYPE_GOTIFY": 9,
+                  "PUSH_TYPE_TELEGRAM": 10,
+                  "PUSH_TYPE_DISCORD": 11,
+                  "PUSH_TYPE_NTFY": 12
+                }
+              },
+              "name": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64, "x-codecOrder": 2 },
+              "url": { "type": "string", "maxLength": 512, "x-maxUtf8Bytes": 512, "x-codecOrder": 3, "x-sensitive": true },
+              "key1": { "type": "string", "maxLength": 256, "x-maxUtf8Bytes": 256, "x-codecOrder": 4, "x-sensitive": true },
+              "key2": { "type": "string", "maxLength": 256, "x-maxUtf8Bytes": 256, "x-codecOrder": 5, "x-sensitive": true },
+              "titleTemplate": { "type": "string", "maxLength": 256, "x-maxUtf8Bytes": 256, "x-maxRenderedUtf8Bytes": 256, "x-codecOrder": 6 },
+              "bodyTemplate": { "type": "string", "maxLength": 2048, "x-maxUtf8Bytes": 2048, "x-maxRenderedUtf8Bytes": 8192, "x-codecOrder": 7 },
+              "customBody": { "type": "string", "maxLength": 2048, "x-maxUtf8Bytes": 2048, "x-maxRenderedUtf8Bytes": 8192, "x-codecOrder": 8, "x-sensitive": true }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "type": { "const": 7 } }, "required": ["type"] },
+                "then": {
+                  "properties": {
+                    "titleTemplate": { "maxLength": 0 },
+                    "bodyTemplate": { "maxLength": 0 }
+                  }
+                },
+                "else": { "properties": { "customBody": { "maxLength": 0 } } }
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
