@@ -10,6 +10,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+$ExpectedIdfVersion = '5.5.4'
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $BuildDir = Join-Path $RepoRoot 'build\idf'
 $SdkConfig = Join-Path $RepoRoot 'build\sdkconfig'
@@ -30,6 +31,11 @@ New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
 $env:IDF_TOOLS_PATH = $IdfToolsPath
 . $ExportScript
+
+$IdfVersionOutput = (& idf.py --version 2>&1) -join "`n"
+if ($IdfVersionOutput -notmatch [regex]::Escape($ExpectedIdfVersion)) {
+    throw "ESP-IDF $ExpectedIdfVersion is required; got: $IdfVersionOutput"
+}
 
 $IdfArgs = @('-B', $BuildDir, '-D', "SDKCONFIG=$SdkConfig")
 

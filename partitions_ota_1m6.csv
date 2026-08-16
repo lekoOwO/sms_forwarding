@@ -1,9 +1,9 @@
 # Name,   Type, SubType, Offset,  Size, Flags
-# app0/app1 各 1.625MB(0x1A0000)：当前固件 ~1.24MB，单槽仍留约 24% 余量给后续功能(如 eSIM)。
-# smsdata(NVS) 640KB：短信本地留存，NVS 自带磨损均衡+掉电原子，远超实际用量、留足寿命headroom。
+# 4MiB flash：两个 1.875MiB OTA 槽位，末尾保留配置与 coredump 分区。
+# appcfg 仅用于应用配置；短信收件箱不使用持久化分区。
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x1A0000,
-app1,     app,  ota_1,   0x1B0000,0x1A0000,
-smsdata,  data, nvs,     0x350000,0xA0000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,
+app1,     app,  ota_1,   0x1F0000,0x1E0000,
+appcfg,   data, nvs,     0x3D0000,0x20000,
 coredump, data, coredump,0x3F0000,0x10000,
