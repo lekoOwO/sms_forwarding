@@ -10,8 +10,15 @@ WEB = ROOT / "components/idf_web"
 
 
 def function_body(source: str, name: str) -> str:
-    start = source.index(f" {name}(")
-    start = source.index("{", start) + 1
+    search = 0
+    while True:
+        start = source.index(f" {name}(", search)
+        brace = source.index("{", start)
+        declaration_end = source.find(";", start, brace)
+        if declaration_end < 0:
+            break
+        search = brace + 1
+    start = brace + 1
     depth = 1
     for index in range(start, len(source)):
         if source[index] == "{":
@@ -83,6 +90,13 @@ int main() {
     std::string too_many;
     for (int i = 0; i < 49; ++i) too_many += (i ? "&" : "") + std::string("x") + std::to_string(i) + "=1";
     assert(!idf_web_decode_form(too_many, 48).valid);
+    std::string config_update;
+    for (int i = 0; i < 51; ++i) config_update += (i ? "&" : "") + std::string("x") + std::to_string(i) + "=1";
+    const IdfWebFormDecodeResult max_config_update = idf_web_decode_form(config_update, 51);
+    assert(max_config_update.valid && !max_config_update.too_many_fields && max_config_update.fields.size() == 51);
+    config_update += "&x51=1";
+    const IdfWebFormDecodeResult oversized_config_update = idf_web_decode_form(config_update, 51);
+    assert(!oversized_config_update.valid && oversized_config_update.too_many_fields);
 
     char request_body[] = "content=before";
     IdfWebOwnedJobInput owned = idf_web_own_job_input("sms", request_body,
@@ -312,8 +326,11 @@ int main() {
     assert "check_csrf(req)" not in function_body(source, "handle_query")
     modern_save = function_body(source, "handle_modern_save")
     save = function_body(source, "handle_save")
+    run_save = function_body(source, "run_save_job")
     assert save.index("reject_oversized_body(req)") < save.index("check_auth(req)")
     assert 'enqueue_api_job(req, "save", body)' in save
+    assert re.search(r"idf_web_decode_form\(body,\s*51\)", run_save)
+    assert re.search(r"idf_web_decode_form\(body,\s*51\)", save)
     assert "idf_config_get()" not in source
     assert "idf_config_save_accounts(accounts, true)" in modern_save
     for api in (
@@ -356,6 +373,14 @@ int main() {
     assert '"400 Bad Request"' in wifi_config
     assert '"409 Conflict"' in wifi_config
     assert '"500 Internal Server Error"' in wifi_config
+
+    assert "static bool keepalive_traffic_preflight" in source
+    keepalive = function_body(source, "keepalive_task")
+    assert keepalive.index("keepalive_traffic_preflight") < keepalive.index("keepalive_prepare_esim")
+    traffic_preflight = function_body(source, "keepalive_traffic_preflight")
+    assert "IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB" in traffic_preflight
+    assert "cfg.kaTrafficKB > static_cast<int>(IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB)" in traffic_preflight
+    assert "Keepalive traffic exceeds the safe 512 KB UART runtime limit" in traffic_preflight
 
 
 if __name__ == "__main__":

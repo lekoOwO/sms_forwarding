@@ -37,16 +37,16 @@ class ConfigSchemaTest(unittest.TestCase):
             path = SCHEMA_DIR / manifest["versions"][str(version)]
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
 
-    def test_v5_covers_durable_idf_fields_and_portable_boundaries(self) -> None:
+    def test_v6_covers_keepalive_traffic_and_legacy_migration(self) -> None:
         manifest = json.loads((SCHEMA_DIR / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["currentVersion"], 5)
-        schema = json.loads((SCHEMA_DIR / manifest["versions"]["5"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["currentVersion"], 6)
+        schema = json.loads((SCHEMA_DIR / manifest["versions"]["6"]).read_text(encoding="utf-8"))
         config = schema["properties"]["config"]["properties"]
         self.assertNotIn("wifiFromFallback", config)
         for field in (
             "deviceName", "notificationLocale", "wifiProfiles", "networkMode", "heartbeatEnable",
             "heartbeatInterval", "wifiTxPowerQuarterDbm", "webAccounts",
-            "emailEnabled", "pushEnabled", "forwardRules", "kaEnabled", "kaIntervalDays",
+            "emailEnabled", "pushEnabled", "forwardRules", "kaEnabled", "kaIntervalDays", "kaTrafficKB",
             "kaAction", "kaTarget", "kaUrl", "kaProfile", "kaLastTime", "tzOffsetMin",
             "ntpServer", "rebootEnabled", "rebootHour",
             "smsHealthEnabled", "smsHealthHour", "smsHealthNotify", "netLedEnabled",
@@ -59,6 +59,19 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertNotIn("mdnsHost", config)
         self.assertNotIn("hbEnabled", config)
         self.assertNotIn("hbHour", config)
+        self.assertEqual(
+            schema["x-legacyMigration"]["keepalive"],
+            {
+                "enabled": {"from": "kaEnable", "target": "kaEnabled"},
+                "intervalDays": {"from": "kaIntervalDays", "target": "kaIntervalDays"},
+                "trafficKB": {"from": "kaTraffic", "target": "kaTrafficKB"},
+                "baseDate": {"from": "kaBaseDate", "target": "kaLastTime"},
+            },
+        )
+        self.assertEqual(config["kaTrafficKB"]["minimum"], 1)
+        self.assertEqual(config["kaTrafficKB"]["maximum"], 10000)
+        self.assertEqual(config["kaTrafficKB"]["default"], 1)
+        self.assertEqual(config["kaTrafficKB"]["x-runtimeMax"], 512)
         self.assertEqual(
             schema["x-legacyMigration"],
             {
@@ -75,6 +88,12 @@ class ConfigSchemaTest(unittest.TestCase):
                     "policy": "ignore-use-default",
                     "default": 6,
                     "reason": "daily clock hour has no interval equivalent",
+                },
+                "keepalive": {
+                    "enabled": {"from": "kaEnable", "target": "kaEnabled"},
+                    "intervalDays": {"from": "kaIntervalDays", "target": "kaIntervalDays"},
+                    "trafficKB": {"from": "kaTraffic", "target": "kaTrafficKB"},
+                    "baseDate": {"from": "kaBaseDate", "target": "kaLastTime"},
                 },
             },
         )
@@ -135,14 +154,14 @@ class ConfigSchemaTest(unittest.TestCase):
 
     def test_worst_case_wire_size_is_bounded(self) -> None:
         manifest = json.loads((SCHEMA_DIR / "manifest.json").read_text(encoding="utf-8"))
-        schema = json.loads((SCHEMA_DIR / manifest["versions"]["5"]).read_text(encoding="utf-8"))
+        schema = json.loads((SCHEMA_DIR / manifest["versions"]["6"]).read_text(encoding="utf-8"))
         wire = schema["x-wireCodec"]
         self.assertEqual(wire["headerBytes"], 20)
         self.assertEqual(wire["stringLengthPrefixBytes"], 2)
         self.assertEqual(wire["arrayCountBytes"], 1)
         self.assertEqual(wire["scalarBytes"], {"boolean": 1, "integer": 4})
-        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 26752)
-        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 26732)
+        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 26756)
+        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 26736)
         self.assertEqual(
             schema["x-wireWorstCase"]["headroomBytes"],
             manifest["maxBinaryBytes"] - schema["x-wireWorstCase"]["binaryBytes"],
@@ -158,13 +177,13 @@ class ConfigSchemaTest(unittest.TestCase):
         header = (ROOT / "components/idf_config/include/config_schema_generated.h").read_text(
             encoding="utf-8"
         )
-        self.assertIn("CONFIG_SCHEMA_VERSION = 5", header)
+        self.assertIn("CONFIG_SCHEMA_VERSION = 6", header)
         self.assertIn("MAX_SIM_CREDENTIALS 5", header)
         self.assertIn("PUSH_TYPE_NTFY = 12", header)
         self.assertNotIn("MAX_WEB_USER_BYTES", header)
         self.assertNotIn("MAX_WEB_PASS_BYTES", header)
-        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26752", header)
-        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6016", header)
+        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26756", header)
+        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6012", header)
         self.assertNotIn("MAX_MDNS_HOST_BYTES", header)
 
 

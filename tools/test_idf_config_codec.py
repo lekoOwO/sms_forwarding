@@ -64,10 +64,12 @@ esp_err_t nvs_flash_erase_partition(const char*);
 """
 
 
-HOST_TEST_CPP = r"""#include <cstdio>
+HOST_TEST_CPP = r"""#include <algorithm>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -267,6 +269,10 @@ int main() {
     fake_legacy_i32["networkMode"] = NETWORK_MODE_MIX;
     fake_legacy_i32["heartbeatInterval"] = 24;
     fake_legacy_u8["heartbeatEnable"] = 0;
+    fake_legacy_u8["kaEnable"] = 0;
+    fake_legacy_i32["kaIntervalDays"] = 60;
+    fake_legacy_i32["kaTraffic"] = 1;
+    fake_legacy_u32["kaBaseDate"] = 1700000000;
     IdfConfig legacy_config;
     bool legacy_existed = false;
     require(loadLegacy(legacy_config, legacy_existed));
@@ -277,6 +283,8 @@ int main() {
     require(legacy_config.deviceName == "Migrated Device");
     require(legacy_config.networkMode == NETWORK_MODE_MIX && !legacy_config.heartbeatEnable &&
             legacy_config.heartbeatInterval == 24);
+    require(!legacy_config.kaEnabled && legacy_config.kaIntervalDays == 60 &&
+            legacy_config.kaTrafficKB == 1 && legacy_config.kaLastTime == 1700000000);
     IdfConfig overlay = defaults();
     require(overlayLegacyConnectivity(overlay));
     require(overlay.wifiNetworks[0].ssid == "develop-wifi" &&
@@ -316,6 +324,7 @@ int main() {
     original.wifiTxPowerQuarterDbm = WIFI_TX_POWER_20DBM;
     original.kaProfile = "source-profile";
     original.kaLastTime = 123456;
+    original.kaTrafficKB = 1234;
     original.phoneNumber = "+886900000001";
     original.simCredentials[0].iccid = "898600000000000000001";
     original.simCredentials[0].pin = "1234";
@@ -380,6 +389,7 @@ int main() {
     require(portable_decoded.wifiTxPowerQuarterDbm == portable_target.wifiTxPowerQuarterDbm);
     require(portable_decoded.kaProfile == portable_target.kaProfile);
     require(portable_decoded.kaLastTime == portable_target.kaLastTime);
+    require(portable_decoded.kaTrafficKB == original.kaTrafficKB);
     require(portable_decoded.roamingEnabled == portable_target.roamingEnabled);
     require(portable_decoded.phoneNumber == portable_target.phoneNumber);
     require(portable_decoded.simCredentials[0].iccid == portable_target.simCredentials[0].iccid);
@@ -416,12 +426,16 @@ int main() {
     invalid_c1.deviceName = std::string("bad\xC1\x81", 5);
     require(!semanticallyValid(invalid_c1));
 
+    std::vector<uint8_t> v5_blob;
     std::vector<uint8_t> blob;
-    require(encodeV5(original, 42, blob));
+    require(encodeV5(original, 42, v5_blob));
+    require(encodeV6(original, 42, blob));
+    require(blob.size() == v5_blob.size() + sizeof(uint32_t));
+    require(std::equal(v5_blob.begin() + kHeaderBytes, v5_blob.end(), blob.begin() + kHeaderBytes));
     IdfConfig decoded;
     uint16_t schema = 0;
     uint32_t generation = 0;
-    Reader direct_reader(blob.data() + kHeaderBytes, blob.data() + blob.size());
+    Reader direct_reader(v5_blob.data() + kHeaderBytes, v5_blob.data() + v5_blob.size());
     IdfConfig direct_decoded;
     bool direct_ok = decodeV5(direct_reader, direct_decoded);
     require(direct_ok && direct_reader.atEnd() && semanticallyValid(direct_decoded));
@@ -435,6 +449,15 @@ int main() {
     require(decoded.wifiNetworks[0].pass == "password");
     require(!decoded.roamingEnabled);
 
+    require(encodeV5(defaults(), 43, v5_blob));
+    require(decodeBlob(v5_blob, decoded, schema, generation) == DecodeResult::Valid);
+    require(schema == 5 && generation == 43 && decoded.kaTrafficKB == DEFAULT_KEEPALIVE_TRAFFIC_KB);
+    writeHeader(v5_blob, 5, 0, kHeaderBytes);
+    portable_target.kaTrafficKB = 4321;
+    require(idf_config_storage_decode_portable(v5_blob.data(), v5_blob.size(), portable_target,
+                                               portable_decoded) == IdfPortableConfigStatus::Ok);
+    require(portable_decoded.kaTrafficKB == portable_target.kaTrafficKB);
+
     std::vector<uint8_t> bad_crc = blob;
     bad_crc.back() ^= 0x01;
     require(decodeBlob(bad_crc, decoded, schema, generation) == DecodeResult::Invalid);
@@ -447,7 +470,10 @@ int main() {
 
     IdfConfig invalid = original;
     invalid.wifiNetworks[0].ssid.assign(MAX_WIFI_SSID_BYTES + 1, 'x');
-    require(!encodeV5(invalid, 43, blob));
+    require(!encodeV6(invalid, 43, blob));
+    IdfConfig invalid_traffic = original;
+    invalid_traffic.kaTrafficKB = MAX_KEEPALIVE_TRAFFIC_KB + 1;
+    require(!encodeV6(invalid_traffic, 43, blob));
 
     IdfConfig maximum = defaults();
     maximum.deviceName.assign(MAX_DEVICE_NAME_BYTES, 'D');
@@ -484,6 +510,7 @@ int main() {
     maximum.kaTarget.assign(MAX_KEEPALIVE_TARGET_BYTES, 't');
     maximum.kaUrl.assign(MAX_KEEPALIVE_URL_BYTES, 'u');
     maximum.kaProfile.assign(MAX_KEEPALIVE_PROFILE_BYTES, 'k');
+    maximum.kaTrafficKB = MAX_KEEPALIVE_TRAFFIC_KB;
     maximum.tzOffsetMin = 840;
     maximum.ntpServer.assign(MAX_NTP_SERVER_BYTES, 'n');
     maximum.rebootHour = 23;
@@ -510,7 +537,7 @@ int main() {
     }
     require(semanticallyValid(maximum));
     std::vector<uint8_t> maximum_blob;
-    require(encodeV5(maximum, 44, maximum_blob));
+    require(encodeV6(maximum, 44, maximum_blob));
     require(maximum_blob.size() <= MAX_CONFIG_BLOB_SIZE);
     size_t maximum_portable_size = 0;
     require(idf_config_storage_encode_portable(maximum, portable_storage,
@@ -535,7 +562,7 @@ int main() {
                         public_portable_storage + public_maximum_size - 1,
                         [](uint8_t value) { return value == 0; }));
     std::vector<uint8_t> live_after_failure;
-    require(encodeV5(s_config, 44, live_after_failure));
+    require(encodeV6(s_config, 44, live_after_failure));
     require(live_after_failure == maximum_blob &&
             s_config.smtpServer == live_smtp_before_failure);
     require(idf_config_export_portable(nullptr, sizeof(public_portable_storage),
@@ -718,7 +745,7 @@ int main() {
     // future schema is ignored when older, but blocks when newer.
     IdfConfig slot_value = defaults();
     std::vector<uint8_t> slot_blob;
-    require(encodeV5(slot_value, 10, slot_blob));
+    require(encodeV6(slot_value, 10, slot_blob));
     FakeStore store;
     fake_store = &store;
     FakeStore allocation_failure_store;
@@ -788,7 +815,7 @@ int main() {
     fake_store = &migration_store;
     migration_store.state_present = true;
     migration_store.state = CONFIG_STATE_MIGRATING;
-    require(encodeV5(defaults(), 1, migration_store.blobs[0]));
+    require(encodeV6(defaults(), 1, migration_store.blobs[0]));
     s_partitionReady = false;
     s_activeSlot = -1;
     s_activeGeneration = 0;
@@ -809,7 +836,7 @@ int main() {
     fake_store = &malformed_store;
     malformed_store.state_present = true;
     malformed_store.state = CONFIG_STATE_MIGRATING;
-    require(encodeV5(defaults(), 1, malformed_store.blobs[0]));
+    require(encodeV6(defaults(), 1, malformed_store.blobs[0]));
     writeMarker(malformed_store.markers[0], CONFIG_SCHEMA_VERSION, 1,
                 static_cast<uint32_t>(malformed_store.blobs[0].size()), 0);
     s_activeSlot = -1;

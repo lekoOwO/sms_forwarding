@@ -45,9 +45,17 @@ struct IdfCellularHttpResult {
     std::string message;
 };
 
+// The MHTTP body is streamed over the 115200-baud UART and has a 90-second
+// download deadline. Keep the configurable schema range broad, but refuse a
+// keepalive threshold above this conservative runtime limit before activation.
+static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB = 512;
+static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES =
+    IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB * 1024UL;
+
 struct IdfCellularHttpConfig {
     bool dataEnabled = false;
     std::string apn;
+    uint32_t minPayloadBytes = 48UL * 1024UL;
 };
 
 // Return immediately when the fixed command slots are full. ESP_ERR_TIMEOUT means an enqueued command timed out.

@@ -545,14 +545,16 @@ static esp_err_t handle_status(httpd_req_t* req)
              "\"tzOffsetMin\":%d,\"rebootEnabled\":%s,\"rebootHour\":%d,"
              "\"hbEnabled\":%s,\"hbHour\":%d,"
              "\"smsHealthEnabled\":%s,\"smsHealthHour\":%d,\"smsHealthNotify\":%s,"
-             "\"dataEnabled\":%s,\"roamingEnabled\":%s,",
+             "\"dataEnabled\":%s,\"roamingEnabled\":%s,"
+             "\"kaEnabled\":%s,\"kaIntervalDays\":%d,\"kaTrafficKB\":%d,",
              cfg.tzOffsetMin,
              cfg.rebootEnabled ? "true" : "false", cfg.rebootHour,
              cfg.hbEnabled ? "true" : "false", cfg.hbHour,
              cfg.smsHealthEnabled ? "true" : "false", cfg.smsHealthHour,
              cfg.smsHealthNotify ? "true" : "false",
              cfg.dataEnabled ? "true" : "false",
-             cfg.roamingEnabled ? "true" : "false");
+             cfg.roamingEnabled ? "true" : "false",
+             cfg.kaEnabled ? "true" : "false", cfg.kaIntervalDays, cfg.kaTrafficKB);
     body += buf;
     json_prop(body, "apn", cfg.apn); body += ",";
     json_prop(body, "phoneNumber", cfg.phoneNumber); body += ",";
@@ -687,8 +689,10 @@ static esp_err_t handle_api_config(httpd_req_t* req)
         body += "}";
     }
     snprintf(buf, sizeof(buf),
-             "],\"networkMode\":%d,\"heartbeatEnable\":%s,\"heartbeatInterval\":%d,",
-             cfg.networkMode, cfg.heartbeatEnable ? "true" : "false", cfg.heartbeatInterval);
+             "],\"networkMode\":%d,\"heartbeatEnable\":%s,\"heartbeatInterval\":%d,"
+             "\"kaEnabled\":%s,\"kaIntervalDays\":%d,\"kaTrafficKB\":%d,",
+             cfg.networkMode, cfg.heartbeatEnable ? "true" : "false", cfg.heartbeatInterval,
+             cfg.kaEnabled ? "true" : "false", cfg.kaIntervalDays, cfg.kaTrafficKB);
     body += buf;
     body += "\"pushChannels\":[";
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
@@ -2290,6 +2294,7 @@ enum class ModernSaveFamily : uint8_t {
     Wifi,
     Network,
     Heartbeat,
+    Keepalive,
     Accounts,
 };
 
@@ -2312,6 +2317,9 @@ static ModernSaveFamily modern_save_field_family(const std::string& key)
     if (key == "adminPhone" || key == "numberBlackList") return ModernSaveFamily::Routing;
     if (key == "networkMode") return ModernSaveFamily::Network;
     if (key == "heartbeatEnable" || key == "heartbeatInterval") return ModernSaveFamily::Heartbeat;
+    if (key == "kaEnabled" || key == "kaIntervalDays" || key == "kaTrafficKB") {
+        return ModernSaveFamily::Keepalive;
+    }
     for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template"}) {
         if (indexed_save_key(key, "push", suffix, IDF_MAX_PUSH_CHANNELS) >= 0) return ModernSaveFamily::Push;
     }
@@ -2331,7 +2339,8 @@ static size_t modern_field_limit(const std::string& key)
     if (key == "notificationLocale") return 16;
     if (key == "smtpServer") return 253;
     if (key == "smtpPort" || key == "networkMode" || key == "heartbeatEnable" ||
-        key == "heartbeatInterval") return 32;
+        key == "heartbeatInterval" || key == "kaEnabled" || key == "kaIntervalDays" ||
+        key == "kaTrafficKB") return 32;
     if (key == "smtpUser" || key == "smtpSendTo") return 254;
     if (key == "smtpPass") return 256;
     if (key == "adminPhone") return 32;
@@ -2436,6 +2445,26 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         }
         return send_modern_save_result(req,
             idf_config_save_heartbeat(has_field(fields, "heartbeatEnable"), interval), "heartbeat");
+    }
+
+    if (family == ModernSaveFamily::Keepalive) {
+        const IdfKeepaliveRunView current = idf_config_get_keepalive_run_view();
+        int interval = current.kaIntervalDays;
+        int traffic = current.kaTrafficKB;
+        if ((has_field(fields, "kaIntervalDays") &&
+             !parse_int_strict(field_text(fields, "kaIntervalDays"), interval)) ||
+            interval < 1 || interval > 3650) {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaIntervalDays");
+        }
+        if ((has_field(fields, "kaTrafficKB") &&
+             !parse_int_strict(field_text(fields, "kaTrafficKB"), traffic)) ||
+            traffic < MIN_KEEPALIVE_TRAFFIC_KB || traffic > MAX_KEEPALIVE_TRAFFIC_KB) {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaTrafficKB");
+        }
+        return send_modern_save_result(req,
+            idf_config_save_keepalive(has_field(fields, "kaEnabled"), interval, current.kaAction,
+                                      current.kaTarget, current.kaUrl, current.kaProfile, traffic),
+            "keepalive");
     }
 
     if (family == ModernSaveFamily::Email) {
@@ -2545,7 +2574,7 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
 
 static std::string run_save_job(const std::string& body)
 {
-    const IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 48);
+    const IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 51);
     if (!decoded.valid) return action_result(false, decoded.too_many_fields ?
         "ACTION_TOO_MANY_FIELDS" : "ACTION_INPUT_INVALID");
     const esp_err_t err = handle_modern_save(nullptr, decoded.fields);
@@ -2576,7 +2605,7 @@ static esp_err_t handle_save(httpd_req_t* req)
     std::string body;
     // 16KB: five custom push templates plus URL-encoded forwarding rules can exceed 8KB.
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
-    const IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 48);
+    const IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 51);
     if (!decoded.valid) return send_action_error(req, decoded.too_many_fields ?
         "ACTION_TOO_MANY_FIELDS" : "ACTION_INPUT_INVALID", "form");
     std::string detail;
@@ -2759,12 +2788,14 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (ka_form) {
+        const IdfKeepaliveRunView current = idf_config_get_keepalive_run_view();
         esp_err_t err = idf_config_save_keepalive(has_field(fields, "kaEnabled"),
-                                                  field_int(fields, "kaIntervalDays", 175),
+                                                  field_int(fields, "kaIntervalDays", current.kaIntervalDays),
                                                   field_u8(fields, "kaAction", 1),
                                                   field_text(fields, "kaTarget"),
                                                   field_text(fields, "kaUrl"),
-                                                  field_text(fields, "kaProfile"));
+                                                  field_text(fields, "kaProfile"),
+                                                  field_int(fields, "kaTrafficKB", current.kaTrafficKB));
         if (err != ESP_OK) return fail(err);
         return ok("Web UI saved SIM keepalive settings");
     }
@@ -3262,11 +3293,13 @@ static std::string cellular_http_message(const IdfCellularHttpResult& result)
     return std::string(buf);
 }
 
-static IdfCellularHttpConfig cellular_http_config(bool data_enabled, const std::string& apn)
+static IdfCellularHttpConfig cellular_http_config(bool data_enabled, const std::string& apn,
+                                                  uint32_t min_payload_bytes = 48UL * 1024UL)
 {
     IdfCellularHttpConfig cfg;
     cfg.dataEnabled = data_enabled;
     cfg.apn = apn;
+    cfg.minPayloadBytes = min_payload_bytes;
     return cfg;
 }
 
@@ -3661,6 +3694,39 @@ static bool keepalive_prepare_esim(const IdfKeepaliveRunView& cfg, EsimJobSwitch
     return esim_prepare_profile(cfg.kaProfile, sw, message);
 }
 
+static bool keepalive_cellular_policy_allows(const IdfKeepaliveRunView& cfg, std::string& message)
+{
+    const IdfModemStatus modem = idf_modem_get_status();
+    if (!modem.modemReady || modem.ceregStat != 1) {
+        message = "Keepalive cellular traffic requires home-network registration";
+        return false;
+    }
+    // ML307Y follows a separate startup path that deliberately skips CGACT; the
+    // existing API contract marks cellular transport unsupported for that model.
+    if (modem.model.empty() || modem.model == "ML307Y") {
+        message = "Keepalive cellular traffic is unavailable for this modem model";
+        return false;
+    }
+    // dataEnabled=false is an existing temporary-PDP path. owner_cellular_http_get
+    // activates it for this request and closes it afterward, so preserve that policy.
+    (void)cfg;
+    return true;
+}
+
+static bool keepalive_traffic_preflight(const IdfKeepaliveRunView& cfg, std::string& message)
+{
+    if (cfg.kaTrafficKB < MIN_KEEPALIVE_TRAFFIC_KB ||
+        cfg.kaTrafficKB > MAX_KEEPALIVE_TRAFFIC_KB) {
+        message = "Keepalive traffic setting is outside the supported range";
+        return false;
+    }
+    if (cfg.kaTrafficKB > static_cast<int>(IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB)) {
+        message = "Keepalive traffic exceeds the safe 512 KB UART runtime limit";
+        return false;
+    }
+    return true;
+}
+
 static void keepalive_task(void* arg_raw)
 {
     KeepAliveTaskArg* arg = static_cast<KeepAliveTaskArg*>(arg_raw);
@@ -3680,8 +3746,12 @@ static void keepalive_task(void* arg_raw)
     std::string profile_note = keepalive_profile_note(cfg);
     if (!profile_note.empty()) idf_logf("Keepalive task %s", profile_note.c_str());
     EsimJobSwitch esim_switch;
-    bool esim_ready = keepalive_prepare_esim(cfg, esim_switch, message);
-    if (!esim_ready) {
+    const bool traffic_ready = cfg.kaAction == 2 || cfg.kaAction == 3 ||
+                               keepalive_traffic_preflight(cfg, message);
+    bool esim_ready = traffic_ready && keepalive_prepare_esim(cfg, esim_switch, message);
+    if (!traffic_ready) {
+        ok = false;
+    } else if (!esim_ready) {
         ok = false;
     } else if (cfg.kaAction == 2) {
         if (cfg.kaTarget.empty()) {
@@ -3703,11 +3773,17 @@ static void keepalive_task(void* arg_raw)
             message = prefix + ussd_msg;
         }
     } else {
-        IdfCellularHttpResult result;
-        std::string url = cfg.kaUrl.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : cfg.kaUrl;
-        esp_err_t err = idf_modem_cellular_http_get(url, cellular_http_config(cfg.dataEnabled, cfg.apn), result);
-        ok = (err == ESP_OK && result.ok);
-        message = message.empty() ? cellular_http_message(result) : (message + "; " + cellular_http_message(result));
+        if (!keepalive_cellular_policy_allows(cfg, message)) {
+            ok = false;
+        } else {
+            IdfCellularHttpResult result;
+            std::string url = cfg.kaUrl.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : cfg.kaUrl;
+            const uint32_t traffic_bytes = static_cast<uint32_t>(cfg.kaTrafficKB) * 1024U;
+            esp_err_t err = idf_modem_cellular_http_get(
+                url, cellular_http_config(cfg.dataEnabled, cfg.apn, traffic_bytes), result);
+            ok = (err == ESP_OK && result.ok);
+            message = message.empty() ? cellular_http_message(result) : (message + "; " + cellular_http_message(result));
+        }
     }
     // Restore the previously active profile after keepalive work; the device primarily forwards SMS from the main card.
     if (esim_switch.switched) {
@@ -4469,8 +4545,9 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
     body.reserve(840);
     char buf[160];
     snprintf(buf, sizeof(buf),
-             "{\"enabled\":%s,\"intervalDays\":%d,\"action\":%u,",
+             "{\"enabled\":%s,\"intervalDays\":%d,\"trafficKB\":%d,\"action\":%u,",
              cfg.kaEnabled ? "true" : "false", cfg.kaIntervalDays,
+             cfg.kaTrafficKB,
              static_cast<unsigned>(cfg.kaAction));
     body += buf;
     json_prop(body, "target", cfg.kaTarget); body += ",";

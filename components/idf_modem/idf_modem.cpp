@@ -1452,7 +1452,8 @@ static void append_sms_urc_line(const std::string& line)
     append_urc_text(text);
 }
 
-static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCellularHttpResult& result)
+static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_payload_bytes,
+                                       IdfCellularHttpResult& result)
 {
     TickDeadline deadline(timeout_ms);
     std::string head;
@@ -1507,7 +1508,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
 
     if (!complete) idf_log_line("cellular HTTP download timed out");
     return !error && complete && result.httpStatus >= 200 && result.httpStatus < 400 &&
-           result.bytesRead >= CELLULAR_KEEPALIVE_MIN_BYTES;
+           result.bytesRead >= min_payload_bytes;
 }
 
 static bool valid_ipv4_address(const std::string& value)
@@ -1803,7 +1804,8 @@ static bool process_data_mode_retry(void)
 }
 
 static bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
-                                    const std::string& path, IdfCellularHttpResult& result)
+                                    const std::string& path, uint32_t min_payload_bytes,
+                                    IdfCellularHttpResult& result)
 {
     for (int i = 0; i < 4; ++i) {
         std::string ignored;
@@ -1855,7 +1857,7 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
         return false;
     }
 
-    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, result);
+    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, min_payload_bytes, result);
     snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
     send_at_locked(cmd, 3000, resp, 256, 20);
     if (ok) {
@@ -1879,6 +1881,10 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
 {
     assert_owner_task();
     result = IdfCellularHttpResult();
+    if (config.minPayloadBytes > IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES) {
+        result.message = "Cellular HTTP payload threshold exceeds the safe UART runtime limit";
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     std::string protocol;
     std::string host;
@@ -1920,12 +1926,14 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
     }
     result.cellIp = ip;
 
-    bool ok = fetch_mhttp_once_locked(protocol, host, path, result);
+    const uint32_t min_payload_bytes = config.minPayloadBytes == 0 ? CELLULAR_KEEPALIVE_MIN_BYTES :
+                                       config.minPayloadBytes;
+    bool ok = fetch_mhttp_once_locked(protocol, host, path, min_payload_bytes, result);
     if (!ok && protocol == "https" && result.mhttpError == 4) {
         idf_log_line("HTTPS handshake failed. Retrying once with HTTP. Disable forced HTTPS redirects after HTTP 301");
         IdfCellularHttpResult retry;
         retry.cellIp = result.cellIp;
-        ok = fetch_mhttp_once_locked("http", host, path, retry);
+        ok = fetch_mhttp_once_locked("http", host, path, min_payload_bytes, retry);
         result = retry;
     }
 

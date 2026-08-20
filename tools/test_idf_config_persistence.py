@@ -73,7 +73,7 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertNotIn("Slot slots[2]", storage)
         self.assertIn("std::unique_ptr<Slot[]>", storage)
         self.assertIn("-Werror=frame-larger-than=4096", cmake)
-        self.assertIn("sizeof(IdfConfig) == 3212", config)
+        self.assertIn("sizeof(IdfConfig) == 3216", config)
 
         # A bad sibling must not erase a valid prior; only a newer authenticated
         # future schema blocks startup.  The implementation-connected codec test

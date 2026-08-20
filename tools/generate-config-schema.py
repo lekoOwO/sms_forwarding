@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the native ESP-IDF configuration constants from schema v5."""
+"""Generate the native ESP-IDF configuration constants from schema v6."""
 
 from __future__ import annotations
 
@@ -233,6 +233,9 @@ constexpr size_t MAX_SCHEDULE_PAYLOAD_BYTES = {task['payload']['x-maxUtf8Bytes']
 constexpr uint16_t MIN_HEARTBEAT_INTERVAL_HOURS = {config['heartbeatInterval']['minimum']};
 constexpr uint16_t MAX_HEARTBEAT_INTERVAL_HOURS = {config['heartbeatInterval']['maximum']};
 constexpr uint16_t DEFAULT_HEARTBEAT_INTERVAL_HOURS = {config['heartbeatInterval']['default']};
+constexpr uint16_t MIN_KEEPALIVE_TRAFFIC_KB = {config['kaTrafficKB']['minimum']};
+constexpr uint16_t MAX_KEEPALIVE_TRAFFIC_KB = {config['kaTrafficKB']['maximum']};
+constexpr uint16_t DEFAULT_KEEPALIVE_TRAFFIC_KB = {config['kaTrafficKB']['default']};
 constexpr size_t MAX_PUSH_NAME_BYTES = {channel['name']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PUSH_URL_BYTES = {channel['url']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PUSH_KEY1_BYTES = {channel['key1']['x-maxUtf8Bytes']};
@@ -257,8 +260,8 @@ def load_inputs() -> tuple[dict, dict]:
     version = str(manifest["currentVersion"])
     schema_path = MANIFEST_PATH.parent / manifest["versions"][version]
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    if version != "5" or schema["properties"]["schemaVersion"]["const"] != 5:
-        raise ValueError("current schema must be v5")
+    if version != "6" or schema["properties"]["schemaVersion"]["const"] != 6:
+        raise ValueError("current schema must be v6")
     if schema["properties"]["format"]["const"] != manifest["format"]:
         raise ValueError("manifest and current schema formats differ")
     envelope = manifest["backupEnvelope"]

@@ -318,6 +318,7 @@ IdfConfig defaults()
     value.heartbeatEnable = true;
     value.heartbeatInterval = DEFAULT_HEARTBEAT_INTERVAL_HOURS;
     value.hbEnabled = value.heartbeatEnable;
+    value.kaTrafficKB = DEFAULT_KEEPALIVE_TRAFFIC_KB;
     value.hbHour = 9;
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char name[24];
@@ -334,6 +335,7 @@ bool semanticallyValid(const IdfConfig& value, bool portable = false)
         value.heartbeatInterval > MAX_HEARTBEAT_INTERVAL_HOURS ||
         (!portable && !txPowerValid(value.wifiTxPowerQuarterDbm)) ||
         value.kaIntervalDays < 1 || value.kaIntervalDays > 3650 || value.kaAction > 3 ||
+        value.kaTrafficKB < MIN_KEEPALIVE_TRAFFIC_KB || value.kaTrafficKB > MAX_KEEPALIVE_TRAFFIC_KB ||
         value.tzOffsetMin < -720 || value.tzOffsetMin > 840 || value.rebootHour < 0 || value.rebootHour > 23 ||
         value.smsHealthHour < 0 || value.smsHealthHour > 23) {
         return false;
@@ -555,6 +557,44 @@ bool readLegacyBool(nvs_handle_t nvs, const char* key, bool& value, bool fallbac
     return true;
 }
 
+bool readLegacyI32Alias(nvs_handle_t nvs, const char* currentKey, const char* legacyKey,
+                        int& value, int fallback)
+{
+    int32_t result = 0;
+    const esp_err_t err = nvs_get_i32(nvs, currentKey, &result);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return readLegacyI32(nvs, legacyKey, value, fallback);
+    if (err != ESP_OK || result < std::numeric_limits<int>::min() ||
+        result > std::numeric_limits<int>::max()) return false;
+    value = static_cast<int>(result);
+    return true;
+}
+
+bool readLegacyBoolAlias(nvs_handle_t nvs, const char* currentKey, const char* legacyKey,
+                         bool& value, bool fallback)
+{
+    uint8_t result = 0;
+    const esp_err_t err = nvs_get_u8(nvs, currentKey, &result);
+    if (err == ESP_ERR_NVS_NOT_FOUND) return readLegacyBool(nvs, legacyKey, value, fallback);
+    if (err != ESP_OK || result > 1) return false;
+    value = result != 0;
+    return true;
+}
+
+bool readLegacyU32Alias(nvs_handle_t nvs, const char* currentKey, const char* legacyKey,
+                        uint32_t& value, uint32_t fallback)
+{
+    uint32_t result = 0;
+    esp_err_t err = nvs_get_u32(nvs, currentKey, &result);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = nvs_get_u32(nvs, legacyKey, &result);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        value = fallback;
+        return true;
+    }
+    if (err != ESP_OK) return false;
+    value = result;
+    return true;
+}
+
 bool readLegacyConnectivity(nvs_handle_t nvs, IdfConfig& value)
 {
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
@@ -671,16 +711,14 @@ bool loadLegacy(IdfConfig& value, bool& existed)
     }
     boolean("emailEn", value.emailEnabled, true);
     boolean("pushEn", value.pushEnabled, true);
-    boolean("kaEn", value.kaEnabled, false);
-    integer("kaDays", value.kaIntervalDays, 175);
+    if (ok) ok = readLegacyBoolAlias(nvs, "kaEn", "kaEnable", value.kaEnabled, false);
+    if (ok) ok = readLegacyI32Alias(nvs, "kaDays", "kaIntervalDays", value.kaIntervalDays, 175);
+    integer("kaTraffic", value.kaTrafficKB, DEFAULT_KEEPALIVE_TRAFFIC_KB);
     byte("kaAct", value.kaAction, 1);
     str("kaTarget", value.kaTarget, MAX_KEEPALIVE_TARGET_BYTES);
     str("kaUrl", value.kaUrl, MAX_KEEPALIVE_URL_BYTES);
     str("kaProfile", value.kaProfile, MAX_KEEPALIVE_PROFILE_BYTES);
-    uint32_t keepaliveLast = value.kaLastTime;
-    esp_err_t keepaliveErr = nvs_get_u32(nvs, "kaLast", &keepaliveLast);
-    if (keepaliveErr != ESP_OK && keepaliveErr != ESP_ERR_NVS_NOT_FOUND) ok = false;
-    value.kaLastTime = keepaliveLast;
+    if (ok) ok = readLegacyU32Alias(nvs, "kaLast", "kaBaseDate", value.kaLastTime, value.kaLastTime);
     boolean("roamEn", value.roamingEnabled, false);
     str("apn", value.apn, MAX_APN_BYTES);
     str("opPlmn", value.operatorPlmn, MAX_OPERATOR_PLMN_BYTES);
@@ -961,6 +999,15 @@ bool decodeV5(Reader& reader, IdfConfig& value)
     return semanticallyValid(value);
 }
 
+bool decodeV6(Reader& reader, IdfConfig& value)
+{
+    if (!decodeV5(reader, value)) return false;
+    uint32_t raw = 0;
+    if (!reader.u32(raw) || raw < MIN_KEEPALIVE_TRAFFIC_KB || raw > MAX_KEEPALIVE_TRAFFIC_KB) return false;
+    value.kaTrafficKB = static_cast<int>(raw);
+    return semanticallyValid(value);
+}
+
 DecodeResult decodeBlob(const uint8_t* blob, size_t length, IdfConfig& value,
                         uint16_t& schema, uint32_t& generation)
 {
@@ -985,7 +1032,8 @@ DecodeResult decodeBlob(const uint8_t* blob, size_t length, IdfConfig& value,
     bool ok = schema == 1 ? decodeV1(reader, value) :
               schema == 2 ? decodeV2Common(reader, value, PUSH_TYPE_TELEGRAM) :
               schema == 3 ? decodeV2Common(reader, value, PUSH_TYPE_NTFY) :
-              schema == 4 ? decodeV4(reader, value) : decodeV5(reader, value);
+              schema == 4 ? decodeV4(reader, value) :
+              schema == 5 ? decodeV5(reader, value) : decodeV6(reader, value);
     return ok && reader.atEnd() ? DecodeResult::Valid : DecodeResult::Invalid;
 }
 
@@ -1014,7 +1062,7 @@ DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value,
 }
 
 template <typename OutputWriter>
-void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable)
+void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable, bool includeTraffic = false)
 {
     writer.u32(static_cast<uint32_t>(value.smtpPort));
     if (portable) {
@@ -1121,6 +1169,7 @@ void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable)
         writer.string(task.payload);
         writer.u32(portable ? 0 : task.lastRun);
     }
+    if (includeTraffic) writer.u32(static_cast<uint32_t>(value.kaTrafficKB));
 }
 
 bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
@@ -1128,6 +1177,19 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
     if (!semanticallyValid(value)) return false;
     Writer writer;
     encodeV5Fields(value, writer, false);
+    std::vector<uint8_t> payload = writer.take();
+    if (payload.size() + kHeaderBytes > MAX_CONFIG_BLOB_SIZE) return false;
+    blob.assign(kHeaderBytes, 0);
+    blob.insert(blob.end(), payload.begin(), payload.end());
+    writeHeader(blob, 5, generation, kHeaderBytes);
+    return true;
+}
+
+bool encodeV6(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
+{
+    if (!semanticallyValid(value)) return false;
+    Writer writer;
+    encodeV5Fields(value, writer, false, true);
     std::vector<uint8_t> payload = writer.take();
     if (payload.size() + kHeaderBytes > MAX_CONFIG_BLOB_SIZE) return false;
     blob.assign(kHeaderBytes, 0);
@@ -1349,7 +1411,7 @@ esp_err_t idf_config_storage_encode_portable(const IdfConfig& source, uint8_t* o
 
     const size_t payloadCapacity = usableCapacity - kHeaderBytes;
     FixedWriter writer(output + kHeaderBytes, payloadCapacity);
-    encodeV5Fields(source, writer, true);
+    encodeV5Fields(source, writer, true, true);
     if (!writer.ok()) {
         std::memset(output, 0, usableCapacity);
         return ESP_ERR_INVALID_SIZE;
@@ -1400,6 +1462,7 @@ IdfPortableConfigStatus idf_config_storage_decode_portable(const uint8_t* bytes,
         decoded.operatorPlmn = target.operatorPlmn;
         for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) decoded.schedTasks[i] = target.schedTasks[i];
     }
+    if (schema < 6) decoded.kaTrafficKB = target.kaTrafficKB;
 
     decoded.deviceName = target.deviceName;
     decoded.hostname = target.hostname;
@@ -1464,7 +1527,7 @@ esp_err_t idf_config_storage_save(const IdfConfig& candidate)
     }
     const int target = active < 0 ? 0 : active == 0 ? 1 : 0;
     const uint32_t nextGeneration = generation + 1U;
-    if (!encodeV5(candidate, nextGeneration, blob)) {
+    if (!encodeV6(candidate, nextGeneration, blob)) {
         nvs_close(nvs);
         return ESP_ERR_INVALID_ARG;
     }

@@ -108,6 +108,7 @@ struct IdfConfig {
     std::string kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
     std::string kaProfile;
     uint32_t kaLastTime = 0;
+    int kaTrafficKB = 1;
 
     int tzOffsetMin = 480;
     std::string ntpServer = "ntp.aliyun.com";
@@ -191,7 +192,7 @@ std::string idf_config_translate_perl_classes(const std::string& pattern);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,
-                                    const std::string& profile);
+                                    const std::string& profile, int traffic_kb = 1);
 esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool hb_enabled, int hb_hour,
                                           bool sms_health_enabled, int sms_health_hour,
@@ -283,6 +284,9 @@ struct IdfConfigWebView {
     std::string apn;
     std::string phoneNumber;
     std::string operatorPlmn;
+    bool kaEnabled = false;
+    int kaIntervalDays = 175;
+    int kaTrafficKB = 1;
     std::string kaProfile;
     bool netLedEnabled = true;
     bool callNotifyEnabled = true;
@@ -309,6 +313,7 @@ struct IdfKeepaliveRunView {
     std::string kaUrl = IDF_KEEPALIVE_DEFAULT_URL;
     std::string kaProfile;
     uint32_t kaLastTime = 0;
+    int kaTrafficKB = 1;
     int tzOffsetMin = 480;
     bool emailEnabled = true;
     bool dataEnabled = false;
@@ -385,6 +390,7 @@ struct IdfEmailSettingsView {
 struct IdfSchedulerView {
     bool kaEnabled = false;
     int kaIntervalDays = 175;
+    int kaTrafficKB = 1;
     uint32_t kaLastTime = 0;
     int tzOffsetMin = 480;
     bool rebootEnabled = false;

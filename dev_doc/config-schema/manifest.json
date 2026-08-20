@@ -20,12 +20,13 @@
     "maxEncryptedBytes": 32828,
     "header": ["magic:8", "version:u16", "kdfId:u8", "cipherId:u8", "iterations:u32", "salt:16", "iv:12"]
   },
-  "currentVersion": 5,
+  "currentVersion": 6,
   "versions": {
     "1": "v1.json",
     "2": "v2.json",
     "3": "v3.json",
     "4": "v4.json",
-    "5": "v5.json"
+    "5": "v5.json",
+    "6": "v6.json"
   }
 }

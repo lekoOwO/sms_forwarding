@@ -23,7 +23,7 @@
 
 static const char* TAG = "idf_config";
 static IdfConfig s_config;
-static_assert(sizeof(IdfConfig) == 3212, "IdfConfig size changed; review stack/heap persistence bounds");
+static_assert(sizeof(IdfConfig) == 3216, "IdfConfig size changed; review stack/heap persistence bounds");
 static SemaphoreHandle_t s_config_mutex = nullptr;
 static SemaphoreHandle_t s_persist_mutex = nullptr;
 static IdfConfigLoadStatus s_config_load_status = IdfConfigLoadStatus::Unknown;
@@ -388,6 +388,7 @@ std::string idf_config_export_text(bool full_export)
     append_kv(out, "kaUrl", c->kaUrl);
     append_kv(out, "kaProfile", c->kaProfile);
     append_kv_u32(out, "kaLastTime", c->kaLastTime);
+    append_kv_i(out, "kaTrafficKB", c->kaTrafficKB);
 
     append_kv_i(out, "netLedEnabled", c->netLedEnabled ? 1 : 0);
     append_kv_i(out, "callNotifyEnabled", c->callNotifyEnabled ? 1 : 0);
@@ -495,6 +496,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "kaUrl") c.kaUrl = value.empty() ? IDF_KEEPALIVE_DEFAULT_URL : value;
     else if (key == "kaProfile") c.kaProfile = value;
     else if (key == "kaLastTime") import_u32_field(c.kaLastTime, value);
+    else if (key == "kaTrafficKB") import_int_field(c.kaTrafficKB, value);
     else if (key == "netLedEnabled") c.netLedEnabled = bool_from_text(value);
     else if (key == "callNotifyEnabled") c.callNotifyEnabled = bool_from_text(value);
     else if (key == "dataEnabled") c.dataEnabled = bool_from_text(value);
@@ -1113,10 +1115,12 @@ catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,
-                                    const std::string& profile) try
+                                    const std::string& profile, int traffic_kb) try
 {
     {
-        if (interval_days < 1 || interval_days > 3650 || action > 3 || target.size() > MAX_KEEPALIVE_TARGET_BYTES ||
+        if (interval_days < 1 || interval_days > 3650 || action > 3 ||
+            traffic_kb < MIN_KEEPALIVE_TRAFFIC_KB || traffic_kb > MAX_KEEPALIVE_TRAFFIC_KB ||
+            target.size() > MAX_KEEPALIVE_TARGET_BYTES ||
             url.size() > MAX_KEEPALIVE_URL_BYTES || profile.size() > MAX_KEEPALIVE_PROFILE_BYTES) {
             return ESP_ERR_INVALID_ARG;
         }
@@ -1129,6 +1133,7 @@ esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t act
         update.next->kaTarget = target;
         update.next->kaUrl = url.empty() ? std::string(IDF_KEEPALIVE_DEFAULT_URL) : url;
         update.next->kaProfile = profile;
+        update.next->kaTrafficKB = traffic_kb;
         return finish_config_update(update);
     }
 }
@@ -1317,6 +1322,9 @@ IdfConfigWebView idf_config_get_web_view(void)
     view.apn = s_config.apn;
     view.phoneNumber = s_config.phoneNumber;
     view.operatorPlmn = s_config.operatorPlmn;
+    view.kaEnabled = s_config.kaEnabled;
+    view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaTrafficKB = s_config.kaTrafficKB;
     view.kaProfile = s_config.kaProfile;
     view.netLedEnabled = s_config.netLedEnabled;
     view.callNotifyEnabled = s_config.callNotifyEnabled;
@@ -1364,6 +1372,7 @@ IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
     view.kaUrl = s_config.kaUrl;
     view.kaProfile = s_config.kaProfile;
     view.kaLastTime = s_config.kaLastTime;
+    view.kaTrafficKB = s_config.kaTrafficKB;
     view.tzOffsetMin = s_config.tzOffsetMin;
     view.emailEnabled = s_config.emailEnabled;
     view.dataEnabled = s_config.dataEnabled;
@@ -1493,6 +1502,7 @@ IdfSchedulerView idf_config_get_scheduler_view(void)
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     view.kaEnabled = s_config.kaEnabled;
     view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaTrafficKB = s_config.kaTrafficKB;
     view.kaLastTime = s_config.kaLastTime;
     view.tzOffsetMin = s_config.tzOffsetMin;
     view.rebootEnabled = s_config.rebootEnabled;

@@ -48,7 +48,7 @@
 	},
 	"x-configSchema": {
 	  "source": "config-schema/manifest.json",
-	  "currentVersion": 5,
+	  "currentVersion": 6,
 	  "mimeType": "application/vnd.sms-forwarding.config",
 	  "maxEncryptedBytes": 32828
 	},
@@ -696,7 +696,7 @@
           },
           "config": {
             "type": "object",
-			"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "pushChannels"],
+		"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
             "additionalProperties": false,
             "properties": {
 			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
@@ -724,6 +724,9 @@
 			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback when available. The preference is stored, but all cellular delivery currently fails closed until CA provisioning is available. ML307Y cellular transport is disabled, GET and ntfy channels are WiFi-only, and roaming always fails closed." },
 			  "heartbeatEnable": { "type": "boolean" },
 			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
+			  "kaEnabled": { "type": "boolean" },
+			  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650 },
+			  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1, "description": "Stored values up to 10000 KB are preserved. A cellular keepalive run fails closed above 512 KB because MHTTP payloads stream over the 115200-baud UART under a 90-second download deadline." },
               "pushChannels": {
                 "type": "array",
                 "minItems": 5,
@@ -737,7 +740,7 @@
       "ConfigUpdate": {
         "type": "object",
         "minProperties": 1,
-		"maxProperties": 48,
+		"maxProperties": 51,
         "additionalProperties": false,
         "properties": {
 		  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
@@ -752,7 +755,10 @@
 		  "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 },
 		  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "x-maxUtf8Bytes": 32 },
 		  "heartbeatEnable": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
-		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 }
+		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 },
+		  "kaEnabled": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
+		  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650, "x-maxUtf8Bytes": 32 },
+		  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "x-maxUtf8Bytes": 32, "description": "Values above the 512 KB runtime limit are stored but rejected before cellular activation." }
         },
         "patternProperties": {
           "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },

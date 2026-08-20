@@ -25,7 +25,7 @@ def main() -> None:
     assert set(provisioning["unauthenticatedRoutes"]) == {
         "GET /", "GET /wifiscan", "GET /apstatus", "POST /wificonfig"
     }
-    assert SPEC["x-configSchema"]["currentVersion"] == 5
+    assert SPEC["x-configSchema"]["currentVersion"] == 6
     assert set(SPEC["paths"]["/api/ota/start"]["post"]["responses"]) == {
         "201", "400", "401", "403", "409", "413", "500"
     }
@@ -90,7 +90,7 @@ def main() -> None:
     assert required_codes <= action_codes
 
     config_update = SPEC["components"]["schemas"]["ConfigUpdate"]
-    assert config_update["maxProperties"] == 48
+    assert config_update["maxProperties"] == 51
     log_limit = SPEC["paths"]["/log"]["get"]["parameters"][1]["schema"]
     assert log_limit["maximum"] == 50
 
