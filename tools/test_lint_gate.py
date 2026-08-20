@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +21,48 @@ def load_runner():
 
 
 class LintGateTests(unittest.TestCase):
+    def test_discovery_reads_only_tracked_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tracked = {
+                "web/src/page.svelte": "",
+                "tools/check.py": "",
+                "tools/check.sh": "",
+                "main/app_main.cpp": "",
+                "components/modem/include/modem.h": "",
+            }
+            for name, content in tracked.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+            (root / ".gitignore").write_text(".secrets/\n", encoding="utf-8")
+            subprocess.run(["git", "init", "--quiet"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "add", ".gitignore", *tracked], cwd=root, check=True
+            )
+
+            (root / ".secrets/bad.py").parent.mkdir(parents=True, exist_ok=True)
+            (root / ".secrets/bad.py").write_text("print(missing)\n", encoding="utf-8")
+            untracked = root / "components/modem/untracked_bad.cpp"
+            untracked.write_text("void f() { int *p = nullptr; *p = 1; }\n", encoding="utf-8")
+            (root / "components/idf_web/OTA_RUNTIME_READY").parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            (root / "components/idf_web/OTA_RUNTIME_READY").write_text(
+                "sentinel\n", encoding="utf-8"
+            )
+
+            discovered = load_runner().discover_sources(root)
+
+        self.assertEqual(["web/src/page.svelte"], discovered["web"])
+        self.assertEqual(["tools/check.py"], discovered["python"])
+        self.assertEqual(["tools/check.sh"], discovered["shell"])
+        self.assertEqual(
+            ["components/modem/include/modem.h", "main/app_main.cpp"],
+            discovered["cpp"],
+        )
+
     def test_discovers_owned_sources_and_excludes_generated_vendor_and_build_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -30,6 +73,7 @@ class LintGateTests(unittest.TestCase):
                 "web/vite.config.ts": "",
                 "tools/check.py": "",
                 "components/modem/test/check.py": "",
+                ".secrets/bad.py": "print(missing)\n",
                 "tools/check.sh": "",
                 "main/app_main.cpp": "",
                 "components/modem/modem.cpp": "",

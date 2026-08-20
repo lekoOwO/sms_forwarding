@@ -1,11 +1,13 @@
 FROM alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 
 ARG CPPCHECK_VERSION=2.14.2-r1
+ARG GIT_VERSION=2.49.1-r0
 ARG RUFF_VERSION=0.16.0
 ARG SHELLCHECK_VERSION=0.10.0-r2
 
 RUN apk add --no-cache \
         cppcheck="${CPPCHECK_VERSION}" \
+        git="${GIT_VERSION}" \
         nodejs \
         npm \
         py3-pip \

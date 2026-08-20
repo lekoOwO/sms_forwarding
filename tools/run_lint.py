@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-IGNORED_PARTS = {".git", ".svelte-kit", "__pycache__", "build", "node_modules"}
+IGNORED_PARTS = {".git", ".secrets", ".svelte-kit", "__pycache__", "build", "node_modules"}
 GENERATED_NAMES = {"config_schema_generated.h", "firmware_version_generated.h"}
 WEB_SUFFIXES = {".cjs", ".js", ".mjs", ".svelte", ".ts"}
 CPP_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp"}
@@ -12,7 +12,33 @@ CPP_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp"}
 
 def discover_sources(root: Path) -> dict[str, list[str]]:
     sources: dict[str, list[str]] = {"web": [], "python": [], "shell": [], "cpp": []}
-    for path in root.rglob("*"):
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-c",
+                f"safe.directory={root}",
+                "-C",
+                str(root),
+                "ls-files",
+                "--cached",
+                "-z",
+            ],
+            check=True,
+            capture_output=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        if (root / ".git").exists():
+            raise RuntimeError("lint source discovery requires Git metadata") from error
+        paths = [path for path in root.rglob("*") if path.is_file()]
+    else:
+        paths = [
+            root / relative
+            for relative in result.stdout.decode("utf-8").split("\0")
+            if relative
+        ]
+
+    for path in paths:
         if not path.is_file():
             continue
         relative = path.relative_to(root)
