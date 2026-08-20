@@ -2,68 +2,202 @@ name: Build ESP-IDF Firmware
 
 on:
   push:
-    paths:
-      - 'main/**'
-      - 'components/**'
-      - 'code/web_src/**'
-      - 'tools/**'
-      - 'CMakeLists.txt'
-      - 'sdkconfig.defaults'
-      - 'partitions_ota_1m6.csv'
-      - '.github/workflows/build.yml'
+    branches: [develop, master]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write  # 发布 Release 需要
+  contents: read
 
 jobs:
-  build:
+  lint:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
-    container: espressif/idf:v5.5.4
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-      - name: Verify generated web assets
-        run: python tools/build_web_assets.py --check
+      - name: Build pinned lint image
+        run: docker build --file tools/lint/Dockerfile --tag sms-forwarding-lint .
+
+      - name: Test lint gate
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint \
+            python3 tools/test_lint_gate.py
+          docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint \
+            python3 tests/lint_gate_smoke.py
+
+      - name: Lint source
+        run: docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint python3 tools/run_lint.py
+
+  build:
+    permissions:
+      contents: read
+    needs: lint
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dev_build: ${{ steps.version.outputs.dev_build }}
+      ota_runtime_ready: ${{ steps.ota_runtime.outputs.ready }}
+    runs-on: ubuntu-latest
+    container: espressif/idf@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify firmware version source
+        run: python3 scripts/generate-firmware-version.py --check
+
+      - name: Test firmware release policy
+        run: python3 -m unittest tools/test_firmware_release.py
+
+      - name: Verify Dev build increased
+        if: >-
+          (github.event_name == 'push' &&
+            (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master')) ||
+          (github.event_name == 'pull_request' &&
+            (github.base_ref == 'develop' || github.base_ref == 'master'))
+        env:
+          BEFORE: ${{ github.event.before }}
+        shell: bash
+        run: |
+          current_build=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
+          if [[ -n "$GITHUB_BASE_REF" ]]; then
+            previous_ref="origin/$GITHUB_BASE_REF"
+          else
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              echo "Push event has no valid previous commit" >&2
+              exit 1
+            fi
+            previous_ref="$BEFORE"
+          fi
+          if ! git rev-parse --verify "${previous_ref}^{commit}" >/dev/null 2>&1; then
+            echo "Previous commit is not available: $previous_ref" >&2
+            exit 1
+          fi
+          if ! previous_json=$(git show "${previous_ref}:firmware-version.json" 2>/dev/null); then
+            echo "Previous commit has no firmware-version.json: $previous_ref" >&2
+            exit 1
+          fi
+          if ! previous_build=$(python3 scripts/generate-firmware-version.py --print-dev-build <<<"$previous_json"); then
+            echo "Previous firmware-version.json is invalid: $previous_ref" >&2
+            exit 1
+          fi
+          if (( current_build <= previous_build )); then
+            echo "devBuild $current_build must exceed previous build $previous_build" >&2
+            exit 1
+          fi
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["releaseVersion"])')"
+          test "$GITHUB_SHA" = "$(git rev-parse origin/master)"
+          current_build=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
+          previous_stable_max=0
+          while IFS= read -r tag; do
+            [[ "$tag" == "$GITHUB_REF_NAME" ]] && continue
+            if ! metadata=$(git show "${tag}:firmware-version.json" 2>/dev/null); then
+              echo "Release tag $tag has no firmware-version.json" >&2
+              exit 1
+            fi
+            if ! previous_build=$(python3 scripts/generate-firmware-version.py --validate-tag "$tag" <<<"$metadata"); then
+              echo "Release tag $tag has invalid firmware version metadata" >&2
+              exit 1
+            fi
+            if (( previous_build > previous_stable_max )); then
+              previous_stable_max=$previous_build
+            fi
+          done < <(git tag --list 'v*')
+          if (( current_build <= previous_stable_max )); then
+            echo "devBuild $current_build must exceed prior stable maximum $previous_stable_max" >&2
+            exit 1
+          fi
 
       - name: Read firmware version
         id: version
         shell: bash
         run: |
-          VERSION=$(grep -oP 'IDF_FW_VERSION = "\K[0-9A-Za-z.\-]+' components/idf_config/include/idf_config.h)
-          test -n "$VERSION"
+          VERSION=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["releaseVersion"])')
+          DEV_BUILD=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "固件版本: $VERSION"
+          echo "dev_build=$DEV_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Check signed OTA runtime gate
+        id: ota_runtime
+        shell: bash
+        run: |
+          if [[ -f components/idf_web/OTA_RUNTIME_READY ]]; then ready=true; else ready=false; fi
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.14.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Web UI dependencies
+        run: npm ci --prefix web
+
+      - name: Check Web UI
+        run: npm --prefix web run check
+
+      - name: Build and verify Web UI assets
+        run: |
+          npm --prefix web run build
+          node --test web/scripts/package.test.mjs
+          node web/scripts/package.mjs --check
+          git diff --exit-code -- code/web_assets.h code/web_assets.cpp
+
+      - name: Run host contract tests
+        run: |
+          python3 tools/test_config_schema.py
+          python3 tools/test_idf_config_codec.py
+          python3 tools/test_idf_config_persistence.py
+          python3 tools/test_idf_config_updates.py
+          python3 components/idf_modem/test/test_uart_owner.py
+          python3 components/idf_push/test/test_push_runtime.py
+          python3 components/idf_sms/test/test_sms_retention_policy.py
+          python3 components/idf_wifi/test/test_wifi_security.py
+          python3 components/idf_web/test/test_web_security.py
+          python3 components/idf_web/test/test_openapi_conformance.py
+          python3 components/idf_web/test/test_ota_runtime.py
 
       - name: Build firmware
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
+          RELEASE_BUILD=0
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then RELEASE_BUILD=1; fi
+          export FIRMWARE_IS_RELEASE="$RELEASE_BUILD"
           idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build
 
       - name: Check ESP-IDF baseline and firmware size
         run: python3 tools/check_idf_baseline.py --build-dir build/idf
 
-      - name: Package release binaries
+      - name: Package full USB image
         shell: bash
         run: |
           . "$IDF_PATH/export.sh"
-          V=${{ steps.version.outputs.version }}
+          VERSION=${{ steps.version.outputs.version }}
           mkdir -p dist
-          # OTA 升级包：网页"固件升级"直接上传这个（仅 app 分区镜像）
-          cp build/idf/sms_forwarding_idf.bin "dist/sms_forwarder_ota_v${V}.bin"
-          # 整机烧录包：bootloader+分区表+app 合并为单文件，esptool 从 0x0 烧录即可
-          esptool.py --chip esp32c3 merge_bin -o "dist/sms_forwarder_full_v${V}.bin" \
+          esptool.py --chip esp32c3 merge_bin -o "dist/sms-forwarder-${VERSION}.bin" \
             0x0 build/idf/bootloader/bootloader.bin \
             0x8000 build/idf/partition_table/partition-table.bin \
             0x10000 build/idf/sms_forwarding_idf.bin
-          ls -l dist/
 
-      - name: Upload firmware artifact (7-day retention)
-        uses: actions/upload-artifact@v4
+      - name: Upload verified firmware inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: esp-idf-firmware-bin
           path: |
@@ -71,34 +205,97 @@ jobs:
             build/idf/sms_forwarding_idf.bin
             build/idf/bootloader/bootloader.bin
             build/idf/partition_table/partition-table.bin
+            firmware-version.json
+            scripts/sign-ota-release.py
           retention-days: 7
 
-      # 推送到 master 时自动发布/更新 Release：tag 为 v<版本号>，附可直接下载的固件。
-      # 同版本再次推送会更新既有 Release 的附件（覆盖同名文件），不会重复建 Release。
-      - name: Publish GitHub Release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-        uses: softprops/action-gh-release@v2
+  prerelease:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Download verified build input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: 固件 v${{ steps.version.outputs.version }}
-          files: dist/*.bin
-          body: |
-            SMS Forwarder ESP-IDF 固件 **v${{ steps.version.outputs.version }}**（构建自 `${{ github.sha }}`）
+          name: esp-idf-firmware-bin
+          path: release-input
 
-            | 文件 | 用途 |
-            | --- | --- |
-            | `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` | 首次刷机、救砖、分区变化后重刷；从地址 `0x0` 整机刷写 |
-            | `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin` | 设备网页「固件升级」页直接上传（OTA，无需数据线） |
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEV_BUILD: ${{ needs.build.outputs.dev_build }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          DEV_TAG="dev-${DEV_BUILD}"
+          ASSET_NAME="sms-forwarder-${DEV_TAG}.bin"
+          mv "release-input/dist/sms-forwarder-${RELEASE_VERSION}.bin" "$ASSET_NAME"
+          if gh release view "$DEV_TAG" >/dev/null 2>&1; then
+            echo "Refusing to replace existing prerelease $DEV_TAG" >&2
+            exit 1
+          fi
+          gh release create "$DEV_TAG" "$ASSET_NAME" --target "$GITHUB_SHA" --prerelease \
+            --title "Development build ${DEV_BUILD}" \
+            --notes "Development firmware build ${DEV_BUILD}."
 
-            普通用户不需要下载源码，也不需要安装 Python/ESP-IDF。首次刷机推荐使用乐鑫官方 GUI 工具：
+  release:
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.outputs.ota_runtime_ready == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      actions: read
 
-            - Windows：[Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html)，选择 `ESP32-C3`，把 `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin` 填到地址 `0x0`，选择实际串口和 `460800` 波特率后开始刷写。
-            - Chrome / Edge：[ESP Launchpad](https://espressif.github.io/esp-launchpad/) 自定义固件刷写，选择 `sms_forwarder_full_v${{ steps.version.outputs.version }}.bin`，地址填 `0x0`。
+    steps:
+      - name: Download verified build input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: esp-idf-firmware-bin
+          path: release-input
 
-            已经安装 Python/esptool 的高级用户，也可以用命令行刷完整包（按实际串口号替换 `COM5`）：
+      - name: Build signed OTA package
+        id: sign
+        env:
+          OTA_SIGNING_PRIVATE_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          DEV_BUILD: ${{ needs.build.outputs.dev_build }}
+        shell: bash
+        run: |
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/ota-signing-private.pem"' EXIT
+          echo 'df6f2cd2a298f52c589823e8bee923c7cd7f6c379985207031958875bb5a3d02  release-input/scripts/sign-ota-release.py' | sha256sum --check
+          printf '%s' "$OTA_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/ota-signing-private.pem"
+          OTA_COUNTER=$((DEV_BUILD * 2 + 1))
+          OTA_ASSET="sms-forwarder-${RELEASE_VERSION}.smsota"
+          FULL_ASSET="sms-forwarder-${RELEASE_VERSION}.bin"
+          python3 release-input/scripts/sign-ota-release.py \
+            release-input/build/idf/sms_forwarding_idf.bin "$OTA_ASSET" \
+            --private-key "$RUNNER_TEMP/ota-signing-private.pem" \
+            --version "$RELEASE_VERSION" \
+            --counter "$OTA_COUNTER" \
+            --expected-public-sha256 a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735
+          mv "release-input/dist/sms-forwarder-${RELEASE_VERSION}.bin" "$FULL_ASSET"
+          echo "ota_asset=$OTA_ASSET" >> "$GITHUB_OUTPUT"
+          echo "full_asset=$FULL_ASSET" >> "$GITHUB_OUTPUT"
 
-            ```powershell
-            esptool.py --chip esp32c3 -p COM5 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 sms_forwarder_full_v${{ steps.version.outputs.version }}.bin
-            ```
-
-            OTA 升级：打开设备网页的「固件升级」页，上传 `sms_forwarder_ota_v${{ steps.version.outputs.version }}.bin`。不要把 `full` 包上传到网页 OTA，也不要把 `ota` 包从 `0x0` 当整机镜像刷写。
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OTA_ASSET: ${{ steps.sign.outputs.ota_asset }}
+          FULL_ASSET: ${{ steps.sign.outputs.full_asset }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Refusing to replace existing release $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$OTA_ASSET" "$FULL_ASSET" --generate-notes

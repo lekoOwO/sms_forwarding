@@ -50,7 +50,7 @@ struct IdfCellularHttpConfig {
     std::string apn;
 };
 
-// 固定命令槽已满时立即返回；与已入队但等待超时的 ESP_ERR_TIMEOUT 明确区分。
+// Return immediately when the fixed command slots are full. ESP_ERR_TIMEOUT means an enqueued command timed out.
 static constexpr esp_err_t IDF_MODEM_ERR_BUSY = static_cast<esp_err_t>(0x7201);
 
 esp_err_t idf_modem_start(const IdfConfig& config);
@@ -59,35 +59,33 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
-// 请求模组任务重新检查 SIM 锁；allow_puk=true 仅用于网页二次确认后的单次 PUK 操作。
+// Ask the modem task to recheck the SIM lock. allow_puk permits one user-confirmed PUK attempt.
 esp_err_t idf_modem_request_sim_unlock(bool allow_puk);
 bool idf_modem_take_urc(std::string& out);
-// 等待模组事件(新 URC 入缓冲/外部唤醒)，超时返回 false；用于替代固定轮询延时
+// Wait for buffered URC data or an external wake-up. Return false on timeout.
 bool idf_modem_wait_event(uint32_t timeout_ms);
-// 唤醒等待者(短信任务)：URC 入缓冲、网页短信入队等场景调用
+// Wake the SMS task after a buffered URC or queued Web SMS.
 void idf_modem_signal_event(void);
 IdfModemStatus idf_modem_get_status(void);
-// AT 通道当前是否空闲（Web 路由用于"模组正忙"快速返回，避免长时间阻塞 httpd 任务）
+// Report whether the AT channel is idle so Web routes can avoid blocking httpd.
 bool idf_modem_at_idle(void);
-// 用户显式请求刷新概览模组信息时，短时间打开展示型身份/信号采样窗口。
+// Open a short identity and signal sampling window after an explicit Web refresh.
 void idf_modem_request_status_sample(void);
-// 重申短信存储选择(CPMS MT→ME→SM)：短信任务随 CMGF/CNMI 周期重申一起调用，
-// 覆盖"模组自发复位后存储回落默认值、短信无处可存"的静默失效
+// Reassert SMS storage selection (CPMS MT, ME, then SM) with CMGF and CNMI.
+// This repairs the default storage state after an unobserved modem reset.
 void idf_modem_reassert_sms_storage(void);
-// 每日后台短信体检：检查注册、PDU、CNMI 与短信存储，配置异常时自动重申。
-// 只能验证本机短信栈，无法证明运营商已实际投递一条新短信。
+// Check registration, PDU mode, CNMI, and SMS storage each day. Repair invalid settings.
+// This checks only the local SMS stack, not carrier delivery.
 bool idf_modem_sms_health_check(std::string& summary);
-// eSIM APDU 会话期间暂停模组/SMS 后台 AT，避免 CPMS/CMGL/健康探测插入逻辑通道操作。
+// Pause background modem and SMS commands during an eSIM APDU session.
 void idf_modem_begin_esim_operation(void);
 void idf_modem_end_esim_operation(void);
 bool idf_modem_esim_operation_active(void);
-// 启用/切换/禁用 eSIM Profile 后调用：清除缓存的卡相关身份(号码/ICCID/IMSI/运营商/APN)
-// 并请求一次采样，使概览重读新生效 Profile 的信息，而不是沿用旧卡缓存值。
+// Clear cached SIM identity after an eSIM profile change and request a new sample.
 void idf_modem_invalidate_sim_identity(void);
-// 注册"卡身份已变化"通知钩子(热插拔/eSIM 切换均触发)，供上层失效自身缓存(如 eSIM EID)。
-// 钩子可能在模组任务上下文被调用，实现必须无阻塞。
+// Register a SIM identity change hook for hot swaps and eSIM changes.
+// The hook can run in the modem task and must not block.
 void idf_modem_set_sim_identity_hook(void (*hook)(void));
-// 计划内 ESP 重启(网页重启/每日定时重启/低堆重启)前调用：拉低 EN 让模组彻底断电，
-// 重启后走全新上电。保留"重启设备可救活 AT 正常但收信已死的模组"的原有语义；
-// 热启动快路径只服务于崩溃/看门狗等意外复位
+// Pull EN low before a planned ESP restart to fully power off the modem.
+// Use the warm-start path only after an unexpected reset such as a crash or watchdog.
 void idf_modem_power_off_for_restart(void);

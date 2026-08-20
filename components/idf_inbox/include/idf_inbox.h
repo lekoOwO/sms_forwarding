@@ -22,11 +22,11 @@ struct IdfSentEntry {
     bool ok = false;
 };
 
-// 收发件箱均为有界 RAM 环，重启清空，不持久化号码或短信正文。
+// The inbox and outbox are bounded RAM rings. A restart clears them. Phone numbers and message bodies are not persistent.
 void idf_inbox_init(void);
 uint32_t idf_inbox_add(const char* sender, const char* text, const char* ts);
 void idf_inbox_mark_forwarded(uint32_t id);
-// 投递最终失败时把条目改回"未转发"，让用户能在收件箱看到并手动重发
+// If delivery fails permanently, mark the item as not forwarded so the user can see and resend it.
 void idf_inbox_set_forwarded(uint32_t id, bool forwarded);
 size_t idf_inbox_count(void);
 bool idf_inbox_get_by_id(uint32_t id, IdfInboxEntry& out);

@@ -11,6 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_IDF = "5.5.4"
+EXPECTED_IDF_IMAGE = (
+    "espressif/idf@sha256:"
+    "b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b"
+)
 EXPECTED_PARTITIONS = {
     "nvs": ("data", "nvs", 0x9000, 0x5000),
     "otadata": ("data", "ota", 0xE000, 0x2000),
@@ -60,9 +64,8 @@ def check_idf_pins() -> None:
     workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
     helper = (ROOT / "tools/idf.ps1").read_text(encoding="utf-8")
     shell_helper = (ROOT / "tools/idf.sh").read_text(encoding="utf-8")
-    expected_image = f"espressif/idf:v{EXPECTED_IDF}"
-    if f"container: {expected_image}" not in workflow:
-        fail(f"CI is not pinned to {expected_image}")
+    if f"container: {EXPECTED_IDF_IMAGE}" not in workflow:
+        fail(f"CI is not pinned to {EXPECTED_IDF_IMAGE}")
     if f"esp-idf-v{EXPECTED_IDF}" not in helper:
         fail(f"local helper default is not pinned to esp-idf-v{EXPECTED_IDF}")
     if f"ExpectedIdfVersion = '{EXPECTED_IDF}'" not in helper:

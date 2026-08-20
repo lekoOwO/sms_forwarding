@@ -91,16 +91,70 @@ public:
 
     void bytes(const uint8_t* data, size_t length) { bytes_.insert(bytes_.end(), data, data + length); }
 
-    void string(const std::string& value)
+    void text(const char* value, size_t length)
     {
-        u16(static_cast<uint16_t>(value.size()));
-        bytes(reinterpret_cast<const uint8_t*>(value.data()), value.size());
+        u16(static_cast<uint16_t>(length));
+        bytes(reinterpret_cast<const uint8_t*>(value), length);
     }
+
+    void string(const std::string& value) { text(value.data(), value.size()); }
 
     std::vector<uint8_t> take() { return std::move(bytes_); }
 
 private:
     std::vector<uint8_t> bytes_;
+};
+
+class FixedWriter {
+public:
+    FixedWriter(uint8_t* output, size_t capacity) : output_(output), capacity_(capacity) {}
+
+    void u8(uint8_t value) { bytes(&value, 1); }
+
+    void u16(uint16_t value)
+    {
+        uint8_t encoded[2] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8)};
+        bytes(encoded, sizeof(encoded));
+    }
+
+    void u32(uint32_t value)
+    {
+        uint8_t encoded[4];
+        for (uint8_t shift = 0; shift < 32; shift += 8) {
+            encoded[shift / 8] = static_cast<uint8_t>(value >> shift);
+        }
+        bytes(encoded, sizeof(encoded));
+    }
+
+    void bytes(const uint8_t* data, size_t length)
+    {
+        if (!ok_ || length > capacity_ - size_) {
+            ok_ = false;
+            return;
+        }
+        if (length > 0) std::memcpy(output_ + size_, data, length);
+        size_ += length;
+    }
+
+    void text(const char* value, size_t length)
+    {
+        if (length > UINT16_MAX) {
+            ok_ = false;
+            return;
+        }
+        u16(static_cast<uint16_t>(length));
+        bytes(reinterpret_cast<const uint8_t*>(value), length);
+    }
+
+    void string(const std::string& value) { text(value.data(), value.size()); }
+    bool ok() const { return ok_; }
+    size_t size() const { return size_; }
+
+private:
+    uint8_t* output_;
+    size_t capacity_;
+    size_t size_ = 0;
+    bool ok_ = true;
 };
 
 class Reader {
@@ -208,9 +262,9 @@ bool bounded(const std::string& value, size_t maxBytes, bool controls = true)
 {
     if (value.size() > maxBytes || value.find('\0') != std::string::npos || !validUtf8(value)) return false;
     if (controls) {
-        for (unsigned char ch : value) {
-            if (ch < 0x20U || ch == 0x7FU) return false;
-        }
+        if (!std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+                return ch >= 0x20U && ch != 0x7FU;
+            })) return false;
     }
     return true;
 }
@@ -219,10 +273,9 @@ bool hostnameValid(const std::string& value)
 {
     if (value.empty() || value.size() > MAX_HOSTNAME_LENGTH ||
         value.front() == '-' || value.back() == '-') return false;
-    for (unsigned char ch : value) {
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-')) return false;
-    }
-    return true;
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-';
+    });
 }
 
 bool wifiPasswordValid(const std::string& value)
@@ -268,24 +321,25 @@ IdfConfig defaults()
     value.hbHour = 9;
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         char name[24];
-        snprintf(name, sizeof(name), "通道%d", i + 1);
+        snprintf(name, sizeof(name), "Channel %d", i + 1);
         value.pushChannels[i].name = name;
     }
     return value;
 }
 
-bool semanticallyValid(const IdfConfig& value)
+bool semanticallyValid(const IdfConfig& value, bool portable = false)
 {
     if (value.smtpPort < 1 || value.smtpPort > 65535 || value.networkMode < NETWORK_MODE_WIFI_ONLY ||
         value.networkMode > NETWORK_MODE_MIX || value.heartbeatInterval < MIN_HEARTBEAT_INTERVAL_HOURS ||
-        value.heartbeatInterval > MAX_HEARTBEAT_INTERVAL_HOURS || !txPowerValid(value.wifiTxPowerQuarterDbm) ||
+        value.heartbeatInterval > MAX_HEARTBEAT_INTERVAL_HOURS ||
+        (!portable && !txPowerValid(value.wifiTxPowerQuarterDbm)) ||
         value.kaIntervalDays < 1 || value.kaIntervalDays > 3650 || value.kaAction > 3 ||
         value.tzOffsetMin < -720 || value.tzOffsetMin > 840 || value.rebootHour < 0 || value.rebootHour > 23 ||
         value.smsHealthHour < 0 || value.smsHealthHour > 23) {
         return false;
     }
-    if (value.deviceName.empty() || !bounded(value.deviceName, MAX_DEVICE_NAME_BYTES) ||
-        !hostnameValid(value.hostname) ||
+    if ((!portable && (value.deviceName.empty() || !bounded(value.deviceName, MAX_DEVICE_NAME_BYTES) ||
+        !hostnameValid(value.hostname))) ||
         (value.notificationLocale != NOTIFICATION_LOCALE_ZH_TW &&
          value.notificationLocale != NOTIFICATION_LOCALE_ZH_CN &&
          value.notificationLocale != NOTIFICATION_LOCALE_EN)) {
@@ -297,10 +351,10 @@ bool semanticallyValid(const IdfConfig& value)
         !bounded(value.adminPhone, MAX_ADMIN_PHONE_BYTES) || !bounded(value.numberBlackList, MAX_BLACKLIST_BYTES, false) ||
         !bounded(value.forwardRules, MAX_FORWARD_RULES_BYTES, false) || !bounded(value.ntpServer, MAX_NTP_SERVER_BYTES) ||
         !bounded(value.apn, MAX_APN_BYTES) || !bounded(value.operatorPlmn, MAX_OPERATOR_PLMN_BYTES) ||
-        !bounded(value.phoneNumber, MAX_PHONE_NUMBER_BYTES)) {
+        (!portable && !bounded(value.phoneNumber, MAX_PHONE_NUMBER_BYTES))) {
         return false;
     }
-    for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
+    for (int i = 0; !portable && i < IDF_MAX_WEB_ACCOUNTS; ++i) {
         if (!bounded(value.webAccounts[i].username, MAX_WEB_USERNAME_BYTES) ||
             !bounded(value.webAccounts[i].password, MAX_WEB_PASSWORD_BYTES)) return false;
     }
@@ -325,7 +379,7 @@ bool semanticallyValid(const IdfConfig& value)
         if (!bounded(profile.ssid, MAX_WIFI_SSID_BYTES) || !wifiPasswordValid(profile.pass) ||
             (profile.ssid.empty() && !profile.pass.empty())) return false;
     }
-    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+    for (int i = 0; !portable && i < IDF_MAX_SIM_CREDENTIALS; ++i) {
         const IdfSimCredential& item = value.simCredentials[i];
         if (!item.iccid.empty() && !digits(item.iccid, 15, MAX_SIM_ICCID_BYTES)) return false;
         if (!item.pin.empty() && !digits(item.pin, 4, MAX_SIM_PIN_BYTES)) return false;
@@ -339,7 +393,8 @@ bool semanticallyValid(const IdfConfig& value)
     }
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
         const IdfSchedTask& task = value.schedTasks[i];
-        if (!bounded(task.name, MAX_SCHEDULE_NAME_BYTES) || !bounded(task.profile, MAX_SCHEDULE_PROFILE_BYTES) ||
+        if (!bounded(task.name, MAX_SCHEDULE_NAME_BYTES) ||
+            (!portable && !bounded(task.profile, MAX_SCHEDULE_PROFILE_BYTES)) ||
             !bounded(task.target, MAX_SCHEDULE_TARGET_BYTES) || !bounded(task.payload, MAX_SCHEDULE_PAYLOAD_BYTES) ||
             task.intervalDays < 1 || task.intervalDays > 3650 || task.action > 3) return false;
     }
@@ -361,6 +416,26 @@ void writeHeader(std::vector<uint8_t>& blob, uint16_t schema, uint32_t generatio
     put32(8, generation);
     put32(12, static_cast<uint32_t>(blob.size() - payloadOffset));
     put32(16, crc32(blob.data() + payloadOffset, blob.size() - payloadOffset));
+}
+
+void writeHeader(uint8_t* blob, size_t blobSize, uint16_t schema, uint32_t generation,
+                 size_t payloadOffset)
+{
+    auto put16 = [blob](size_t offset, uint16_t value) {
+        blob[offset] = static_cast<uint8_t>(value);
+        blob[offset + 1] = static_cast<uint8_t>(value >> 8);
+    };
+    auto put32 = [blob](size_t offset, uint32_t value) {
+        for (uint8_t shift = 0; shift < 32; shift += 8) {
+            blob[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+        }
+    };
+    put32(0, kConfigMagic);
+    put16(4, schema);
+    put16(6, 0);
+    put32(8, generation);
+    put32(12, static_cast<uint32_t>(blobSize - payloadOffset));
+    put32(16, crc32(blob + payloadOffset, blobSize - payloadOffset));
 }
 
 void writeMarker(std::vector<uint8_t>& marker, uint16_t schema, uint32_t generation,
@@ -886,13 +961,14 @@ bool decodeV5(Reader& reader, IdfConfig& value)
     return semanticallyValid(value);
 }
 
-DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value, uint16_t& schema, uint32_t& generation)
+DecodeResult decodeBlob(const uint8_t* blob, size_t length, IdfConfig& value,
+                        uint16_t& schema, uint32_t& generation)
 {
-    if (blob.size() < kHeaderBytes || blob.size() > MAX_CONFIG_BLOB_SIZE) return DecodeResult::Invalid;
-    auto get16 = [&blob](size_t offset) {
+    if (!blob || length < kHeaderBytes || length > MAX_CONFIG_BLOB_SIZE) return DecodeResult::Invalid;
+    auto get16 = [blob](size_t offset) {
         return static_cast<uint16_t>(blob[offset]) | static_cast<uint16_t>(blob[offset + 1] << 8);
     };
-    auto get32 = [&blob](size_t offset) {
+    auto get32 = [blob](size_t offset) {
         return static_cast<uint32_t>(blob[offset]) | (static_cast<uint32_t>(blob[offset + 1]) << 8) |
                (static_cast<uint32_t>(blob[offset + 2]) << 16) |
                (static_cast<uint32_t>(blob[offset + 3]) << 24);
@@ -901,11 +977,11 @@ DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value, uint
     schema = get16(4);
     generation = get32(8);
     const uint32_t payloadLength = get32(12);
-    if (payloadLength != blob.size() - kHeaderBytes ||
-        get32(16) != crc32(blob.data() + kHeaderBytes, payloadLength)) return DecodeResult::Invalid;
+    if (payloadLength != length - kHeaderBytes ||
+        get32(16) != crc32(blob + kHeaderBytes, payloadLength)) return DecodeResult::Invalid;
     if (schema > CONFIG_SCHEMA_VERSION) return DecodeResult::Unsupported;
     if (schema == 0) return DecodeResult::Invalid;
-    Reader reader(blob.data() + kHeaderBytes, blob.data() + blob.size());
+    Reader reader(blob + kHeaderBytes, blob + length);
     bool ok = schema == 1 ? decodeV1(reader, value) :
               schema == 2 ? decodeV2Common(reader, value, PUSH_TYPE_TELEGRAM) :
               schema == 3 ? decodeV2Common(reader, value, PUSH_TYPE_NTFY) :
@@ -913,13 +989,41 @@ DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value, uint
     return ok && reader.atEnd() ? DecodeResult::Valid : DecodeResult::Invalid;
 }
 
-bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
+bool blobEnvelopeValid(const uint8_t* blob, size_t length, uint16_t expectedSchema,
+                       uint32_t expectedGeneration)
 {
-    if (!semanticallyValid(value)) return false;
-    Writer writer;
+    if (!blob || length < kHeaderBytes || length > MAX_CONFIG_BLOB_SIZE) return false;
+    auto get16 = [blob](size_t offset) {
+        return static_cast<uint16_t>(blob[offset]) | static_cast<uint16_t>(blob[offset + 1] << 8);
+    };
+    auto get32 = [blob](size_t offset) {
+        return static_cast<uint32_t>(blob[offset]) | (static_cast<uint32_t>(blob[offset + 1]) << 8) |
+               (static_cast<uint32_t>(blob[offset + 2]) << 16) |
+               (static_cast<uint32_t>(blob[offset + 3]) << 24);
+    };
+    const uint32_t payloadLength = get32(12);
+    return get32(0) == kConfigMagic && get16(4) == expectedSchema && get16(6) == 0 &&
+           get32(8) == expectedGeneration && payloadLength == length - kHeaderBytes &&
+           get32(16) == crc32(blob + kHeaderBytes, payloadLength);
+}
+
+DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value,
+                        uint16_t& schema, uint32_t& generation)
+{
+    return decodeBlob(blob.data(), blob.size(), value, schema, generation);
+}
+
+template <typename OutputWriter>
+void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable)
+{
     writer.u32(static_cast<uint32_t>(value.smtpPort));
-    writer.string(value.deviceName);
-    writer.string(value.hostname);
+    if (portable) {
+        writer.text(PORTABLE_DEVICE_NAME, sizeof(PORTABLE_DEVICE_NAME) - 1);
+        writer.text(PORTABLE_HOSTNAME, sizeof(PORTABLE_HOSTNAME) - 1);
+    } else {
+        writer.string(value.deviceName);
+        writer.string(value.hostname);
+    }
     writer.string(value.notificationLocale);
     writer.string(value.smtpServer);
     writer.string(value.smtpUser);
@@ -929,8 +1033,13 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
     writer.string(value.numberBlackList);
     writer.u8(IDF_MAX_WEB_ACCOUNTS);
     for (const IdfWebAccount& account : value.webAccounts) {
-        writer.string(account.username);
-        writer.string(account.password);
+        if (portable) {
+            writer.text("", 0);
+            writer.text("", 0);
+        } else {
+            writer.string(account.username);
+            writer.string(account.password);
+        }
     }
     writer.u8(IDF_MAX_PUSH_CHANNELS);
     for (const IdfPushChannel& channel : value.pushChannels) {
@@ -952,7 +1061,7 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
     writer.u32(static_cast<uint32_t>(value.networkMode));
     writer.u8(value.heartbeatEnable ? 1 : 0);
     writer.u32(static_cast<uint32_t>(value.heartbeatInterval));
-    writer.u32(value.wifiTxPowerQuarterDbm);
+    writer.u32(portable ? WIFI_TX_POWER_8_5DBM : value.wifiTxPowerQuarterDbm);
     writer.u8(value.emailEnabled ? 1 : 0);
     writer.u8(value.pushEnabled ? 1 : 0);
     writer.string(value.forwardRules);
@@ -961,8 +1070,9 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
     writer.u32(value.kaAction);
     writer.string(value.kaTarget);
     writer.string(value.kaUrl);
-    writer.string(value.kaProfile);
-    writer.u32(value.kaLastTime);
+    if (portable) writer.text("", 0);
+    else writer.string(value.kaProfile);
+    writer.u32(portable ? 0 : value.kaLastTime);
     writer.u32(static_cast<uint32_t>(value.tzOffsetMin));
     writer.string(value.ntpServer);
     writer.u8(value.rebootEnabled ? 1 : 0);
@@ -973,32 +1083,51 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
     writer.u8(value.netLedEnabled ? 1 : 0);
     writer.u8(value.callNotifyEnabled ? 1 : 0);
     writer.u8(value.dataEnabled ? 1 : 0);
-    writer.u8(value.roamingEnabled ? 1 : 0);
+    writer.u8(!portable && value.roamingEnabled ? 1 : 0);
     writer.string(value.apn);
     writer.string(value.operatorPlmn);
-    writer.string(value.phoneNumber);
+    if (portable) writer.text("", 0);
+    else writer.string(value.phoneNumber);
     writer.u8(IDF_MAX_SIM_CREDENTIALS);
     for (const IdfSimCredential& item : value.simCredentials) {
-        writer.string(item.iccid);
-        writer.string(item.pin);
-        writer.string(item.puk);
-        writer.u32(item.pinMaxAttempts);
-        writer.u32(item.pukMaxAttempts);
-        writer.u32(item.pinFailedAttempts);
-        writer.u32(item.pukFailedAttempts);
+        if (portable) {
+            writer.text("", 0);
+            writer.text("", 0);
+            writer.text("", 0);
+            writer.u32(1);
+            writer.u32(1);
+            writer.u32(0);
+            writer.u32(0);
+        } else {
+            writer.string(item.iccid);
+            writer.string(item.pin);
+            writer.string(item.puk);
+            writer.u32(item.pinMaxAttempts);
+            writer.u32(item.pukMaxAttempts);
+            writer.u32(item.pinFailedAttempts);
+            writer.u32(item.pukFailedAttempts);
+        }
     }
     writer.u8(IDF_MAX_SCHED_TASKS);
     for (const IdfSchedTask& task : value.schedTasks) {
         writer.u8(task.enabled ? 1 : 0);
         writer.string(task.name);
-        writer.string(task.profile);
+        if (portable) writer.text("", 0);
+        else writer.string(task.profile);
         writer.u8(task.switchBack ? 1 : 0);
         writer.u32(static_cast<uint32_t>(task.intervalDays));
         writer.u32(task.action);
         writer.string(task.target);
         writer.string(task.payload);
-        writer.u32(task.lastRun);
+        writer.u32(portable ? 0 : task.lastRun);
     }
+}
+
+bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
+{
+    if (!semanticallyValid(value)) return false;
+    Writer writer;
+    encodeV5Fields(value, writer, false);
     std::vector<uint8_t> payload = writer.take();
     if (payload.size() + kHeaderBytes > MAX_CONFIG_BLOB_SIZE) return false;
     blob.assign(kHeaderBytes, 0);
@@ -1203,12 +1332,105 @@ void idf_config_storage_factory_reset(IdfConfig& out)
     out = defaults();
 }
 
+esp_err_t idf_config_storage_encode_portable(const IdfConfig& source, uint8_t* output,
+                                             size_t capacity, size_t* written)
+{
+    if (written) *written = 0;
+    if (!output || !written) return ESP_ERR_INVALID_ARG;
+    const size_t usableCapacity = std::min(capacity, MAX_CONFIG_BLOB_SIZE);
+    if (capacity < kHeaderBytes) {
+        std::memset(output, 0, usableCapacity);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (!semanticallyValid(source, true)) {
+        std::memset(output, 0, usableCapacity);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const size_t payloadCapacity = usableCapacity - kHeaderBytes;
+    FixedWriter writer(output + kHeaderBytes, payloadCapacity);
+    encodeV5Fields(source, writer, true);
+    if (!writer.ok()) {
+        std::memset(output, 0, usableCapacity);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    const size_t total = kHeaderBytes + writer.size();
+    writeHeader(output, total, CONFIG_SCHEMA_VERSION, 0, kHeaderBytes);
+    *written = total;
+    return ESP_OK;
+}
+
+IdfPortableConfigStatus idf_config_storage_decode_portable(const uint8_t* bytes, size_t length,
+                                                           const IdfConfig& target,
+                                                           IdfConfig& output)
+{
+    IdfConfig decoded;
+    uint16_t schema = 0;
+    uint32_t generation = 0;
+    const DecodeResult result = decodeBlob(bytes, length, decoded, schema, generation);
+    if (result == DecodeResult::Unsupported) return IdfPortableConfigStatus::UnsupportedVersion;
+    if (result != DecodeResult::Valid || generation != 0) return IdfPortableConfigStatus::Invalid;
+
+    if (schema < 4) {
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) decoded.wifiNetworks[i] = target.wifiNetworks[i];
+        decoded.networkMode = target.networkMode;
+        decoded.heartbeatEnable = target.heartbeatEnable;
+        decoded.heartbeatInterval = target.heartbeatInterval;
+    }
+    if (schema < 5) {
+        decoded.emailEnabled = target.emailEnabled;
+        decoded.pushEnabled = target.pushEnabled;
+        decoded.forwardRules = target.forwardRules;
+        decoded.kaEnabled = target.kaEnabled;
+        decoded.kaIntervalDays = target.kaIntervalDays;
+        decoded.kaAction = target.kaAction;
+        decoded.kaTarget = target.kaTarget;
+        decoded.kaUrl = target.kaUrl;
+        decoded.tzOffsetMin = target.tzOffsetMin;
+        decoded.ntpServer = target.ntpServer;
+        decoded.rebootEnabled = target.rebootEnabled;
+        decoded.rebootHour = target.rebootHour;
+        decoded.smsHealthEnabled = target.smsHealthEnabled;
+        decoded.smsHealthHour = target.smsHealthHour;
+        decoded.smsHealthNotify = target.smsHealthNotify;
+        decoded.netLedEnabled = target.netLedEnabled;
+        decoded.callNotifyEnabled = target.callNotifyEnabled;
+        decoded.dataEnabled = target.dataEnabled;
+        decoded.apn = target.apn;
+        decoded.operatorPlmn = target.operatorPlmn;
+        for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) decoded.schedTasks[i] = target.schedTasks[i];
+    }
+
+    decoded.deviceName = target.deviceName;
+    decoded.hostname = target.hostname;
+    for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) decoded.webAccounts[i] = target.webAccounts[i];
+    decoded.wifiTxPowerQuarterDbm = target.wifiTxPowerQuarterDbm;
+    decoded.kaProfile = target.kaProfile;
+    decoded.kaLastTime = target.kaLastTime;
+    decoded.roamingEnabled = target.roamingEnabled;
+    decoded.phoneNumber = target.phoneNumber;
+    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+        decoded.simCredentials[i] = target.simCredentials[i];
+    }
+    for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
+        decoded.schedTasks[i].profile = target.schedTasks[i].profile;
+        decoded.schedTasks[i].lastRun = target.schedTasks[i].lastRun;
+    }
+    syncLegacyMirrors(decoded);
+    if (!semanticallyValid(decoded)) return IdfPortableConfigStatus::Invalid;
+    output = std::move(decoded);
+    return IdfPortableConfigStatus::Ok;
+}
+
 esp_err_t idf_config_storage_save(const IdfConfig& candidate)
 {
     std::vector<uint8_t> blob;
     nvs_handle_t nvs = 0;
+    bool nvsOpen = false;
+    try {
     esp_err_t err = openStorage(NVS_READWRITE, nvs);
     if (err != ESP_OK) return err;
+    nvsOpen = true;
     std::unique_ptr<Slot[]> slots(new (std::nothrow) Slot[2]);
     if (!slots) {
         nvs_close(nvs);
@@ -1248,6 +1470,8 @@ esp_err_t idf_config_storage_save(const IdfConfig& candidate)
     }
     const uint32_t expectedBlobLength = static_cast<uint32_t>(blob.size());
     const uint32_t expectedBlobCrc = crc32(blob.data(), blob.size());
+    std::vector<uint8_t> marker;
+    writeMarker(marker, CONFIG_SCHEMA_VERSION, nextGeneration, expectedBlobLength, expectedBlobCrc);
     // The inactive slot may still carry its previous marker.  Remove it in a
     // separate commit before replacing the blob so a power cut between blob
     // and marker commits leaves an incomplete slot, never a mismatched
@@ -1257,56 +1481,59 @@ esp_err_t idf_config_storage_save(const IdfConfig& candidate)
     if (err == ESP_OK) err = nvs_commit(nvs);
     if (err == ESP_OK) err = nvs_set_blob(nvs, kBlobKeys[target], blob.data(), blob.size());
     if (err == ESP_OK) err = nvs_commit(nvs);
-    // The original encode buffer is no longer needed after NVS accepts the
-    // blob.  Release it before allocating the readback buffer so save has at
-    // most one full-size payload resident at a time.
-    std::vector<uint8_t>().swap(blob);
     if (err == ESP_OK) {
-        std::vector<uint8_t> checked;
+        // Reuse the encode allocation for readback. No allocation may occur
+        // after the first NVS mutation, so bad_alloc cannot strand a new slot.
         bool present = false;
-        err = readBlob(nvs, kBlobKeys[target], checked, present);
-        uint16_t schema = 0;
-        uint32_t checkedGeneration = 0;
-        std::unique_ptr<IdfConfig> checkedValue(new (std::nothrow) IdfConfig);
-        if (err == ESP_OK && (!present || checked.size() != expectedBlobLength ||
-                              crc32(checked.data(), checked.size()) != expectedBlobCrc ||
-                              !checkedValue ||
-                              decodeBlob(checked, *checkedValue, schema, checkedGeneration) != DecodeResult::Valid ||
-                              schema != CONFIG_SCHEMA_VERSION || checkedGeneration != nextGeneration)) {
+        err = readBlob(nvs, kBlobKeys[target], blob, present);
+        if (err == ESP_OK && (!present || blob.size() != expectedBlobLength ||
+                              crc32(blob.data(), blob.size()) != expectedBlobCrc ||
+                              !blobEnvelopeValid(blob.data(), blob.size(), CONFIG_SCHEMA_VERSION,
+                                                 nextGeneration))) {
             err = ESP_ERR_INVALID_STATE;
         }
-        std::vector<uint8_t>().swap(checked);
     }
+    std::vector<uint8_t>().swap(blob);
     if (err == ESP_OK) {
-        std::vector<uint8_t> marker;
-        writeMarker(marker, CONFIG_SCHEMA_VERSION, nextGeneration, expectedBlobLength, expectedBlobCrc);
         err = nvs_set_blob(nvs, kMarkerKeys[target], marker.data(), marker.size());
         if (err == ESP_OK) err = nvs_set_u8(nvs, kStateKey, CONFIG_STATE_READY);
         if (err == ESP_OK) err = nvs_commit(nvs);
         if (err == ESP_OK) {
-            std::vector<uint8_t> checkedMarker;
-            bool present = false;
-            err = readMarkerBlob(nvs, kMarkerKeys[target], checkedMarker, present);
-            if (err == ESP_OK && (!present || checkedMarker != marker)) err = ESP_ERR_INVALID_STATE;
+            uint8_t checkedMarker[kMarkerBytes] = {};
+            size_t checkedLength = sizeof(checkedMarker);
+            err = nvs_get_blob(nvs, kMarkerKeys[target], checkedMarker, &checkedLength);
+            if (err == ESP_OK &&
+                (checkedLength != marker.size() ||
+                 std::memcmp(checkedMarker, marker.data(), marker.size()) != 0)) {
+                err = ESP_ERR_INVALID_STATE;
+            }
         }
     }
     nvs_close(nvs);
+    nvsOpen = false;
     if (err == ESP_OK) {
         s_activeSlot = target;
         s_activeGeneration = nextGeneration;
     }
     return err;
+    } catch (const std::bad_alloc&) {
+        if (nvsOpen) nvs_close(nvs);
+        return ESP_ERR_NO_MEM;
+    }
 }
 
 esp_err_t idf_config_storage_load(IdfConfig& out, IdfConfigLoadStatus* status)
 {
     if (status) *status = IdfConfigLoadStatus::Unknown;
     nvs_handle_t nvs = 0;
+    bool nvsOpen = false;
+    try {
     esp_err_t err = openStorage(NVS_READWRITE, nvs);
     if (err != ESP_OK) {
         if (status) *status = IdfConfigLoadStatus::StorageError;
         return err;
     }
+    nvsOpen = true;
     std::unique_ptr<Slot[]> slots(new (std::nothrow) Slot[2]);
     if (!slots) {
         nvs_close(nvs);
@@ -1361,6 +1588,7 @@ esp_err_t idf_config_storage_load(IdfConfig& out, IdfConfigLoadStatus* status)
         }
         const bool migrated = activeSchema < CONFIG_SCHEMA_VERSION;
         nvs_close(nvs);
+        nvsOpen = false;
         if (migrated) {
             err = idf_config_storage_save(out);
             if (err != ESP_OK) {
@@ -1384,6 +1612,7 @@ esp_err_t idf_config_storage_load(IdfConfig& out, IdfConfigLoadStatus* status)
         return ESP_ERR_INVALID_STATE;
     }
     nvs_close(nvs);
+    nvsOpen = false;
 
     bool existed = false;
     if (!loadLegacy(out, existed)) {
@@ -1397,4 +1626,9 @@ esp_err_t idf_config_storage_load(IdfConfig& out, IdfConfigLoadStatus* status)
     }
     if (status) *status = existed ? IdfConfigLoadStatus::Migrated : IdfConfigLoadStatus::FirstBoot;
     return ESP_OK;
+    } catch (const std::bad_alloc&) {
+        if (nvsOpen) nvs_close(nvs);
+        if (status) *status = IdfConfigLoadStatus::StorageError;
+        return ESP_ERR_NO_MEM;
+    }
 }

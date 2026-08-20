@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <ctype.h>
+#include <iterator>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,9 +19,9 @@
 namespace {
 
 static constexpr const char* ISDR_AID_HEX = "A0000005591010FFFFFFFF8900000100";
-// lpac 默认单块 120 字节：240 个 HEX 字符加框架不会超过常见模组的 AT 行长限制。
+// lpac uses 120-byte blocks by default. The 240 hex characters and framing fit common modem AT line limits.
 static constexpr size_t STORE_DATA_MSS = 120;
-// ES10c 列表只取 UI 所需字段；给畸形 61xx 响应链留上限，避免后台任务无限占用蜂窝通道。
+// Request only the ES10c fields that the UI uses. Limit malformed 61xx chains so a task cannot hold the cellular channel forever.
 static constexpr size_t APDU_RESPONSE_DATA_MAX = 16 * 1024;
 static constexpr size_t GET_RESPONSE_CHAIN_MAX = 64;
 
@@ -39,7 +40,9 @@ struct ProfileIdentifier {
 
 static std::string lower_ascii(std::string value)
 {
-    for (char& ch : value) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    std::transform(value.begin(), value.end(), value.begin(), [](char ch) {
+        return static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+    });
     return value;
 }
 
@@ -59,10 +62,7 @@ static int hex_value(char ch)
 static bool is_hex_string(const std::string& value)
 {
     if (value.empty() || (value.size() % 2) != 0) return false;
-    for (char ch : value) {
-        if (hex_value(ch) < 0) return false;
-    }
-    return true;
+    return std::all_of(value.begin(), value.end(), [](char ch) { return hex_value(ch) >= 0; });
 }
 
 static bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out)
@@ -96,15 +96,14 @@ static std::string bytes_to_hex(const std::vector<uint8_t>& data)
 static bool all_digits(const std::string& value)
 {
     if (value.empty()) return false;
-    for (char ch : value) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return isdigit(static_cast<unsigned char>(ch));
+    });
 }
 
 static bool parse_positive_int_token(const std::string& value, int& out)
 {
-    // all_digits 先拒绝空串/符号/非数字(strtol 本身太宽松)，纯数字串必被整体消费
+    // Reject empty, signed, and nondigit input before strtol. A digit-only string must be consumed in full.
     std::string text = idf_util_trim_copy(value);
     if (!all_digits(text)) return false;
     long parsed = strtol(text.c_str(), nullptr, 10);
@@ -117,9 +116,9 @@ static std::string compact_digits(const std::string& value)
 {
     std::string out;
     out.reserve(value.size());
-    for (char ch : value) {
-        if (isdigit(static_cast<unsigned char>(ch))) out.push_back(ch);
-    }
+    std::copy_if(value.begin(), value.end(), std::back_inserter(out), [](char ch) {
+        return isdigit(static_cast<unsigned char>(ch));
+    });
     return out;
 }
 
@@ -147,7 +146,7 @@ static bool gsm_bcd_encode(const std::string& digits, std::vector<uint8_t>& out)
         uint8_t hi = (i + 1 < digits.size()) ? static_cast<uint8_t>(digits[i + 1] - '0') : 0x0F;
         out.push_back(static_cast<uint8_t>((hi << 4) | lo));
     }
-    // SGP.22 中 ICCID(tag 5A) 固定 10 字节，不足时按 lpac 约定补 0xFF。
+    // SGP.22 defines ICCID (tag 5A) as 10 bytes. Pad short values with 0xFF as lpac does.
     while (out.size() < 10) out.push_back(0xFF);
     return true;
 }
@@ -169,7 +168,7 @@ static std::string eid_decode(const std::vector<uint8_t>& value)
 static int tlv_int_value(const Tlv& tlv, int def = 0)
 {
     if (tlv.value.empty()) return def;
-    // 卡片可控数据：仅取尾部 4 字节，防止超长 TLV 左移出符号位(有符号溢出为 UB)
+    // Card-controlled data: use only the final four bytes so a long TLV cannot cause signed overflow during a left shift.
     uint32_t out = 0;
     size_t start = tlv.value.size() > 4 ? tlv.value.size() - 4 : 0;
     for (size_t i = start; i < tlv.value.size(); ++i) out = (out << 8) | tlv.value[i];
@@ -190,22 +189,22 @@ static bool tag_is(const Tlv& tlv, const uint8_t (&tag)[N])
 template <size_t N>
 static const Tlv* first_child(const Tlv& tlv, const uint8_t (&tag)[N])
 {
-    for (const Tlv& child : tlv.children) {
-        if (tag_is(child, tag)) return &child;
-    }
-    return nullptr;
+    const auto child = std::find_if(tlv.children.begin(), tlv.children.end(), [&](const Tlv& item) {
+        return tag_is(item, tag);
+    });
+    return child == tlv.children.end() ? nullptr : &*child;
 }
 
 static bool parse_tlv_one(const std::vector<uint8_t>& data, size_t end, size_t& pos, Tlv& out,
                           std::string& message, int depth = 0)
 {
-    // ES10c 响应实际嵌套 3~4 层；深度上限防止畸形响应递归打爆任务栈
+    // ES10c responses have three or four nested levels. Limit depth so malformed data cannot exhaust the task stack.
     if (depth > 8) {
-        message = "TLV 嵌套过深";
+        message = "TLV nesting is too deep";
         return false;
     }
     if (pos >= end) {
-        message = "TLV 数据为空";
+        message = "TLV data is empty";
         return false;
     }
     size_t tag_start = pos;
@@ -218,13 +217,13 @@ static bool parse_tlv_one(const std::vector<uint8_t>& data, size_t end, size_t& 
             if ((b & 0x80) == 0) break;
         }
         if ((data[pos - 1] & 0x80) != 0) {
-            message = "TLV tag 不完整";
+            message = "TLV tag is incomplete";
             return false;
         }
     }
     out.tag.assign(data.begin() + tag_start, data.begin() + pos);
     if (pos >= end) {
-        message = "TLV length 缺失";
+        message = "TLV length is missing";
         return false;
     }
     uint8_t len0 = data[pos++];
@@ -234,13 +233,13 @@ static bool parse_tlv_one(const std::vector<uint8_t>& data, size_t end, size_t& 
     } else {
         size_t count = len0 & 0x7F;
         if (count == 0 || count > 3 || pos + count > end) {
-            message = "TLV length 格式不支持";
+            message = "TLV length format is not supported";
             return false;
         }
         for (size_t i = 0; i < count; ++i) len = (len << 8) | data[pos++];
     }
     if (pos + len > end) {
-        message = "TLV length 超出响应";
+        message = "TLV length exceeds the response";
         return false;
     }
     out.value.assign(data.begin() + pos, data.begin() + pos + len);
@@ -262,7 +261,7 @@ static bool parse_tlv(const std::vector<uint8_t>& data, Tlv& out, std::string& m
     size_t pos = 0;
     if (!parse_tlv_one(data, data.size(), pos, out, message)) return false;
     if (pos != data.size()) {
-        message = "TLV 响应含有多余数据";
+        message = "TLV response contains extra data";
         return false;
     }
     return true;
@@ -303,13 +302,13 @@ static std::string status_word_text(uint16_t sw)
     char buf[96];
     switch (sw) {
         case 0x9000: return "OK";
-        case 0x6A82: return "未找到 eUICC 应用或 Profile";
-        case 0x6985: return "卡策略拒绝当前操作";
-        case 0x6A86: return "APDU 参数不被卡接受";
-        case 0x6D00: return "eUICC 不支持该 APDU 指令";
-        case 0x6E00: return "APDU 逻辑通道 CLA 不被接受";
+        case 0x6A82: return "eUICC application or profile not found";
+        case 0x6985: return "Card policy rejected this operation";
+        case 0x6A86: return "The card rejected the APDU parameters";
+        case 0x6D00: return "The eUICC does not support this APDU command";
+        case 0x6E00: return "The APDU logical channel rejected the CLA";
         default:
-            snprintf(buf, sizeof(buf), "APDU 状态字 %04X", static_cast<unsigned>(sw));
+            snprintf(buf, sizeof(buf), "APDU status word %04X", static_cast<unsigned>(sw));
             return buf;
     }
 }
@@ -334,7 +333,7 @@ static bool parse_quoted_hex_response(const std::string& resp,
 {
     std::string line = first_line_containing(resp, prefix);
     if (line.empty()) {
-        message = "模组未返回 APDU 数据";
+        message = "The modem did not return APDU data";
         return false;
     }
     std::string hex;
@@ -349,11 +348,11 @@ static bool parse_quoted_hex_response(const std::string& resp,
         if (!hex.empty() && hex.back() == '"') hex.pop_back();
     }
     if (hex.empty()) {
-        message = "模组 APDU 响应格式无法解析";
+        message = "The modem APDU response format cannot be parsed";
         return false;
     }
     if (!hex_to_bytes(hex, out)) {
-        message = "模组 APDU 响应不是合法 HEX";
+        message = "The modem APDU response is not valid hex";
         return false;
     }
     return true;
@@ -368,7 +367,7 @@ static bool parse_ccho_channel(const std::string& resp, int& channel)
         return parse_positive_int_token(p + 1, channel);
     }
 
-    // 有些模组只返回裸数字；跳过 echo/OK/空行。
+    // Some modems return only a bare number. Skip echo, OK, and empty lines.
     size_t pos = 0;
     while (pos < resp.size()) {
         size_t end = resp.find('\n', pos);
@@ -408,7 +407,7 @@ public:
         std::string resp;
         esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
-            // 上次会话异常退出可能残留逻辑通道，先清理 1..3 再重试一次。
+            // An abnormal previous session can leave a logical channel open. Close channels 1 through 3 and retry once.
             for (int ch = 1; ch <= 3; ++ch) {
                 char cchc[24];
                 snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", ch);
@@ -419,19 +418,17 @@ public:
             err = idf_modem_send_at(cmd, 30000, resp);
         }
         if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
-            message = "打开 eUICC 逻辑通道失败：";
+            message = "Failed to open the eUICC logical channel: ";
             message += resp.empty() ? esp_err_to_name(err) : resp;
-            // 卡内残留主动式会话(如旧固件 REFRESH 遗留)会让 CCHO 一直报 CME ERROR，
-            // 只有复位 UICC 能清掉；给用户指出恢复路径
-            message += "；如反复失败请在概览页重启模组";
+            // A stale proactive session can make CCHO return CME ERROR until a UICC reset clears it.
+            message += "; if this repeats, restart the modem from the overview page";
             return err == ESP_OK ? ESP_FAIL : err;
         }
         if (m_channel <= 0 || m_channel > 19) {
             char buf[96];
-            snprintf(buf, sizeof(buf), "模组返回了不支持的逻辑通道 %d", m_channel);
+            snprintf(buf, sizeof(buf), "The modem returned unsupported logical channel %d", m_channel);
             message = buf;
-            // close() 只在 m_open 时生效，这里通道确实已被模组打开，必须直接关掉，
-            // 否则超范围通道会一直泄漏到卡上逻辑通道耗尽
+            // close() only acts when m_open is true. Close this out-of-range channel directly to prevent a channel leak.
             char cchc[24];
             snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", m_channel);
             std::string ignored;
@@ -464,7 +461,7 @@ public:
                             std::string& message)
     {
         if (!m_open) {
-            message = "eUICC 逻辑通道未打开";
+            message = "The eUICC logical channel is not open";
             return ESP_ERR_INVALID_STATE;
         }
         std::string hex = bytes_to_hex(apdu);
@@ -481,7 +478,7 @@ public:
         }
         if (!parse_quoted_hex_response(resp, "+CGLA:", response, message)) return ESP_FAIL;
         if (response.size() < 2) {
-            message = "APDU 响应过短";
+            message = "APDU response is too short";
             return ESP_FAIL;
         }
         return ESP_OK;
@@ -492,7 +489,7 @@ public:
                                   std::string& message)
     {
         if (payload.empty()) {
-            message = "APDU payload 为空";
+            message = "APDU payload is empty";
             return ESP_ERR_INVALID_ARG;
         }
         response_data.clear();
@@ -532,23 +529,23 @@ private:
         while (true) {
             uint16_t sw = response_sw(resp);
             if (sw == 0) {
-                message = "APDU 响应过短";
+                message = "APDU response is too short";
                 return ESP_FAIL;
             }
             size_t data_len = resp.size() - 2;
             if (out.size() + data_len > APDU_RESPONSE_DATA_MAX) {
-                message = "APDU 响应过大";
+                message = "APDU response is too large";
                 return ESP_ERR_NO_MEM;
             }
             out.insert(out.end(), resp.begin(), resp.end() - 2);
-            // 91xx 表示命令已成功且模组将执行 SIM REFRESH；SW2 是主动命令长度，不是错误码。
+            // 91xx means success and an upcoming SIM REFRESH. SW2 is the proactive-command length, not an error code.
             if (response_sw_ok(sw)) return ESP_OK;
             if ((sw >> 8) != 0x61) {
                 message = status_word_text(sw);
                 return ESP_FAIL;
             }
             if (++get_response_count > GET_RESPONSE_CHAIN_MAX) {
-                message = "APDU 分段响应过多";
+                message = "APDU response has too many segments";
                 return ESP_FAIL;
             }
 
@@ -596,7 +593,7 @@ static std::vector<uint8_t> make_profile_list_request(bool with_tags)
 {
     std::vector<uint8_t> body;
     if (with_tags) {
-        // 仅请求 UI 需要的字段，避免 Profile 图标等大字段撑高堆峰值。
+        // Request only fields that the UI uses. Large fields such as profile icons increase peak heap use.
         std::vector<uint8_t> tags = {0x5A, 0x4F, 0x9F, 0x70, 0x90, 0x91, 0x92, 0x95};
         static constexpr uint8_t tag_list_tag[] = {0x5C};
         append_tlv(body, tag_list_tag, tags);
@@ -658,12 +655,12 @@ static bool parse_profile_list_response(const Tlv& response,
     static constexpr uint8_t TAG_PROFILE_BF25[] = {0xBF, 0x25};
 
     if (!tag_is(response, TAG_LIST)) {
-        message = "Profile 列表响应 tag 不匹配";
+        message = "Profile list response tag does not match";
         return false;
     }
     if (const Tlv* err = first_child(response, TAG_ERROR)) {
         int code = tlv_int_value(*err, 127);
-        message = (code == 1) ? "eUICC 拒绝 Profile 列表查询参数" : "eUICC 返回 Profile 列表未知错误";
+        message = (code == 1) ? "The eUICC rejected the profile list query" : "The eUICC returned an unknown profile list error";
         return false;
     }
     const Tlv* container = first_child(response, TAG_CONTAINER);
@@ -678,10 +675,9 @@ static bool parse_profile_list_response(const Tlv& response,
     return true;
 }
 
-// EID 是单张 eUICC 的固定标识，读到一次后缓存：省掉每次列表前的一整个 APDU 会话。
-// 调用方由蜂窝任务互斥锁串行化，无并发写。但可插拔 eUICC 热插拔换卡后 EID 会变，
-// 模组的卡身份钩子只置原子脏标记(可能在模组任务上下文触发)，真正清缓存在
-// 下次 read_eid(蜂窝任务上下文)执行，与读取方天然串行，无竞争。
+// The EID is fixed for one eUICC. Cache it after the first read to avoid an APDU session before each list request.
+// The cellular-task mutex serializes callers. A replaceable eUICC can change its EID after a hot swap.
+// The modem hook only sets an atomic dirty flag. The next read_eid call clears the cache in the serialized cellular task.
 static std::string s_eid_cache;
 static std::atomic<bool> s_eid_cache_stale{false};
 
@@ -698,7 +694,7 @@ static esp_err_t read_eid(std::string& eid, std::string& message)
     if (s_eid_cache_stale.exchange(false, std::memory_order_relaxed)) s_eid_cache.clear();
     if (!s_eid_cache.empty()) {
         eid = s_eid_cache;
-        message = "EID(缓存)";
+        message = "EID (cached)";
         return ESP_OK;
     }
 
@@ -706,17 +702,17 @@ static esp_err_t read_eid(std::string& eid, std::string& message)
     esp_err_t err = invoke_es10c(make_get_eid_request(), response, message);
     if (err != ESP_OK) return err;
     if (!tag_is(response, TAG_EID_RESP)) {
-        message = "EID 响应 tag 不匹配";
+        message = "EID response tag does not match";
         return ESP_FAIL;
     }
     const Tlv* eid_tlv = first_child(response, TAG_EID);
     if (!eid_tlv || eid_tlv->value.empty()) {
-        message = "eUICC 未返回 EID";
+        message = "The eUICC did not return an EID";
         return ESP_FAIL;
     }
     eid = eid_decode(eid_tlv->value);
     s_eid_cache = eid;
-    message = "EID 读取成功";
+    message = "EID read succeeded";
     return ESP_OK;
 }
 
@@ -726,22 +722,22 @@ static esp_err_t read_profiles(std::vector<IdfEsimProfile>& profiles, std::strin
     esp_err_t err = invoke_es10c(make_profile_list_request(true), response, message);
     if (err == ESP_OK && parse_profile_list_response(response, profiles, message)) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "已读取 %u 个 eSIM Profile", static_cast<unsigned>(profiles.size()));
+        snprintf(buf, sizeof(buf), "Read %u eSIM profiles", static_cast<unsigned>(profiles.size()));
         message = buf;
         return ESP_OK;
     }
 
-    // 部分卡对 tag-list 参数较挑剔，退回 BF2D00 再试一次。
+    // Some cards reject the tag-list parameter. Fall back to BF2D00 and retry once.
     std::string first_error = message;
     response = Tlv();
     err = invoke_es10c(make_profile_list_request(false), response, message);
     if (err == ESP_OK && parse_profile_list_response(response, profiles, message)) {
         char buf[96];
-        snprintf(buf, sizeof(buf), "已读取 %u 个 eSIM Profile（兼容模式）", static_cast<unsigned>(profiles.size()));
+        snprintf(buf, sizeof(buf), "Read %u eSIM profiles (compatibility mode)", static_cast<unsigned>(profiles.size()));
         message = buf;
         return ESP_OK;
     }
-    if (!first_error.empty()) message = first_error + "；兼容查询仍失败: " + message;
+    if (!first_error.empty()) message = first_error + "; compatibility query also failed: " + message;
     return err == ESP_OK ? ESP_FAIL : err;
 }
 
@@ -755,7 +751,7 @@ static bool make_direct_identifier(const std::string& raw,
     if (digits.size() >= 18 && digits.size() <= 22 && digits.size() == value.size()) {
         std::vector<uint8_t> bcd;
         if (!gsm_bcd_encode(digits, bcd)) {
-            message = "ICCID 格式无效";
+            message = "ICCID format is invalid";
             return false;
         }
         out.tag = {0x5A};
@@ -790,7 +786,7 @@ static bool identifier_from_profile(const IdfEsimProfile& profile,
                                     std::string& message)
 {
     if (profile.iccid.empty()) {
-        message = "目标 Profile 没有 ICCID，暂不能执行该操作";
+        message = "The target profile has no ICCID, so this operation cannot continue";
         return false;
     }
     return make_direct_identifier(profile.iccid, true, out, message);
@@ -802,7 +798,7 @@ static esp_err_t resolve_identifier(const std::string& raw,
                                     std::string& message)
 {
     if (raw.empty()) {
-        message = "Profile 标识为空";
+        message = "Profile identifier is empty";
         return ESP_ERR_INVALID_ARG;
     }
     if (make_direct_identifier(raw, require_iccid, out, message)) return ESP_OK;
@@ -811,7 +807,7 @@ static esp_err_t resolve_identifier(const std::string& raw,
     std::string list_msg;
     esp_err_t err = read_profiles(profiles, list_msg);
     if (err != ESP_OK) {
-        message = "无法解析别名/Profile 名称：" + list_msg;
+        message = "Cannot resolve the alias or profile name: " + list_msg;
         return err;
     }
     const IdfEsimProfile* hit = nullptr;
@@ -822,15 +818,14 @@ static esp_err_t resolve_identifier(const std::string& raw,
         if (!hit) hit = &profile;
     }
     if (matched > 1) {
-        // 昵称/运营商名可能重复(如两张同一运营商的卡)。启停尤其是删除都不可逆，
-        // 绝不能"默默选第一个"，必须让用户改用唯一的完整 ICCID
+        // Nicknames and carrier names can repeat. Do not select the first match for irreversible operations.
         char buf[96];
-        snprintf(buf, sizeof(buf), "该标识匹配到 %d 个 Profile，请改用完整 ICCID 指定", matched);
+        snprintf(buf, sizeof(buf), "The identifier matches %d profiles. Use the full ICCID", matched);
         message = buf;
         return ESP_ERR_INVALID_ARG;
     }
     if (hit) return identifier_from_profile(*hit, out, message) ? ESP_OK : ESP_FAIL;
-    message = "未找到匹配的 eSIM Profile: " + idf_esim_mask_profile_id(raw);
+    message = "No matching eSIM profile: " + idf_esim_mask_profile_id(raw);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -843,9 +838,9 @@ static std::vector<uint8_t> make_profile_operation_request(const ProfileIdentifi
     std::vector<uint8_t> body;
     static constexpr uint8_t TAG_A0[] = {0xA0};
     append_tlv(body, TAG_A0, id_tlv);
-    // refreshFlag 显式编码为 FALSE(0x00)：REFRESH 主动式命令在 ML307R 上不会被取走
-    // 执行，遗留的主动式会话会让后续 CCHO/ES10c 轮番报 catBusy/CME ERROR 4(issue #17)。
-    // SGP.22 允许无 refreshFlag 模式，由 LPA(本固件)在成功后自行复位 UICC。
+    // Encode refreshFlag as FALSE (0x00). The ML307R does not consume a proactive REFRESH command.
+    // A stale session then makes CCHO and ES10c alternate between catBusy and CME ERROR 4 (issue #17).
+    // SGP.22 permits operation without refreshFlag. This LPA resets the UICC after success.
     std::vector<uint8_t> refresh_value = {0x00};
     static constexpr uint8_t TAG_REFRESH[] = {0x81};
     append_tlv(body, TAG_REFRESH, refresh_value);
@@ -862,13 +857,13 @@ static const char* operation_result_text(bool enable, int result)
 {
     switch (result) {
         case 0: return "OK";
-        case 1: return "ICCID/AID 不存在";
-        case 2: return enable ? "Profile 不是禁用状态" : "Profile 不是启用状态";
-        case 3: return "Profile 策略禁止该操作";
-        case 4: return "卡拒绝重复启用当前 Profile";
-        case 5: return "卡工具包忙，请稍后重试";
-        case 127: return "eUICC 未定义错误";
-        default: return "未知结果码";
+        case 1: return "ICCID/AID does not exist";
+        case 2: return enable ? "Profile is not disabled" : "Profile is not enabled";
+        case 3: return "Profile policy prohibits this operation";
+        case 4: return "The card rejected repeated activation of the current profile";
+        case 5: return "The card toolkit is busy. Retry later";
+        case 127: return "Undefined eUICC error";
+        default: return "Unknown result code";
     }
 }
 
@@ -876,12 +871,12 @@ static const char* delete_result_text(int result)
 {
     switch (result) {
         case 0: return "OK";
-        case 1: return "ICCID/AID 不存在";
-        case 2: return "Profile 不是禁用状态";
-        case 3: return "Profile 策略禁止删除";
-        case 5: return "卡工具包忙，请稍后重试";
-        case 127: return "eUICC 未定义错误";
-        default: return "未知结果码";
+        case 1: return "ICCID/AID does not exist";
+        case 2: return "Profile is not disabled";
+        case 3: return "Profile policy prohibits deletion";
+        case 5: return "The card toolkit is busy. Retry later";
+        case 127: return "Undefined eUICC error";
+        default: return "Unknown result code";
     }
 }
 
@@ -898,13 +893,13 @@ static esp_err_t profile_operation_once(const ProfileIdentifier& identifier,
     const uint8_t expected_enable[] = {0xBF, 0x31};
     const uint8_t expected_disable[] = {0xBF, 0x32};
     if ((enable && !tag_is(response, expected_enable)) || (!enable && !tag_is(response, expected_disable))) {
-        message = "Profile 操作响应 tag 不匹配";
+        message = "Profile operation response tag does not match";
         return ESP_FAIL;
     }
     static constexpr uint8_t TAG_RESULT[] = {0x80};
     const Tlv* result = first_child(response, TAG_RESULT);
     if (!result) {
-        message = "Profile 操作响应缺少结果码";
+        message = "Profile operation response has no result code";
         return ESP_FAIL;
     }
     result_code = tlv_int_value(*result, 127);
@@ -915,8 +910,8 @@ static esp_err_t profile_operation_once(const ProfileIdentifier& identifier,
     return ESP_OK;
 }
 
-// 等待模组重启(软/硬)完成：重启请求受理时 phase 立即变 powering，重启后完成短信/注册
-// 配置才进入 registering，此时 SIM 已就绪，可重新打开逻辑通道。
+// Wait for a soft or hard modem restart. The phase changes to powering when the request starts.
+// It changes to registering after SMS and registration setup, when the SIM can open a logical channel again.
 static bool wait_modem_reset_done(uint32_t timeout_ms)
 {
     for (uint32_t waited = 0; waited < timeout_ms; waited += 1000) {
@@ -936,23 +931,22 @@ static esp_err_t profile_operation(const std::string& raw, bool enable, std::str
     int code = -1;
     err = profile_operation_once(identifier, enable, code, message);
     if (err != ESP_OK && code == 5) {
-        // catBusy：卡内残留主动式会话(多为旧固件 refreshFlag 遗留；模组不断电时
-        // 可跨 ESP 重启甚至 OTA 升级存活)。硬重启(断电)彻底清掉卡内会话后重试一次，
-        // 免得用户反复点击都停在"卡工具包忙"
-        idf_logf("eSIM 操作遇到 catBusy，硬重启模组复位 UICC 后重试");
+        // catBusy indicates a stale proactive session, often left by an old refreshFlag implementation.
+        // It can survive an ESP restart or OTA update while modem power remains on. Power-cycle and retry once.
+        idf_logf("eSIM operation returned catBusy; power-cycle the modem to reset the UICC and retry");
         idf_modem_request_reset(true);
         if (!wait_modem_reset_done(90000)) {
-            message += "；模组重启超时，请稍后重试";
+            message += "; modem restart timed out. Retry later";
             return ESP_FAIL;
         }
         err = profile_operation_once(identifier, enable, code, message);
     }
     if (err != ESP_OK) return err;
-    // 启停结果已写入 eUICC，但当前 UICC 会话仍运行旧 Profile：必须复位 UICC(模组
-    // 软重启)才真正生效。这一步就是 issue #17 里用户手动"重启+断电"的自动化。
+    // The eUICC contains the new state, but the current UICC session still uses the old profile.
+    // Reset the UICC with a soft modem restart to apply the change automatically (issue #17).
     idf_modem_request_reset(false);
-    message = enable ? "eSIM Profile 已启用，模组重启附着新卡中"
-                     : "eSIM Profile 已禁用，模组重启生效中";
+    message = enable ? "eSIM profile enabled; modem is restarting and attaching with the new card"
+                     : "eSIM profile disabled; modem is restarting to apply the change";
     return ESP_OK;
 }
 
@@ -980,12 +974,12 @@ static esp_err_t delete_profile(const std::string& raw, std::string& message)
     static constexpr uint8_t TAG_RESP[] = {0xBF, 0x33};
     static constexpr uint8_t TAG_RESULT[] = {0x80};
     if (!tag_is(response, TAG_RESP)) {
-        message = "Profile 删除响应 tag 不匹配";
+        message = "Profile deletion response tag does not match";
         return ESP_FAIL;
     }
     const Tlv* result = first_child(response, TAG_RESULT);
     if (!result) {
-        message = "Profile 删除响应缺少结果码";
+        message = "Profile deletion response has no result code";
         return ESP_FAIL;
     }
     int code = tlv_int_value(*result, 127);
@@ -993,7 +987,7 @@ static esp_err_t delete_profile(const std::string& raw, std::string& message)
         message = delete_result_text(code);
         return ESP_FAIL;
     }
-    message = "eSIM Profile 已删除";
+    message = "eSIM profile deleted";
     return ESP_OK;
 }
 
@@ -1018,7 +1012,7 @@ static esp_err_t set_profile_nickname(const std::string& raw,
 {
     std::string nick = idf_util_trim_copy(nickname);
     if (nick.size() > 64) {
-        message = "昵称最长 64 字节";
+        message = "Nickname cannot exceed 64 bytes";
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1033,20 +1027,20 @@ static esp_err_t set_profile_nickname(const std::string& raw,
     static constexpr uint8_t TAG_RESP[] = {0xBF, 0x29};
     static constexpr uint8_t TAG_RESULT[] = {0x80};
     if (!tag_is(response, TAG_RESP)) {
-        message = "昵称设置响应 tag 不匹配";
+        message = "Nickname update response tag does not match";
         return ESP_FAIL;
     }
     const Tlv* result = first_child(response, TAG_RESULT);
     if (!result) {
-        message = "昵称设置响应缺少结果码";
+        message = "Nickname update response has no result code";
         return ESP_FAIL;
     }
     int code = tlv_int_value(*result, 127);
     if (code == 0) {
-        message = "eSIM Profile 昵称已更新";
+        message = "eSIM profile nickname updated";
         return ESP_OK;
     }
-    message = (code == 1) ? "ICCID 不存在" : "eUICC 设置昵称失败";
+    message = (code == 1) ? "ICCID does not exist" : "The eUICC failed to set the nickname";
     return ESP_FAIL;
 }
 
@@ -1054,7 +1048,7 @@ static esp_err_t set_profile_nickname(const std::string& raw,
 
 void idf_esim_init(void)
 {
-    // 必须定义在匿名命名空间之外，否则是内部链接，app_main 链接不到
+    // Define this outside the anonymous namespace so app_main can link it.
     idf_modem_set_sim_identity_hook(on_sim_identity_changed);
 }
 
@@ -1072,12 +1066,12 @@ esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& profiles,
     esp_err_t list_err = read_profiles(profiles, message);
     if (list_err == ESP_OK) {
         if (eid_err != ESP_OK) {
-            message += "；EID 读取失败: " + eid_msg;
+            message += "; EID read failed: " + eid_msg;
         }
         return ESP_OK;
     }
     if (eid_err == ESP_OK) {
-        message = "EID 已读取，但 Profile 列表失败: " + message;
+        message = "EID read succeeded, but the profile list failed: " + message;
     }
     return list_err;
 }
@@ -1111,7 +1105,7 @@ esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& me
     std::string list_msg;
     esp_err_t err = read_profiles(profiles, list_msg);
     if (err != ESP_OK) {
-        message = "切换前无法读取 Profile 列表: " + list_msg;
+        message = "Cannot read the profile list before switching: " + list_msg;
         return err;
     }
     for (const IdfEsimProfile& profile : profiles) {
@@ -1119,33 +1113,33 @@ esp_err_t idf_esim_switch_profile(const std::string& identifier, std::string& me
         if (profile.state == "enabled") {
             std::string display_id = profile.iccid.empty() ? profile.isdpAid : profile.iccid;
             if (display_id.empty()) display_id = identifier;
-            message = "目标 eSIM Profile 已经启用: " + idf_esim_mask_profile_id(display_id);
+            message = "The target eSIM profile is already enabled: " + idf_esim_mask_profile_id(display_id);
             return ESP_OK;
         }
-        // 列表条目可能缺 ICCID(5A tag)，退回 ISD-P AID 启用
+        // A list entry can omit ICCID (tag 5A). Fall back to its ISD-P AID.
         const std::string& enable_id = profile.iccid.empty() ? profile.isdpAid : profile.iccid;
-        if (enable_id.empty()) break;  // 两者都没有则走下面的直接标识兜底
+        if (enable_id.empty()) break;  // If both are absent, use the direct identifier fallback below
         err = idf_esim_enable_profile(enable_id, message);
         if (err == ESP_OK) {
-            message = "已切换到 eSIM Profile: " + idf_esim_mask_profile_id(enable_id) +
-                      "，模组重启附着新卡中";
+            message = "Switched to eSIM profile: " + idf_esim_mask_profile_id(enable_id) +
+                      "; modem is restarting and attaching with the new card";
         }
         return err;
     }
 
-    // 用户填 ICCID/AID 时，列表里没有读到可匹配字段也尝试直接启用一次。
+    // If the user enters an ICCID or AID, try it directly when list fields do not match.
     ProfileIdentifier direct;
     std::string direct_msg;
     if (make_direct_identifier(identifier, false, direct, direct_msg)) {
         err = idf_esim_enable_profile(identifier, message);
         if (err == ESP_OK) {
-            message = "已按输入标识尝试启用 eSIM Profile: " + idf_esim_mask_profile_id(identifier) +
-                      "，模组重启附着新卡中";
+            message = "Tried to enable the eSIM profile by identifier: " + idf_esim_mask_profile_id(identifier) +
+                      "; modem is restarting and attaching with the new card";
         }
         return err;
     }
 
-    message = "未找到目标 eSIM Profile: " + idf_esim_mask_profile_id(identifier);
+    message = "Target eSIM profile not found: " + idf_esim_mask_profile_id(identifier);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -1158,9 +1152,7 @@ std::string idf_esim_mask_profile_id(const std::string& identifier)
 {
     std::string value = idf_util_trim_copy(identifier);
     if (value.size() <= 8) return value;
-    // 中文别名按字节切会产生非法 UTF-8，污染 JSON/推送；别名非敏感，原样返回
-    for (char ch : value) {
-        if (static_cast<unsigned char>(ch) >= 0x80) return value;
-    }
+    // Byte truncation can make a non-ASCII alias invalid UTF-8 and corrupt JSON or notifications. Return aliases unchanged.
+    if (std::any_of(value.begin(), value.end(), [](unsigned char ch) { return ch >= 0x80; })) return value;
     return value.substr(0, 4) + "****" + value.substr(value.size() - 4);
 }

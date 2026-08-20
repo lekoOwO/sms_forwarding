@@ -22,6 +22,8 @@ typedef int32_t esp_err_t;
 #define ESP_ERR_INVALID_SIZE 0x103
 #define ESP_ERR_INVALID_STATE 0x104
 #define ESP_ERR_NOT_SUPPORTED 0x105
+#define ESP_ERR_TIMEOUT 0x106
+#define ESP_ERR_NOT_FOUND 0x107
 #define ESP_ERR_NVS_NOT_FOUND 0x1102
 #define ESP_ERR_NVS_TYPE_MISMATCH 0x1103
 #define ESP_ERR_NVS_NO_FREE_PAGES 0x110d
@@ -74,8 +76,32 @@ HOST_TEST_CPP = r"""#include <cstdio>
 // Writer/Reader, version decoders, header/marker checks, and slot generation
 // arithmetic rather than a parallel model.
 #include "idf_config_storage.cpp"
+#define static_assert(...)
+#include "idf_config.cpp"
+#undef static_assert
 
 static int check_number = 0;
+static bool reject_allocations = false;
+static int fail_allocation_after = -1;
+
+void* operator new(std::size_t size) {
+    if (reject_allocations) std::abort();
+    if (fail_allocation_after == 0) throw std::bad_alloc();
+    if (fail_allocation_after > 0) --fail_allocation_after;
+    void* value = std::malloc(size);
+    if (!value) std::abort();
+    return value;
+}
+
+void* operator new[](std::size_t size) {
+    if (reject_allocations) std::abort();
+    if (fail_allocation_after == 0) throw std::bad_alloc();
+    if (fail_allocation_after > 0) --fail_allocation_after;
+    void* value = std::malloc(size);
+    if (!value) std::abort();
+    return value;
+}
+
 static void require(bool condition) {
     ++check_number;
     if (!condition) {
@@ -97,6 +123,12 @@ static std::unordered_map<std::string, std::string> fake_legacy_strings;
 static std::unordered_map<std::string, int32_t> fake_legacy_i32;
 static std::unordered_map<std::string, uint8_t> fake_legacy_u8;
 static std::unordered_map<std::string, uint32_t> fake_legacy_u32;
+
+SemaphoreHandle_t xSemaphoreCreateMutex() { return reinterpret_cast<void*>(1); }
+int xSemaphoreTake(SemaphoreHandle_t, uint32_t) { return pdTRUE; }
+int xSemaphoreGive(SemaphoreHandle_t) { return pdTRUE; }
+void idf_log_line(const char*) {}
+void idf_logf(const char*, ...) {}
 
 esp_err_t nvs_open(const char* namespace_name, nvs_open_mode_t, nvs_handle_t* handle) {
     if (fake_legacy_open && std::strcmp(namespace_name, "sms_config") == 0) {
@@ -281,7 +313,94 @@ int main() {
     original.wifiNetworks[0].ssid = "ssid-01";
     original.wifiNetworks[0].pass = "password";
     original.roamingEnabled = false;
+    original.wifiTxPowerQuarterDbm = WIFI_TX_POWER_20DBM;
+    original.kaProfile = "source-profile";
+    original.kaLastTime = 123456;
+    original.phoneNumber = "+886900000001";
+    original.simCredentials[0].iccid = "898600000000000000001";
+    original.simCredentials[0].pin = "1234";
+    original.schedTasks[0].profile = "source-schedule-profile";
+    original.schedTasks[0].lastRun = 654321;
     require(semanticallyValid(original));
+
+    uint8_t portable_storage[MAX_CONFIG_BLOB_SIZE] = {};
+    size_t portable_size = 0;
+    require(idf_config_storage_encode_portable(original, portable_storage,
+                                               sizeof(portable_storage), &portable_size) == ESP_OK);
+    std::vector<uint8_t> portable(portable_storage, portable_storage + portable_size);
+    require(portable.size() >= kHeaderBytes);
+    require(portable[8] == 0 && portable[9] == 0 && portable[10] == 0 && portable[11] == 0);
+    auto does_not_contain = [&portable](const std::string& secret) {
+        return std::search(portable.begin(), portable.end(), secret.begin(), secret.end()) == portable.end();
+    };
+    for (const std::string& local : {
+             original.deviceName, original.hostname, original.webAccounts[1].username,
+             original.webAccounts[1].password, original.kaProfile, original.phoneNumber,
+             original.simCredentials[0].iccid, original.simCredentials[0].pin,
+             original.schedTasks[0].profile,
+         }) {
+        require(does_not_contain(local));
+    }
+    s_config = original;
+    uint8_t public_portable_storage[MAX_CONFIG_BLOB_SIZE] = {};
+    size_t public_portable_size = 0;
+    reject_allocations = true;
+    require(idf_config_export_portable(public_portable_storage,
+                                       sizeof(public_portable_storage),
+                                       &public_portable_size) == ESP_OK);
+    reject_allocations = false;
+    require(public_portable_size == portable_size &&
+            std::memcmp(public_portable_storage, portable_storage, portable_size) == 0);
+
+    IdfConfig portable_target = defaults();
+    portable_target.deviceName = "Target device";
+    portable_target.hostname = "target-device";
+    portable_target.webAccounts[0] = {"target-admin", "target-password"};
+    portable_target.wifiNetworks[0] = {"target-wifi", "target-password"};
+    portable_target.networkMode = NETWORK_MODE_4G_ONLY;
+    portable_target.heartbeatEnable = false;
+    portable_target.heartbeatInterval = 88;
+    portable_target.wifiTxPowerQuarterDbm = WIFI_TX_POWER_5DBM;
+    portable_target.kaProfile = "target-profile";
+    portable_target.kaLastTime = 987654;
+    portable_target.roamingEnabled = true;
+    portable_target.phoneNumber = "+886900000099";
+    portable_target.simCredentials[0].iccid = "898600000000000000099";
+    portable_target.simCredentials[0].pin = "9999";
+    portable_target.schedTasks[0].profile = "target-schedule-profile";
+    portable_target.schedTasks[0].lastRun = 456789;
+    IdfConfig portable_decoded;
+    require(idf_config_storage_decode_portable(portable.data(), portable.size(), portable_target,
+                                               portable_decoded) == IdfPortableConfigStatus::Ok);
+    require(portable_decoded.smtpServer == original.smtpServer);
+    require(portable_decoded.wifiNetworks[0].ssid == original.wifiNetworks[0].ssid);
+    require(portable_decoded.deviceName == portable_target.deviceName);
+    require(portable_decoded.hostname == portable_target.hostname);
+    require(portable_decoded.webAccounts[0].username == portable_target.webAccounts[0].username);
+    require(portable_decoded.wifiTxPowerQuarterDbm == portable_target.wifiTxPowerQuarterDbm);
+    require(portable_decoded.kaProfile == portable_target.kaProfile);
+    require(portable_decoded.kaLastTime == portable_target.kaLastTime);
+    require(portable_decoded.roamingEnabled == portable_target.roamingEnabled);
+    require(portable_decoded.phoneNumber == portable_target.phoneNumber);
+    require(portable_decoded.simCredentials[0].iccid == portable_target.simCredentials[0].iccid);
+    require(portable_decoded.schedTasks[0].profile == portable_target.schedTasks[0].profile);
+    require(portable_decoded.schedTasks[0].lastRun == portable_target.schedTasks[0].lastRun);
+
+    std::vector<uint8_t> portable_nonzero_generation = portable;
+    writeHeader(portable_nonzero_generation, CONFIG_SCHEMA_VERSION, 1, kHeaderBytes);
+    require(idf_config_storage_decode_portable(portable_nonzero_generation.data(),
+                                               portable_nonzero_generation.size(), portable_target,
+                                               portable_decoded) == IdfPortableConfigStatus::Invalid);
+    std::vector<uint8_t> portable_corrupt = portable;
+    portable_corrupt.back() ^= 1;
+    require(idf_config_storage_decode_portable(portable_corrupt.data(), portable_corrupt.size(),
+                                               portable_target, portable_decoded) ==
+            IdfPortableConfigStatus::Invalid);
+    std::vector<uint8_t> portable_future = portable;
+    writeHeader(portable_future, CONFIG_SCHEMA_VERSION + 1, 0, kHeaderBytes);
+    require(idf_config_storage_decode_portable(portable_future.data(), portable_future.size(),
+                                               portable_target, portable_decoded) ==
+            IdfPortableConfigStatus::UnsupportedVersion);
 
     IdfConfig readable = defaults();
     readable.numberBlackList = "+886\t123\n+886456";
@@ -393,6 +512,36 @@ int main() {
     std::vector<uint8_t> maximum_blob;
     require(encodeV5(maximum, 44, maximum_blob));
     require(maximum_blob.size() <= MAX_CONFIG_BLOB_SIZE);
+    size_t maximum_portable_size = 0;
+    require(idf_config_storage_encode_portable(maximum, portable_storage,
+                                               sizeof(portable_storage),
+                                               &maximum_portable_size) == ESP_OK);
+    require(maximum_portable_size <= MAX_CONFIG_BLOB_SIZE);
+    s_config = maximum;
+    size_t public_maximum_size = 0;
+    reject_allocations = true;
+    require(idf_config_export_portable(public_portable_storage,
+                                       sizeof(public_portable_storage),
+                                       &public_maximum_size) == ESP_OK);
+    reject_allocations = false;
+    require(public_maximum_size == maximum_portable_size);
+    const std::string live_smtp_before_failure = s_config.smtpServer;
+    size_t rejected_size = 123;
+    require(idf_config_export_portable(public_portable_storage,
+                                       public_maximum_size - 1,
+                                       &rejected_size) == ESP_ERR_INVALID_SIZE);
+    require(rejected_size == 0);
+    require(std::all_of(public_portable_storage,
+                        public_portable_storage + public_maximum_size - 1,
+                        [](uint8_t value) { return value == 0; }));
+    std::vector<uint8_t> live_after_failure;
+    require(encodeV5(s_config, 44, live_after_failure));
+    require(live_after_failure == maximum_blob &&
+            s_config.smtpServer == live_smtp_before_failure);
+    require(idf_config_export_portable(nullptr, sizeof(public_portable_storage),
+                                       &rejected_size) == ESP_ERR_INVALID_ARG);
+    require(idf_config_export_portable(public_portable_storage,
+                                       sizeof(public_portable_storage), nullptr) == ESP_ERR_INVALID_ARG);
 
     std::vector<uint8_t> marker;
     writeMarker(marker, CONFIG_SCHEMA_VERSION, 42, static_cast<uint32_t>(blob.size()),
@@ -444,6 +593,24 @@ int main() {
     require(decoded.pushChannels[1].customBody.empty());
     require(decoded.pushChannels[1].type == PUSH_TYPE_POST_JSON);
 
+    writeHeader(v1, 1, 0, kHeaderBytes);
+    portable_target.emailEnabled = false;
+    portable_target.forwardRules = "target-forward-rule";
+    portable_target.kaEnabled = true;
+    portable_target.dataEnabled = true;
+    portable_target.apn = "target-apn";
+    require(idf_config_storage_decode_portable(v1.data(), v1.size(), portable_target,
+                                               portable_decoded) == IdfPortableConfigStatus::Ok);
+    require(portable_decoded.smtpServer == "smtp.example");
+    require(portable_decoded.deviceName == portable_target.deviceName);
+    require(portable_decoded.webAccounts[0].username == portable_target.webAccounts[0].username);
+    require(portable_decoded.wifiNetworks[0].ssid == portable_target.wifiNetworks[0].ssid);
+    require(portable_decoded.emailEnabled == portable_target.emailEnabled);
+    require(portable_decoded.forwardRules == portable_target.forwardRules);
+    require(portable_decoded.kaEnabled == portable_target.kaEnabled);
+    require(portable_decoded.dataEnabled == portable_target.dataEnabled);
+    require(portable_decoded.apn == portable_target.apn);
+
     auto append_common_v2_payload = [](Writer& writer, uint8_t push_type, bool zero_slot = false,
                                        bool stale_body = false) {
         writer.u32(465);
@@ -490,6 +657,17 @@ int main() {
         require(decoded.pushChannels[1].customBody.empty());
         require(decoded.pushChannels[1].type == PUSH_TYPE_POST_JSON);
         require(!decoded.roamingEnabled);
+
+        writeHeader(old_blob, old_schema, 0, kHeaderBytes);
+        require(idf_config_storage_decode_portable(old_blob.data(), old_blob.size(), portable_target,
+                                                   portable_decoded) == IdfPortableConfigStatus::Ok);
+        require(portable_decoded.smtpServer == "smtp.example");
+        require(portable_decoded.deviceName == portable_target.deviceName);
+        require(portable_decoded.webAccounts[0].username == portable_target.webAccounts[0].username);
+        require(portable_decoded.wifiNetworks[0].ssid == portable_target.wifiNetworks[0].ssid);
+        require(portable_decoded.networkMode == portable_target.networkMode);
+        require(portable_decoded.emailEnabled == portable_target.emailEnabled);
+        require(portable_decoded.kaEnabled == portable_target.kaEnabled);
     }
 
     Writer malformed_v2_payload;
@@ -521,6 +699,20 @@ int main() {
     require(decoded.pushChannels[1].type == PUSH_TYPE_POST_JSON);
     require(!decoded.roamingEnabled);
 
+    writeHeader(v4, 4, 0, kHeaderBytes);
+    require(idf_config_storage_decode_portable(v4.data(), v4.size(), portable_target,
+                                               portable_decoded) == IdfPortableConfigStatus::Ok);
+    require(portable_decoded.deviceName == portable_target.deviceName);
+    require(portable_decoded.webAccounts[0].username == portable_target.webAccounts[0].username);
+    require(portable_decoded.wifiNetworks[0].ssid == "wifi-v4");
+    require(portable_decoded.networkMode == NETWORK_MODE_MIX);
+    require(!portable_decoded.heartbeatEnable && portable_decoded.heartbeatInterval == 12);
+    require(portable_decoded.emailEnabled == portable_target.emailEnabled);
+    require(portable_decoded.forwardRules == portable_target.forwardRules);
+    require(portable_decoded.kaEnabled == portable_target.kaEnabled);
+    require(portable_decoded.dataEnabled == portable_target.dataEnabled);
+    require(portable_decoded.apn == portable_target.apn);
+
     // Exercise the production slot selector against a tiny NVS shim.  A
     // damaged/incomplete sibling must not hide a valid prior; an authenticated
     // future schema is ignored when older, but blocks when newer.
@@ -528,6 +720,17 @@ int main() {
     std::vector<uint8_t> slot_blob;
     require(encodeV5(slot_value, 10, slot_blob));
     FakeStore store;
+    fake_store = &store;
+    FakeStore allocation_failure_store;
+    fake_store = &allocation_failure_store;
+    fail_allocation_after = 1;
+    require(idf_config_storage_save(slot_value) == ESP_ERR_NO_MEM);
+    fail_allocation_after = -1;
+    require(!allocation_failure_store.state_present &&
+            allocation_failure_store.blobs[0].empty() &&
+            allocation_failure_store.blobs[1].empty() &&
+            allocation_failure_store.markers[0].empty() &&
+            allocation_failure_store.markers[1].empty());
     fake_store = &store;
     install_pair(store, 0, slot_blob, 10);
     store.blobs[1] = {0x01, 0x02, 0x03};
@@ -627,12 +830,29 @@ class IdfConfigCodecTest(unittest.TestCase):
             (temp / "esp_log.h").write_text(ESP_LOG_H, encoding="utf-8")
             (temp / "nvs.h").write_text(NVS_H, encoding="utf-8")
             (temp / "nvs_flash.h").write_text(NVS_FLASH_H, encoding="utf-8")
+            (temp / "freertos").mkdir()
+            (temp / "freertos" / "FreeRTOS.h").write_text(
+                "#pragma once\n#include <stdint.h>\n#define pdTRUE 1\n#define portMAX_DELAY UINT32_MAX\n",
+                encoding="utf-8",
+            )
+            (temp / "freertos" / "semphr.h").write_text(
+                "#pragma once\n#include <stdint.h>\ntypedef void* SemaphoreHandle_t;\n"
+                "SemaphoreHandle_t xSemaphoreCreateMutex();\n"
+                "int xSemaphoreTake(SemaphoreHandle_t, uint32_t);\n"
+                "int xSemaphoreGive(SemaphoreHandle_t);\n",
+                encoding="utf-8",
+            )
+            (temp / "idf_log.h").write_text(
+                "#pragma once\nvoid idf_log_line(const char*);\nvoid idf_logf(const char*, ...);\n",
+                encoding="utf-8",
+            )
             source = temp / "idf_config_codec_host.cpp"
             source.write_text(HOST_TEST_CPP, encoding="utf-8")
             binary = temp / "idf_config_codec_host"
             compile = [
                 compiler,
                 "-std=c++17",
+                "-fexceptions",
                 "-O0",
                 "-ffunction-sections",
                 "-fdata-sections",

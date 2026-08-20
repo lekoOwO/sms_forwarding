@@ -51,8 +51,6 @@ class ConfigPersistenceTest(unittest.TestCase):
             path.read_text(encoding="utf-8") for path in (SOURCE, STORAGE)
         )
         main = MAIN.read_text(encoding="utf-8")
-        header = HEADER.read_text(encoding="utf-8")
-        cmake = CMAKE.read_text(encoding="utf-8")
         for token in (
             'nvs_open_from_partition', '"appcfg"', '"config"', '"cfgA"', '"cfgB"',
             '"markA"', '"markB"', 'crc32', 'CONFIG_SCHEMA_VERSION', 'nvs_get_blob',

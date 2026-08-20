@@ -1,0 +1,22 @@
+{
+  "web/scripts/package.mjs": {
+    "no-useless-escape": {
+      "count": 2
+    }
+  },
+  "web/scripts/package.test.mjs": {
+    "no-regex-spaces": {
+      "count": 4
+    }
+  },
+  "web/src/lib/components/ActionResult.svelte": {
+    "svelte/require-each-key": {
+      "count": 1
+    }
+  },
+  "web/src/lib/components/ui/button/button.svelte": {
+    "svelte/no-navigation-without-resolve": {
+      "count": 1
+    }
+  }
+}

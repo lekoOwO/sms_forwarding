@@ -1,5 +1,6 @@
 #include "idf_push_core.h"
 
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -55,9 +56,9 @@ bool idf_push_render_template(const std::string& source, const IdfPushTemplateVa
         {"{local_number}", &values.localNumber},
     }};
     if (!idf_push_utf8_valid(source)) return false;
-    for (const auto& replacement : replacements) {
-        if (!idf_push_utf8_valid(*replacement.second)) return false;
-    }
+    if (!std::all_of(replacements.begin(), replacements.end(), [](const auto& replacement) {
+            return idf_push_utf8_valid(*replacement.second);
+        })) return false;
 
     output.clear();
     output.reserve(source.size() < max_bytes ? source.size() : max_bytes);
@@ -84,9 +85,9 @@ bool idf_push_render_template(const std::string& source, const IdfPushTemplateVa
     }
     if (!idf_push_utf8_valid(output)) return false;
     if (header) {
-        for (unsigned char ch : output) {
-            if (ch < 0x20 || ch == 0x7F) return false;
-        }
+        if (std::any_of(output.begin(), output.end(), [](unsigned char ch) {
+                return ch < 0x20 || ch == 0x7F;
+            })) return false;
     }
     return true;
 }

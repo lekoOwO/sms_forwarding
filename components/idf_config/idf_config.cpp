@@ -7,6 +7,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <iterator>
 #include <memory>
 #include <new>
 #include <regex.h>
@@ -32,6 +33,11 @@ struct ConfigUpdate {
     std::unique_ptr<IdfConfig> next;
     bool locked = false;
     bool factory_reset = false;
+
+    ~ConfigUpdate()
+    {
+        if (locked) xSemaphoreGive(s_persist_mutex);
+    }
 };
 
 static esp_err_t begin_config_update(ConfigUpdate& update);
@@ -62,12 +68,14 @@ static IdfConfig config_snapshot()
     return std::move(*copy);
 }
 
-static esp_err_t replace_config(const IdfConfig& next)
+static esp_err_t replace_config(IdfConfig& next)
 {
     esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    s_config = next;
+    using std::swap;
+    static_assert(noexcept(swap(s_config, next)), "IdfConfig publication must not allocate");
+    swap(s_config, next);
     xSemaphoreGive(s_config_mutex);
     return ESP_OK;
 }
@@ -75,7 +83,7 @@ static esp_err_t replace_config(const IdfConfig& next)
 static std::string channel_default_name(int idx)
 {
     char buf[20];
-    snprintf(buf, sizeof(buf), "通道%d", idx + 1);
+    snprintf(buf, sizeof(buf), "Channel %d", idx + 1);
     return std::string(buf);
 }
 
@@ -90,7 +98,7 @@ static constexpr bool wifi_tx_power_valid(uint8_t power)
            power == 52 || power == 56 || power == 60 || power == 66 || power == 72 || power == 80;
 }
 static_assert(wifi_tx_power_valid(34) && wifi_tx_power_valid(80) && !wifi_tx_power_valid(40),
-              "WiFi 功率档位必须与 ESP-IDF 映射表一致");
+              "WiFi power levels must match the ESP-IDF mapping");
 
 static std::string trim_copy(const std::string& value)
 {
@@ -221,9 +229,9 @@ static bool is_redacted_secret(const std::string& value)
     return value == "__REDACTED__";
 }
 
-// POSIX ERE 不认识 Perl 风格 \d \w \s；Arduino 版自研引擎支持这些转义，迁移前
-// 用户已存的转发规则依赖它们，先翻译成 POSIX 字符类再编译。
-// 保存时校验(本文件)与运行时匹配(idf_push)共用，保证两边语义一致。
+// POSIX ERE does not support Perl-style \d, \w, or \s. Translate saved legacy
+// rules to POSIX classes before compilation. Validation and runtime matching
+// share this translation to keep their behavior consistent.
 std::string idf_config_translate_perl_classes(const std::string& pattern)
 {
     std::string out;
@@ -260,7 +268,7 @@ std::string idf_config_translate_perl_classes(const std::string& pattern)
     return out;
 }
 
-esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message)
+esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message) try
 {
     size_t pos = 0;
     int line_no = 0;
@@ -289,7 +297,7 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
             if (message) {
                 char errbuf[96] = {};
                 regerror(rc, &re, errbuf, sizeof(errbuf));
-                *message = "第 " + std::to_string(line_no) + " 行正则无效: " + errbuf;
+                *message = "Invalid regex on line " + std::to_string(line_no) + ": " + errbuf;
             }
             return ESP_ERR_INVALID_ARG;
         }
@@ -298,27 +306,32 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
     if (message) message->clear();
     return ESP_OK;
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_load(void)
 {
-    esp_err_t mutex_err = ensure_config_mutex();
-    if (mutex_err != ESP_OK) return mutex_err;
-    std::unique_ptr<IdfConfig> loaded(new (std::nothrow) IdfConfig);
-    if (!loaded) return ESP_ERR_NO_MEM;
-    IdfConfigLoadStatus status = IdfConfigLoadStatus::Unknown;
-    esp_err_t err = idf_config_storage_load(*loaded, &status);
-    if (err != ESP_OK) {
+    try {
+        esp_err_t mutex_err = ensure_config_mutex();
+        if (mutex_err != ESP_OK) return mutex_err;
+        std::unique_ptr<IdfConfig> loaded(new IdfConfig);
+        IdfConfigLoadStatus status = IdfConfigLoadStatus::Unknown;
+        esp_err_t err = idf_config_storage_load(*loaded, &status);
+        if (err != ESP_OK) {
+            s_config_load_status = status;
+            ESP_LOGE(TAG, "config load failed: %s", esp_err_to_name(err));
+            idf_logf("config load failed (%s)", esp_err_to_name(err));
+            return err;
+        }
+        mutex_err = replace_config(*loaded);
+        if (mutex_err != ESP_OK) return mutex_err;
         s_config_load_status = status;
-        ESP_LOGE(TAG, "配置加载失败: %s", esp_err_to_name(err));
-        idf_logf("配置加载失败(%s)", esp_err_to_name(err));
-        return err;
+        ESP_LOGI(TAG, "config loaded (status=%u)", static_cast<unsigned>(status));
+        idf_logf("config loaded (status=%u)", static_cast<unsigned>(status));
+        return ESP_OK;
+    } catch (const std::bad_alloc&) {
+        s_config_load_status = IdfConfigLoadStatus::StorageError;
+        return ESP_ERR_NO_MEM;
     }
-    mutex_err = replace_config(*loaded);
-    if (mutex_err != ESP_OK) return mutex_err;
-    s_config_load_status = status;
-    ESP_LOGI(TAG, "配置已加载 (status=%u)", static_cast<unsigned>(status));
-    idf_logf("配置已加载 (status=%u)", static_cast<unsigned>(status));
-    return ESP_OK;
 }
 
 IdfConfigLoadStatus idf_config_last_load_status(void)
@@ -333,7 +346,7 @@ std::string idf_config_export_text(bool full_export)
     std::string out;
     out.reserve(4096);
 
-    // 槽位 0 用旧键名导出，旧固件也能导入最近配网的网络；其余槽位用 wifiNSsid/Pass
+    // Export slot 0 with legacy keys for old firmware. Other slots use wifiNSsid/Pass.
     append_kv(out, "wifiSsid", c->wifiNetworks[0].ssid);
     append_kv(out, "wifiPass", full_export ? c->wifiNetworks[0].pass : redact_secret(c->wifiNetworks[0].pass));
     for (int i = 1; i < IDF_MAX_WIFI_NETWORKS; ++i) {
@@ -445,7 +458,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     else if (key == "wifiPass" && !is_redacted_secret(value)) c.wifiNetworks[0].pass = value;
     else if (key.size() == 9 && key.rfind("wifi", 0) == 0 &&
              isdigit(static_cast<unsigned char>(key[4]))) {
-        // wifi1Ssid / wifi1Pass … 备用槽位(脱敏导出的密码占位跳过，保留原值)
+        // wifi1Ssid / wifi1Pass ... Keep saved passwords when a redacted export omits them.
         int idx = key[4] - '0';
         if (idx < 1 || idx >= IDF_MAX_WIFI_NETWORKS) return;
         std::string suffix = key.substr(5);
@@ -539,7 +552,7 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
     }
 }
 
-esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
+esp_err_t idf_config_import_text(const std::string& text, int* applied_count) try
 {
     if (text.empty()) return ESP_ERR_INVALID_ARG;
     ConfigUpdate update;
@@ -574,8 +587,56 @@ esp_err_t idf_config_import_text(const std::string& text, int* applied_count)
     if (err == ESP_OK && applied_count) *applied_count = applied;
     return err;
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_factory_reset(void)
+esp_err_t idf_config_export_portable(uint8_t* output, size_t capacity, size_t* written)
+{
+    if (written) *written = 0;
+    if (!output || !written) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = ensure_config_mutex();
+    if (err != ESP_OK) return err;
+    if (xSemaphoreTake(s_config_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    try {
+        err = idf_config_storage_encode_portable(s_config, output, capacity, written);
+    } catch (const std::bad_alloc&) {
+        err = ESP_ERR_NO_MEM;
+        *written = 0;
+    }
+    xSemaphoreGive(s_config_mutex);
+    return err;
+}
+
+esp_err_t idf_config_restore_portable(const uint8_t* bytes, size_t length,
+                                      IdfPortableConfigStatus* status)
+{
+    if (status) *status = IdfPortableConfigStatus::Invalid;
+    if (!bytes || length == 0) return ESP_ERR_INVALID_ARG;
+    if (status) *status = IdfPortableConfigStatus::Ok;
+
+    ConfigUpdate update;
+    esp_err_t err = begin_config_update(update);
+    if (err != ESP_OK) return err;
+    try {
+        // Keep the decode target off the worker stack and publish it only after validation and persistence.
+        std::unique_ptr<IdfConfig> decoded(new IdfConfig);
+        const IdfPortableConfigStatus decoded_status =
+            idf_config_storage_decode_portable(bytes, length, *update.base, *decoded);
+        if (status) *status = decoded_status;
+        if (decoded_status == IdfPortableConfigStatus::UnsupportedVersion) {
+            return cancel_config_update(update, ESP_ERR_NOT_SUPPORTED);
+        }
+        if (decoded_status != IdfPortableConfigStatus::Ok) {
+            return cancel_config_update(update, ESP_ERR_INVALID_ARG);
+        }
+
+        *update.next = std::move(*decoded);
+        return finish_config_update(update);
+    } catch (const std::bad_alloc&) {
+        return cancel_config_update(update, ESP_ERR_NO_MEM);
+    }
+}
+
+esp_err_t idf_config_factory_reset(void) try
 {
     ConfigUpdate update;
     esp_err_t err = begin_config_update(update);
@@ -583,11 +644,12 @@ esp_err_t idf_config_factory_reset(void)
     idf_config_storage_factory_reset(*update.next);
     update.factory_reset = true;
     err = finish_config_update(update);
-    if (err == ESP_OK) idf_log_line("配置已恢复出厂设置");
+    if (err == ESP_OK) idf_log_line("config reset to factory defaults");
     return err;
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_set_keepalive_last(uint32_t epoch)
+esp_err_t idf_config_set_keepalive_last(uint32_t epoch) try
 {
     ConfigUpdate update;
     esp_err_t err = begin_config_update(update);
@@ -595,8 +657,9 @@ esp_err_t idf_config_set_keepalive_last(uint32_t epoch)
     update.next->kaLastTime = epoch;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_set_sched_last(int index, uint32_t epoch)
+esp_err_t idf_config_set_sched_last(int index, uint32_t epoch) try
 {
     if (index < 0 || index >= IDF_MAX_SCHED_TASKS) return ESP_ERR_INVALID_ARG;
     ConfigUpdate update;
@@ -605,8 +668,9 @@ esp_err_t idf_config_set_sched_last(int index, uint32_t epoch)
     update.next->schedTasks[index].lastRun = epoch;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_set_net_led_enabled(bool enabled)
+esp_err_t idf_config_set_net_led_enabled(bool enabled) try
 {
     ConfigUpdate update;
     esp_err_t err = begin_config_update(update);
@@ -614,8 +678,9 @@ esp_err_t idf_config_set_net_led_enabled(bool enabled)
     update.next->netLedEnabled = enabled;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_set_call_notify_enabled(bool enabled)
+esp_err_t idf_config_set_call_notify_enabled(bool enabled) try
 {
     ConfigUpdate update;
     esp_err_t err = begin_config_update(update);
@@ -623,11 +688,12 @@ esp_err_t idf_config_set_call_notify_enabled(bool enabled)
     update.next->callNotifyEnabled = enabled;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 static void merge_runtime_markers(IdfConfig& next, const IdfConfig& base)
 {
-    // kaLast/stXLast 是运行时进度。若本次保存没有主动改它们，就带上最新 RAM 值，
-    // 避免慢速整包 NVS 保存把后台调度器刚写入的进度回滚。
+    // kaLast/stXLast track runtime progress. Preserve current RAM values unless
+    // this update changes them, so a slow NVS save cannot revert scheduler progress.
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     if (next.kaLastTime == base.kaLastTime) next.kaLastTime = s_config.kaLastTime;
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
@@ -660,41 +726,49 @@ static esp_err_t begin_config_update(ConfigUpdate& update)
     esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
     if (xSemaphoreTake(s_persist_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-
-    update.base.reset(new (std::nothrow) IdfConfig);
-    update.next.reset(new (std::nothrow) IdfConfig);
-    if (!update.base || !update.next) {
+    update.locked = true;
+    try {
+        update.base.reset(new IdfConfig);
+        update.next.reset(new IdfConfig);
+        xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+        try {
+            *update.base = s_config;
+            *update.next = s_config;
+        } catch (...) {
+            xSemaphoreGive(s_config_mutex);
+            throw;
+        }
+        xSemaphoreGive(s_config_mutex);
+        return ESP_OK;
+    } catch (const std::bad_alloc&) {
         update.base.reset();
         update.next.reset();
-        xSemaphoreGive(s_persist_mutex);
-        return ESP_ERR_NO_MEM;
+        return cancel_config_update(update, ESP_ERR_NO_MEM);
     }
-    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    *update.base = s_config;
-    *update.next = s_config;
-    xSemaphoreGive(s_config_mutex);
-    update.locked = true;
-    return ESP_OK;
 }
 
 static esp_err_t finish_config_update(ConfigUpdate& update)
 {
     if (!update.locked || !update.base || !update.next) return ESP_ERR_INVALID_STATE;
-    if (!update.factory_reset) {
-        merge_legacy_mirrors(*update.next, *update.base);
-        merge_runtime_markers(*update.next, *update.base);
+    try {
+        if (!update.factory_reset) {
+            merge_legacy_mirrors(*update.next, *update.base);
+            merge_runtime_markers(*update.next, *update.base);
+        }
+        esp_err_t err = idf_config_storage_save(*update.next);
+        if (err == ESP_OK) {
+            update.next->mdnsHost = update.next->hostname;
+            update.next->hbEnabled = update.next->heartbeatEnable;
+            update.next->webUser = update.next->webAccounts[0].username;
+            update.next->webPass = update.next->webAccounts[0].password;
+            err = replace_config(*update.next);
+        }
+        xSemaphoreGive(s_persist_mutex);
+        update.locked = false;
+        return err;
+    } catch (const std::bad_alloc&) {
+        return cancel_config_update(update, ESP_ERR_NO_MEM);
     }
-    esp_err_t err = idf_config_storage_save(*update.next);
-    if (err == ESP_OK) {
-        update.next->mdnsHost = update.next->hostname;
-        update.next->hbEnabled = update.next->heartbeatEnable;
-        update.next->webUser = update.next->webAccounts[0].username;
-        update.next->webPass = update.next->webAccounts[0].password;
-        err = replace_config(*update.next);
-    }
-    xSemaphoreGive(s_persist_mutex);
-    update.locked = false;
-    return err;
 }
 
 static esp_err_t cancel_config_update(ConfigUpdate& update, esp_err_t err)
@@ -706,7 +780,7 @@ static esp_err_t cancel_config_update(ConfigUpdate& update, esp_err_t err)
     return err;
 }
 
-esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
+esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass) try
 {
     {
         if (ssid.empty() || ssid.size() > MAX_WIFI_SSID_BYTES ||
@@ -727,16 +801,17 @@ esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass)
+esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass) try
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;
     esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
 
-    // 列表顺序即"最近使用"序：已在首位(常驻网络重连的常态)直接返回零开销；
-    // 在列表但不在首位 → 提到首位，满员时挤掉的末位自然是最久未用的一组(LRU)。
-    // 只有真正换网/新网络才触发落盘，且 NVS 对值未变化的键会跳过实际写入
+    // The list uses most-recently-used order. Slot 0 returns without a write.
+    // Move another saved network to slot 0. The last slot is the LRU entry.
+    // Persist only a changed or new network. NVS skips unchanged values.
     int found = -1;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
@@ -749,12 +824,13 @@ esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::str
     if (found == 0) return ESP_OK;
 
     err = idf_config_save_wifi(ssid, pass);
-    if (err == ESP_OK && found < 0) idf_logf("已连接新网络，自动加入历史 WiFi: %s", ssid.c_str());
+    if (err == ESP_OK && found < 0) idf_logf("new network added to saved WiFi: %s", ssid.c_str());
     return err;
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets_in[IDF_MAX_WIFI_NETWORKS],
-                                         bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm)
+                                         bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm) try
 {
     {
         if (!wifi_tx_power_valid(wifi_tx_power_quarter_dbm)) return ESP_ERR_INVALID_ARG;
@@ -777,11 +853,12 @@ esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets_in[IDF_MAX_WIF
             if (duplicate) continue;
             next.wifiNetworks[w] = nets_in[i];
             if (preserve_blank_pass && next.wifiNetworks[w].pass.empty()) {
-                for (const auto& current : base.wifiNetworks) {
-                    if (current.ssid == next.wifiNetworks[w].ssid) {
-                        next.wifiNetworks[w].pass = current.pass;
-                        break;
-                    }
+                const auto current = std::find_if(
+                    std::begin(base.wifiNetworks), std::end(base.wifiNetworks), [&](const auto& item) {
+                        return item.ssid == next.wifiNetworks[w].ssid;
+                    });
+                if (current != std::end(base.wifiNetworks)) {
+                    next.wifiNetworks[w].pass = current->pass;
                 }
             }
             ++w;
@@ -791,10 +868,11 @@ esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets_in[IDF_MAX_WIF
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_wifi_profile(int index, const std::string& ssid,
                                        const std::string& password, bool open,
-                                       bool retain_password)
+                                       bool retain_password) try
 {
     if (index < 0 || index >= IDF_MAX_WIFI_NETWORKS || ssid.size() > MAX_WIFI_SSID_BYTES) {
         return ESP_ERR_INVALID_ARG;
@@ -822,8 +900,9 @@ esp_err_t idf_config_save_wifi_profile(int index, const std::string& ssid,
     update.next->wifiFromFallback = false;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_account(const std::string& user, const std::string& pass)
+esp_err_t idf_config_save_account(const std::string& user, const std::string& pass) try
 {
     {
         if (user.size() > MAX_WEB_USERNAME_BYTES || pass.size() > MAX_WEB_PASSWORD_BYTES) {
@@ -842,9 +921,10 @@ esp_err_t idf_config_save_account(const std::string& user, const std::string& pa
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_accounts(const IdfWebAccount accounts[IDF_MAX_WEB_ACCOUNTS],
-                                   bool preserve_blank_password)
+                                   bool preserve_blank_password) try
 {
     if (!accounts) return ESP_ERR_INVALID_ARG;
     for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
@@ -864,28 +944,25 @@ esp_err_t idf_config_save_accounts(const IdfWebAccount accounts[IDF_MAX_WEB_ACCO
             update.next->webAccounts[i].password = update.base->webAccounts[i].password;
         }
     }
-    bool usable = false;
-    for (const IdfWebAccount& account : update.next->webAccounts) {
-        if (!account.username.empty() && !account.password.empty()) {
-            usable = true;
-            break;
-        }
-    }
+    const bool usable = std::any_of(
+        std::begin(update.next->webAccounts), std::end(update.next->webAccounts),
+        [](const IdfWebAccount& account) {
+            return !account.username.empty() && !account.password.empty();
+        });
     if (!usable) return cancel_config_update(update, ESP_ERR_INVALID_ARG);
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_identity(const std::string& device_name, const std::string& hostname)
+esp_err_t idf_config_save_identity(const std::string& device_name, const std::string& hostname) try
 {
     if (device_name.empty() || device_name.size() > MAX_DEVICE_NAME_BYTES || hostname.empty() ||
         hostname.size() > MAX_HOSTNAME_LENGTH || hostname.front() == '-' || hostname.back() == '-') {
         return ESP_ERR_INVALID_ARG;
     }
-    for (unsigned char ch : hostname) {
-        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-')) {
-            return ESP_ERR_INVALID_ARG;
-        }
-    }
+    if (!std::all_of(hostname.begin(), hostname.end(), [](unsigned char ch) {
+            return (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-';
+        })) return ESP_ERR_INVALID_ARG;
     ConfigUpdate update;
     esp_err_t err = begin_config_update(update);
     if (err != ESP_OK) return err;
@@ -894,8 +971,9 @@ esp_err_t idf_config_save_identity(const std::string& device_name, const std::st
     update.next->mdnsHost = hostname;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_notification_locale(const std::string& locale)
+esp_err_t idf_config_save_notification_locale(const std::string& locale) try
 {
     if (locale != NOTIFICATION_LOCALE_ZH_TW && locale != NOTIFICATION_LOCALE_ZH_CN &&
         locale != NOTIFICATION_LOCALE_EN) {
@@ -907,8 +985,9 @@ esp_err_t idf_config_save_notification_locale(const std::string& locale)
     update.next->notificationLocale = locale;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_network_mode(int network_mode)
+esp_err_t idf_config_save_network_mode(int network_mode) try
 {
     if (network_mode < NETWORK_MODE_WIFI_ONLY || network_mode > NETWORK_MODE_MIX) {
         return ESP_ERR_INVALID_ARG;
@@ -919,8 +998,9 @@ esp_err_t idf_config_save_network_mode(int network_mode)
     update.next->networkMode = network_mode;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_heartbeat(bool enabled, int interval_hours)
+esp_err_t idf_config_save_heartbeat(bool enabled, int interval_hours) try
 {
     if (interval_hours < MIN_HEARTBEAT_INTERVAL_HOURS || interval_hours > MAX_HEARTBEAT_INTERVAL_HOURS) {
         return ESP_ERR_INVALID_ARG;
@@ -933,8 +1013,9 @@ esp_err_t idf_config_save_heartbeat(bool enabled, int interval_hours)
     update.next->heartbeatInterval = interval_hours;
     return finish_config_update(update);
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
+esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server) try
 {
     {
         if (tz_offset_min < -720 || tz_offset_min > 840 || ntp_server.size() > MAX_NTP_SERVER_BYTES) {
@@ -948,8 +1029,9 @@ esp_err_t idf_config_save_time(int tz_offset_min, const std::string& ntp_server)
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_mdns_host(const std::string& host)
+esp_err_t idf_config_save_mdns_host(const std::string& host) try
 {
     {
         if (host.empty() || host.size() > MAX_HOSTNAME_LENGTH) return ESP_ERR_INVALID_ARG;
@@ -961,10 +1043,11 @@ esp_err_t idf_config_save_mdns_host(const std::string& host)
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_email(bool enabled, const std::string& server, int port,
                                 const std::string& user, const std::string& pass,
-                                const std::string& send_to, bool preserve_blank_pass)
+                                const std::string& send_to, bool preserve_blank_pass) try
 {
     {
         if (port < 1 || port > 65535 || server.size() > MAX_SMTP_SERVER_BYTES ||
@@ -982,8 +1065,9 @@ esp_err_t idf_config_save_email(bool enabled, const std::string& server, int por
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS])
+esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]) try
 {
     {
         ConfigUpdate update;
@@ -994,8 +1078,9 @@ esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_M
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist)
+esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist) try
 {
     {
         if (admin_phone.size() > MAX_ADMIN_PHONE_BYTES || number_blacklist.size() > MAX_BLACKLIST_BYTES) {
@@ -1009,8 +1094,9 @@ esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::stri
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_forward_rules(const std::string& rules)
+esp_err_t idf_config_save_forward_rules(const std::string& rules) try
 {
     {
         if (rules.size() > MAX_FORWARD_RULES_BYTES || idf_config_validate_forward_rules(rules, nullptr) != ESP_OK) {
@@ -1023,10 +1109,11 @@ esp_err_t idf_config_save_forward_rules(const std::string& rules)
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t action,
                                     const std::string& target, const std::string& url,
-                                    const std::string& profile)
+                                    const std::string& profile) try
 {
     {
         if (interval_days < 1 || interval_days > 3650 || action > 3 || target.size() > MAX_KEEPALIVE_TARGET_BYTES ||
@@ -1045,11 +1132,12 @@ esp_err_t idf_config_save_keepalive(bool enabled, int interval_days, uint8_t act
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
                                           bool hb_enabled, int hb_hour,
                                           bool sms_health_enabled, int sms_health_hour,
-                                          bool sms_health_notify)
+                                          bool sms_health_notify) try
 {
     {
         if (reboot_hour < 0 || reboot_hour > 23 || hb_hour < 0 || hb_hour > 23 ||
@@ -1068,8 +1156,9 @@ esp_err_t idf_config_save_system_schedule(bool reboot_enabled, int reboot_hour,
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS])
+esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TASKS]) try
 {
     {
         ConfigUpdate update;
@@ -1082,10 +1171,11 @@ esp_err_t idf_config_save_sched_tasks(const IdfSchedTask tasks[IDF_MAX_SCHED_TAS
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std::string& apn,
                               const std::string& operator_plmn, const std::string& phone_number,
-                              const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS])
+                              const IdfSimCredential credentials[IDF_MAX_SIM_CREDENTIALS]) try
 {
     {
         if (apn.size() > MAX_APN_BYTES || operator_plmn.size() > MAX_OPERATOR_PLMN_BYTES ||
@@ -1119,8 +1209,9 @@ esp_err_t idf_config_save_sim(bool data_enabled, bool roaming_enabled, const std
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
-esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success)
+esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk, bool success) try
 {
     {
         ConfigUpdate update;
@@ -1149,6 +1240,7 @@ esp_err_t idf_config_record_sim_unlock_result(const std::string& iccid, bool puk
         return finish_config_update(update);
     }
 }
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 IdfConfig idf_config_get(void)
 {
@@ -1163,11 +1255,9 @@ static bool email_configured_locked()
 
 static int enabled_push_count_locked()
 {
-    int count = 0;
-    for (const auto& ch : s_config.pushChannels) {
-        if (ch.enabled) ++count;
-    }
-    return count;
+    return static_cast<int>(std::count_if(
+        std::begin(s_config.pushChannels), std::end(s_config.pushChannels),
+        [](const auto& channel) { return channel.enabled; }));
 }
 
 IdfConfigStatusView idf_config_get_status_view(void)
@@ -1182,7 +1272,7 @@ IdfConfigStatusView idf_config_get_status_view(void)
     view.adminPhone = s_config.adminPhone;
     view.phoneNumber = s_config.phoneNumber;
     view.apn = s_config.apn;
-    // 一次持锁取齐 /status 所需派生值：既省两次锁往返，也保证同一快照内自洽
+    // Derive all /status values under one lock for a consistent snapshot.
     view.emailConfigured = email_configured_locked();
     view.pushEnabledCount = enabled_push_count_locked();
     xSemaphoreGive(s_config_mutex);
@@ -1319,12 +1409,12 @@ IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)
     IdfSimUnlockView view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    for (const auto& item : s_config.simCredentials) {
-        if (item.iccid == iccid) {
-            view.found = true;
-            view.credential = item;
-            break;
-        }
+    const auto item = std::find_if(
+        std::begin(s_config.simCredentials), std::end(s_config.simCredentials),
+        [&iccid](const auto& credential) { return credential.iccid == iccid; });
+    if (item != std::end(s_config.simCredentials)) {
+        view.found = true;
+        view.credential = *item;
     }
     xSemaphoreGive(s_config_mutex);
     return view;
@@ -1428,8 +1518,8 @@ bool idf_config_get_push_channel(uint8_t channel, IdfPushChannel& out)
     return true;
 }
 
-// 以下布尔/小字段访问器都在锁内直接求值：全量快照要深拷贝 42 个 std::string，
-// 在每个 HTTP 请求上都做一次会造成持续的堆分配抖动与碎片化
+// Read small fields under the lock. A full snapshot copies 42 std::string values
+// and causes repeated heap allocation and fragmentation on each HTTP request.
 std::vector<IdfWifiNetwork> idf_config_get_wifi_networks(void)
 {
     std::vector<IdfWifiNetwork> nets;
@@ -1473,9 +1563,9 @@ bool idf_config_call_notify_enabled(void)
     return on;
 }
 
-// 时区/NTP 窄访问器：SNTP 同步回调跑在 tiT(lwip) 任务、事件回调跑在系统事件任务，
-// 两者栈都很小(约 3.5KB / 4KB)。全量 idf_config_get() 会把含多个定时任务的大 IdfConfig
-// 深拷贝上这些小栈——任务数上调后直接爆栈(Stack protection fault)。这里只锁内取所需字段。
+// SNTP and system event callbacks have small stacks (about 3.5 KB and 4 KB).
+// Copy only the required fields under the lock. A full IdfConfig copy can overflow
+// these stacks when the scheduled task count increases.
 int idf_config_get_tz_offset(void)
 {
     if (ensure_config_mutex() != ESP_OK) return 480;
@@ -1517,7 +1607,7 @@ bool idf_config_email_configured(void)
     return ok;
 }
 
-// 常数时间比对：逐字节累积差异，不因首字节不匹配提前返回，避免计时侧信道
+// Accumulate byte differences without an early return to limit timing leakage.
 static bool timing_safe_equals(const std::string& expected, const char* actual)
 {
     size_t actual_len = strlen(actual);

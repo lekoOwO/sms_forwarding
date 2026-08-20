@@ -33,6 +33,14 @@ int main() {
     assert(title == "SMS from +886900000001");
     assert(body == "Device: Hallway C3\nSender: +886900000001\nTime: 2026-08-16 12:34:56\nMessage: OTP {device}: 1234");
 
+    assert(idf_push_render_sms_notification("zh-CN", "", "", values, title, body));
+    assert(title == "来自 +886900000001 的短信");
+    assert(body == "设备：Hallway C3\n发件人：+886900000001\n时间：2026-08-16 12:34:56\n内容：OTP {device}: 1234");
+
+    assert(idf_push_render_sms_notification("zh-TW", "", "", values, title, body));
+    assert(title == "來自 +886900000001 的簡訊");
+    assert(body == "裝置：Hallway C3\n寄件者：+886900000001\n時間：2026-08-16 12:34:56\n內容：OTP {device}: 1234");
+
     assert(!idf_push_render_template("bad\nheader", values, 256, true, output));
     assert(!idf_push_render_template("bad\theader", values, 256, true, output));
     assert(!idf_push_render_template(std::string("bad\xC0\xAF", 5), values, 256, false, output));
@@ -86,7 +94,7 @@ int main() {
         "if (network == IdfPushNetworkDecision::Unsupported)", 1
     )[1].split("IdfPushChannel channel", 1)[0]
     assert "fail_push_job_without_retry" in unsupported
-    assert "蜂窝推送尚不支持" in unsupported
+    assert "Cellular push is not supported" in unsupported
     assert "job.attempts++" not in unsupported
     locked_selection = push_worker.split(
         "for (size_t i = 0; i < s_push_jobs.size(); ++i)", 1
@@ -103,7 +111,7 @@ int main() {
     tests = source.split("static bool process_test_one()", 1)[1].split(
         "static bool process_startup_notification()", 1
     )[0]
-    assert 'fail_pending_tests("蜂窝推送尚不支持，测试已终止")' in tests
+    assert 'fail_pending_tests("Cellular push is not supported; test stopped")' in tests
     assert "channel_waits_for_time(cfg.pushChannels[i])" in tests
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
 

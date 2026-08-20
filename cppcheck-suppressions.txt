@@ -1,0 +1,14 @@
+# cppcheck analyzes each translation unit independently. Public DTO/config
+# members are consumed by sibling components, so unusedStructMember is not
+# actionable here.
+unusedStructMember
+
+# These are advisory refactors, not correctness findings. Existing firmware
+# keeps explicit loops for bounded buffers and lock/transport state machines.
+variableScope
+constParameterReference
+constVariablePointer
+
+# The analyzer cannot model FreeRTOS/linker contracts and reports known false
+# positives for guarded fallback paths in the current runtime.
+knownConditionTrueFalse

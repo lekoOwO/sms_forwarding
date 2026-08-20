@@ -10,7 +10,7 @@
 #include "freertos/semphr.h"
 #include "idf_util.h"
 
-// 收发件箱只供本次运行中的网页速览；正文不会写入 flash，重启即清空。
+// The inbox and outbox are runtime-only Web views. Message bodies never enter flash and a restart clears them.
 static constexpr size_t INBOX_MAX = 50;
 static constexpr size_t SENT_MAX = 10;
 static constexpr size_t BODY_MAX = 320;
@@ -104,10 +104,9 @@ size_t idf_inbox_count(void)
 {
     ensure_init();
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return 0;
-    size_t count = 0;
-    for (size_t i = 0; i < s_inbox_filled; ++i) {
-        if (!s_inbox[i].deleted) ++count;
-    }
+    const size_t count = static_cast<size_t>(std::count_if(
+        s_inbox.begin(), s_inbox.begin() + s_inbox_filled,
+        [](const InboxSlot& entry) { return !entry.deleted; }));
     xSemaphoreGive(s_mutex);
     return count;
 }

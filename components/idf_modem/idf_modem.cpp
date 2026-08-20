@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iterator>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
@@ -40,15 +41,15 @@ static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
-// 用户显式刷新概览模组信息后才做展示型采样：启动期不主动读取身份/信号；
-// 采样仍受 at_channel_idle 门控，不与收发/保号抢 AT 通道
+// Sample display identity and signal data only after an explicit overview refresh.
+// at_channel_idle prevents sampling from competing for the AT channel.
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
-static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM 热插拔检测轮询间隔
+static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM hot-swap poll interval
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 static constexpr size_t OWNER_COMMAND_SLOTS = 4;
-// HTTPS 失败后允许完整 HTTP fallback：两次 90s 下载、两轮配置/清理及 PDP 等待。
+// Allow two 90-second downloads, setup, cleanup, and PDP waits for HTTPS fallback.
 static constexpr uint32_t CELLULAR_HTTP_CALL_TIMEOUT_MS = 360000UL;
 
 enum class OwnerCommandKind : uint8_t { at, until, pdu, cellular_http };
@@ -73,7 +74,7 @@ struct OwnerCommandSlot {
     SemaphoreHandle_t completed = nullptr;
 };
 
-// session_mutex 保留 eSIM 多命令会话的独占语义；命令槽永远不保存 caller 指针。
+// session_mutex keeps exclusive eSIM multi-command sessions. Command slots never store caller pointers.
 static SemaphoreHandle_t s_session_mutex = nullptr;
 static SemaphoreHandle_t s_command_mutex = nullptr;
 static SemaphoreHandle_t s_status_mutex = nullptr;
@@ -82,31 +83,31 @@ static QueueHandle_t s_command_queue = nullptr;
 static QueueHandle_t s_priority_command_queue = nullptr;
 static OwnerCommandSlot s_command_slots[OWNER_COMMAND_SLOTS];
 static TaskHandle_t s_owner_task = nullptr;
-// UART 驱动事件队列：URC 一到就唤醒模组任务抓取，替代固定 500ms 轮询延时
+// UART events wake the modem task when a URC arrives instead of polling every 500 ms.
 static QueueHandle_t s_uart_evt_queue = nullptr;
-// 模组事件信号：新 URC 入缓冲/网页短信入队时唤醒短信任务，消除轮询等待
+// Wake the SMS task for a buffered URC or queued Web SMS.
 static SemaphoreHandle_t s_event_sem = nullptr;
 static IdfModemStatus s_status;
 static std::string s_urc_buffer;
-// 普通 AT 响应与异步 URC 共用 UART。按行持续提取短信/来电 URC，避免 +CMT 头和
-// 后续 PDU 落在两个读取周期时，PDU 被误吞进下一条 AT 响应。
+// AT responses and asynchronous URCs share the UART. Extract SMS and call URCs
+// by line so a split +CMT header and PDU do not enter the next AT response.
 static std::string s_uart_line_carry;
 static bool s_uart_wait_cmt_pdu = false;
 static int64_t s_uart_wait_cmt_until_us = 0;
 static bool s_started = false;
-// 启动握手/注册期间 owner 尚未进入普通队列调度；此时只接收短信直推确认。
+// Before normal queue scheduling, accept only direct SMS acknowledgments.
 static std::atomic<bool> s_runtime_queue_ready{false};
-static std::atomic<int> s_reset_request{0};  // 1=AT软重启，2=EN硬重启；由模组任务执行
+static std::atomic<int> s_reset_request{0};  // 1=AT soft reset, 2=EN hard reset; modem task executes
 static bool s_data_mode_retry_pending = false;
 static uint8_t s_data_mode_retry_count = 0;
 static TickType_t s_next_data_mode_retry = 0;
-static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=未知，0=MT，1=ME，2=SM
+static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=unknown, 0=MT, 1=ME, 2=SM
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
 static std::atomic<int64_t> s_last_web_poll_us{-WEB_POLL_ACTIVE_WINDOW_US};
 static std::atomic<uint32_t> s_status_sample_requests{0};
 static std::atomic<uint32_t> s_esim_operation_depth{0};
-static std::atomic<int> s_sim_unlock_request{0};  // 1=重查/自动 PIN，2=用户确认后的单次 PUK
+static std::atomic<int> s_sim_unlock_request{0};  // 1=recheck or automatic PIN, 2=confirmed PUK attempt
 static std::string s_last_pin_attempt_key;
 
 void idf_modem_signal_event(void);
@@ -221,8 +222,7 @@ static bool parse_comma_longs(const std::string& text, long* values, int max_val
     return count > 0;
 }
 
-// tick 回绕安全的超时窗口：`now + timeout` 在 49.7 天(1000Hz tick)回绕时会溢出，
-// 使 `now < deadline` 永远为假，所有 AT 读循环瞬间退出。统一改用无符号差值判断。
+// Use an unsigned elapsed-time difference across the 49.7-day tick wrap.
 struct TickDeadline {
     TickType_t start;
     TickType_t span;
@@ -231,8 +231,8 @@ struct TickDeadline {
     void restart(uint32_t ms) { start = xTaskGetTickCount(); span = pdMS_TO_TICKS(ms); }
 };
 
-// AT 最终结果码：1=OK，-1=ERROR/+CMS ERROR/+CME ERROR(27.005/27.007 定义的失败终结码)，0=未结束。
-// 不要求末尾必须再跟 CRLF：部分长命令的最后一个 UART 块可能恰好止于 "OK"。
+// Final AT result: 1=OK, -1=ERROR/+CMS ERROR/+CME ERROR, 0=incomplete.
+// Accept a final result without trailing CRLF because a UART block can end at "OK".
 static int at_final_result(const std::string& resp)
 {
     size_t pos = 0;
@@ -260,7 +260,7 @@ static bool has_cmgs_result(const std::string& resp)
     return true;
 }
 
-// 取包含 token 的那一整行(不同 URC 混在同一段响应里时不能只取"第一有效行")
+// Return the complete line that contains the token, not the first non-empty line.
 static std::string line_containing(const std::string& resp, size_t pos)
 {
     size_t start = resp.rfind('\n', pos);
@@ -350,19 +350,17 @@ static bool is_iccid_text(const std::string& value)
 static bool is_imei_text(const std::string& value)
 {
     if (value.size() < 14 || value.size() > 17) return false;
-    for (char ch : value) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return isdigit(static_cast<unsigned char>(ch));
+    });
 }
 
 static bool is_imsi_text(const std::string& value)
 {
     if (value.size() < 14 || value.size() > 16) return false;
-    for (char ch : value) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return isdigit(static_cast<unsigned char>(ch));
+    });
 }
 
 static std::string first_quoted(const std::string& line, size_t start = 0)
@@ -461,8 +459,8 @@ static bool startup_info_complete(void)
     return complete;
 }
 
-// ICCID/运营商等字段可能被 SIM 或网络长期拒绝返回；完成一轮采样后即可进入 ready，
-// 缺失字段仍由 startup_info_complete() 驱动后台补采，不能让概览永远停在“读取中”。
+// SIM or network responses can omit ICCID or operator data. Mark one sampling
+// pass ready, then let startup_info_complete() request missing fields later.
 static bool startup_sampling_done(void)
 {
     IdfModemStatus status = idf_modem_get_status();
@@ -515,7 +513,7 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
     }
     if (err == ESP_OK && changed) err = nvs_commit(nvs);
     nvs_close(nvs);
-    if (err == ESP_OK && changed) idf_log_line("模组身份信息已写入缓存");
+    if (err == ESP_OK && changed) idf_log_line("modem identity written to cache");
 }
 
 static void append_urc_text(const std::string& text)
@@ -523,7 +521,7 @@ static void append_urc_text(const std::string& text)
     if (text.empty() || !s_urc_mutex) return;
     if (xSemaphoreTake(s_urc_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return;
     if (text.size() >= URC_BUFFER_MAX) {
-        // 长 AT 响应里夹 URC 时，整段转存会突破缓冲上限；保留尾部且尽量从完整行开始。
+        // Keep a complete-line tail when URCs in a long AT response exceed the buffer.
         size_t start = text.size() - URC_BUFFER_MAX;
         size_t nl = text.find('\n', start);
         if (nl != std::string::npos && nl + 1 < text.size()) start = nl + 1;
@@ -539,7 +537,7 @@ static void append_urc_text(const std::string& text)
         s_urc_buffer += text;
     }
     xSemaphoreGive(s_urc_mutex);
-    idf_modem_signal_event();  // 立即唤醒短信任务处理，不等它的轮询周期
+    idf_modem_signal_event();  // Wake the SMS task immediately.
 }
 
 static void append_capped(std::string& out, const uint8_t* data, size_t len, size_t cap);
@@ -590,15 +588,13 @@ static void preserve_uart_urcs(const uint8_t* data, size_t len)
 static void capture_pending_uart_locked(uint32_t max_ms)
 {
     assert_owner_task();
-    // RX 缓冲为空时立即返回：该函数在每条 AT 命令前都会执行，
-    // 空转等待 20ms×2 会拖慢所有 AT 操作(健康探测/补收批量删除/身份采样)
+    // Return immediately when RX is empty. This runs before every AT command.
     size_t buffered = 0;
     if (uart_get_buffered_data_len(MODEM_UART, &buffered) == ESP_OK && buffered == 0) return;
 
     uint8_t buf[128];
-    // 静默窗口(有数据就续期)之上必须再加总时长硬上限：模组连续吐数据
-    // (下载中途中止的 MHTTP 载荷、复位横幅、错误波特率乱码)时，纯续期
-    // 循环会长期占住 AT 通道；按行提取器本身已有固定长度上限，不在这里重复缓存。
+    // Set a total limit in addition to the renewable quiet window so continuous
+    // modem output cannot retain the AT channel indefinitely.
     TickDeadline hard_deadline(std::max<uint32_t>(max_ms, 1000));
     TickDeadline quiet(max_ms);
     do {
@@ -621,12 +617,12 @@ static void handle_uart_event_error(const uart_event_t& evt)
 {
     if (evt.type == UART_FIFO_OVF || evt.type == UART_BUFFER_FULL) {
         idf_log_line(evt.type == UART_FIFO_OVF
-                         ? "模组 UART 硬件 FIFO 溢出，本次接收数据可能不完整"
-                         : "模组 UART 接收缓冲已满，本次接收数据可能不完整");
+                         ? "modem UART hardware FIFO overflow; received data can be incomplete"
+                         : "modem UART receive buffer full; received data can be incomplete");
     } else if (evt.type == UART_PARITY_ERR) {
-        idf_log_line("模组 UART 奇偶校验错误，本次接收数据可能损坏");
+        idf_log_line("modem UART parity error; received data can be corrupt");
     } else if (evt.type == UART_FRAME_ERR) {
-        idf_log_line("模组 UART 帧错误，本次接收数据可能损坏");
+        idf_log_line("modem UART frame error; received data can be corrupt");
     }
 }
 
@@ -637,13 +633,9 @@ static bool at_channel_idle_now(void)
     if (xSemaphoreTakeRecursive(s_session_mutex, 0) != pdTRUE) return false;
     bool idle = false;
     if (xSemaphoreTake(s_command_mutex, 0) == pdTRUE) {
-        idle = true;
-        for (const auto& slot : s_command_slots) {
-            if (slot.state != OwnerCommandState::free) {
-                idle = false;
-                break;
-            }
-        }
+        idle = std::all_of(std::begin(s_command_slots), std::end(s_command_slots), [](const auto& slot) {
+            return slot.state == OwnerCommandState::free;
+        });
         xSemaphoreGive(s_command_mutex);
     }
     xSemaphoreGiveRecursive(s_session_mutex);
@@ -673,12 +665,12 @@ static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std:
 
     response.clear();
     response.reserve(512);
-    // 响应上限 8KB：满存储的 AT+CMGL 可达十几 KB，无上限会造成堆峰值风险；
-    // 截断后 OK/ERROR 终结符仍通过重叠扫描窗口检测，漏收的短信由下轮轮询补齐。
+    // Limit responses to 8 KB because AT+CMGL can exceed 10 KB with full storage.
+    // Detect a truncated OK or ERROR in the overlap window. Later polling recovers omitted SMS.
     constexpr size_t MAX_RESPONSE = 8192;
     TickDeadline deadline(timeout_ms);
     uint8_t buf[128];
-    std::string scan;  // 跨块重叠扫描窗口，保证被截断/跨块的终结符也能被识别
+    std::string scan;  // Overlap window for truncated or split final result codes
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
         int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
@@ -766,7 +758,7 @@ static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
                 break;
             }
             if (at_final_result(scan) < 0) {
-                ret = ESP_FAIL;  // 提示符阶段就报错(如未注册的 +CMS ERROR)，按失败而非超时上报
+                ret = ESP_FAIL;  // A prompt-stage error such as +CMS ERROR is a failure, not a timeout.
                 break;
             }
             if (scan.size() > 64) scan.erase(0, scan.size() - 64);
@@ -776,8 +768,7 @@ static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
     if (got_prompt) {
         size_t pdu_len = strlen(pdu);
         owner_uart_write(pdu, pdu_len);
-        // Ctrl+Z 提交 PDU；encodePDU 生成的缓冲已自带 0x1A 结尾，
-        // 避免重复发送在命令模式下多注入一个孤立控制字符
+        // encodePDU already terminates the PDU with Ctrl+Z. Do not send another 0x1A.
         if (pdu_len == 0 || static_cast<uint8_t>(pdu[pdu_len - 1]) != 0x1A) {
             const uint8_t end = 0x1A;
             owner_uart_write(&end, 1);
@@ -790,8 +781,8 @@ static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
                 preserve_uart_urcs(buf, static_cast<size_t>(got));
                 append_capped(response, buf, static_cast<size_t>(got), MAX_RESPONSE);
                 scan.append(reinterpret_cast<const char*>(buf), got);
-                // 官方手册定义 +CMGS:<mr> 即网络已接受 SMS-SUBMIT；某些固件的尾随 OK
-                // 可能没有完整 CRLF，不能因此把已经发送成功的短信等到超时。
+                // +CMGS:<mr> means the network accepted SMS-SUBMIT. Do not require
+                // complete CRLF after the trailing OK.
                 if (has_cmgs_result(response) || has_cmgs_result(scan)) {
                     ret = ESP_OK;
                     break;
@@ -818,8 +809,8 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
     bool priority = cmd.rfind("AT+CNMA", 0) == 0;
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
         esp_err_t result = owner_send_at(cmd, timeout_ms, response);
-        // 启动握手、注册及采样同样会在每条普通 AT 的安全边界确认直推短信。
-        // CNMA 自身不再递归 drain，避免连续确认形成嵌套调用链。
+        // Acknowledge direct SMS at safe AT boundaries during startup and sampling.
+        // CNMA does not recurse into drain, which avoids nested acknowledgment calls.
         if (!priority) owner_drain_priority_commands();
         return result;
     }
@@ -874,8 +865,7 @@ static bool owner_request_bounded(const OwnerCommand& request)
 
 static void wake_owner_task()
 {
-    // owner 空闲时阻塞在 UART 事件队列；注入无载荷 DATA 事件只负责提前唤醒。
-    // 若队列已满，真实 UART 事件本身也会立即唤醒 owner。
+    // The owner waits on UART events while idle. A payload-free DATA event wakes it early.
     if (!s_uart_evt_queue) return;
     uart_event_t wake = {};
     wake.type = UART_DATA;
@@ -949,7 +939,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
             if (cellular_result) *cellular_result = slot.cellular_result;
             reset_owner_slot(slot);
         } else if (slot.state == OwnerCommandState::done) {
-            // 完成信号与 caller 超时同时发生时，完成结果优先，避免误报超时。
+            // Prefer completion if its signal arrives with the caller timeout.
             result = slot.result;
             if (response) *response = slot.response;
             if (cellular_result) *cellular_result = slot.cellular_result;
@@ -978,10 +968,10 @@ static std::string parse_iccid_response(const std::string& raw)
     size_t p = line.find(':');
     std::string value = idf_util_trim_copy(p == std::string::npos ? line : line.substr(p + 1));
     value.erase(std::remove(value.begin(), value.end(), '"'), value.end());
-    for (char& ch : value) if (ch == 'f') ch = 'F';
+    std::replace(value.begin(), value.end(), 'f', 'F');
     if (!value.empty() && value.back() == 'F') value.pop_back();
     if (is_iccid_text(value)) return value;
-    // 部分固件会在 ICCID 前后附加槽位或状态字段，退回提取响应中的连续数字。
+    // Some firmware adds slot or status fields around ICCID. Fall back to consecutive digits.
     return first_digit_run(raw, 15, 22);
 }
 
@@ -1037,9 +1027,9 @@ static constexpr bool sim_unlock_allowed(bool has_secret, uint8_t failed, uint8_
 {
     return has_secret && failed < limit && (!puk || user_confirmed);
 }
-static_assert(sim_unlock_allowed(true, 0, 1, false, false), "PIN 应允许自动首次尝试");
-static_assert(!sim_unlock_allowed(true, 1, 1, false, false), "达到上限后必须停止 PIN");
-static_assert(!sim_unlock_allowed(true, 0, 1, true, false), "PUK 不得自动尝试");
+static_assert(sim_unlock_allowed(true, 0, 1, false, false), "first automatic PIN attempt must be allowed");
+static_assert(!sim_unlock_allowed(true, 1, 1, false, false), "PIN must stop at the attempt limit");
+static_assert(!sim_unlock_allowed(true, 0, 1, true, false), "PUK must not run automatically");
 
 static bool try_unlock_sim(bool allow_puk)
 {
@@ -1047,26 +1037,26 @@ static bool try_unlock_sim(bool allow_puk)
     send_ok("AT+CMEE=1", 1200);
     std::string state = query_sim_state();
     if (state == "ready") {
-        set_sim_status("ready", false, "SIM 已就绪");
+        set_sim_status("ready", false, "SIM is ready");
         return true;
     }
     if (state != "pin" && state != "puk") {
-        set_sim_status(state, false, state == "absent" ? "未检测到 SIM" : "无法自动处理该 SIM 状态");
+        set_sim_status(state, false, state == "absent" ? "SIM not detected" : "Cannot handle this SIM state automatically");
         return false;
     }
     if (allow_puk && state != "puk") {
-        set_sim_status(state, false, "当前 SIM 等待 PIN，未执行 PUK");
+        set_sim_status(state, false, "SIM requires a PIN. PUK was not attempted");
         return false;
     }
 
     std::string iccid = query_current_iccid();
     if (iccid.empty()) {
-        set_sim_status(state, false, "锁卡状态下无法读取 ICCID，未尝试任何密码");
+        set_sim_status(state, false, "Cannot read ICCID while SIM is locked. No credential was attempted");
         return false;
     }
     IdfSimUnlockView view = idf_config_get_sim_unlock_view(iccid);
     if (!view.found) {
-        set_sim_status(state, false, "当前 ICCID 没有匹配的凭据", iccid);
+        set_sim_status(state, false, "No credential matches this ICCID", iccid);
         return false;
     }
     const IdfSimCredential& item = view.credential;
@@ -1076,20 +1066,20 @@ static bool try_unlock_sim(bool allow_puk)
     uint8_t limit = puk ? item.pukMaxAttempts : item.pinMaxAttempts;
     bool has_secret = !secret.empty() && (!puk || !item.pin.empty());
     if (!sim_unlock_allowed(has_secret, failed, limit, puk, allow_puk) && !has_secret) {
-        set_sim_status(state, true, puk ? "需要同时保存 PUK 和新 PIN" : "未保存 PIN", iccid);
+        set_sim_status(state, true, puk ? "Save the PUK and a new PIN" : "No PIN is saved", iccid);
         return false;
     }
     if (!sim_unlock_allowed(has_secret, failed, limit, puk, allow_puk) && failed >= limit) {
-        set_sim_status(state, true, std::string(puk ? "PUK" : "PIN") + " 已达到本机失败次数上限", iccid);
+        set_sim_status(state, true, std::string(puk ? "PUK" : "PIN") + " reached the local attempt limit", iccid);
         return false;
     }
     if (!sim_unlock_allowed(has_secret, failed, limit, puk, allow_puk)) {
-        set_sim_status(state, true, "PUK 只允许在网页中手动确认执行", iccid);
+        set_sim_status(state, true, "Confirm the PUK attempt manually in the Web UI", iccid);
         return false;
     }
     std::string attempt_key = iccid;
     if (!puk && s_last_pin_attempt_key == attempt_key) {
-        set_sim_status(state, true, "本次运行已尝试该 PIN，等待修改凭据", iccid);
+        set_sim_status(state, true, "This PIN was already attempted. Update the credential", iccid);
         return false;
     }
     if (!puk) s_last_pin_attempt_key = attempt_key;
@@ -1107,14 +1097,14 @@ static bool try_unlock_sim(bool allow_puk)
         idf_config_record_sim_unlock_result(iccid, puk, true);
         if (puk) idf_config_record_sim_unlock_result(iccid, false, true);
         s_last_pin_attempt_key.clear();
-        set_sim_status("ready", true, puk ? "PUK 解锁成功" : "PIN 自动解锁成功", iccid);
-        idf_log_line(puk ? "SIM PUK 手动解锁成功" : "SIM PIN 自动解锁成功");
+        set_sim_status("ready", true, puk ? "PUK unlock succeeded" : "Automatic PIN unlock succeeded", iccid);
+        idf_log_line(puk ? "manual SIM PUK unlock succeeded" : "automatic SIM PIN unlock succeeded");
         return true;
     }
     if (submit_err == ESP_FAIL) idf_config_record_sim_unlock_result(iccid, puk, false);
     set_sim_status(state, true, std::string(puk ? "PUK" : "PIN") +
-                   (submit_err == ESP_FAIL ? " 被模组拒绝，已停止继续尝试" : " 提交超时，未计入密码错误"), iccid);
-    idf_log_line(puk ? "SIM PUK 解锁未成功，已停止继续尝试" : "SIM PIN 解锁未成功，已停止继续尝试");
+                   (submit_err == ESP_FAIL ? " was rejected by the modem. Attempts stopped" : " submission timed out. Attempt count unchanged"), iccid);
+    idf_log_line(puk ? "SIM PUK unlock failed. Attempts stopped" : "SIM PIN unlock failed. Attempts stopped");
     return false;
 }
 
@@ -1154,8 +1144,8 @@ static bool parse_cereg(const std::string& resp, int& stat)
         std::string second = idf_util_trim_copy(rest.substr(
             comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
         long second_value = -1;
-        // 查询响应是 +CEREG: <n>,<stat>；URC 是 +CEREG: <stat>[,<tac>,...]，
-        // 后者第二字段通常是带引号的 TAC，不能把它当注册状态。
+        // A query is +CEREG: <n>,<stat>. A URC is +CEREG: <stat>[,<tac>,...].
+        // Do not treat the quoted TAC in the second URC field as registration state.
         if (parse_long_token(second, second_value)) status_value = second_value;
     }
     if (status_value < 0 || status_value > 5) return false;
@@ -1163,15 +1153,15 @@ static bool parse_cereg(const std::string& resp, int& stat)
     return true;
 }
 
-// 注意：都要解析"包含 token 的那一行"。CEREG=2 的 URC 可能与查询响应混在同一段，
-// 取"第一有效行"会把 +CEREG 行错当成 +COPS/+CGDCONT/+CNUM 的内容。
+// Parse the line that contains the token. A CEREG=2 URC can share the response,
+// so the first non-empty line can belong to a different command.
 static std::string parse_cops(const std::string& resp)
 {
     size_t p = resp.find("+COPS:");
     if (p == std::string::npos) return {};
     std::string line = line_containing(resp, p);
-    // 自动模式下若未先选名称格式，AT+COPS? 只回 "+COPS: 0"(无引号运营商名)。
-    // 此时返回空让上层改用 COPS=3,0 重试，而不是把模式位当运营商缓存下来。
+    // Automatic mode can return only "+COPS: 0" until the name format is selected.
+    // Return empty so the caller retries with COPS=3,0 instead of caching the mode.
     return first_quoted(line);
 }
 
@@ -1194,9 +1184,8 @@ static std::string parse_apn(const std::string& resp)
     }
 }
 
-// 部分模组/卡会把国际 TOA 字节 0x91 误解成 BCD 数字，导致 CNUM 号码出现
-// "+19..." 前缀，例如 +1944756... 实际应为 +44756...。这里只在 "19" 后
-// 紧跟常见国家/地区码时剥离，避免误伤真实 NANP 号码。
+// Some modems decode international TOA 0x91 as BCD and prefix CNUM with "+19".
+// Strip "19" only before a known country code so valid NANP numbers remain unchanged.
 static std::string normalize_msisdn(std::string phone)
 {
     size_t start = 0;
@@ -1290,13 +1279,13 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     std::string url = idf_util_trim_copy(raw_url);
     if (url.empty()) url = IDF_KEEPALIVE_DEFAULT_URL;
     if (url.size() > 240) {
-        error = "蜂窝HTTP URL过长";
+        error = "Cellular HTTP URL is too long";
         return false;
     }
 
     size_t proto_end = url.find("://");
     if (proto_end == std::string::npos || proto_end == 0) {
-        error = "蜂窝HTTP URL格式无效，需要 http:// 或 https://";
+        error = "Cellular HTTP URL must start with http:// or https://";
         return false;
     }
 
@@ -1304,7 +1293,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     std::transform(protocol.begin(), protocol.end(), protocol.begin(),
                    [](unsigned char ch) { return static_cast<char>(tolower(ch)); });
     if (protocol != "http" && protocol != "https") {
-        error = "蜂窝HTTP URL仅支持 http/https";
+        error = "Cellular HTTP URL supports only HTTP and HTTPS";
         return false;
     }
 
@@ -1323,7 +1312,7 @@ static bool parse_http_url(const std::string& raw_url, std::string& protocol,
     if (host.empty() || host.find('"') != std::string::npos ||
         host.find(' ') != std::string::npos || path.find('"') != std::string::npos ||
         path.find(' ') != std::string::npos) {
-        error = "蜂窝HTTP URL包含非法字符";
+        error = "Cellular HTTP URL contains invalid characters";
         return false;
     }
     return true;
@@ -1371,8 +1360,7 @@ static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
             int final_code = at_final_result(response);
             if (final_code != 0) {
                 ret = final_code > 0 ? ESP_OK : ESP_FAIL;
-                // 静默续期之上加总时长硬上限：URC 持续刷屏(如下载进度)时
-                // 纯续期循环会无限占住 AT 通道锁，拖死所有 AT 使用方
+                // Set a total limit so continuous URCs cannot retain the AT lock indefinitely.
                 TickDeadline extra_hard(extra_read_ms * 4 + 200);
                 TickDeadline extra_deadline(extra_read_ms);
                 while (!extra_deadline.expired() && !extra_hard.expired()) {
@@ -1414,7 +1402,7 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
         int n = 0;
         if (parse_comma_longs(head.substr(comma + 1), nums, 4, n) && n >= 2 && nums[0] == http_id) {
             result.httpStatus = static_cast<int>(nums[1]);
-            idf_logf("蜂窝HTTP响应状态: %d", result.httpStatus);
+            idf_logf("cellular HTTP response status: %d", result.httpStatus);
         }
     } else if (starts_with(head, "+MHTTPURC: \"content\"")) {
         long nums[5];
@@ -1432,8 +1420,8 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
         int n = 0;
         if (parse_comma_longs(head.substr(comma + 1), nums, 3, n) && n >= 2 && nums[0] == http_id) {
             result.mhttpError = static_cast<int>(nums[1]);
-            idf_logf("蜂窝HTTP错误码: %d%s", result.mhttpError,
-                     result.mhttpError == 4 ? "(SSL握手失败)" : "");
+            idf_logf("cellular HTTP error code: %d%s", result.mhttpError,
+                     result.mhttpError == 4 ? " (SSL handshake failed)" : "");
             error = true;
             complete = true;
         }
@@ -1442,11 +1430,7 @@ static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHt
 
 static int comma_count(const std::string& text)
 {
-    int count = 0;
-    for (char ch : text) {
-        if (ch == ',') ++count;
-    }
-    return count;
+    return static_cast<int>(std::count(text.begin(), text.end(), ','));
 }
 
 static bool send_mhttp_header_locked(int http_id, bool more, const std::string& line)
@@ -1500,15 +1484,15 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
                         append_sms_urc_line(line);
                         append_next_sms_payload = starts_with(line, "+CMT:");
                     } else if (line == "RING" || starts_with(line, "+CLIP:")) {
-                        // 保号下载最长可占用 UART ~90s，整段响铃都可能落在窗口内；
-                        // 不转发这两类行来电通知就静默丢了
+                        // A keep-alive download can hold UART for 90 seconds.
+                        // Forward call lines that arrive during the full window.
                         append_sms_urc_line(line);
                     }
                 }
                 head.clear();
                 continue;
             }
-            if (head.size() < 620) head += ch;  // 需容纳下载中途插入的最大 PDU 行(~600 hex 字符)
+            if (head.size() < 620) head += ch;  // Fits a maximum PDU line inserted during download.
 
             int need_commas = 0;
             if (starts_with(head, "+MHTTPURC: \"content\"")) need_commas = 5;
@@ -1521,7 +1505,7 @@ static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, IdfCell
         }
     }
 
-    if (!complete) idf_log_line("蜂窝HTTP下载等待超时");
+    if (!complete) idf_log_line("cellular HTTP download timed out");
     return !error && complete && result.httpStatus >= 200 && result.httpStatus < 400 &&
            result.bytesRead >= CELLULAR_KEEPALIVE_MIN_BYTES;
 }
@@ -1573,7 +1557,7 @@ static bool sample_cell_ip_once(void)
     std::string ip;
     if (send_ok("AT+CGPADDR=1", 3000, &resp) && parse_cgpaddr_ip(resp, ip)) {
         set_status_cell_ip(ip);
-        idf_logf("蜂窝PDP IP: %s", ip.c_str());
+        idf_logf("cellular PDP IP: %s", ip.c_str());
         return true;
     }
     set_status_cell_ip("");
@@ -1589,12 +1573,12 @@ static bool wait_pdp_ready_locked(uint32_t timeout_ms, std::string& ip)
             IdfModemStatus patch;
             patch.cellIp = ip;
             update_status(patch);
-            idf_logf("蜂窝PDP已就绪，IP: %s", ip.c_str());
+            idf_logf("cellular PDP ready. IP: %s", ip.c_str());
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(700));
     }
-    idf_log_line("蜂窝PDP等待超时：未取得有效IP");
+    idf_log_line("cellular PDP timed out without a valid IP");
     return false;
 }
 
@@ -1708,8 +1692,8 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
 {
     std::string resp;
     std::string apn = idf_util_trim_copy(cfg.apn);
-    // 数据漫游策略：未勾选"允许数据漫游"且当前处于漫游(CEREG=5)时不激活蜂窝数据。
-    // 启动阶段注册状态未知(stat=-1)会乐观激活，注册完成后由 enforce_roaming_data_policy 兜底关闭。
+    // Do not activate cellular data while roaming (CEREG=5) unless enabled.
+    // Startup can activate with unknown state. Enforce the policy after registration.
     bool want_data = cfg.dataEnabled &&
                      (cfg.roamingEnabled || idf_modem_get_status().ceregStat != 5);
     if (want_data) {
@@ -1719,7 +1703,7 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
             cmd += "\"";
             send_ok(cmd.c_str(), 3000, &resp);
         } else if (!apn.empty()) {
-            idf_log_line("APN 包含非法字符，启动时未下发 CGDCONT");
+            idf_log_line("APN contains invalid characters. CGDCONT not sent at startup");
         }
         bool ok = send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
         if (ok) sample_cell_ip_once();
@@ -1731,19 +1715,18 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
     return ok;
 }
 
-// 数据漫游策略兜底：未勾选"允许数据漫游"且当前漫游(stat=5)时确保蜂窝数据关闭。
-// 启动阶段拿不到注册状态会先乐观激活，注册完成后在此关闭，避免漫游误跑流量。
-// 此开关只控制数据 PDP；短信是否可用由 SIM、模组和运营商短信承载共同决定，
-// 不能仅凭 CEREG/CREG 中的某一个状态判断。归属网络(stat=1)不干预，按常规激活。
+// Disable data after registration if roaming is not allowed. This switch controls
+// only PDP data. SMS availability also depends on the SIM, modem, and carrier.
+// Do not infer SMS availability from one CEREG or CREG state.
 static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
 {
-    if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // 未开数据或允许漫游数据：无需干预
-    if (stat != 5) return;                                // 非漫游：归属网络按常规激活即可
-    if (idf_modem_get_status().cellIp.empty()) return;    // 数据本就未激活，无需再关
+    if (!cfg.dataEnabled || cfg.roamingEnabled) return;  // No policy change required.
+    if (stat != 5) return;                                // Home network.
+    if (idf_modem_get_status().cellIp.empty()) return;    // PDP data is already inactive.
     std::string resp;
     if (send_ok("AT+CGACT=0,1", 3000, &resp)) {
         set_status_cell_ip("");
-        idf_log_line("数据漫游已关闭：检测到漫游，已停用蜂窝数据(不跑流量)");
+        idf_log_line("data roaming disabled. Cellular data stopped while roaming");
     }
 }
 
@@ -1757,17 +1740,17 @@ static void schedule_data_mode_retry(void)
 static void apply_startup_data_mode(void)
 {
     if (model_skips_cgact()) {
-        idf_log_line("该型号跳过启动 CGACT 配置");
+        idf_log_line("this model skips startup CGACT setup");
         return;
     }
     IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 6000, 2500);
     if (ok) {
-        idf_log_line(cfg.dataEnabled ? "已按配置启用蜂窝数据(AT+CGACT=1,1)"
-                                     : "已禁用数据连接(AT+CGACT=0,1)，防止流量消耗");
+        idf_log_line(cfg.dataEnabled ? "cellular data enabled (AT+CGACT=1,1)"
+                                     : "data connection disabled (AT+CGACT=0,1)");
     } else {
-        idf_log_line(cfg.dataEnabled ? "启动时激活数据连接未成功，转入后台重试"
-                                     : "启动时禁用数据连接未确认，转入后台重试");
+        idf_log_line(cfg.dataEnabled ? "startup data activation failed. Retrying in background"
+                                     : "startup data disable not confirmed. Retrying in background");
         schedule_data_mode_retry();
     }
 }
@@ -1776,17 +1759,16 @@ static bool plmn_valid(const std::string& plmn)
 {
     if (plmn.empty()) return true;
     if (plmn.size() < 5 || plmn.size() > 6) return false;
-    for (char ch : plmn) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-    }
-    return true;
+    return std::all_of(plmn.begin(), plmn.end(), [](char ch) {
+        return isdigit(static_cast<unsigned char>(ch));
+    });
 }
 
 static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
 {
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
-        idf_log_line("运营商 PLMN 非法，启动时未下发 COPS");
+        idf_log_line("operator PLMN is invalid. COPS not sent at startup");
         return;
     }
     std::string cmd = "AT+COPS=1,2,\"";
@@ -1794,14 +1776,14 @@ static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
     cmd += "\"";
     std::string resp;
     esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
-    idf_logf("运营商: 锁定 PLMN %s %s", cfg.operatorPlmn.c_str(),
-             err == ESP_OK ? "成功" : "失败(可能不可达)");
+    idf_logf("operator: lock PLMN %s %s", cfg.operatorPlmn.c_str(),
+             err == ESP_OK ? "succeeded" : "failed (possibly unreachable)");
 }
 
 static bool process_data_mode_retry(void)
 {
     if (!s_data_mode_retry_pending) return false;
-    if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // 回绕安全
+    if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // Wrap-safe.
     if (!at_channel_idle_now()) return false;
 
     ++s_data_mode_retry_count;
@@ -1809,13 +1791,13 @@ static bool process_data_mode_retry(void)
     bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
     if (ok) {
         s_data_mode_retry_pending = false;
-        idf_log_line(cfg.dataEnabled ? "后台重试：蜂窝数据已启用" : "后台重试：蜂窝数据已禁用");
+        idf_log_line(cfg.dataEnabled ? "background retry enabled cellular data" : "background retry disabled cellular data");
     } else if (s_data_mode_retry_count >= MODEM_DATA_MODE_RETRY_MAX) {
         s_data_mode_retry_pending = false;
-        idf_log_line("后台重试 CGACT 仍失败，保留当前模组状态");
+        idf_log_line("background CGACT retry failed. Current modem state retained");
     } else {
         s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
-        idf_log_line("后台重试 CGACT 未成功，稍后再试");
+        idf_log_line("background CGACT retry did not succeed. Retrying later");
     }
     return true;
 }
@@ -1837,15 +1819,15 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     create_cmd += "\"";
     std::string resp;
     if (send_at_locked(create_cmd, 10000, resp, 1600, 1200) != ESP_OK) {
-        result.message = "蜂窝HTTP创建失败";
-        idf_logf("蜂窝HTTP创建失败: %s", resp.c_str());
+        result.message = "Cellular HTTP creation failed";
+        idf_logf("cellular HTTP creation failed: %s", resp.c_str());
         return false;
     }
 
     int http_id = parse_mhttp_create_id(resp);
     if (http_id < 0) {
-        result.message = "蜂窝HTTP创建失败：未返回连接ID";
-        idf_logf("蜂窝HTTP创建失败: %s", resp.c_str());
+        result.message = "Cellular HTTP creation failed without a connection ID";
+        idf_logf("cellular HTTP creation failed: %s", resp.c_str());
         return false;
     }
 
@@ -1866,8 +1848,8 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     request_cmd += ",1,0,";
     request_cmd += hex_encode_ascii(path);
     if (send_at_locked(request_cmd, 10000, resp) != ESP_OK) {
-        result.message = "蜂窝HTTP请求发送失败";
-        idf_logf("蜂窝HTTP请求发送失败: %s", resp.c_str());
+        result.message = "Cellular HTTP request send failed";
+        idf_logf("cellular HTTP request send failed: %s", resp.c_str());
         snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
         send_at_locked(cmd, 2000, resp, 256, 20);
         return false;
@@ -1877,12 +1859,12 @@ static bool fetch_mhttp_once_locked(const std::string& protocol, const std::stri
     snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
     send_at_locked(cmd, 3000, resp, 256, 20);
     if (ok) {
-        result.message = "蜂窝HTTP payload 下载完成";
-        idf_logf("蜂窝HTTP保号完成: HTTP %d, 已下载约 %uKB",
+        result.message = "Cellular HTTP payload downloaded";
+        idf_logf("cellular HTTP keep-alive complete: HTTP %d, downloaded about %u KB",
                  result.httpStatus, static_cast<unsigned>(result.bytesRead / 1024UL));
     } else {
-        if (result.message.empty()) result.message = "蜂窝HTTP payload 下载失败";
-        idf_logf("蜂窝HTTP保号失败: HTTP %d, 已下载约 %uKB/期望%uKB",
+        if (result.message.empty()) result.message = "Cellular HTTP payload download failed";
+        idf_logf("cellular HTTP keep-alive failed: HTTP %d, downloaded about %u/%u KB",
                  result.httpStatus,
                  static_cast<unsigned>(result.bytesRead / 1024UL),
                  static_cast<unsigned>(result.expectedBytes / 1024UL));
@@ -1907,7 +1889,7 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
     normalize_keepalive_payload_size(host, path);
     append_no_cache_query(path);
 
-    idf_logf("准备通过蜂窝HTTP下载payload: %s://%s%s",
+    idf_logf("starting cellular HTTP payload download: %s://%s%s",
              protocol.c_str(), host.c_str(), path.c_str());
 
     std::string resp;
@@ -1919,10 +1901,10 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
         send_at_locked(cmd, 3000, resp);
     }
 
-    idf_log_line("激活数据连接(CGACT)...");
+    idf_log_line("activating data connection (CGACT)...");
     esp_err_t activate_err = send_at_locked("AT+CGACT=1,1", 10000, resp);
     if (activate_err != ESP_OK) {
-        idf_logf("CGACT激活未返回OK，继续等待PDP: %s", resp.c_str());
+        idf_logf("CGACT activation did not return OK. Waiting for PDP: %s", resp.c_str());
     }
 
     std::string ip;
@@ -1930,17 +1912,17 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
     if (!pdp_ready) {
         set_status_cell_ip("");
         if (!config.dataEnabled) {
-            idf_log_line("关闭PDP上下文(CGACT=0)...");
+            idf_log_line("closing PDP context (CGACT=0)...");
             send_at_locked("AT+CGACT=0,1", 5000, resp);
         }
-        result.message = "蜂窝PDP未取得有效IP，请查看日志";
+        result.message = "Cellular PDP did not get a valid IP. See the log";
         return ESP_FAIL;
     }
     result.cellIp = ip;
 
     bool ok = fetch_mhttp_once_locked(protocol, host, path, result);
     if (!ok && protocol == "https" && result.mhttpError == 4) {
-        idf_log_line("HTTPS握手失败，改用HTTP重试一次；若返回301，请关闭强制HTTPS跳转");
+        idf_log_line("HTTPS handshake failed. Retrying once with HTTP. Disable forced HTTPS redirects after HTTP 301");
         IdfCellularHttpResult retry;
         retry.cellIp = result.cellIp;
         ok = fetch_mhttp_once_locked("http", host, path, retry);
@@ -1948,13 +1930,13 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
     }
 
     if (!config.dataEnabled) {
-        idf_log_line("关闭PDP上下文(CGACT=0)...");
+        idf_log_line("closing PDP context (CGACT=0)...");
         send_at_locked("AT+CGACT=0,1", 5000, resp);
         set_status_cell_ip("");
     }
 
     if (result.message.empty()) {
-        result.message = ok ? "蜂窝HTTP payload 下载完成" : "蜂窝HTTP payload 下载失败，请查看日志";
+        result.message = ok ? "Cellular HTTP payload downloaded" : "Cellular HTTP payload download failed. See the log";
     }
     result.ok = ok;
     return ok ? ESP_OK : ESP_FAIL;
@@ -1973,9 +1955,9 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
         return owner_cellular_http_get(url, config, result);
     }
     esp_err_t err = submit_owner_command(request, nullptr, &result, false);
-    if (err == IDF_MODEM_ERR_BUSY) result.message = "模组命令队列已满，蜂窝HTTP未执行";
-    if (err == ESP_ERR_TIMEOUT) result.message = "模组命令等待超时，蜂窝HTTP未完成";
-    if (err == ESP_ERR_INVALID_STATE) result.message = "模组尚未启动";
+    if (err == IDF_MODEM_ERR_BUSY) result.message = "Modem command queue is full. Cellular HTTP did not run";
+    if (err == ESP_ERR_TIMEOUT) result.message = "Modem command timed out. Cellular HTTP did not complete";
+    if (err == ESP_ERR_INVALID_STATE) result.message = "Modem is not started";
     return err;
 }
 
@@ -2062,7 +2044,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     std::string resp;
     IdfModemStatus patch;
 
-    // 固件/厂家信息基本不变；启动采样未完整前允许补采，完整后不再反复查询。
+    // Retry stable firmware and manufacturer fields until startup sampling is complete.
     if (need_static && before.mfr.empty()) {
         if (send_ok("AT+CGMI", 1000, &resp)) patch.mfr = first_payload_line(resp, "AT+CGMI");
         vTaskDelay(pdMS_TO_TICKS(150));
@@ -2107,12 +2089,12 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
-    // 运营商/APN 是启动展示字段，注册完成后至少要拿到运营商；本机号码很多 SIM 不返回，不阻塞启动。
+    // Get operator and APN after registration. A missing SIM phone number does not block startup.
     bool need_network = include_network_fields &&
                         (!s_identity_network_attempted || before.operatorName.empty());
     if (need_network) {
         if (before.operatorName.empty()) {
-            // 先选长名称格式：自动模式下不设格式时 COPS? 只回模式位(+COPS: 0)，读不到运营商名
+            // Select the long-name format before COPS? so automatic mode returns an operator name.
             send_ok("AT+COPS=3,0", 1500, &resp);
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
@@ -2150,7 +2132,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                  after.imei.empty() ? "-" : after.imei.c_str(),
                  after.iccid.empty() ? "-" : after.iccid.c_str(),
                  after.imsi.empty() ? "-" : after.imsi.c_str());
-        idf_logf("模组身份变化 IMEI=%s ICCID=%s IMSI=%s",
+        idf_logf("modem identity changed IMEI=%s ICCID=%s IMSI=%s",
                  after.imei.empty() ? "-" : after.imei.c_str(),
                  after.iccid.empty() ? "-" : after.iccid.c_str(),
                  after.imsi.empty() ? "-" : after.imsi.c_str());
@@ -2170,9 +2152,8 @@ static void modem_en_gpio_init(void)
     gpio_config(&io);
 }
 
-// 只拉高 EN 保持/接通供电，不做断电周期(热启动探测用)。
-// 先写输出寄存器再配方向：gpio_config 切到输出的瞬间即输出高，
-// 避免默认输出 0 造成 EN 瞬时拉低、给在运行的模组一个断电毛刺
+// Raise EN without a power cycle for warm-start detection. Write the output
+// register before setting its direction to avoid a low pulse on a running modem.
 static void modem_power_hold_on(void)
 {
     gpio_set_level(MODEM_EN, 1);
@@ -2227,8 +2208,8 @@ static bool modem_quick_start_allowed(esp_reset_reason_t reason)
     }
 }
 
-// 解析 AT+CPMS 设置命令的响应 "+CPMS: <used1>,<total1>,<used2>,<total2>,<used3>,<total3>"，
-// 输出 <mem1> 总容量。查询响应(+CPMS: "SM",0,0,...)带引号存储名会解析失败，恰好只匹配设置响应。
+// Parse <mem1> capacity from an AT+CPMS set response. A quoted storage name
+// belongs to a query response and intentionally does not match.
 static bool parse_cpms_total(const std::string& resp, long& total)
 {
     size_t p = resp.find("+CPMS:");
@@ -2256,13 +2237,12 @@ static void log_sms_storage_if_changed(const char* name)
     int current = sms_storage_code(name);
     int previous = s_logged_sms_storage_code.exchange(current, std::memory_order_relaxed);
     if (previous == current) return;
-    // 首次 MT 是常规路径不提示；非 MT 或后续类型变化才记录，避免周期性 CPMS 重申刷屏。
-    if (previous != -1 || current != 0) idf_logf("短信存储使用 %s", name);
+    // Suppress the initial normal MT selection. Log fallback or later changes.
+    if (previous != -1 || current != 0) idf_logf("SMS storage uses %s", name);
 }
 
-// 按优先级选择短信存储：MT → ME → SM。部分可写 eSIM 的 SM 存储返回 OK 但容量为
-// 0,0(issue #3)，此时短信实际无处可存，必须视为不可用并继续尝试下一候选；
-// 响应里解析不出容量的按可用处理(不同固件设置命令可能只回 OK)。
+// Select SMS storage in MT, ME, SM order. Treat reported zero capacity as
+// unavailable (issue #3). Accept an OK response when firmware omits capacity.
 static bool select_sms_storage(void)
 {
     static const struct { const char* cmd; const char* name; } kCandidates[] = {
@@ -2275,61 +2255,55 @@ static bool select_sms_storage(void)
         if (!send_ok(c.cmd, 1500, &resp)) continue;
         long total = -1;
         if (parse_cpms_total(resp, total) && total <= 0) {
-            idf_logf("短信存储 %s 容量为 0，尝试下一候选", c.name);
+            idf_logf("SMS storage %s has zero capacity. Trying the next candidate", c.name);
             continue;
         }
         log_sms_storage_if_changed(c.name);
         return true;
     }
-    idf_log_line("警告: 无可用短信存储(MT/ME/SM 均不可用)，短信接收可能失败");
+    idf_log_line("WARNING: No SMS storage is available (MT, ME, or SM). SMS reception can fail");
     return false;
 }
 
-// 存储选择失败待补跑标志：冷启动时 CPMS 早于 SIM 就绪执行，SIM 初始化慢的开机
-// 可能三个候选全失败(SIM busy)。注册成功意味着 SIM 必已就绪，届时补跑一次。
-// 只在 modem_task 上下文读写，无需原子量。
+// CPMS can run before a slow SIM is ready and reject every storage candidate.
+// Retry after registration. Only modem_task accesses this flag.
 static bool s_sms_storage_pending = false;
 
 static void retry_sms_storage_if_pending(void)
 {
     if (!s_sms_storage_pending) return;
-    idf_log_line("SIM 已就绪，补跑短信存储选择");
+    idf_log_line("SIM ready. Retrying SMS storage selection");
     s_sms_storage_pending = !select_sms_storage();
 }
 
 void idf_modem_reassert_sms_storage(void)
 {
-    // 供短信任务周期性重申：模组自发复位(未被 ESP 侧察觉)后 CPMS 会回落到固件
-    // 默认存储(常为 SM)；SM 容量为 0 的 eSIM 上短信从此无处可存，接收静默死亡，
-    // 而 AT 探测/发送一切正常——"先能收后失效"的典型固件侧成因。
-    // select_sms_storage 内部走加锁的 AT 通道，跨任务调用安全。
+    // Reassert CPMS after an unobserved modem reset restores default storage.
+    // select_sms_storage uses the locked AT channel and is safe across tasks.
     select_sms_storage();
 }
 
 static bool configure_sms_and_registration(void)
 {
     send_ok("ATE0", 1000);
-    send_ok("AT+CMEE=1", 1200);  // 明确返回 +CMS/+CME 数字错误，避免只有笼统 ERROR
-    // 直推 +CMT 使用 Phase 2+ 确认流程；收到每个 PDU 后由短信任务发送 AT+CNMA=0。
-    // ML307R 手册明确指出可靠的 TA-TE 短信传输需要 +CNMA，否则连续长短信可能只上报一段。
+    send_ok("AT+CMEE=1", 1200);  // Request specific +CMS/+CME numeric errors.
+    // Use Phase 2+ acknowledgment for direct +CMT. The SMS task sends AT+CNMA=0
+    // after each PDU, as required for reliable ML307R multipart delivery.
     bool phase2_ok = send_ok("AT+CSMS=1", 1200);
     bool pdu_mode_ok = send_ok("AT+CMGF=0", 1200);
-    // 统一补收路径的短信存储位置：特殊类别/启动期落盘后，+CMTI 与 CMGL/CMGR
-    // 必须查看同一存储，否则兜底索引会指向另一块存储。
+    // Keep +CMTI and CMGL/CMGR on the same storage for startup and special-class backfill.
     bool storage_ok = select_sms_storage();
     s_sms_storage_pending = !storage_ok;
-    // 普通短信直接以 +CMT 送到 ESP32，绕过部分 eSIM/模组存储只留下末段的问题；
-    // +CMTI 与 CMGL 轮询仍保留，补收启动期或特殊类别落盘的短信。
+    // Deliver normal SMS directly with +CMT to avoid storage that keeps only the
+    // final segment. Keep +CMTI and CMGL for startup and special-class backfill.
     bool cnmi_ok = send_ok("AT+CNMI=2,2,0,0,0", 1200);
     send_ok("AT+CEREG=2", 1200);
-    // 开启主叫号码上报：来电时模组主动上报 RING + +CLIP: "号码",...，供来电通知使用。
-    // 无语音能力的卡/模组下该指令可能 ERROR，忽略即可(收不到来电就不会有 URC)。
+    // Enable caller ID through RING and +CLIP. Ignore ERROR on hardware without voice support.
     send_ok("AT+CLIP=1", 1200);
-    // NET 指示灯开关(ML307R: AT+MLED=0,<0/1>)：每次初始化按保存的配置下发，
-    // 覆盖模组记住的上次状态
+    // Apply the saved NET LED setting (ML307R: AT+MLED=0,<0/1>) on each initialization.
     send_ok(idf_config_net_led_enabled() ? "AT+MLED=0,1" : "AT+MLED=0,0", 1200);
     bool sms_ready = phase2_ok && pdu_mode_ok && storage_ok && cnmi_ok;
-    if (!sms_ready) idf_log_line("短信收发配置未完整生效，将在后续健康检查中重试");
+    if (!sms_ready) idf_log_line("SMS setup incomplete. A later health check will retry");
     return sms_ready;
 }
 
@@ -2355,8 +2329,8 @@ bool idf_modem_sms_health_check(std::string& summary)
     summary.clear();
     if (!idf_modem_get_status().atReady) {
         idf_modem_request_reset(true);
-        summary = "模组 AT 未就绪，已请求模组硬重启";
-        idf_logf("每日短信体检异常: %s", summary.c_str());
+        summary = "Modem AT is not ready. Hard reset requested";
+        idf_logf("daily SMS health check failed: %s", summary.c_str());
         return false;
     }
 
@@ -2383,41 +2357,39 @@ bool idf_modem_sms_health_check(std::string& summary)
     bool final_ok = registered && phase2 && pdu && cnmi && storage;
     char state[192];
     snprintf(state, sizeof(state),
-             "注册=%s，Phase2+=%s，PDU=%s，CNMI=%s，存储=%s（不含运营商端到端投递）",
-             registered ? "正常" : "异常", phase2 ? "正常" : "异常", pdu ? "正常" : "异常",
-             cnmi ? "正常" : "异常", storage ? "正常" : "异常");
+             "registration=%s, Phase2+=%s, PDU=%s, CNMI=%s, storage=%s (carrier delivery not tested)",
+             registered ? "ok" : "error", phase2 ? "ok" : "error", pdu ? "ok" : "error",
+             cnmi ? "ok" : "error", storage ? "ok" : "error");
 
     if (initially_ok) {
-        summary = std::string("正常：") + state;
-        idf_logf("每日短信体检通过: %s", summary.c_str());
+        summary = std::string("OK: ") + state;
+        idf_logf("daily SMS health check passed: %s", summary.c_str());
         return true;
     }
     if (final_ok) {
-        summary = std::string("发现异常，已修复：") + state;
+        summary = std::string("Error found and repaired: ") + state;
     } else {
         idf_modem_request_reset(true);
-        summary = std::string("异常未恢复，已请求模组硬重启：") + state;
+        summary = std::string("Error remains. Hard modem reset requested: ") + state;
     }
-    idf_logf("每日短信体检异常: %s", summary.c_str());
+    idf_logf("daily SMS health check failed: %s", summary.c_str());
     return false;
 }
 
-// 锁 PIN/PUK 的 SIM 仍然在位，热插拔检测不能把它当成拔卡并触发重启循环。
+// A PIN- or PUK-locked SIM is present. Hot-swap detection must not restart it as absent.
 static bool query_sim_present(void)
 {
     std::string state = query_sim_state();
     return state != "absent" && state != "unknown";
 }
 
-// 重启后 AT 握手失败时置位：一旦后续任何探测发现 AT 恢复，立即补跑完整初始化
-// (ATE0/CMGF/CNMI/CEREG/CGACT)。否则模组以默认配置运行——回显开着、URC 不上报、
-// 数据连接按模组默认自动激活(产生流量费，恰是本项目要防止的)。
+// After a reset handshake fails, run full initialization when any later probe
+// finds AT ready. This restores echo, URCs, registration, and data policy.
 static bool s_reinit_pending = false;
 
 static bool handle_reset_request_if_any(void)
 {
-    // 逻辑通道尚未关闭时重启会把 eSIM 操作截断；切卡成功后 idf_esim 请求的软重启
-    // 会等到 APDU 会话结束(深度归零)才执行。
+    // Delay a requested reset until the APDU session closes to avoid truncating eSIM work.
     if (s_esim_operation_depth.load(std::memory_order_relaxed) != 0) return false;
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
@@ -2429,17 +2401,17 @@ static bool handle_reset_request_if_any(void)
     update_status(patch);
     reset_identity_sampling_state();
     if (request == 2) {
-        idf_log_line("执行模组硬重启");
+        idf_log_line("performing hard modem reset");
         modem_power_cycle();
     } else {
-        idf_log_line("执行模组软重启");
+        idf_log_line("performing soft modem reset");
         send_ok("AT+CFUN=1,1", 15000);
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
 
     if (!wait_at_ready()) {
         set_phase("failed");
-        idf_log_line("模组重启后 AT 握手失败，等待恢复后补跑初始化");
+        idf_log_line("AT handshake failed after modem reset. Initialization will run after recovery");
         s_reinit_pending = true;
         return true;
     }
@@ -2458,13 +2430,13 @@ static bool handle_reset_request_if_any(void)
     return true;
 }
 
-// AT 恢复后的补初始化（配合 s_reinit_pending）
+// Complete initialization after AT recovery when s_reinit_pending is set.
 static void run_pending_reinit_if_recovered(void)
 {
     if (!s_reinit_pending) return;
     if (!at_channel_idle_now()) return;
     if (!send_ok("AT", 700)) return;
-    idf_log_line("模组 AT 已恢复，补跑短信/注册/数据配置");
+    idf_log_line("modem AT recovered. Restoring SMS, registration, and data setup");
     IdfModemStatus patch;
     patch.started = true;
     patch.atReady = true;
@@ -2491,42 +2463,42 @@ static void modem_task(void*)
 
     bool at_ready = false;
     esp_reset_reason_t reset_reason = esp_reset_reason();
-    // 热启动快路径只留给崩溃/看门狗等意外复位；正常上电/软件重启先快速拉高 EN 探测，
-    // 能直接 AT 就省掉强制断电周期。USB/串口复位仍冷启动，避免烧录后沿用半初始化状态。
+    // Use the warm-start fast path only after an unexpected crash or watchdog reset.
+    // USB and serial resets use a cold start to avoid a partially initialized modem.
     if (modem_hot_start_allowed(reset_reason)) {
         modem_power_hold_on();
         if (wait_at_ready()) {
             at_ready = true;
-            idf_log_line("模组已在运行，跳过断电上电(热启动)");
+            idf_log_line("modem already running. Skipping power cycle for warm start");
         } else {
-            idf_log_line("意外复位后热启动探测失败，改为模组冷启动");
+            idf_log_line("warm-start probe failed after unexpected reset. Using cold start");
         }
     } else if (modem_quick_start_allowed(reset_reason)) {
         modem_power_hold_on();
         if (wait_at_ready()) {
             at_ready = true;
-            idf_logf("复位原因 %d，模组快速上电完成", static_cast<int>(reset_reason));
+            idf_logf("reset reason %d. Modem fast power-on complete", static_cast<int>(reset_reason));
         } else {
-            idf_logf("复位原因 %d，模组快速上电超时，改为冷启动", static_cast<int>(reset_reason));
+            idf_logf("reset reason %d. Modem fast power-on timed out. Using cold start", static_cast<int>(reset_reason));
         }
     } else {
-        idf_logf("复位原因 %d，模组执行冷启动", static_cast<int>(reset_reason));
+        idf_logf("reset reason %d. Performing modem cold start", static_cast<int>(reset_reason));
     }
 
     if (!at_ready) {
-        // 启动握手：失败绝不放弃(Arduino 版靠 modemHealthTick 无限恢复)。任务一旦退出，
-        // 网页重启模组、URC 轮询、健康探测全部失效，设备只能整机断电才能恢复。
+        // Never abandon the startup handshake. Exiting this task disables reset,
+        // URC polling, and health recovery until a full device power cycle.
         modem_power_cycle();
         int round = 0;
         uint32_t retry_gap_ms = 5000;
         while (!wait_at_ready()) {
             set_phase("failed");
             ++round;
-            ESP_LOGE(TAG, "AT 握手超时(第%d轮)", round);
-            idf_logf("模组 AT 握手超时(第%d轮)，稍后重新上电重试", round);
-            s_reset_request.store(0, std::memory_order_relaxed);  // 重启请求由本轮上电一并满足
+            ESP_LOGE(TAG, "AT handshake timed out (round %d)", round);
+            idf_logf("modem AT handshake timed out (round %d). Retrying power-on later", round);
+            s_reset_request.store(0, std::memory_order_relaxed);  // This power-on satisfies the reset request.
             vTaskDelay(pdMS_TO_TICKS(retry_gap_ms));
-            if (retry_gap_ms < 60000) retry_gap_ms *= 2;  // 5s→10s→…→60s 封顶，避免热循环
+            if (retry_gap_ms < 60000) retry_gap_ms *= 2;  // Back off from 5 to 60 seconds.
             modem_power_cycle();
         }
     }
@@ -2536,8 +2508,8 @@ static void modem_task(void*)
     patch.atReady = true;
     patch.phase = "at_ready";
     update_status(patch);
-    ESP_LOGI(TAG, "AT 已就绪");
-    idf_log_line("模组 AT 已就绪");
+    ESP_LOGI(TAG, "AT ready");
+    idf_log_line("modem AT ready");
 
     bool sim_ready = try_unlock_sim(false);
     if (sim_ready) {
@@ -2563,7 +2535,7 @@ static void modem_task(void*)
     bool registered = (stat == 1 || stat == 5);
     bool post_register_done = false;
     if (!sim_ready) {
-        // 锁卡/无卡状态由 try_unlock_sim 写入，等待热插拔或网页更新凭据。
+        // try_unlock_sim records locked or absent state until hot swap or credential update.
     } else if (!registered) {
         set_phase("failed");
     } else {
@@ -2572,7 +2544,7 @@ static void modem_task(void*)
         apply_operator_if_configured(cfg);
         if (cfg.dataEnabled) sample_cell_ip_once();
         enforce_roaming_data_policy(cfg, stat);
-        // 注册成功后立即做一轮首页基础信息采样；Web/WiFi 已先启动，不会阻塞页面打开。
+        // Sample overview data after registration. Web and WiFi are already available.
         sample_signal_once();
         sample_signal_detail_once();
         sample_identity_once(false, true);
@@ -2587,13 +2559,13 @@ static void modem_task(void*)
     int health_fail_count = 0;
     int dereg_count = 0;
     TickType_t last_sim_check = 0;
-    int64_t sim_check_not_before_us = 0;  // 模组重启后给 SIM/CPIN 充分上电时间，避免误判二次拔插
-    int sim_present = -1;  // -1=未知(仅记基线) 0=无卡 1=有卡
-    bool sms_reconfigure_pending = false;  // 换卡/掉网恢复后在注册成功点再次重申短信栈
+    int64_t sim_check_not_before_us = 0;  // Allow SIM and CPIN startup time after modem reset.
+    int sim_present = -1;  // -1=unknown baseline, 0=absent, 1=present
+    bool sms_reconfigure_pending = false;  // Reassert SMS after SIM or network recovery.
     s_runtime_queue_ready.store(true, std::memory_order_release);
     while (true) {
-        // 短信直推确认永远先于普通 caller 命令；普通命令每轮至多执行一个，
-        // 让 owner 回到 URC/复位/健康状态机，不被 caller 队列长期独占。
+        // Process direct SMS acknowledgments before caller commands. Run at most
+        // one caller command per pass so the owner returns to URC and health work.
         while (owner_process_one_command(true)) {}
         if (owner_process_one_command(false)) continue;
         bool reset_handled = handle_reset_request_if_any();
@@ -2602,14 +2574,14 @@ static void modem_task(void*)
         TickType_t now = xTaskGetTickCount();
         if (reset_handled) {
             sim_ready = idf_modem_get_status().simState == "ready";
-            // 运行中重启不能沿用重启前的局部注册状态；否则 status 已进入 registering，
-            // 但本任务仍以 registered=true 按 60 秒慢周期探测，换卡后恢复会被无谓拖延。
+            // Clear local registration state after an in-service reset so recovery
+            // uses the fast probe interval instead of the 60-second registered interval.
             registered = false;
             post_register_done = false;
             health_fail_count = 0;
             dereg_count = 0;
             last_health = 0;
-            last_sim_check = now;  // 给 SIM 上电初始化留出一个完整检测周期
+            last_sim_check = now;  // Allow one full SIM initialization interval.
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
             sms_reconfigure_pending = true;
@@ -2637,7 +2609,7 @@ static void modem_task(void*)
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
-        // 用户手动刷新会绕过常规间隔并尽快跑一轮；若 AT 正忙，请求保留到下轮空闲时执行。
+        // A manual refresh bypasses the interval. Retain the request while AT is busy.
         bool force_sample = s_status_sample_requests.load(std::memory_order_relaxed) > 0;
         bool web_active = force_sample ||
                           (esp_timer_get_time() -
@@ -2668,8 +2640,8 @@ static void modem_task(void*)
                 post_register_done = true;
             }
         }
-        // 正常态按 60s 健康探测；未注册但并非已确认无卡时缩短到 5s，
-        // 让热插拔/自动重启后的注册恢复不必最多再等一分钟。
+        // Probe every 60 seconds when healthy and every 5 seconds while unregistered
+        // unless the SIM is confirmed absent.
         uint32_t health_interval_ms = 60000UL;
         if (!registered && sim_present != 0) health_interval_ms = 5000UL;
         else if (sms_reconfigure_pending && sim_present != 0) health_interval_ms = 15000UL;
@@ -2690,16 +2662,15 @@ static void modem_task(void*)
                     dereg_count = 0;
                     bool sms_reconfigured_now = false;
                     if (sms_reconfigure_pending) {
-                        // CPIN READY 之后模组仍可能异步重建短信栈并回落默认设置；
-                        // 必须在真正注册成功的稳定点再次写入 PDU/CNMI/CPMS。
-                        idf_log_line("网络重新注册成功，重申短信收发配置");
+                        // The modem can rebuild its SMS stack after CPIN READY.
+                        // Reassert PDU, CNMI, and CPMS after stable registration.
+                        idf_log_line("network registration restored. Reasserting SMS setup");
                         sms_reconfigure_pending = !configure_sms_and_registration();
                         sms_reconfigured_now = true;
                     }
                     if (!post_register_done) {
-                        // 迟到/恢复的注册也要补跑必须的网络配置和首页基础信息。
-                        // 掉网后恢复可能意味着模组自发复位过：存储选择无条件重跑，
-                        // 不能只看 pending 标志(初次成功后它恒为 false)
+                        // Apply required network settings and overview data after late
+                        // registration. Always rerun storage selection after network recovery.
                         if (!sms_reconfigured_now) s_sms_storage_pending = !select_sms_storage();
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
                         apply_operator_if_configured(cfg);
@@ -2715,25 +2686,24 @@ static void modem_task(void*)
                     registered = false;
                     post_register_done = false;
                     sms_reconfigure_pending = true;
-                    // 未注册态改为 5 秒快探测后，仍保持约 5 分钟再重启，避免普通的小区
-                    // 重选/漫游注册过程被过早打断；已确认无卡时不做无意义的周期重启。
+                    // Wait about five minutes before reset so cell reselection or roaming
+                    // registration can finish. Do not reset repeatedly when SIM is absent.
                     if (sim_present == 0) {
                         dereg_count = 0;
                     } else if (++dereg_count >= 60) {
                         dereg_count = 0;
-                        idf_log_line("模组长时间未注册网络，触发硬重启恢复");
+                        idf_log_line("modem remained unregistered. Requesting hard reset");
                         s_reset_request.store(2, std::memory_order_relaxed);
                     }
                 }
             } else if (++health_fail_count >= 3) {
                 health_fail_count = 0;
-                idf_log_line("模组健康探测连续失败，触发硬重启恢复");
+                idf_log_line("modem health probes failed repeatedly. Requesting hard reset");
                 s_reset_request.store(2, std::memory_order_relaxed);
             }
         }
-        // SIM 热插拔检测：低频轮询 AT+CPIN?，识别运行中插卡/拔卡。
-        // 插入(无卡→有卡)：自动硬重启模组 + 作废旧身份，让新卡从干净状态初始化；
-        // 拔出(有卡→无卡)：标记未就绪并清空身份，避免概览沿用旧卡信息。
+        // Poll AT+CPIN? for SIM hot swaps. On insertion, reset the modem and clear
+        // old identity. On removal, mark unavailable and clear old identity.
         int64_t sim_check_now_us = esp_timer_get_time();
         if (sim_check_now_us >= sim_check_not_before_us &&
             (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
@@ -2741,14 +2711,13 @@ static void modem_task(void*)
             last_sim_check = now;
             int present_now = query_sim_present() ? 1 : 0;
             if (sim_present == -1) {
-                sim_present = present_now;  // 首次仅记基线，不当作插拔事件
+                sim_present = present_now;  // Record the initial baseline without a hot-swap event.
             } else if (present_now != sim_present) {
                 sim_present = present_now;
                 if (present_now == 1) {
-                    // 仅在 CPIN READY 时立即重发 CMGF/CNMI 不够可靠：部分 ML307 固件会在
-                    // 换卡后继续异步重建协议栈，随后把短信模式恢复默认值。自动硬重启一次，
-                    // 等价于用户手动断电恢复，同时保留“换卡无需重启 ESP32”的体验。
-                    idf_log_line("检测到 SIM 卡插入，自动硬重启模组以完整初始化短信栈");
+                    // ML307 firmware can restore SMS defaults after CPIN READY while
+                    // rebuilding the stack. Hard reset once to initialize the new SIM.
+                    idf_log_line("SIM inserted. Hard-resetting modem to initialize the SMS stack");
                     idf_modem_invalidate_sim_identity();
                     registered = false;
                     post_register_done = false;
@@ -2756,24 +2725,23 @@ static void modem_task(void*)
                     sms_reconfigure_pending = true;
                     idf_modem_request_reset(true);
                 } else {
-                    idf_log_line("检测到 SIM 卡移除");
+                    idf_log_line("SIM removed");
                     registered = false;
                     post_register_done = false;
                     sms_reconfigure_pending = true;
                     sim_ready = false;
                     idf_modem_invalidate_sim_identity();
-                    set_sim_status("absent", false, "未检测到 SIM");
+                    set_sim_status("absent", false, "SIM not detected");
                     set_phase("registering");
                 }
             }
         }
         for (int i = 0; i < 10; ++i) {
-            // 采样请求只有 AT 空闲时才会被外层消费；通道被长任务(保号下载/eSIM)
-            // 占用期间若无条件 break，外层 while 会变成无延时热自旋，饿死 idle 任务
+            // Consume sampling requests only while AT is idle. Avoid a hot loop while
+            // keep-alive downloads or eSIM work hold the channel.
             if (s_status_sample_requests.load(std::memory_order_relaxed) > 0 &&
                 at_channel_idle_now()) break;
-            // 事件驱动等待：UART 一有数据(URC/短信直推)立刻醒来抓取；
-            // 无事件时 500ms 超时兜底轮询，节奏与原轮询一致
+            // Wake on UART data and use a 500 ms timeout as fallback.
             uart_event_t evt;
             if (s_uart_evt_queue) {
                 if (xQueueReceive(s_uart_evt_queue, &evt, pdMS_TO_TICKS(500)) == pdTRUE) {
@@ -2786,10 +2754,9 @@ static void modem_task(void*)
             }
             while (owner_process_one_command(true)) {}
             if (owner_process_one_command(false)) break;
-            // AT 通道被长任务(保号下载/大批量 CMGL)占用时抢不到锁：小睡再试，
-            // 避免下载期间每个 RX 块事件都空转唤醒(数据由持锁方消费，URC 也由其转存)
+            // Sleep before retrying when a long task holds the AT lock.
             if (!poll_unsolicited_uart(20)) vTaskDelay(pdMS_TO_TICKS(100));
-            // 重启请求/AT恢复补初始化尽快响应，不等满 5s 轮询窗
+            // Handle reset or AT recovery without waiting for the five-second poll.
             if (s_reset_request.load(std::memory_order_relaxed) != 0) break;
             if (s_status_sample_requests.load(std::memory_order_relaxed) > 0 &&
                 at_channel_idle_now()) break;
@@ -2803,7 +2770,7 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     cleanup_start_resources();
     s_sim_unlock_request.store(0, std::memory_order_relaxed);
     s_last_pin_attempt_key.clear();
-    // eSIM 需跨多条 CCHO/CGLA/CCHC 独占 caller 提交顺序；UART 始终只由 owner task 操作。
+    // Keep caller order exclusive across eSIM CCHO/CGLA/CCHC commands. Only the owner uses UART.
     s_session_mutex = xSemaphoreCreateRecursiveMutex();
     s_command_mutex = xSemaphoreCreateMutex();
     s_status_mutex = xSemaphoreCreateMutex();
@@ -2829,18 +2796,18 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     uart_cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
     uart_cfg.source_clk = UART_SCLK_DEFAULT;
 
-    // 带事件队列安装：RX 数据到达即产生事件，模组任务空闲期可被立刻唤醒
+    // Install an event queue so RX data wakes the idle modem task immediately.
     esp_err_t err = uart_driver_install(MODEM_UART, UART_RX_BUF, 0, 16, &s_uart_evt_queue, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART driver install failed: %s", esp_err_to_name(err));
-        idf_logf("模组 UART 驱动安装失败: %s", esp_err_to_name(err));
+        idf_logf("modem UART driver install failed: %s", esp_err_to_name(err));
         cleanup_start_resources();
         return err;
     }
     err = uart_param_config(MODEM_UART, &uart_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART param config failed: %s", esp_err_to_name(err));
-        idf_logf("模组 UART 参数配置失败: %s", esp_err_to_name(err));
+        idf_logf("modem UART parameter setup failed: %s", esp_err_to_name(err));
         uart_driver_delete(MODEM_UART);
         s_uart_evt_queue = nullptr;
         cleanup_start_resources();
@@ -2849,7 +2816,7 @@ esp_err_t idf_modem_start(const IdfConfig& config)
     err = uart_set_pin(MODEM_UART, MODEM_TXD, MODEM_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "UART pin config failed: %s", esp_err_to_name(err));
-        idf_logf("模组 UART 引脚配置失败: %s", esp_err_to_name(err));
+        idf_logf("modem UART pin setup failed: %s", esp_err_to_name(err));
         uart_driver_delete(MODEM_UART);
         s_uart_evt_queue = nullptr;
         cleanup_start_resources();
@@ -2931,8 +2898,8 @@ void idf_modem_set_sim_identity_hook(void (*hook)(void))
 
 void idf_modem_invalidate_sim_identity(void)
 {
-    // 清除随卡变化的身份字段：切/启/禁 eSIM Profile 后当前生效的卡已不同，
-    // 但 sample_identity_once 对非空字段跳过重读，会一直沿用旧卡的号码/ICCID/运营商。
+    // Clear SIM-dependent identity after an eSIM profile change so sampling does
+    // not reuse the old phone number, ICCID, or operator.
     if (s_status_mutex && xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
         s_status.iccid.clear();
         s_status.imsi.clear();
@@ -2942,21 +2909,21 @@ void idf_modem_invalidate_sim_identity(void)
         s_status.identityFresh = false;
         xSemaphoreGive(s_status_mutex);
     }
-    // 复位采样"已尝试"标志，让网络字段(运营商/号码)重新查询；静态字段(型号/IMEI)非空仍跳过
+    // Reset sampling attempts for network fields. Keep static model and IMEI values.
     reset_identity_sampling_state();
     idf_modem_request_status_sample();
-    // 通知上层(idf_esim)：热插拔换卡后 EID 等缓存也要失效
+    // Notify idf_esim so hot swaps also invalidate the EID cache.
     void (*hook)(void) = s_sim_identity_hook.load(std::memory_order_relaxed);
     if (hook) hook();
 }
 
 void idf_modem_power_off_for_restart(void)
 {
-    // 先写输出寄存器再配方向，切到输出的瞬间即输出低
+    // Write the output register before direction so EN becomes low immediately.
     gpio_set_level(MODEM_EN, 0);
     modem_en_gpio_init();
     gpio_set_level(MODEM_EN, 0);
-    // 保证断电时间足够(与 modem_power_cycle 一致)，ESP 重启后是干净的模组冷启动
+    // Match modem_power_cycle off-time so the ESP restart gets a clean modem cold start.
     vTaskDelay(pdMS_TO_TICKS(MODEM_POWERDOWN_MS));
 }
 

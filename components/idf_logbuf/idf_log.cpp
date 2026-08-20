@@ -24,35 +24,35 @@ static constexpr size_t LOG_LINE_MAX = 192;
 static SemaphoreHandle_t s_log_mutex = nullptr;
 static std::array<std::string, LOG_RING_SIZE> s_lines;
 static uint32_t s_seq = 0;
-// s_seq 的无锁镜像：锁竞争超时的降级路径也能返回真实序号。
-// 返回 seq=0 会被网页当成"设备重启过"，触发清屏+全量重放
+// Lock-free mirror of s_seq. The lock-timeout fallback can still return the actual sequence number.
+// The Web UI treats seq=0 as a device restart and clears and replays the log.
 static std::atomic<uint32_t> s_seq_mirror{0};
 static size_t s_count = 0;
 static size_t s_next = 0;
 
-// ---- 上次运行日志(重启前镜像) ----
-// 日志同时写入一块 .noinit RAM 字节环。软件复位/看门狗复位/panic 都不会清
-// 这块内存，开机时把上一次会话的日志取出来，崩溃前的最后动作就能看到。
-// 掉电(上电复位)会丢 RAM，所以异常复位时再把它写进 smsdata NVS 分区兜底。
+// ---- Previous-run log (pre-restart image) ----
+// The log also enters a .noinit RAM byte ring. Software, watchdog, and panic resets preserve this memory.
+// Startup extracts the previous session so the user can see the final actions before a crash.
+// A power-on reset loses RAM, so an abnormal reset also saves the ring in the smsdata NVS partition.
 static constexpr size_t PREV_RING_SIZE = 8192;
 static constexpr uint32_t PREV_MAGIC = 0x4C4F4752;  // 'LOGR'
 
 struct NoinitLogRing {
     uint32_t magic;
-    uint32_t head;   // 下一个写入位置
-    uint32_t used;   // 有效字节数(<= PREV_RING_SIZE)
-    uint32_t check;  // 简单一致性校验，防止上电后的随机内容被当成日志
+    uint32_t head;   // Next write position
+    uint32_t used;   // Valid byte count (<= PREV_RING_SIZE)
+    uint32_t check;  // Simple consistency check that rejects random power-on contents
     char buf[PREV_RING_SIZE];
 };
 
 static __NOINIT_ATTR NoinitLogRing s_prev_ring;
-static bool s_prev_ring_ready = false;   // 捕获完成前不写入，避免污染上一会话内容
-static std::string s_prev_log;           // 开机时提取出的上次日志(含头部说明)
+static bool s_prev_ring_ready = false;   // Do not write before capture completes, to preserve the previous session
+static std::string s_prev_log;           // Previous log extracted at startup, including its header
 static bool s_prev_deferred_save = false;
 static bool s_prev_deferred_started = false;
 static bool s_prev_flash_load_tried = false;
 
-// smsdata 为 640KB 独立 NVS 分区(短信留存也在用)，写入频率仅为每次异常复位一次
+// smsdata is a dedicated 640 KB NVS partition that also stores retained SMS data. Write only after an abnormal reset.
 static constexpr const char* PREV_NVS_PART = "smsdata";
 static constexpr const char* PREV_NVS_NS = "prevlog";
 static constexpr const char* PREV_NVS_KEY = "log";
@@ -78,8 +78,7 @@ static void prev_ring_reset()
     s_prev_ring.check = prev_ring_checksum();
 }
 
-// 追加到 noinit 环。先写数据再更新元信息：崩溃打断时元信息仍描述旧内容，
-// 最多丢这一行，不会让整个环失效
+// Append to the noinit ring. Write data before metadata so a crash loses at most the current line.
 static void prev_ring_append(const char* data, size_t len)
 {
     if (!s_prev_ring_ready || len == 0) return;
@@ -101,22 +100,22 @@ static void prev_ring_append(const char* data, size_t len)
 static const char* reset_reason_text(esp_reset_reason_t reason)
 {
     switch (reason) {
-        case ESP_RST_POWERON: return "上电复位";
-        case ESP_RST_EXT: return "外部复位";
-        case ESP_RST_SW: return "软件重启";
-        case ESP_RST_PANIC: return "程序崩溃(panic)";
-        case ESP_RST_INT_WDT: return "中断看门狗";
-        case ESP_RST_TASK_WDT: return "任务看门狗";
-        case ESP_RST_WDT: return "其他看门狗";
-        case ESP_RST_DEEPSLEEP: return "深度睡眠唤醒";
-        case ESP_RST_BROWNOUT: return "欠压复位";
-        case ESP_RST_SDIO: return "SDIO 复位";
-        case ESP_RST_USB: return "USB/串口复位";
-        case ESP_RST_JTAG: return "JTAG 复位";
-        case ESP_RST_EFUSE: return "eFuse 错误复位";
-        case ESP_RST_PWR_GLITCH: return "电源毛刺复位";
-        case ESP_RST_CPU_LOCKUP: return "CPU 锁死复位";
-        default: return "未知";
+        case ESP_RST_POWERON: return "Power-on reset";
+        case ESP_RST_EXT: return "External reset";
+        case ESP_RST_SW: return "Software restart";
+        case ESP_RST_PANIC: return "Program panic";
+        case ESP_RST_INT_WDT: return "Interrupt watchdog";
+        case ESP_RST_TASK_WDT: return "Task watchdog";
+        case ESP_RST_WDT: return "Other watchdog";
+        case ESP_RST_DEEPSLEEP: return "Deep-sleep wakeup";
+        case ESP_RST_BROWNOUT: return "Brownout reset";
+        case ESP_RST_SDIO: return "SDIO reset";
+        case ESP_RST_USB: return "USB/serial reset";
+        case ESP_RST_JTAG: return "JTAG reset";
+        case ESP_RST_EFUSE: return "eFuse error reset";
+        case ESP_RST_PWR_GLITCH: return "Power-glitch reset";
+        case ESP_RST_CPU_LOCKUP: return "CPU lockup reset";
+        default: return "Unknown";
     }
 }
 
@@ -140,14 +139,14 @@ static esp_err_t prev_log_prepare_nvs()
 {
     esp_err_t err = nvs_flash_init_partition(PREV_NVS_PART);
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        // smsdata 是短信留存分区，不能在日志模块里擅自擦除；交给收件箱初始化流程处理
+        // smsdata retains SMS data. Only the inbox initialization flow can erase this partition.
         return err;
     }
     if (err == ESP_ERR_INVALID_STATE) return ESP_OK;
     return err;
 }
 
-// 从 NVS 读上一次异常复位存下的日志(设备掉过电、RAM 镜像已丢时的兜底)
+// Read the log saved after the previous abnormal reset when power loss removed the RAM image.
 static bool prev_log_load_from_nvs(std::string& out)
 {
     if (prev_log_prepare_nvs() != ESP_OK) return false;
@@ -200,14 +199,14 @@ static std::string prev_log_get()
 
 static void prev_log_deferred_task(void*)
 {
-    // 启动路径只做 RAM 捕获；异常复位后的 Flash 保存延后，避免卡在开机早期。
+    // Capture RAM only on the startup path. Defer flash writes after an abnormal reset to avoid blocking early startup.
     vTaskDelay(pdMS_TO_TICKS(15000));
 
     if (s_prev_deferred_save) {
         std::string snapshot = prev_log_get();
         if (!snapshot.empty()) {
             prev_log_save_to_nvs(snapshot);
-            idf_log_line("上次运行日志已后台保存到 Flash");
+            idf_log_line("The previous-run log was saved to flash in the background");
         }
     }
 
@@ -222,11 +221,11 @@ static void prev_log_start_deferred_save()
     BaseType_t ok = xTaskCreate(prev_log_deferred_task, "prev_log_save", 6144, nullptr, 1, nullptr);
     if (ok != pdPASS) {
         s_prev_deferred_started = false;
-        idf_log_line("上次运行日志后台任务启动失败");
+        idf_log_line("Failed to start the previous-run log task");
     }
 }
 
-// 开机时执行一次：把上一会话留在 noinit 环里的日志取出来，异常复位再落盘
+// At startup, extract the previous session from the noinit ring. Persist it only after an abnormal reset.
 static void prev_log_capture()
 {
     esp_reset_reason_t reason = esp_reset_reason();
@@ -240,11 +239,11 @@ static void prev_log_capture()
         body.reserve(used);
         for (size_t i = 0; i < used; ++i) {
             char ch = s_prev_ring.buf[(start + i) % PREV_RING_SIZE];
-            // 极小概率崩在环写入中途，个别字节可能是半行残留；替换控制字符保证可读
+            // A crash during a ring write can leave a partial line. Replace control characters to keep it readable.
             if (ch != '\n' && static_cast<unsigned char>(ch) < 0x20) ch = ' ';
             body += ch;
         }
-        // 环满时最旧一行通常被截半，去掉第一个换行前的残段
+        // A full ring usually truncates its oldest line. Remove the fragment before the first newline.
         if (used == PREV_RING_SIZE) {
             size_t nl = body.find('\n');
             if (nl != std::string::npos) body.erase(0, nl + 1);
@@ -254,24 +253,24 @@ static void prev_log_capture()
     s_prev_ring_ready = true;
 
     if (from_ram) {
-        std::string text = "===== 上次运行日志 =====\n";
-        text += "本次复位原因: ";
+        std::string text = "===== Previous-run log =====\n";
+        text += "Current reset reason: ";
         text += reset_reason_text(reason);
         char num[16];
         snprintf(num, sizeof(num), " (%d)\n", static_cast<int>(reason));
         text += num;
         if (abnormal) {
-            text += "异常复位日志将在启动完成后后台保存到 Flash；完整崩溃转储可在日志页下载。\n";
+            text += "The log will be saved to flash after startup. Download the full crash dump from the log page.\n";
         }
         text += "------------------------\n";
         text += body;
         prev_log_set(std::move(text));
-        // 只有异常复位才写 Flash，且必须放到后台：启动期 Flash/NVS 操作可能引发看门狗连环重启
+        // Write flash only after an abnormal reset and only in the background. Startup flash operations can cause watchdog reset loops.
         if (abnormal) prev_log_start_deferred_save();
     }
 
-    idf_logf("本次启动复位原因: %s (%d)%s", reset_reason_text(reason), static_cast<int>(reason),
-             prev_log_get().empty() ? "" : "，上次日志已保留(日志页可查看)");
+    idf_logf("Current startup reset reason: %s (%d)%s", reset_reason_text(reason), static_cast<int>(reason),
+             prev_log_get().empty() ? "" : ", previous log retained (available on the log page)");
 }
 
 static void ensure_init()
@@ -297,7 +296,7 @@ void idf_log_line(const char* line)
     std::string item(line);
     if (item.size() > LOG_LINE_MAX) {
         size_t end = LOG_LINE_MAX - 3;
-        // 退到 UTF-8 字符边界：日志多为中文(3 字节/字)，硬截会产生乱码
+        // Move back to a UTF-8 character boundary to prevent invalid output after truncation.
         while (end > 0 && (static_cast<unsigned char>(item[end]) & 0xC0) == 0x80) --end;
         item.resize(end);
         item += "...";
@@ -322,14 +321,14 @@ void idf_logf(const char* fmt, ...)
     int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     if (ret > static_cast<int>(LOG_LINE_MAX)) {
-        // vsnprintf 截断可能落在多字节字符中间；退到 UTF-8 边界，避免输出乱码
+        // vsnprintf can truncate inside a multibyte character. Move back to a UTF-8 boundary.
         size_t end = LOG_LINE_MAX;
         size_t p = end;
         while (p > 0 && (static_cast<unsigned char>(buf[p - 1]) & 0xC0) == 0x80) --p;
         if (p > 0) {
             unsigned char lead = static_cast<unsigned char>(buf[p - 1]);
             size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
-            if (need > 1 && p - 1 + need > end) end = p - 1;  // 末字符不完整，整个去掉
+            if (need > 1 && p - 1 + need > end) end = p - 1;  // Remove an incomplete final character
         }
         buf[end] = '\0';
     }
@@ -343,7 +342,7 @@ std::string idf_log_json_since(uint32_t since)
     out.reserve(2048);
 
     if (!s_log_mutex || xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-        // 返回最近已知序号而非 0：seq 回退会被网页误判为设备重启，清屏重放
+        // Return the latest known sequence instead of 0. A sequence decrease makes the Web UI replay the log.
         char fallback[48];
         snprintf(fallback, sizeof(fallback), "{\"seq\":%" PRIu32 ",\"lines\":[]}",
                  s_seq_mirror.load(std::memory_order_relaxed));
@@ -354,8 +353,8 @@ std::string idf_log_json_since(uint32_t since)
     size_t count = s_count;
     size_t start = (s_next + LOG_RING_SIZE - count) % LOG_RING_SIZE;
     uint32_t oldest = seq >= count ? seq - static_cast<uint32_t>(count) + 1 : 1;
-    // 客户端游标比当前序号还大 = 设备已重启、序号从头计。从 0 重放，
-    // 否则网页要等新日志追上旧游标才恢复显示
+    // A client cursor above the current sequence means the device restarted. Replay from 0.
+    // Otherwise the Web UI waits until the new log reaches the old cursor.
     if (since > seq) since = 0;
 
     char head[48];
@@ -406,7 +405,7 @@ std::string idf_log_prev_dump(void)
     s_prev_flash_load_tried = true;
     std::string saved;
     if (prev_log_load_from_nvs(saved) && !saved.empty()) {
-        out = "(本次启动未读取 Flash；以下是在用户请求时读取的最近一次异常复位日志)\n";
+        out = "(This startup did not read flash. This is the latest abnormal-reset log read at the user's request.)\n";
         out += saved;
         prev_log_set(out);
     }

@@ -30,19 +30,19 @@ struct IdfWifiScanSnapshot {
 
 esp_err_t idf_wifi_start(const IdfConfig& config);
 esp_err_t idf_wifi_reconnect(void);
-// ESP-IDF 原始单位为 0.25dBm；仅应传入驱动支持的离散档位。
+// ESP-IDF uses 0.25dBm units; pass only discrete levels supported by the driver.
 esp_err_t idf_wifi_set_tx_power(uint8_t quarter_dbm);
-// 手动强制立即 NTP 校时(网页"立即校时"按钮)；未联网返回 ESP_ERR_INVALID_STATE
+// Force an immediate NTP sync from the Web UI; returns ESP_ERR_INVALID_STATE when offline.
 esp_err_t idf_wifi_resync_ntp(void);
-// 发起一次异步扫描；已有扫描时合并请求，不等待射频扫描完成。
+// Start an asynchronous scan; coalesce with an active scan without waiting for radio completion.
 esp_err_t idf_wifi_scan_request(void);
 IdfWifiScanSnapshot idf_wifi_scan_get_snapshot(void);
-// 兼容旧调用方：发起异步刷新并立即返回最近缓存，首次尚未完成时返回 []。
+// Legacy compatibility: start an async refresh and return the latest cache immediately, or [] before the first result.
 esp_err_t idf_wifi_scan_json(std::string& out_json);
 IdfWifiStatus idf_wifi_get_status(void);
-// 是否处于配网热点(AP/APSTA)模式的轻量查询——只读内部状态快照，不触发
-// esp_wifi/MAC/IP 读取，供每个请求都要判断的 Web 鉴权快速路径使用。
+// Lightweight AP/APSTA provisioning-mode query. Reads only the internal snapshot without esp_wifi/MAC/IP calls
+// for the Web authentication fast path used by every request.
 bool idf_wifi_is_ap_mode(void);
-// 配网热点内保存 WiFi 后原地(APSTA)发起连接，不重启；连上后设备会延时自动关闭热点。
-// 供 Web /wificonfig 在 AP 模式下调用，配网页轮询 /apstatus 显示获取到的 IP。
+// Save WiFi and connect in place with APSTA without restarting; close the AP after a delay on success.
+// Used by Web /wificonfig in AP mode while the provisioning page polls /apstatus for the assigned IP.
 esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass);

@@ -4,13 +4,13 @@
 
 #include <string>
 
-// 通用小工具集合：原先各组件各自复制一份，统一收拢到 idf_logbuf(几乎所有组件都已依赖)。
+// Shared small utilities. Most components already depend on idf_logbuf, so keep the common implementation here.
 
-// 将 value 按 JSON 字符串规则转义后追加到 out(反斜杠/引号/换行/制表符，其余控制字符转 \u00xx)
+// Append value to out with JSON string escaping for slashes, quotes, whitespace, and other control characters.
 void idf_util_json_escape_append(std::string& out, const std::string& value);
 
-// 去掉首尾空白(isspace 语义)并返回副本，原串不变
+// Return a copy without leading or trailing isspace characters. Do not change the source string.
 std::string idf_util_trim_copy(const std::string& value);
 
-// epoch 秒 → "YYYY-MM-DD HH:MM:SS" 本地时间；时间未同步(epoch 过小)返回空串
+// Convert epoch seconds to local time in "YYYY-MM-DD HH:MM:SS" format. Return an empty string if time is not synchronized.
 std::string idf_util_format_epoch_local(uint32_t epoch, int tz_offset_min);

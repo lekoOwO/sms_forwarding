@@ -74,8 +74,8 @@ static std::atomic<bool> s_suppress_next_connect_log{false};
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
 static esp_timer_handle_t s_ap_close_timer = nullptr;
-static std::atomic<bool> s_provisioning{false};  // 配网页触发的连接进行中：连上后延时关热点
-static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // 连上后保留热点让配网页显示 IP
+static std::atomic<bool> s_provisioning{false};  // Provisioning-page connection in progress; close AP after a delay on success.
+static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // Keep AP long enough for the page to display the IP.
 
 static esp_err_t start_provisioning_ap(bool manual = false);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
@@ -129,8 +129,8 @@ static esp_err_t public_scan_error(esp_err_t err)
 static ApState ap_state_snapshot()
 {
     ApState state;
-    // portMAX_DELAY：持锁方只做几次赋值(微秒级)。带超时的版本一旦超时会把
-    // "AP 开着"误报成"AP 关闭"，后果是热点该关不关/该答不答
+    // The holder only performs a few assignments, so use portMAX_DELAY. A timed read could report an active AP
+    // as closed and break AP shutdown or response behavior.
     if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
         state.mode = s_ap_mode;
         state.manual = s_ap_manual_mode;
@@ -203,16 +203,16 @@ static bool bind_provisioning_bssid(uint32_t generation, const uint8_t bssid[6])
     return bound;
 }
 
-// 配网连接成功后延时关闭热点：给配网页时间显示 IP，再切回纯 STA
+// Delay AP shutdown after provisioning succeeds so the page can display the IP before switching to STA-only.
 static void ap_close_timer_cb(void*)
 {
     if (s_provisioning.load(std::memory_order_acquire)) return;
-    if (!ap_state_snapshot().mode) return;  // 已经关了
+    if (!ap_state_snapshot().mode) return;  // Already closed.
     if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
         set_ap_state(false, false, std::string());
         char host[33] = {};
         idf_config_copy_mdns_host(host, sizeof(host));
-        idf_logf("配网热点已关闭，请改用设备 IP 或 http://%s.local 访问", host);
+        idf_logf("Provisioning AP closed; use the device IP or http://%s.local", host);
     }
 }
 
@@ -227,7 +227,7 @@ static void schedule_ap_close(uint32_t delay_ms)
             .skip_unhandled_events = true,
         };
         if (esp_timer_create(&targs, &s_ap_close_timer) != ESP_OK) {
-            ap_close_timer_cb(nullptr);  // 创建失败退回立即关闭，避免卡在 AP
+            ap_close_timer_cb(nullptr);  // Close immediately if timer creation fails to avoid remaining in AP mode.
             return;
         }
     }
@@ -281,8 +281,8 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
 
 static void sntp_sync_cb(timeval*)
 {
-    // 只在首次同步成功或手动校时后打日志：周期同步静默，避免刷屏。
-    // 窗口放宽到 10 分钟(弱网下 SNTP 重试可能很慢)，命中一次即清除标记
+    // Log only the first successful sync or a manual sync; periodic sync remains quiet.
+    // Allow ten minutes for slow SNTP retries on weak networks, then clear the marker after one match.
     bool first = !s_ntp_first_logged.exchange(true, std::memory_order_relaxed);
     int64_t manual_us = s_ntp_manual_us.load(std::memory_order_relaxed);
     bool manual = manual_us >= 0 && (esp_timer_get_time() - manual_us) < 600000000LL;
@@ -290,12 +290,12 @@ static void sntp_sync_cb(timeval*)
     if (!first && !manual) return;
 
     time_t now = time(nullptr);
-    // 本回调在 tiT(lwip) 小栈上执行：只取时区，绝不深拷贝整个 IdfConfig(会爆栈)
+    // This callback runs on the small tiT (lwIP) stack; read only the timezone and never deep-copy IdfConfig.
     std::string local = idf_util_format_epoch_local(static_cast<uint32_t>(now), idf_config_get_tz_offset());
     if (local.empty()) {
-        idf_logf("NTP 时间同步成功，epoch=%ld", static_cast<long>(now));
+        idf_logf("NTP time synchronized, epoch=%ld", static_cast<long>(now));
     } else {
-        idf_logf("NTP 时间同步成功：%s (epoch=%ld)", local.c_str(), static_cast<long>(now));
+        idf_logf("NTP time synchronized: %s (epoch=%ld)", local.c_str(), static_cast<long>(now));
     }
 }
 
@@ -304,7 +304,7 @@ static void start_sntp_once()
     bool expected = false;
     if (!s_sntp_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
 
-    // 在系统事件任务(栈 4KB)上执行：只取 NTP 服务器名，避免深拷贝整个 IdfConfig
+    // This runs on the 4KB system-event stack; read only the NTP server name instead of deep-copying IdfConfig.
     std::string server = idf_config_get_ntp_server();
     if (server.empty()) server = "ntp.aliyun.com";
     strlcpy(s_ntp_server, server.c_str(), sizeof(s_ntp_server));
@@ -312,14 +312,14 @@ static void start_sntp_once()
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
     esp_sntp_setservername(0, s_ntp_server);
-    // 备用服务器：单一 NTP 不可达时时间永远不同步，会连锁禁用所有按时间调度的任务
-    // (需要 CONFIG_LWIP_SNTP_MAX_SERVERS>=3，见 sdkconfig.defaults)
+    // Fallback servers prevent one unreachable NTP host from disabling every time-based task.
+    // Requires CONFIG_LWIP_SNTP_MAX_SERVERS>=3; see sdkconfig.defaults.
     esp_sntp_setservername(1, "ntp.ntsc.ac.cn");
     esp_sntp_setservername(2, "pool.ntp.org");
-    // ESP32-C3 晶振日漂移在秒级，调度粒度是"天"——每 24h 校一次足够，默认 1h 太频繁
+    // ESP32-C3 oscillator drift is seconds per day while scheduling is daily, so syncing every 24h is sufficient.
     esp_sntp_set_sync_interval(24 * 3600 * 1000);
     esp_sntp_init();
-    idf_logf("NTP 时间同步已启动：首选=%s，备用=ntp.ntsc.ac.cn,pool.ntp.org", s_ntp_server);
+    idf_logf("NTP synchronization started: primary=%s, fallback=ntp.ntsc.ac.cn,pool.ntp.org", s_ntp_server);
 }
 
 static std::string ip4_to_string(const esp_ip4_addr_t& addr)
@@ -340,34 +340,34 @@ static std::string mac_to_string(const uint8_t mac[6])
 static const char* wifi_disconnect_reason_name(uint8_t reason)
 {
     switch (reason) {
-        case WIFI_REASON_UNSPECIFIED: return "未指定";
-        case WIFI_REASON_AUTH_EXPIRE: return "认证过期";
-        case WIFI_REASON_AUTH_LEAVE: return "认证离开";
-        case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "空闲断开";
-        case WIFI_REASON_ASSOC_TOOMANY: return "AP连接数满";
-        case WIFI_REASON_ASSOC_LEAVE: return "关联离开";
-        case WIFI_REASON_ASSOC_NOT_AUTHED: return "关联未认证";
-        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "四次握手超时";
-        case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT: return "组密钥更新超时";
-        case WIFI_REASON_IE_IN_4WAY_DIFFERS: return "四次握手IE不匹配";
-        case WIFI_REASON_802_1X_AUTH_FAILED: return "802.1X认证失败";
-        case WIFI_REASON_TIMEOUT: return "链路超时";
-        case WIFI_REASON_PEER_INITIATED: return "对端主动断开";
-        case WIFI_REASON_AP_INITIATED: return "AP主动断开";
-        case WIFI_REASON_BEACON_TIMEOUT: return "Beacon超时";
-        case WIFI_REASON_NO_AP_FOUND: return "未找到AP";
-        case WIFI_REASON_AUTH_FAIL: return "认证失败";
-        case WIFI_REASON_ASSOC_FAIL: return "关联失败";
-        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "握手超时";
-        case WIFI_REASON_CONNECTION_FAIL: return "连接失败";
-        case WIFI_REASON_AP_TSF_RESET: return "AP时钟重置";
-        case WIFI_REASON_ROAMING: return "漫游切换";
-        case WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG: return "关联等待过长";
-        case WIFI_REASON_SA_QUERY_TIMEOUT: return "SA查询超时";
-        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: return "未找到兼容安全AP";
-        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: return "认证方式不匹配";
-        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "信号低于阈值";
-        default: return "未知原因";
+        case WIFI_REASON_UNSPECIFIED: return "unspecified";
+        case WIFI_REASON_AUTH_EXPIRE: return "authentication expired";
+        case WIFI_REASON_AUTH_LEAVE: return "authentication left";
+        case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "inactive";
+        case WIFI_REASON_ASSOC_TOOMANY: return "AP client limit reached";
+        case WIFI_REASON_ASSOC_LEAVE: return "association left";
+        case WIFI_REASON_ASSOC_NOT_AUTHED: return "association not authenticated";
+        case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "four-way handshake timeout";
+        case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT: return "group-key update timeout";
+        case WIFI_REASON_IE_IN_4WAY_DIFFERS: return "four-way handshake IE mismatch";
+        case WIFI_REASON_802_1X_AUTH_FAILED: return "802.1X authentication failed";
+        case WIFI_REASON_TIMEOUT: return "link timeout";
+        case WIFI_REASON_PEER_INITIATED: return "peer disconnected";
+        case WIFI_REASON_AP_INITIATED: return "AP disconnected client";
+        case WIFI_REASON_BEACON_TIMEOUT: return "beacon timeout";
+        case WIFI_REASON_NO_AP_FOUND: return "AP not found";
+        case WIFI_REASON_AUTH_FAIL: return "authentication failed";
+        case WIFI_REASON_ASSOC_FAIL: return "association failed";
+        case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake timeout";
+        case WIFI_REASON_CONNECTION_FAIL: return "connection failed";
+        case WIFI_REASON_AP_TSF_RESET: return "AP clock reset";
+        case WIFI_REASON_ROAMING: return "roaming switch";
+        case WIFI_REASON_ASSOC_COMEBACK_TIME_TOO_LONG: return "association wait too long";
+        case WIFI_REASON_SA_QUERY_TIMEOUT: return "SA query timeout";
+        case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY: return "no AP with compatible security";
+        case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD: return "authentication mode mismatch";
+        case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD: return "signal below threshold";
+        default: return "unknown reason";
     }
 }
 
@@ -395,15 +395,15 @@ static void log_wifi_disconnect_once(uint8_t reason, int8_t rssi)
     if (rssi < 0) {
         snprintf(rssi_text, sizeof(rssi_text), "%d dBm", static_cast<int>(rssi));
     } else {
-        snprintf(rssi_text, sizeof(rssi_text), "未知");
+        snprintf(rssi_text, sizeof(rssi_text), "unknown");
     }
     const char* reason_name = wifi_disconnect_reason_name(reason);
     char tail[80] = {};
     if (suppressed) {
-        snprintf(tail, sizeof(tail), "，此前 Beacon 瞬断%lu次已合并",
+        snprintf(tail, sizeof(tail), "; %lu earlier beacon drops coalesced",
                  static_cast<unsigned long>(suppressed));
     }
-    idf_logf("WiFi 断开: %s(%u)，RSSI=%s，自动重连%s",
+    idf_logf("WiFi disconnected: %s (%u), RSSI=%s, auto-reconnect%s",
              reason_name, static_cast<unsigned>(reason), rssi_text, tail);
     s_suppress_next_connect_log.store(false, std::memory_order_relaxed);
 }
@@ -438,21 +438,21 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
         }
-        // 主动切换凭据时先关闭自动重连；等调用方看到本事件后再应用新配置。
+        // Disable auto-reconnect while switching credentials; apply the new configuration after the caller sees this event.
         if (!s_sta_configured.load(std::memory_order_relaxed)) return;
-        // 前几次断开立即重连(快速恢复瞬断)；持续失败后退避，交给 15s 看门狗定时器，
-        // 避免错误密码/信号差时无间隔连接风暴打断配网 AP 和 WiFi 扫描
+        // Reconnect immediately after the first few drops, then back off to the 15s watchdog.
+        // This avoids a tight connection storm disrupting the provisioning AP and scans on bad credentials or weak signal.
         int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
         if (streak == 1 && event_data) {
-            // 只在断开链的第一次记 Web 日志；频繁 Beacon 瞬断合并，避免日志页刷屏。
+            // Write one Web log per disconnect chain and coalesce repeated beacon drops.
             auto* ev = static_cast<wifi_event_sta_disconnected_t*>(event_data);
             log_wifi_disconnect_once(ev->reason, ev->rssi);
         }
         if (streak <= 3 && sta_can_connect()) {
             esp_wifi_connect();
-            ESP_LOGW(TAG, "STA 断开，立即重连(第%d次)", streak);
+            ESP_LOGW(TAG, "STA disconnected; reconnecting immediately (attempt %d)", streak);
         } else {
-            ESP_LOGW(TAG, "STA 连续断开%d次，转入定时重连", streak);
+            ESP_LOGW(TAG, "STA disconnected %d consecutive times; switching to timed reconnect", streak);
         }
         return;
     }
@@ -461,15 +461,15 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
         s_candidate_attempt.store(0, std::memory_order_relaxed);
-        ESP_LOGI(TAG, "STA 已获取 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "STA acquired IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (!s_suppress_next_connect_log.exchange(false, std::memory_order_relaxed)) {
-            idf_logf("WiFi 已连接，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+            idf_logf("WiFi connected, IP=" IPSTR, IP2STR(&event->ip_info.ip));
         }
         start_sntp_once();
-        // 同手机：成功连上的网络自动记住(任务内部去重，已知网络秒退不写 NVS)。
-        // 记忆路径会处理历史 WiFi 临时数组并保存 NVS，4KB 栈不足，使用独立 8KB 栈避免栈保护重启。
+        // Remember successful networks like a phone. The task deduplicates known networks without writing NVS.
+        // This path handles a temporary WiFi-history array and NVS, so use a separate 8KB stack instead of the 4KB event stack.
         if (xTaskCreate(wifi_remember_task, "idf_wifi_mem", 8192, nullptr, 2, nullptr) != pdPASS) {
-            ESP_LOGW(TAG, "WiFi 记忆任务创建失败，本次连接不自动记入历史列表");
+            ESP_LOGW(TAG, "Could not create WiFi remember task; this connection will not be added to history");
         }
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
@@ -489,26 +489,26 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
                         reinterpret_cast<const char*>(connected_ap.ssid), connected_bssid);
                 }
                 if (matched && complete_provisioning_target(target.generation)) {
-                    // 只有本次提交的目标真正拿到 IP 才关闭热点；旧配置兜底连上不算配网成功。
+                    // Close the AP only when this submitted target gets an IP; fallback to old credentials is not provisioning success.
                     schedule_ap_close(AP_PROVISION_HOLD_MS);
-                    idf_logf("配网连接成功，%lu 秒后自动关闭热点",
+                    idf_logf("Provisioning connection succeeded; AP closes in %lu seconds",
                              static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
                 } else {
-                    ESP_LOGW(TAG, "忽略非当前配网目标的 GOT_IP，热点保持开启");
+                    ESP_LOGW(TAG, "Ignoring GOT_IP from a non-current provisioning target; keeping AP open");
                 }
             } else if (!ap.manual) {
                 if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
                     set_ap_state(false, false, std::string());
-                    idf_log_line("STA 已恢复连接，已关闭配网热点");
+                    idf_log_line("STA reconnected; provisioning AP closed");
                 }
             }
         }
     }
 }
 
-// 类手机行为：STA 成功拿到 IP 后把当前凭据记入历史 WiFi(新网络/密码变更才落盘，
-// idf_config_note_wifi_connected 内部去重)。放独立一次性任务执行：系统事件任务
-// 栈小，NVS 落盘也不该阻塞事件循环
+// After STA gets an IP, remember its credentials like a phone. idf_config_note_wifi_connected writes only
+// new networks or password changes. Run this in a one-shot task because the event stack is small and NVS
+// writes must not block the event loop.
 static void wifi_remember_task(void*)
 {
     wifi_config_t cfg = {};
@@ -522,35 +522,33 @@ static void wifi_remember_task(void*)
     vTaskDelete(nullptr);
 }
 
-// 15s 周期重连看门狗：事件链(断开→重连)任何一环失败(如扫描期间 esp_wifi_connect
-// 返回错误)都不会再有新事件，仅靠事件驱动设备会永久离线。这里兜底补发连接。
-// 存了多组历史 WiFi 时改为触发扫描选网(设备可能已被搬到另一网络覆盖下)；
-// 运行时掉线只静默重连/重扫，不会自动开配网热点(无人值守设备遇路由器宕机
-// 不该广播开放 AP 扩大攻击面)。
+// A 15s reconnect watchdog recovers when any disconnect-to-reconnect event step fails and no later event fires.
+// With multiple saved networks, rescan because the device may have moved. Runtime drops only reconnect or rescan;
+// never open a provisioning AP automatically on an unattended device, which would expand the attack surface.
 static void reconnect_watchdog_cb(void*)
 {
     if (!s_started.load(std::memory_order_relaxed) || !sta_can_connect()) return;
     if (s_sta_connected.load(std::memory_order_relaxed)) return;
-    static uint32_t tick = 0;  // esp_timer 回调串行执行，无并发
+    static uint32_t tick = 0;  // esp_timer callbacks run serially.
     ++tick;
-    // 配网热点开启时降频到 60s：连接尝试会把 STA 拉去跑信道，影响 AP 客户端与扫描
+    // Slow to 60s while the provisioning AP is open because STA connection attempts disrupt AP clients and scans.
     if (ap_state_snapshot().mode && (tick % 4) != 0) return;
     if (s_provisioning.load(std::memory_order_acquire)) {
-        // 配网期间只重试本次已应用的驱动配置，不能选回历史网络并误判为配网成功。
+        // During provisioning, retry only the applied driver configuration; do not select a saved network as a false success.
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-            ESP_LOGW(TAG, "配网重连发起失败: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "Could not start provisioning reconnect: %s", esp_err_to_name(err));
         }
         return;
     }
     if (idf_config_wifi_network_count() > 1 ||
         s_current_profile_open.load(std::memory_order_relaxed)) {
-        start_wifi_select_once();  // 扫描(约 2-3s)在独立小任务里做，不阻塞 esp_timer
+        start_wifi_select_once();  // Scan for about 2-3s in a small task without blocking esp_timer.
         return;
     }
     esp_err_t err = esp_wifi_connect();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-        ESP_LOGW(TAG, "看门狗重连发起失败: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "Watchdog reconnect failed to start: %s", esp_err_to_name(err));
     }
 }
 
@@ -559,7 +557,7 @@ static void dns_captive_task(void*)
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
         s_dns_task_started.store(false, std::memory_order_relaxed);
-        idf_log_line("配网 DNS 创建失败");
+        idf_log_line("Could not create provisioning DNS socket");
         vTaskDelete(nullptr);
         return;
     }
@@ -573,7 +571,7 @@ static void dns_captive_task(void*)
     addr.sin_port = htons(53);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        idf_log_line("配网 DNS 绑定 53 端口失败");
+        idf_log_line("Could not bind provisioning DNS to port 53");
         close(sock);
         s_dns_task_started.store(false, std::memory_order_relaxed);
         vTaskDelete(nullptr);
@@ -586,11 +584,10 @@ static void dns_captive_task(void*)
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
-        // 立即报错(非超时，如 lwIP 缺内存返回 ENOMEM)时必须让出 CPU：
-        // 节奏本来全靠 1s 接收超时，错误直返会变成高优先级忙等，饿死空闲任务
+        // Yield after immediate errors such as ENOMEM; otherwise the missing receive timeout creates a busy loop.
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
         if (!ap_state_snapshot().mode) {
-            // 配网结束后释放 53 端口和任务(recv 超时 1s，约 10s 后自退出；再次配网会重建)
+            // Release port 53 and exit about 10s after provisioning ends; recreate on next provisioning.
             if (++ap_off_seconds >= 10) break;
             continue;
         }
@@ -609,7 +606,7 @@ static void dns_captive_task(void*)
         if (question_end + 16 > static_cast<int>(sizeof(resp))) continue;
         memcpy(resp, req, question_end);
         resp[2] = 0x81; resp[3] = 0x80;  // standard response, no error
-        resp[4] = 0x00; resp[5] = 0x01;  // 只回带了第一个问题，qdcount 必须同步改成 1
+        resp[4] = 0x00; resp[5] = 0x01;  // Only the first question is copied, so qdcount must be one.
         resp[6] = 0x00; resp[7] = 0x01;  // one A answer
         resp[8] = resp[9] = resp[10] = resp[11] = 0;
         int out = question_end;
@@ -624,7 +621,7 @@ static void dns_captive_task(void*)
 
     close(sock);
     s_dns_task_started.store(false, std::memory_order_relaxed);
-    idf_log_line("配网已结束，DNS 门户任务已退出");
+    idf_log_line("Provisioning ended; DNS portal task exited");
     vTaskDelete(nullptr);
 }
 
@@ -635,24 +632,16 @@ static void start_dns_task_once()
     BaseType_t ok = xTaskCreate(dns_captive_task, "idf_dns", 3072, nullptr, 2, nullptr);
     if (ok != pdPASS) {
         s_dns_task_started.store(false, std::memory_order_relaxed);
-        idf_log_line("配网 DNS 任务启动失败");
+        idf_log_line("Provisioning DNS task failed to start");
     }
 }
 
-// —— 轻量 mDNS 应答器，服务 <host>.local(主机名可配置，默认 sms，issue #9) ——
-// 针对"sms.local 先能用、几分钟后失效"做过的关键修复：
-// 1) 组播成员每 60s 强制退组重加。IGMP snooping 交换机/网状路由在无查询器的
-//    家庭网络里几分钟就老化转发表项，而 lwIP 对已加入的组不会重发 IGMP 报告，
-//    必须周期性 DROP+ADD 逼它重发，否则设备从此收不到任何查询；
-// 2) STA 与 AP 两张网卡同时加组(配网保持期手机在热点侧也能解析)；
-// 3) 来源端口≠5353 的一次性/传统查询按 RFC 6762 §6.7 单播回源端口：复制查询
-//    ID、回带问题段、TTL≤10s、不设 cache-flush，路由器 DNS 代理类客户端才收得到；
-// 4) QU 位按单播应答；AAAA 查询回 NSEC(声明只有 A)，双栈解析器不必等超时；
-// 5) 新加组后主动通告两次，客户端无需等到下次查询。
+// Lightweight mDNS responder for configurable <host>.local (default sms; issue #9).
+// Rejoin multicast every 60s to refresh IGMP snooping, join on STA and AP, unicast legacy and QU queries,
+// answer AAAA with NSEC for A-only support, and announce twice after joining.
 
-// 主机名 DNS 编码 "\xNN<host>\x05local"；应答任务每秒节拍从配置刷新，
-// 网页保存新主机名后 ≤1s 生效并主动通告，无需重启
-static constexpr size_t MDNS_NAME_CAP = 40;  // 1 + 32(主机名上限) + 1 + 5("local") = 39
+// DNS-encoded hostname is "\xNN<host>\x05local"; refresh every second and announce changes without restart.
+static constexpr size_t MDNS_NAME_CAP = 40;  // 1 + 32 hostname limit + 1 + 5 ("local") = 39.
 
 static size_t mdns_encode_name(const char* host, uint8_t* out)
 {
@@ -670,7 +659,7 @@ static size_t mdns_encode_name(const char* host, uint8_t* out)
 static bool mdns_query_matches_host(const uint8_t* packet, int len, int offset,
                                     const uint8_t* name, size_t name_len)
 {
-    // 逐字节比较编码名(长度字节 ≤32 不落在大写字母区间，统一转小写不会误伤)
+    // Compare bytewise; length bytes <=32 cannot be mistaken for uppercase letters.
     int pos = offset;
     for (size_t i = 0; i < name_len; ++i) {
         if (pos >= len) return false;
@@ -682,7 +671,7 @@ static bool mdns_query_matches_host(const uint8_t* packet, int len, int offset,
     return pos < len && packet[pos] == 0;
 }
 
-// 依据询问方地址选择要通告的 IP：热点网段的客户端给热点 IP，其余给 STA IP
+// Advertise the AP IP on the AP subnet and the STA IP elsewhere.
 static bool mdns_pick_ip(uint32_t from_addr, uint8_t out[4])
 {
     bool ap = ap_state_snapshot().mode;
@@ -704,9 +693,9 @@ static bool mdns_pick_ip(uint32_t from_addr, uint8_t out[4])
 
 struct MdnsAnswerPlan {
     bool wantA = false;
-    bool wantNsec = false;   // AAAA 查询 → NSEC"仅存在 A 记录"
-    bool legacy = false;     // 来源端口≠5353 的传统查询
-    bool unicast = false;    // legacy 或 QU 位
+    bool wantNsec = false;   // AAAA query: NSEC declares only an A record.
+    bool legacy = false;     // Query from a source port other than 5353.
+    bool unicast = false;    // Legacy query or QU bit.
     uint16_t id = 0;
     uint16_t firstQtype = 0;
 };
@@ -728,12 +717,12 @@ static int mdns_append_ttl(uint8_t* buf, int out, uint32_t ttl)
     return out;
 }
 
-// resp 至少 256 字节：主机名取上限 32 时，头 12 + 问题 45 + A 记录 55 + NSEC 96 ≈ 208
+// resp needs 256 bytes: at the hostname limit, header 12 + question 45 + A 55 + NSEC 96 is about 208.
 static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const uint8_t ip[4],
                                const uint8_t* name, size_t name_len)
 {
-    uint32_t ttl = plan.legacy ? 10 : 120;             // RFC 6762 §6.7 传统应答 TTL≤10s
-    uint16_t rrclass = plan.legacy ? 0x0001 : 0x8001;  // 传统应答不设 cache-flush 位
+    uint32_t ttl = plan.legacy ? 10 : 120;             // RFC 6762 section 6.7 limits legacy TTL to 10s.
+    uint16_t rrclass = plan.legacy ? 0x0001 : 0x8001;  // Legacy replies omit cache-flush.
     int an = (plan.wantA ? 1 : 0) + (plan.wantNsec ? 1 : 0);
     int out = 0;
     resp[out++] = static_cast<uint8_t>(plan.id >> 8);
@@ -743,7 +732,7 @@ static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const 
     resp[out++] = 0; resp[out++] = static_cast<uint8_t>(an);
     resp[out++] = 0; resp[out++] = 0;
     resp[out++] = 0; resp[out++] = 0;
-    if (plan.legacy) {  // 传统应答需回带问题段
+    if (plan.legacy) {  // Legacy replies include the question.
         out = mdns_append_name(resp, out, name, name_len);
         resp[out++] = static_cast<uint8_t>(plan.firstQtype >> 8);
         resp[out++] = static_cast<uint8_t>(plan.firstQtype);
@@ -764,11 +753,11 @@ static int mdns_build_response(uint8_t* resp, const MdnsAnswerPlan& plan, const 
         resp[out++] = static_cast<uint8_t>(rrclass >> 8);
         resp[out++] = static_cast<uint8_t>(rrclass);
         out = mdns_append_ttl(resp, out, ttl);
-        uint16_t rdlen = static_cast<uint16_t>(name_len + 1 + 3);  // next domain + 位图 3
+        uint16_t rdlen = static_cast<uint16_t>(name_len + 1 + 3);  // Next domain plus three-byte bitmap.
         resp[out++] = static_cast<uint8_t>(rdlen >> 8);
         resp[out++] = static_cast<uint8_t>(rdlen);
-        out = mdns_append_name(resp, out, name, name_len);  // next domain = 自身
-        resp[out++] = 0; resp[out++] = 1; resp[out++] = 0x40;  // 窗口 0 长度 1，仅类型 1(A)
+        out = mdns_append_name(resp, out, name, name_len);  // Next domain is this host.
+        resp[out++] = 0; resp[out++] = 1; resp[out++] = 0x40;  // Window 0, length 1, type 1 (A) only.
     }
     return out;
 }
@@ -778,7 +767,7 @@ static void mdns_sms_task(void*)
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
     if (sock < 0) {
         s_mdns_task_started.store(false, std::memory_order_relaxed);
-        idf_log_line("mDNS socket 创建失败");
+        idf_log_line("Could not create mDNS socket");
         vTaskDelete(nullptr);
         return;
     }
@@ -794,17 +783,17 @@ static void mdns_sms_task(void*)
     addr.sin_port = htons(5353);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        idf_log_line("mDNS 绑定 5353 端口失败");
+        idf_log_line("Could not bind mDNS to port 5353");
         close(sock);
         s_mdns_task_started.store(false, std::memory_order_relaxed);
         vTaskDelete(nullptr);
         return;
     }
 
-    uint8_t ttl = 255;  // RFC 6762 要求组播 TTL=255
+    uint8_t ttl = 255;  // RFC 6762 requires multicast TTL=255.
     setsockopt(sock, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 
-    // 可配置主机名(issue #9)：任务内缓存编码名，每秒节拍比对配置，变更即切换
+    // Cache the configurable encoded hostname (issue #9) and compare it with configuration every second.
     char host[33] = {};
     uint8_t name[MDNS_NAME_CAP];
     size_t name_len = 0;
@@ -814,15 +803,14 @@ static void mdns_sms_task(void*)
     auto sta_addr = []() -> uint32_t {
         esp_netif_ip_info_t ip = {};
         if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ip) == ESP_OK && ip.ip.addr != 0) {
-            return ip.ip.addr;  // 网络字节序
+            return ip.ip.addr;  // Network byte order.
         }
         return 0;
     };
     auto ap_addr = []() -> uint32_t {
         return ap_state_snapshot().mode ? inet_addr("192.168.1.1") : 0;
     };
-    // 退组再加组：既处理网卡/IP 变化，也用于周期性逼 lwIP 重发 IGMP 报告
-    // (对已加入的组重复 ADD 只会加引用计数，不会重发报告)。返回"是否新加入"。
+    // Leave then rejoin for interface/IP changes and periodic IGMP reports; repeated ADD only increments references.
     auto refresh_membership = [&](uint32_t& tracked, uint32_t cur, bool force) -> bool {
         if (cur == tracked && !force) return false;
         bool changed = (cur != tracked);
@@ -840,7 +828,7 @@ static void mdns_sms_task(void*)
             if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &a, sizeof(a)) == 0) {
                 tracked = cur;
                 if (changed) {
-                    idf_logf("mDNS 已加入组播: http://%s.local", host);
+                    idf_logf("mDNS joined multicast: http://%s.local", host);
                     return true;
                 }
             }
@@ -859,10 +847,10 @@ static void mdns_sms_task(void*)
         sockaddr_in from = {};
         socklen_t from_len = sizeof(from);
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
-        // 同配网 DNS：立即报错时让出 CPU，防止 lwIP 内存紧张期高优先级忙等
+        // Yield after immediate errors to avoid a high-priority busy loop during lwIP memory pressure.
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
 
-        // 主机名热更新：网页保存后下一个节拍(≤1s)换名，换名立即主动通告新名字
+        // Hot-update within one second and immediately announce the new hostname.
         {
             char cur_host[33] = {};
             idf_config_copy_mdns_host(cur_host, sizeof(cur_host));
@@ -870,11 +858,11 @@ static void mdns_sms_task(void*)
                 strcpy(host, cur_host);
                 name_len = mdns_encode_name(host, name);
                 announce_left = 2;
-                idf_logf("mDNS 主机名已切换: http://%s.local", host);
+                idf_logf("mDNS hostname changed: http://%s.local", host);
             }
         }
 
-        // recv 超时约 1s 一轮：网卡一变立即迁移；每 60s 强制刷新对抗 snooping 老化
+        // The one-second timeout follows interface changes; force refresh every 60s against snooping expiry.
         int64_t now_us = esp_timer_get_time();
         bool force = (now_us - last_refresh_us) >= 60000000LL;
         if (force) last_refresh_us = now_us;
@@ -882,7 +870,7 @@ static void mdns_sms_task(void*)
         newly_joined = refresh_membership(joined_ap, ap_addr(), force) || newly_joined;
         if (newly_joined) announce_left = 2;
         if (announce_left > 0) {
-            // 主动通告：相邻两次天然间隔≥1s(recv 超时节拍)
+            // Announcements are naturally at least one second apart.
             uint8_t ip[4] = {};
             if (mdns_pick_ip(0, ip)) {
                 MdnsAnswerPlan ann;
@@ -898,7 +886,7 @@ static void mdns_sms_task(void*)
         }
 
         if (len < 12) continue;
-        if (req[2] & 0xF8) continue;  // 忽略响应包(QR=1)与非标准 opcode
+        if (req[2] & 0xF8) continue;  // Ignore responses (QR=1) and nonstandard opcodes.
 
         uint16_t qd = (static_cast<uint16_t>(req[4]) << 8) | req[5];
         int pos = 12;
@@ -907,7 +895,7 @@ static void mdns_sms_task(void*)
         if (plan.legacy) plan.id = (static_cast<uint16_t>(req[0]) << 8) | req[1];
         for (uint16_t q = 0; q < qd && pos < len; ++q) {
             bool matched = mdns_query_matches_host(req, len, pos, name, name_len);
-            // 跳过名字：0xC0 开头的压缩指针是 2 字节终结符，不能当长度前缀
+            // A compression pointer beginning with 0xC0 is a two-byte terminator, not a length prefix.
             while (pos < len) {
                 uint8_t b = req[pos];
                 if (b == 0) { pos += 1; break; }
@@ -923,7 +911,7 @@ static void mdns_sms_task(void*)
             else if (qtype == 28) plan.wantNsec = true;
             else continue;
             if (plan.firstQtype == 0) plan.firstQtype = qtype;
-            if (qclass & 0x8000) plan.unicast = true;  // QU 位：请求单播应答
+            if (qclass & 0x8000) plan.unicast = true;  // QU requests unicast.
         }
         if (!plan.wantA && !plan.wantNsec) continue;
         if (plan.legacy) plan.unicast = true;
@@ -947,11 +935,11 @@ static void start_mdns_task_once()
 {
     bool expected = false;
     if (!s_mdns_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-    // 3456：resp 缓冲扩到 256(可配置主机名后应答报文变长) + 主机名缓存
+    // 3456 covers the 256-byte response required by configurable hostnames plus hostname cache.
     BaseType_t ok = xTaskCreate(mdns_sms_task, "idf_mdns", 3456, nullptr, 2, nullptr);
     if (ok != pdPASS) {
         s_mdns_task_started.store(false, std::memory_order_relaxed);
-        idf_log_line("mDNS responder 启动失败");
+        idf_log_line("mDNS responder failed to start");
     }
 }
 
@@ -980,24 +968,24 @@ static esp_err_t start_provisioning_ap(bool manual)
     if (ap.mode) {
         if (manual && !ap.manual) {
             set_ap_state(true, true, ap.ssid);
-            idf_log_line("BOOT长按触发：保留当前配网热点，已切为手动配网模式");
+            idf_log_line("BOOT long press: keeping current AP and switching to manual provisioning mode");
         }
         start_dns_task_once();
-        idf_logf("配网热点已开启，请访问 http://192.168.1.1/");
+        idf_logf("Provisioning AP started; visit http://192.168.1.1/");
         return ESP_OK;
     }
 
     uint8_t mac[6] = {};
     esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
     if (err != ESP_OK) {
-        idf_logf("配网热点启动失败: 读取 MAC 失败 %s", esp_err_to_name(err));
+        idf_logf("Provisioning AP failed: could not read MAC: %s", esp_err_to_name(err));
         return err;
     }
     char ssid[33];
     snprintf(ssid, sizeof(ssid), "%s%02X%02X%02X", AP_SSID_PREFIX, mac[3], mac[4], mac[5]);
     err = configure_ap_netif();
     if (err != ESP_OK) {
-        idf_logf("配网热点启动失败: 配置 AP IP 失败 %s", esp_err_to_name(err));
+        idf_logf("Provisioning AP failed: could not configure AP IP: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -1013,21 +1001,21 @@ static esp_err_t start_provisioning_ap(bool manual)
 
     err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
-        idf_logf("配网热点启动失败: 设置 APSTA 模式失败 %s", esp_err_to_name(err));
+        idf_logf("Provisioning AP failed: could not set APSTA mode: %s", esp_err_to_name(err));
         return err;
     }
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
     if (err != ESP_OK) {
-        idf_logf("配网热点启动失败: 设置 AP 参数失败 %s", esp_err_to_name(err));
+        idf_logf("Provisioning AP failed: could not set AP parameters: %s", esp_err_to_name(err));
         return err;
     }
     if (sta_can_connect()) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
     set_ap_state(true, manual, ssid);
     start_dns_task_once();
     ESP_LOGW(TAG, "%s: %s, http://192.168.1.1/",
-             manual ? "BOOT长按触发，已开启配网热点" : "已开启配网热点", ssid);
+             manual ? "BOOT long press started provisioning AP" : "Provisioning AP started", ssid);
     idf_logf("%s: %s, http://192.168.1.1/",
-             manual ? "BOOT长按触发，已开启配网热点" : "已开启配网热点", ssid);
+             manual ? "BOOT long press started provisioning AP" : "Provisioning AP started", ssid);
     return ESP_OK;
 }
 
@@ -1064,14 +1052,13 @@ static bool wifi_profile_password_valid(const std::string& pass)
 {
     if (pass.empty()) return true;
     if (pass.size() < 8 || pass.size() > 63) return false;
-    for (unsigned char ch : pass) {
-        if (ch < 0x20 || ch > 0x7E) return false;
-    }
-    return true;
+    return std::all_of(pass.begin(), pass.end(), [](unsigned char ch) {
+        return ch >= 0x20 && ch <= 0x7E;
+    });
 }
 
-// 应用凭据并发起 STA 连接(不等待结果)。开放网络必须绑定扫描命中的开放 BSSID，
-// 加密网络由驱动认证阈值拒绝同名开放热点，避免凭据降级到 evil twin。
+// Apply credentials and start STA without waiting. Open networks bind the scanned open BSSID; the driver
+// rejects same-name open APs for secured networks to prevent evil-twin downgrade.
 static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass,
                                         const wifi_ap_record_t* ap = nullptr)
 {
@@ -1110,7 +1097,7 @@ static esp_err_t wifi_disconnect_quietly()
     }
     esp_err_t err = esp_wifi_disconnect();
     if (err != ESP_OK) {
-        // 已经离线时没有事件可等；连接态仍报告失败则保留旧配置交给调用方恢复。
+        // Offline state has no event to await; if connected state still fails, preserve old configuration for caller recovery.
         return s_sta_connected.load(std::memory_order_relaxed) ? err : ESP_OK;
     }
     if (!s_wifi_event_group) return ESP_ERR_INVALID_STATE;
@@ -1160,7 +1147,7 @@ static esp_err_t wifi_scan_candidates(
         if (matched[i]) {
             candidates.push_back({i, best_by_profile[i].rssi, true});
         } else if (!nets[i].pass.empty() && wifi_profile_password_valid(nets[i].pass)) {
-            // 未广播 SSID 的加密网络可依靠 WPA2+ 阈值安全盲连；开放网络必须扫描命中后绑定 BSSID。
+            // Hidden secured networks can use the WPA2+ threshold; open networks require a scanned and bound BSSID.
             candidates.push_back({i, -128, false});
         }
     }
@@ -1168,10 +1155,8 @@ static esp_err_t wifi_scan_candidates(
     return ESP_OK;
 }
 
-// —— 历史 WiFi 扫描选网(取代固定顺序盲试，见 issue #9 讨论) ——
-// 存了多组网络时，先做一次约 2-3s 的全信道扫描，把结果与已存列表匹配，直连
-// 在场且信号最好的一组；扫描不到任何已存网络(隐藏 SSID 或全部不在场)时按轮转
-// 索引逐组兜底，避免每组各吃 20s 连接超时的顺序盲等。
+// Scan saved WiFi networks instead of blind fixed-order attempts (issue #9). Pick the strongest present match;
+// if none are visible, rotate through hidden or absent networks without serial 20s scan waits.
 static std::atomic<bool> s_select_running{false};
 static void wifi_select_task(void*)
 {
@@ -1190,11 +1175,11 @@ static void wifi_select_task(void*)
         std::array<wifi_ap_record_t, IDF_MAX_WIFI_NETWORKS> best_by_profile = {};
         esp_err_t scan_err = wifi_scan_candidates(nets, candidates, best_by_profile);
         if (scan_err != ESP_OK) {
-            ESP_LOGW(TAG, "选网扫描失败: %s", esp_err_to_name(scan_err));
+            ESP_LOGW(TAG, "Network-selection scan failed: %s", esp_err_to_name(scan_err));
             break;
         }
         if (candidates.empty()) {
-            idf_log_line("扫描未见匹配安全类型的已存 WiFi，跳过连接");
+            idf_log_line("No saved WiFi with matching security found; skipping connection");
             break;
         }
         uint32_t attempt = s_candidate_attempt.fetch_add(1, std::memory_order_relaxed);
@@ -1202,9 +1187,9 @@ static void wifi_select_task(void*)
             candidates[idf_wifi_candidate_position(candidates.size(), attempt)];
         const IdfWifiNetwork& net = nets[candidate.profileIndex];
         if (candidate.scanned) {
-            idf_logf("扫描命中已存 WiFi: %s (RSSI %d)，尝试连接", net.ssid.c_str(), candidate.rssi);
+            idf_logf("Saved WiFi found: %s (RSSI %d); connecting", net.ssid.c_str(), candidate.rssi);
         } else {
-            idf_logf("扫描未见该加密 WiFi，按隐藏网络尝试: %s", net.ssid.c_str());
+            idf_logf("Secured WiFi not visible; trying as hidden network: %s", net.ssid.c_str());
         }
         if (!idf_wifi_selector_can_apply(
                 generation, s_provisioning_generation.load(std::memory_order_acquire),
@@ -1215,7 +1200,7 @@ static void wifi_select_task(void*)
             net.ssid, net.pass,
             candidate.scanned ? &best_by_profile[candidate.profileIndex] : nullptr);
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-            ESP_LOGW(TAG, "选网后连接发起失败: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "Connection failed to start after network selection: %s", esp_err_to_name(err));
         }
     } while (false);
     s_select_running.store(false, std::memory_order_relaxed);
@@ -1226,17 +1211,16 @@ static void start_wifi_select_once(void)
 {
     bool expected = false;
     if (!s_select_running.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
-    // 4096：扫描记录放堆上(vector)，但 esp_wifi 扫描 API + 字符串/日志格式化仍需余量
+    // 4096: scan records are on the heap, but esp_wifi scan APIs and log formatting still need stack headroom.
     if (xTaskCreate(wifi_select_task, "idf_wifi_sel", 4096, nullptr, 2, nullptr) != pdPASS) {
         s_select_running.store(false, std::memory_order_relaxed);
-        idf_log_line("WiFi 选网任务启动失败，按当前配置直连");
+        idf_log_line("WiFi selection task failed to start; connecting with current configuration");
         if (sta_can_connect()) esp_wifi_connect();
     }
 }
 
-// 只发起 STA 连接不等待结果；首连成败由 sta_connect_watch_task 后台判定。
-// 这样 app_main 不再被首连(最长 20s)阻塞，Web/推送/模组/短信与 WiFi 连接并行启动。
-// 单组加密网络直连(免扫描且兼容隐藏 SSID)；多组或开放网络走扫描选网任务。
+// Start STA without waiting; sta_connect_watch_task decides the result so startup continues in parallel.
+// Connect one secured network directly for hidden-SSID support; scan for multiple or open networks.
 static esp_err_t connect_sta_begin(const IdfConfig& config)
 {
     int count = 0;
@@ -1244,19 +1228,19 @@ static esp_err_t connect_sta_begin(const IdfConfig& config)
         if (!config.wifiNetworks[i].ssid.empty()) ++count;
     }
     if (count > 1 || config.wifiNetworks[0].pass.empty()) {
-        idf_logf("已存 %d 组 WiFi，扫描选择在场信号最好的网络…", count);
+        idf_logf("%d WiFi networks saved; scanning for the strongest available", count);
         start_wifi_select_once();
         return ESP_OK;
     }
     const IdfWifiNetwork& net = config.wifiNetworks[0];
     esp_err_t err = wifi_apply_and_connect(net.ssid, net.pass);
     if (err != ESP_OK) return err;
-    ESP_LOGI(TAG, "连接 WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
-    idf_logf("连接 WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    ESP_LOGI(TAG, "Connecting WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
+    idf_logf("Connecting WiFi: %s%s", net.ssid.c_str(), config.wifiFromFallback ? " (fallback)" : "");
     return ESP_OK;
 }
 
-// 等待首连结果：成功清 AP 态；20s 超时回退配网 AP(与原同步逻辑一致)
+// Wait for first connection: success clears AP state; a 20s timeout falls back to provisioning AP.
 static void sta_wait_first_connect(void)
 {
     EventBits_t bits = xEventGroupWaitBits(
@@ -1265,8 +1249,8 @@ static void sta_wait_first_connect(void)
     if (bits & WIFI_CONNECTED_BIT) {
         set_ap_state(false, false, std::string());
     } else {
-        ESP_LOGW(TAG, "WiFi 首次连接超时，进入 APSTA 配网模式");
-        idf_log_line("WiFi 首次连接超时，进入 APSTA 配网模式");
+        ESP_LOGW(TAG, "Initial WiFi connection timed out; entering APSTA provisioning mode");
+        idf_log_line("Initial WiFi connection timed out; entering APSTA provisioning mode");
         ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
     }
 }
@@ -1298,10 +1282,10 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return ESP_ERR_NO_MEM;
     }
 
-    // hostname 已由配置层校验；空值只可能来自旧调用方，沿用既有 sms fallback。
-    const std::string& hostname = config.hostname.empty() ? std::string("sms") : config.hostname;
+    // Configuration validates hostname; only legacy callers can pass empty, so retain the sms fallback.
+    const std::string hostname = config.hostname.empty() ? std::string("sms") : config.hostname;
     esp_err_t hostname_err = esp_netif_set_hostname(s_sta_netif, hostname.c_str());
-    if (hostname_err != ESP_OK) idf_logf("设置 DHCP 主机名失败: %s", esp_err_to_name(hostname_err));
+    if (hostname_err != ESP_OK) idf_logf("Failed to set DHCP hostname: %s", esp_err_to_name(hostname_err));
 
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     bool wifi_inited = false;
@@ -1310,7 +1294,7 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
     esp_err_t err = esp_wifi_init(&init_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(err));
-        idf_logf("WiFi 初始化失败: %s", esp_err_to_name(err));
+        idf_logf("WiFi initialization failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(false, false, false);
         return err;
     }
@@ -1318,21 +1302,21 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
     err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_storage failed: %s", esp_err_to_name(err));
-        idf_logf("WiFi 存储模式配置失败: %s", esp_err_to_name(err));
+        idf_logf("WiFi storage-mode configuration failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     err = esp_wifi_set_ps(WIFI_PS_NONE);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_ps failed: %s", esp_err_to_name(err));
-        idf_logf("WiFi 省电模式配置失败: %s", esp_err_to_name(err));
+        idf_logf("WiFi power-save configuration failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     err = esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, nullptr);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WIFI_EVENT handler register failed: %s", esp_err_to_name(err));
-        idf_logf("WiFi 事件处理器注册失败: %s", esp_err_to_name(err));
+        idf_logf("WiFi event-handler registration failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(wifi_inited, false, false);
         return err;
     }
@@ -1340,7 +1324,7 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
     err = esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, nullptr);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "IP_EVENT handler register failed: %s", esp_err_to_name(err));
-        idf_logf("IP 事件处理器注册失败: %s", esp_err_to_name(err));
+        idf_logf("IP event-handler registration failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, false);
         return err;
     }
@@ -1348,26 +1332,26 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
-        idf_logf("WiFi 启动失败: %s", esp_err_to_name(err));
+        idf_logf("WiFi startup failed: %s", esp_err_to_name(err));
         cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
         return err;
     }
     s_started.store(true, std::memory_order_relaxed);
-    // SuperMini 板载天线默认 8.5dBm 最稳；射频条件更好的硬件可从网页选择更高档位。
+    // The SuperMini antenna is most stable at 8.5dBm; better RF hardware can select a higher Web setting.
     err = idf_wifi_set_tx_power(config.wifiTxPowerQuarterDbm);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_max_tx_power failed: %s", esp_err_to_name(err));
-        idf_logf("设置 WiFi 发射功率失败: %s", esp_err_to_name(err));
+        idf_logf("Failed to set WiFi transmit power: %s", esp_err_to_name(err));
     }
     start_mdns_task_once();
-    // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t(~132B) + 日志格式化缓冲
+    // 3072 covers wifi_config_t (~132B) plus log formatting in start_provisioning_ap.
     {
         bool expected = false;
         if (s_button_task_started.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
             BaseType_t ok = xTaskCreate(provision_button_task, "idf_boot_ap", 3072, nullptr, 2, nullptr);
             if (ok != pdPASS) {
                 s_button_task_started.store(false, std::memory_order_relaxed);
-                idf_log_line("BOOT 配网按键任务启动失败");
+                idf_log_line("BOOT provisioning-button task failed to start");
             }
         }
     }
@@ -1383,27 +1367,27 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         if (esp_timer_create(&targs, &s_reconnect_timer) == ESP_OK) {
             esp_timer_start_periodic(s_reconnect_timer, 15ULL * 1000 * 1000);
         } else {
-            idf_log_line("WiFi 重连看门狗创建失败");
+            idf_log_line("Could not create WiFi reconnect watchdog");
         }
     }
 
     if (config.wifiNetworks[0].ssid.empty()) {
-        ESP_LOGW(TAG, "未配置 WiFi，进入配网 AP");
-        idf_log_line("未配置 WiFi，进入配网 AP");
+        ESP_LOGW(TAG, "WiFi is not configured; entering provisioning AP");
+        idf_log_line("WiFi is not configured; entering provisioning AP");
         return start_provisioning_ap(false);
     }
 
     err = connect_sta_begin(config);
     if (err != ESP_OK) {
-        // 连接发起即失败(set_mode/set_config/connect 错误)：记录真实错误码后直接回退配网
-        ESP_LOGW(TAG, "WiFi 连接发起失败(%s)，进入 APSTA 配网模式", esp_err_to_name(err));
-        idf_logf("WiFi 连接发起失败(%s)，进入 APSTA 配网模式", esp_err_to_name(err));
+        // On immediate set_mode/set_config/connect failure, log the real error and fall back to provisioning.
+        ESP_LOGW(TAG, "WiFi connection failed to start (%s); entering APSTA provisioning mode", esp_err_to_name(err));
+        idf_logf("WiFi connection failed to start (%s); entering APSTA provisioning mode", esp_err_to_name(err));
         ESP_ERROR_CHECK_WITHOUT_ABORT(start_provisioning_ap(false));
         return ESP_OK;
     }
-    // 3072：任务里 start_provisioning_ap 会用到 wifi_config_t + 日志格式化缓冲
+    // 3072 covers wifi_config_t plus log formatting in start_provisioning_ap.
     if (xTaskCreate(sta_connect_watch_task, "idf_sta_watch", 3072, nullptr, 2, nullptr) != pdPASS) {
-        sta_wait_first_connect();  // 任务创建失败退回同步等待，保证配网回退不丢
+        sta_wait_first_connect();  // Fall back to synchronous wait so provisioning fallback is preserved.
     }
     return ESP_OK;
 }
@@ -1411,14 +1395,14 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
 esp_err_t idf_wifi_resync_ntp(void)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
-    if (!s_sta_connected.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;  // 未联网无法校时
-    s_ntp_manual_us.store(esp_timer_get_time(), std::memory_order_relaxed);  // 手动校时的结果要打日志
+    if (!s_sta_connected.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;  // Cannot sync while offline.
+    s_ntp_manual_us.store(esp_timer_get_time(), std::memory_order_relaxed);  // Log manual-sync results.
     if (!s_sntp_started.load(std::memory_order_relaxed)) {
-        start_sntp_once();  // 尚未启动则启动(内部会立即发起一次请求)
-        idf_logf("网页触发 NTP 校时：SNTP 已启动");
+        start_sntp_once();  // Start SNTP and issue the first request immediately.
+        idf_logf("Web UI requested NTP sync; SNTP started");
     } else {
-        esp_sntp_restart();  // 已启动则强制立即重新同步
-        idf_logf("网页触发 NTP 立即校时");
+        esp_sntp_restart();  // Force immediate resynchronization.
+        idf_logf("Web UI requested immediate NTP sync");
     }
     return ESP_OK;
 }
@@ -1455,7 +1439,7 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     if (!lease) return ESP_ERR_INVALID_STATE;
     if (s_ap_close_timer) esp_timer_stop(s_ap_close_timer);
 
-    // 保持 APSTA：配网页仍连在热点上，连上后由 IP 事件调度延时关热点(见 wifi_event_handler)
+    // Keep APSTA so the page remains connected; the IP event schedules delayed AP shutdown.
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) return err;
 
@@ -1484,12 +1468,14 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
         if (!cache_ready || !idf_wifi_find_cached_open_ap(scanned, ssid, selected_bssid)) {
             return cache_ready ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_STATE;
         }
-        for (const wifi_ap_record_t& record : cached_records) {
-            if (memcmp(record.bssid, selected_bssid.data(), selected_bssid.size()) == 0) {
-                ap = record;
-                selected = &ap;
-                break;
-            }
+        const auto record = std::find_if(cached_records.begin(), cached_records.end(),
+                                         [&](const wifi_ap_record_t& candidate) {
+                                             return memcmp(candidate.bssid, selected_bssid.data(),
+                                                           selected_bssid.size()) == 0;
+                                         });
+        if (record != cached_records.end()) {
+            ap = *record;
+            selected = &ap;
         }
         if (!selected) return ESP_ERR_NOT_FOUND;
     }
@@ -1511,7 +1497,7 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
         if (previous_has_credentials && previous_configured) esp_wifi_connect();
     };
 
-    // 先让旧配网代次失效，再断开；这样排队中的旧 GOT_IP 不会关闭当前热点。
+    // Invalidate the old provisioning generation before disconnecting so a queued old GOT_IP cannot close the current AP.
     s_sta_configured.store(false, std::memory_order_relaxed);
     replace_provisioning_target(ProvisioningTarget());
     err = wifi_disconnect_quietly();
@@ -1530,7 +1516,7 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
             restore_previous();
             return ESP_ERR_INVALID_STATE;
         }
-        selected = &ap;  // 开放网络只有扫描命中并绑定 BSSID 后才允许连接
+        selected = &ap;  // Open networks require a scanned and bound BSSID.
     }
 
     s_has_sta_credentials.store(true, std::memory_order_relaxed);
@@ -1541,8 +1527,8 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
         restore_previous();
         return err;
     }
-    ESP_LOGI(TAG, "配网：保存并连接 %s", ssid.c_str());
-    idf_logf("配网热点内保存 WiFi 并尝试连接: %s", ssid.c_str());
+    ESP_LOGI(TAG, "Provisioning: saving and connecting %s", ssid.c_str());
+    idf_logf("Saved WiFi in provisioning AP and connecting: %s", ssid.c_str());
     return err;
 }
 
@@ -1561,7 +1547,7 @@ static std::string wifi_scan_records_json(const std::vector<wifi_ap_record_t>& r
             const char* other = reinterpret_cast<const char*>(records[k].ssid);
             if (strcmp(ssid, other) != 0) continue;
             if (records[k].rssi > records[i].rssi ||
-                (records[k].rssi == records[i].rssi && k < i)) {
+                (k < i && records[k].rssi == records[i].rssi)) {
                 duplicate = true;
                 break;
             }
@@ -1636,7 +1622,7 @@ esp_err_t idf_wifi_scan_request(void)
         }
         return public_scan_error(err);
     }
-    lease.detach();  // SCAN_DONE 收集任务释放跨任务持有的扫描/连接操作权
+    lease.detach();  // SCAN_DONE collector releases scan/connection ownership held across tasks.
     return ESP_OK;
 }
 

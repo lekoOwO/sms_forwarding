@@ -10,6 +10,7 @@ idf_component_register(
 # Configuration copies must stay off the FreeRTOS task stack.  Keep a hard
 # frame-size guard on both codec and public update entrypoints.
 target_compile_options(${COMPONENT_LIB} PRIVATE "-Werror=frame-larger-than=4096")
+target_compile_options(${COMPONENT_LIB} PRIVATE "-fexceptions")
 
 if(EXISTS "${PROJECT_DIR}/code/wifi_config.h")
   target_include_directories(${COMPONENT_LIB} PRIVATE "${PROJECT_DIR}/code")
