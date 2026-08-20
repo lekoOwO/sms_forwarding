@@ -719,6 +719,7 @@ bool loadLegacy(IdfConfig& value, bool& existed)
     str("kaUrl", value.kaUrl, MAX_KEEPALIVE_URL_BYTES);
     str("kaProfile", value.kaProfile, MAX_KEEPALIVE_PROFILE_BYTES);
     if (ok) ok = readLegacyU32Alias(nvs, "kaLast", "kaBaseDate", value.kaLastTime, value.kaLastTime);
+    integer("tzMin", value.tzOffsetMin, 480);
     boolean("roamEn", value.roamingEnabled, false);
     str("apn", value.apn, MAX_APN_BYTES);
     str("opPlmn", value.operatorPlmn, MAX_OPERATOR_PLMN_BYTES);

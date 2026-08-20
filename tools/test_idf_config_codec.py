@@ -273,6 +273,7 @@ int main() {
     fake_legacy_i32["kaIntervalDays"] = 60;
     fake_legacy_i32["kaTraffic"] = 1;
     fake_legacy_u32["kaBaseDate"] = 1700000000;
+    fake_legacy_i32["tzMin"] = -300;
     IdfConfig legacy_config;
     bool legacy_existed = false;
     require(loadLegacy(legacy_config, legacy_existed));
@@ -285,6 +286,16 @@ int main() {
             legacy_config.heartbeatInterval == 24);
     require(!legacy_config.kaEnabled && legacy_config.kaIntervalDays == 60 &&
             legacy_config.kaTrafficKB == 1 && legacy_config.kaLastTime == 1700000000);
+    require(legacy_config.tzOffsetMin == -300);
+    std::vector<uint8_t> migrated_tz_blob;
+    require(encodeV6(legacy_config, 1, migrated_tz_blob));
+    IdfConfig migrated_tz_config;
+    uint16_t migrated_tz_schema = 0;
+    uint32_t migrated_tz_generation = 0;
+    require(decodeBlob(migrated_tz_blob, migrated_tz_config, migrated_tz_schema,
+                       migrated_tz_generation) == DecodeResult::Valid);
+    require(migrated_tz_schema == CONFIG_SCHEMA_VERSION &&
+            migrated_tz_config.tzOffsetMin == -300);
     IdfConfig overlay = defaults();
     require(overlayLegacyConnectivity(overlay));
     require(overlay.wifiNetworks[0].ssid == "develop-wifi" &&
@@ -292,9 +303,17 @@ int main() {
             overlay.networkMode == NETWORK_MODE_MIX && !overlay.heartbeatEnable &&
             overlay.heartbeatInterval == 24);
 
-    fake_legacy_i32["emailEn"] = 1;
     IdfConfig wrong_bool_type;
     bool wrong_bool_existed = false;
+    fake_legacy_i32.erase("tzMin");
+    fake_legacy_u8["tzMin"] = 1;
+    require(!loadLegacy(wrong_bool_type, wrong_bool_existed));
+    fake_legacy_u8.erase("tzMin");
+    fake_legacy_i32["tzMin"] = 841;
+    require(!loadLegacy(wrong_bool_type, wrong_bool_existed));
+    fake_legacy_i32["tzMin"] = -300;
+
+    fake_legacy_i32["emailEn"] = 1;
     require(!loadLegacy(wrong_bool_type, wrong_bool_existed));
     fake_legacy_i32.erase("emailEn");
     fake_legacy_u8["emailEn"] = 2;
