@@ -65,7 +65,7 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 
 `idf_config` 將設定保存在 `appcfg` NVS 的雙槽格式。每次更新會先完成編碼與讀回驗證，再更新有效 marker。
 
-`dev_doc/config-schema/manifest.json` 是格式的手寫來源。版本化 JSON Schema 保留舊版讀取邊界，目前版本為 v5。
+`dev_doc/config-schema/manifest.json` 是格式的手寫來源。版本化 JSON Schema 保留 v1-v5 相容讀取邊界。目前版本為 v6，並追加 `kaTrafficKB`。
 
 可攜備份使用 `.smscfg`。檔案以 PBKDF2-SHA256 與 AES-256-GCM 加密，最大長度為 32,828 bytes。
 

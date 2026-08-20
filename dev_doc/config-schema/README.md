@@ -5,16 +5,17 @@ little-endian, the 20-byte CFG2 header is included in the 32,768-byte binary
 limit, and the encrypted envelope is at most 32,828 bytes (44-byte envelope
 header plus the payload and 16-byte GCM tag).
 
-`v1.json` through `v4.json` are immutable compatibility fixtures. `v5.json` is
-the current native ESP-IDF schema. Every variable-length string is bounded by
-`x-maxUtf8Bytes`; fixed arrays contain exactly their declared item count.
-The legacy ESP-IDF `webUser`/`webPass` pair is migration-only and is copied to
-`webAccounts[0]`; neither field is encoded in v5.
+`v1.json` through `v5.json` are compatibility fixtures. `v6.json` is the
+current native ESP-IDF schema and appends `kaTrafficKB`. Every variable-length
+string is bounded by `x-maxUtf8Bytes`; fixed arrays contain exactly their
+declared item count. The legacy ESP-IDF `webUser`/`webPass` pair is
+migration-only and is copied to `webAccounts[0]`; neither field is encoded in
+v6.
 
-The v5 wire-size metadata uses a 2-byte string-length prefix, a 1-byte count
+The v6 wire-size metadata uses a 2-byte string-length prefix, a 1-byte count
 for each fixed array, and 1-byte booleans or 4-byte integers. The worst-case
-CFG2 payload is 26,732 bytes; with its 20-byte header the encoded binary is
-26,752 bytes, leaving 6,016 bytes under the 32,768-byte limit. Push template
+CFG2 payload is 26,736 bytes; with its 20-byte header the encoded binary is
+26,756 bytes, leaving 6,012 bytes under the 32,768-byte limit. Push template
 alternatives are counted exclusively because custom channels use `customBody`
 instead of title/body templates.
 
