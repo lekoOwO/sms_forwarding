@@ -62,3 +62,19 @@ bool idf_wifi_find_cached_open_ap(const std::vector<IdfWifiScannedAp>& records,
     bssid_out = best->bssid;
     return true;
 }
+
+bool idf_wifi_recovery_ap_due(const IdfWifiRecoveryPolicy& policy)
+{
+    if (policy.apStarted || policy.staConnected || !policy.staConfigured ||
+        policy.apMode || policy.provisioning || policy.selectorActive) {
+        return false;
+    }
+    if (policy.outageSinceUs < 0 || policy.outageGeneration != policy.currentGeneration ||
+        policy.nowUs < policy.outageSinceUs ||
+        policy.nowUs - policy.outageSinceUs < IDF_WIFI_RECOVERY_AP_AFTER_US) {
+        return false;
+    }
+    return policy.lastApAttemptUs < 0 ||
+           (policy.nowUs >= policy.lastApAttemptUs &&
+            policy.nowUs - policy.lastApAttemptUs >= IDF_WIFI_RECOVERY_AP_AFTER_US);
+}

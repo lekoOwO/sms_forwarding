@@ -1,4 +1,7 @@
 code/wifi_config.h
+/.secrets/
+/.svelte-kit/
+__pycache__/
 
 # ESP-IDF 编译产物：统一只允许输出到 build/，且不纳入版本库
 /build/**

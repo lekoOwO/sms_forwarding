@@ -42,9 +42,12 @@ static constexpr const char* AP_PASSWORD = "sms-forwarder-setup";
 static constexpr gpio_num_t PROVISION_BUTTON_PIN = GPIO_NUM_9;
 static constexpr uint32_t PROVISION_BUTTON_HOLD_MS = 5000;
 static constexpr uint16_t WIFI_SCAN_RECORD_LIMIT = 40;
+static constexpr uint32_t WIFI_RECOVERY_SYNC_TIMEOUT_MS = 2000;
 
 static EventGroupHandle_t s_wifi_event_group = nullptr;
 static SemaphoreHandle_t s_state_mutex = nullptr;
+static SemaphoreHandle_t s_recovery_mutex = nullptr;
+static SemaphoreHandle_t s_wifi_driver_mutex = nullptr;
 static esp_netif_t* s_sta_netif = nullptr;
 static esp_netif_t* s_ap_netif = nullptr;
 static std::atomic<bool> s_started{false};
@@ -61,25 +64,85 @@ static std::atomic<bool> s_sta_connected{false};
 static std::atomic<bool> s_current_profile_open{false};
 static std::atomic<bool> s_scan_running{false};
 static std::atomic<bool> s_scan_refresh_pending{false};
+static std::atomic<int> s_scan_cleanup_error{ESP_ERR_NO_MEM};
+static std::atomic<bool> s_scan_cleanup_retry_pending{false};
+static std::atomic<bool> s_select_running{false};
 static bool s_scan_cache_ready = false;
 static esp_err_t s_scan_cache_error = ESP_OK;
 static std::string s_scan_cache_json = "[]";
 static std::array<wifi_ap_record_t, WIFI_SCAN_RECORD_LIMIT> s_scan_cache_records = {};
+static std::array<wifi_ap_record_t, WIFI_SCAN_RECORD_LIMIT> s_scan_collect_records = {};
 static uint16_t s_scan_cache_count = 0;
 static std::atomic<uint32_t> s_candidate_attempt{0};
 static std::atomic<int> s_disconnect_streak{0};
+static std::atomic<int64_t> s_sta_outage_since_us{-1};
+static std::atomic<uint32_t> s_sta_outage_generation{0};
+static std::atomic<bool> s_recovery_ap_started{false};
+static std::atomic<int64_t> s_recovery_ap_last_attempt_us{-1};
+static bool s_recovery_ap_inflight = false;  // Protected by s_recovery_mutex.
+static uint32_t s_recovery_claim_generation = 0;  // Protected by s_recovery_mutex.
+static std::atomic<bool> s_recovery_completion_retry_pending{false};
+static std::atomic<uint32_t> s_recovery_completion_generation{0};
+static std::atomic<bool> s_recovery_ap_close_failed{false};
 static std::atomic<int64_t> s_last_beacon_log_us{0};
 static std::atomic<uint32_t> s_suppressed_beacon_logs{0};
 static std::atomic<bool> s_suppress_next_connect_log{false};
 static esp_timer_handle_t s_reconnect_timer = nullptr;
 static char s_ntp_server[128] = "ntp.aliyun.com";
 static esp_timer_handle_t s_ap_close_timer = nullptr;
+static esp_timer_handle_t s_scan_cleanup_timer = nullptr;
+static std::atomic<bool> s_ap_close_pending{false};
+static std::atomic<uint32_t> s_provisioning_validation_generation{0};
 static std::atomic<bool> s_provisioning{false};  // Provisioning-page connection in progress; close AP after a delay on success.
 static constexpr uint32_t AP_PROVISION_HOLD_MS = 20000;  // Keep AP long enough for the page to display the IP.
 
+class WifiDriverOperation {
+public:
+    explicit WifiDriverOperation(TickType_t timeout, bool scan_owner = false)
+    {
+        if (!scan_owner && s_scan_running.load(std::memory_order_acquire)) return;
+        if (s_wifi_driver_mutex == nullptr) {
+            held_ = true;
+            return;
+        }
+        if (xSemaphoreTake(s_wifi_driver_mutex, timeout) != pdTRUE) return;
+        if (!scan_owner && s_scan_running.load(std::memory_order_acquire)) {
+            xSemaphoreGive(s_wifi_driver_mutex);
+            return;
+        }
+        held_ = true;
+    }
+
+    ~WifiDriverOperation()
+    {
+        if (held_ && s_wifi_driver_mutex) xSemaphoreGive(s_wifi_driver_mutex);
+    }
+
+    explicit operator bool() const { return held_; }
+
+private:
+    bool held_ = false;
+};
+
+static esp_err_t wifi_connect_locked()
+{
+    return esp_wifi_connect();
+}
+
+// Event callbacks must not wait behind a task that is synchronously changing mode/configuration.
+static esp_err_t wifi_connect_now()
+{
+    WifiDriverOperation operation(0);
+    if (!operation) return ESP_ERR_TIMEOUT;
+    return wifi_connect_locked();
+}
+
 static esp_err_t start_provisioning_ap(bool manual = false);
+static esp_err_t start_provisioning_ap_locked(bool manual, TickType_t state_timeout);
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data);
 static void schedule_ap_close(uint32_t delay_ms);
+static void schedule_scan_cleanup(esp_err_t err);
+static void scan_cleanup_timer_cb(void*);
 static void start_wifi_select_once(void);
 static void wifi_remember_task(void*);
 static void wifi_scan_collect_task(void*);
@@ -88,6 +151,12 @@ struct ApState {
     bool mode = false;
     bool manual = false;
     std::string ssid;
+};
+
+struct RecoveryClaim {
+    bool claimed = false;
+    bool ap_was_active = false;
+    uint32_t generation = 0;
 };
 
 struct ProvisioningTarget {
@@ -115,6 +184,11 @@ public:
     }
 
     explicit operator bool() const { return held_; }
+    void release()
+    {
+        if (held_) s_scan_running.store(false, std::memory_order_relaxed);
+        held_ = false;
+    }
     void detach() { held_ = false; }
 
 private:
@@ -126,18 +200,15 @@ static esp_err_t public_scan_error(esp_err_t err)
     return err == ESP_ERR_WIFI_STATE ? ESP_ERR_INVALID_STATE : err;
 }
 
-static ApState ap_state_snapshot()
+static bool ap_state_snapshot(ApState& state, TickType_t timeout)
 {
-    ApState state;
-    // The holder only performs a few assignments, so use portMAX_DELAY. A timed read could report an active AP
-    // as closed and break AP shutdown or response behavior.
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
-        state.mode = s_ap_mode;
-        state.manual = s_ap_manual_mode;
-        state.ssid = s_ap_ssid;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return state;
+    if (!s_state_mutex) return true;
+    if (xSemaphoreTake(s_state_mutex, timeout) != pdTRUE) return false;
+    state.mode = s_ap_mode;
+    state.manual = s_ap_manual_mode;
+    state.ssid = s_ap_ssid;
+    xSemaphoreGive(s_state_mutex);
+    return true;
 }
 
 static void set_ap_state(bool mode, bool manual, const std::string& ssid)
@@ -150,33 +221,39 @@ static void set_ap_state(bool mode, bool manual, const std::string& ssid)
     }
 }
 
-static ProvisioningTarget provisioning_target_snapshot()
+static bool provisioning_target_snapshot(ProvisioningTarget& target, TickType_t timeout)
 {
-    ProvisioningTarget target;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
-        target = s_provisioning_target;
-        xSemaphoreGive(s_state_mutex);
-    }
-    return target;
+    if (!s_state_mutex) return true;
+    if (xSemaphoreTake(s_state_mutex, timeout) != pdTRUE) return false;
+    target = s_provisioning_target;
+    xSemaphoreGive(s_state_mutex);
+    return true;
 }
 
-static uint32_t replace_provisioning_target(const ProvisioningTarget& target)
+static uint32_t replace_provisioning_target(const ProvisioningTarget& target, TickType_t timeout)
 {
+    bool state_locked = false;
+    if (s_state_mutex) {
+        if (xSemaphoreTake(s_state_mutex, timeout) != pdTRUE) return 0;
+        state_locked = true;
+    }
     s_provisioning.store(false, std::memory_order_release);
     uint32_t generation = s_provisioning_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+    {
         s_provisioning_target = target;
         s_provisioning_target.generation = generation;
+    }
+    if (state_locked) {
         xSemaphoreGive(s_state_mutex);
     }
     s_provisioning.store(target.active, std::memory_order_release);
     return generation;
 }
 
-static bool complete_provisioning_target(uint32_t generation)
+static bool complete_provisioning_target(uint32_t generation, TickType_t timeout)
 {
     bool completed = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, timeout) == pdTRUE) {
         if (s_provisioning_target.active && s_provisioning_target.generation == generation) {
             s_provisioning_target = ProvisioningTarget();
             s_provisioning_target.generation =
@@ -189,10 +266,10 @@ static bool complete_provisioning_target(uint32_t generation)
     return completed;
 }
 
-static bool bind_provisioning_bssid(uint32_t generation, const uint8_t bssid[6])
+static bool bind_provisioning_bssid(uint32_t generation, const uint8_t bssid[6], TickType_t timeout)
 {
     bool bound = false;
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, timeout) == pdTRUE) {
         if (s_provisioning_target.active && s_provisioning_target.generation == generation) {
             memcpy(s_provisioning_target.bssid.data(), bssid, s_provisioning_target.bssid.size());
             s_provisioning_target.bssidSet = true;
@@ -203,16 +280,95 @@ static bool bind_provisioning_bssid(uint32_t generation, const uint8_t bssid[6])
     return bound;
 }
 
+enum class ProvisioningValidationResult {
+    NoAction,
+    Retry,
+    Matched,
+};
+
+// Caller holds WifiDriverOperation. The target and AP snapshot are checked again so a stale GOT_IP
+// cannot close a manual AP or a newer provisioning target.
+static ProvisioningValidationResult validate_provisioning_target_locked(uint32_t generation)
+{
+    if (!s_provisioning.load(std::memory_order_acquire)) return ProvisioningValidationResult::NoAction;
+    ProvisioningTarget target;
+    ApState ap;
+    const TickType_t timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    if (!provisioning_target_snapshot(target, timeout) || !ap_state_snapshot(ap, timeout)) {
+        return ProvisioningValidationResult::Retry;
+    }
+    if (!target.active || target.generation != generation || !ap.mode || ap.manual) {
+        return ProvisioningValidationResult::NoAction;
+    }
+
+    wifi_ap_record_t connected_ap = {};
+    if (esp_wifi_sta_get_ap_info(&connected_ap) != ESP_OK) {
+        return ProvisioningValidationResult::Retry;
+    }
+    std::array<uint8_t, 6> connected_bssid = {};
+    memcpy(connected_bssid.data(), connected_ap.bssid, connected_bssid.size());
+    if (!idf_wifi_provision_target_matches(
+            target.ssid, target.bssidSet, target.bssid,
+            reinterpret_cast<const char*>(connected_ap.ssid), connected_bssid)) {
+        return ProvisioningValidationResult::NoAction;
+    }
+    return complete_provisioning_target(generation, timeout)
+               ? ProvisioningValidationResult::Matched
+               : ProvisioningValidationResult::Retry;
+}
+
 // Delay AP shutdown after provisioning succeeds so the page can display the IP before switching to STA-only.
 static void ap_close_timer_cb(void*)
 {
-    if (s_provisioning.load(std::memory_order_acquire)) return;
-    if (!ap_state_snapshot().mode) return;  // Already closed.
+    const uint32_t validation_generation =
+        s_provisioning_validation_generation.exchange(0, std::memory_order_acq_rel);
+    if (validation_generation != 0) {
+        WifiDriverOperation operation(0);
+        if (!operation) {
+            s_provisioning_validation_generation.store(validation_generation, std::memory_order_release);
+            schedule_ap_close(1000);
+            return;
+        }
+        const ProvisioningValidationResult result =
+            validate_provisioning_target_locked(validation_generation);
+        if (result == ProvisioningValidationResult::Retry) {
+            s_provisioning_validation_generation.store(validation_generation, std::memory_order_release);
+            schedule_ap_close(1000);
+        } else if (result == ProvisioningValidationResult::Matched) {
+            schedule_ap_close(AP_PROVISION_HOLD_MS);
+            idf_logf("Provisioning connection succeeded; AP closes in %lu seconds",
+                     static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+        } else {
+            s_ap_close_pending.store(false, std::memory_order_release);
+        }
+        return;
+    }
+    if (s_provisioning.load(std::memory_order_acquire)) {
+        schedule_ap_close(1000);
+        return;
+    }
+    WifiDriverOperation operation(0);
+    if (!operation) {
+        schedule_ap_close(1000);
+        return;
+    }
+    ApState ap;
+    if (!ap_state_snapshot(ap, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+        schedule_ap_close(1000);
+        return;
+    }
+    if (!ap.mode || ap.manual || s_provisioning.load(std::memory_order_acquire)) {
+        s_ap_close_pending.store(false, std::memory_order_release);
+        return;
+    }
     if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
         set_ap_state(false, false, std::string());
+        s_ap_close_pending.store(false, std::memory_order_release);
         char host[33] = {};
         idf_config_copy_mdns_host(host, sizeof(host));
         idf_logf("Provisioning AP closed; use the device IP or http://%s.local", host);
+    } else {
+        schedule_ap_close(1000);
     }
 }
 
@@ -227,18 +383,216 @@ static void schedule_ap_close(uint32_t delay_ms)
             .skip_unhandled_events = true,
         };
         if (esp_timer_create(&targs, &s_ap_close_timer) != ESP_OK) {
-            ap_close_timer_cb(nullptr);  // Close immediately if timer creation fails to avoid remaining in AP mode.
+            s_ap_close_pending.store(true, std::memory_order_release);
             return;
         }
     }
     esp_timer_stop(s_ap_close_timer);
-    esp_timer_start_once(s_ap_close_timer, static_cast<uint64_t>(delay_ms) * 1000ULL);
+    if (esp_timer_start_once(s_ap_close_timer, static_cast<uint64_t>(delay_ms) * 1000ULL) != ESP_OK) {
+        s_ap_close_pending.store(true, std::memory_order_release);
+        return;
+    }
+    s_ap_close_pending.store(false, std::memory_order_release);
+}
+
+static void schedule_scan_cleanup(esp_err_t err)
+{
+    s_scan_cleanup_error.store(static_cast<int>(err), std::memory_order_relaxed);
+    if (!s_scan_cleanup_timer) {
+        s_scan_cleanup_retry_pending.store(true, std::memory_order_release);
+        return;
+    }
+    esp_timer_stop(s_scan_cleanup_timer);
+    if (esp_timer_start_once(s_scan_cleanup_timer, 1000ULL * 1000ULL) != ESP_OK) {
+        s_scan_cleanup_retry_pending.store(true, std::memory_order_release);
+        return;
+    }
+    s_scan_cleanup_retry_pending.store(false, std::memory_order_release);
 }
 
 static bool sta_can_connect()
 {
     return s_has_sta_credentials.load(std::memory_order_relaxed) &&
            s_sta_configured.load(std::memory_order_relaxed);
+}
+
+static bool close_recovery_ap_if_active_locked(
+    TickType_t timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))
+{
+    ApState ap;
+    if (!ap_state_snapshot(ap, timeout)) return false;
+    if (!ap.mode || ap.manual || s_provisioning.load(std::memory_order_acquire)) return true;
+    if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
+        set_ap_state(false, false, std::string());
+        idf_log_line("Recovery provisioning AP cancelled");
+        return true;
+    }
+    return false;
+}
+
+static bool close_recovery_ap_if_active(TickType_t timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))
+{
+    WifiDriverOperation operation(timeout);
+    if (!operation) return false;
+    return close_recovery_ap_if_active_locked(timeout);
+}
+
+// Invalidate recovery before an intentional/configuration state change. The AP close is kept outside
+// the recovery lock because esp_wifi_set_mode can synchronously deliver events back to this component.
+static bool reset_recovery_state(bool close_ap, bool driver_locked = false,
+                                 TickType_t timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))
+{
+    bool close_started_ap = false;
+    if (s_recovery_mutex && xSemaphoreTake(s_recovery_mutex, timeout) == pdTRUE) {
+        close_started_ap = close_ap && s_recovery_ap_started.load(std::memory_order_relaxed);
+        s_recovery_ap_inflight = false;
+        s_recovery_claim_generation = 0;
+        s_recovery_completion_generation.store(0, std::memory_order_relaxed);
+        s_recovery_completion_retry_pending.store(false, std::memory_order_release);
+        s_sta_outage_since_us.store(-1, std::memory_order_relaxed);
+        s_sta_outage_generation.fetch_add(1, std::memory_order_relaxed);
+        s_recovery_ap_started.store(false, std::memory_order_relaxed);
+        s_recovery_ap_last_attempt_us.store(-1, std::memory_order_relaxed);
+        s_recovery_ap_close_failed.store(false, std::memory_order_relaxed);
+        xSemaphoreGive(s_recovery_mutex);
+    } else if (s_recovery_mutex) {
+        return false;
+    } else {
+        s_recovery_ap_inflight = false;
+        s_recovery_claim_generation = 0;
+        s_recovery_completion_generation.store(0, std::memory_order_relaxed);
+        s_recovery_completion_retry_pending.store(false, std::memory_order_release);
+        s_sta_outage_since_us.store(-1, std::memory_order_relaxed);
+        s_sta_outage_generation.fetch_add(1, std::memory_order_relaxed);
+        s_recovery_ap_started.store(false, std::memory_order_relaxed);
+        s_recovery_ap_last_attempt_us.store(-1, std::memory_order_relaxed);
+    }
+    if (close_started_ap && !(driver_locked ? close_recovery_ap_if_active_locked(timeout)
+                                             : close_recovery_ap_if_active(timeout))) {
+        s_recovery_ap_close_failed.store(true, std::memory_order_relaxed);
+    }
+    return !s_recovery_ap_close_failed.load(std::memory_order_relaxed);
+}
+
+static RecoveryClaim claim_recovery_ap_if_due(int64_t now_us, uint32_t outage_generation,
+                                              TickType_t timeout)
+{
+    RecoveryClaim claim;
+    if (!s_recovery_mutex || xSemaphoreTake(s_recovery_mutex, timeout) != pdTRUE) return claim;
+
+    if (!s_recovery_ap_inflight) {
+        ApState ap;
+        if (!ap_state_snapshot(ap, timeout)) {
+            xSemaphoreGive(s_recovery_mutex);
+            return claim;
+        }
+        const IdfWifiRecoveryPolicy policy = {
+            now_us,
+            s_sta_outage_since_us.load(std::memory_order_relaxed),
+            outage_generation,
+            s_sta_outage_generation.load(std::memory_order_relaxed),
+            s_recovery_ap_last_attempt_us.load(std::memory_order_relaxed),
+            s_recovery_ap_started.load(std::memory_order_relaxed),
+            s_sta_connected.load(std::memory_order_relaxed),
+            s_sta_configured.load(std::memory_order_relaxed),
+            ap.mode,
+            s_provisioning.load(std::memory_order_acquire),
+            s_select_running.load(std::memory_order_relaxed),
+        };
+        if (idf_wifi_recovery_ap_due(policy)) {
+            s_recovery_ap_inflight = true;
+            s_recovery_claim_generation = policy.currentGeneration;
+            s_recovery_ap_last_attempt_us.store(now_us, std::memory_order_relaxed);
+            s_recovery_ap_close_failed.store(false, std::memory_order_relaxed);
+            claim.claimed = true;
+            claim.ap_was_active = ap.mode;
+            claim.generation = policy.currentGeneration;
+        }
+    }
+
+    xSemaphoreGive(s_recovery_mutex);
+    return claim;
+}
+
+static bool recovery_claim_is_current(const RecoveryClaim& claim,
+                                      TickType_t timeout)
+{
+    if (!s_recovery_mutex || xSemaphoreTake(s_recovery_mutex, timeout) != pdTRUE) return false;
+    const bool current =
+        s_recovery_ap_inflight && s_recovery_claim_generation == claim.generation &&
+        s_sta_outage_generation.load(std::memory_order_relaxed) == claim.generation &&
+        s_sta_configured.load(std::memory_order_relaxed) &&
+        !s_sta_connected.load(std::memory_order_relaxed) &&
+        !s_provisioning.load(std::memory_order_acquire);
+    xSemaphoreGive(s_recovery_mutex);
+    return current;
+}
+
+static bool finish_recovery_ap_claim(const RecoveryClaim& claim, esp_err_t ap_err,
+                                     bool driver_locked,
+                                     TickType_t timeout)
+{
+    if (!claim.claimed) return false;
+    ApState ap;
+    const bool state_known = ap_state_snapshot(ap, timeout);
+    const bool may_close_stale_ap =
+        !claim.ap_was_active && !s_provisioning.load(std::memory_order_acquire);
+    // A timed-out snapshot is unknown, never "AP inactive". Keep the close deferred so a late AP start
+    // cannot strand the recovery network if the state lock is still busy.
+    bool close_stale_ap = !state_known && may_close_stale_ap;
+    if (!state_known && may_close_stale_ap) schedule_ap_close(1000);
+    const bool claim_lock_acquired =
+        s_recovery_mutex && xSemaphoreTake(s_recovery_mutex, timeout) == pdTRUE;
+    if (claim_lock_acquired) {
+        const bool claim_valid = state_known &&
+            s_recovery_ap_inflight && s_recovery_claim_generation == claim.generation &&
+            s_sta_outage_generation.load(std::memory_order_relaxed) == claim.generation &&
+            !s_sta_connected.load(std::memory_order_relaxed) && ap_err == ESP_OK &&
+            ap.mode && !ap.manual;
+        if (claim_valid) {
+            s_recovery_ap_started.store(true, std::memory_order_relaxed);
+        } else if ((ap_err == ESP_OK && ap.mode && !ap.manual) && may_close_stale_ap) {
+            // A reset may have invalidated the claim while start_provisioning_ap was in flight.
+            close_stale_ap = true;
+        }
+        xSemaphoreGive(s_recovery_mutex);
+    } else if (may_close_stale_ap) {
+        close_stale_ap = true;
+    }
+    if (close_stale_ap) {
+        const bool closed = driver_locked ? close_recovery_ap_if_active_locked(timeout)
+                                          : close_recovery_ap_if_active(timeout);
+        s_recovery_ap_close_failed.store(!closed, std::memory_order_relaxed);
+        if (!closed) schedule_ap_close(1000);
+    }
+    if (s_recovery_mutex && xSemaphoreTake(s_recovery_mutex, timeout) == pdTRUE) {
+        s_recovery_ap_inflight = false;
+        s_recovery_claim_generation = 0;
+        s_recovery_completion_generation.store(0, std::memory_order_relaxed);
+        s_recovery_completion_retry_pending.store(false, std::memory_order_release);
+        xSemaphoreGive(s_recovery_mutex);
+    } else if (s_recovery_mutex) {
+        s_recovery_completion_generation.store(claim.generation, std::memory_order_relaxed);
+        s_recovery_completion_retry_pending.store(true, std::memory_order_release);
+    }
+    return close_stale_ap;
+}
+
+static void retry_recovery_claim_completion(TickType_t timeout)
+{
+    if (!s_recovery_completion_retry_pending.load(std::memory_order_acquire) || !s_recovery_mutex) {
+        return;
+    }
+    if (xSemaphoreTake(s_recovery_mutex, timeout) != pdTRUE) return;
+    const uint32_t generation =
+        s_recovery_completion_generation.load(std::memory_order_relaxed);
+    if (s_recovery_ap_inflight && s_recovery_claim_generation == generation) {
+        s_recovery_ap_inflight = false;
+        s_recovery_claim_generation = 0;
+    }
+    s_recovery_completion_generation.store(0, std::memory_order_relaxed);
+    s_recovery_completion_retry_pending.store(false, std::memory_order_release);
+    xSemaphoreGive(s_recovery_mutex);
 }
 
 static std::atomic<bool> s_ntp_first_logged{false};
@@ -248,6 +602,14 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
                                          bool wifi_event_registered,
                                          bool ip_event_registered)
 {
+    if (s_scan_cleanup_timer) {
+        esp_timer_stop(s_scan_cleanup_timer);
+        esp_timer_delete(s_scan_cleanup_timer);
+        s_scan_cleanup_timer = nullptr;
+    }
+    s_scan_cleanup_retry_pending.store(false, std::memory_order_release);
+    s_ap_close_pending.store(false, std::memory_order_release);
+    s_provisioning_validation_generation.store(0, std::memory_order_release);
     if (ip_event_registered) {
         esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
     }
@@ -267,6 +629,15 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
         vEventGroupDelete(s_wifi_event_group);
         s_wifi_event_group = nullptr;
     }
+    reset_recovery_state(false);
+    if (s_recovery_mutex) {
+        vSemaphoreDelete(s_recovery_mutex);
+        s_recovery_mutex = nullptr;
+    }
+    if (s_wifi_driver_mutex) {
+        vSemaphoreDelete(s_wifi_driver_mutex);
+        s_wifi_driver_mutex = nullptr;
+    }
     if (s_state_mutex) {
         vSemaphoreDelete(s_state_mutex);
         s_state_mutex = nullptr;
@@ -276,6 +647,7 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
     s_sta_connected.store(false, std::memory_order_relaxed);
     s_current_profile_open.store(false, std::memory_order_relaxed);
     s_scan_running.store(false, std::memory_order_relaxed);
+    s_scan_refresh_pending.store(false, std::memory_order_relaxed);
     s_candidate_attempt.store(0, std::memory_order_relaxed);
 }
 
@@ -408,14 +780,90 @@ static void log_wifi_disconnect_once(uint8_t reason, int8_t rssi)
     s_suppress_next_connect_log.store(false, std::memory_order_relaxed);
 }
 
-static void finish_scan_refresh_error(esp_err_t err)
+static std::string wifi_scan_records_json(const wifi_ap_record_t* records, size_t count);
+
+static bool finish_scan_refresh_error(esp_err_t err, TickType_t timeout)
 {
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, timeout) != pdTRUE) return false;
+    if (s_state_mutex) {
         s_scan_cache_error = err;
         xSemaphoreGive(s_state_mutex);
     }
     s_scan_running.store(false, std::memory_order_release);
     s_scan_refresh_pending.store(false, std::memory_order_release);
+    s_scan_cleanup_retry_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+static bool finish_scan_refresh_success(const wifi_ap_record_t* records, uint16_t count,
+                                        std::string&& json,
+                                        TickType_t timeout)
+{
+    if (s_state_mutex && xSemaphoreTake(s_state_mutex, timeout) != pdTRUE) return false;
+    if (s_state_mutex) {
+        s_scan_cache_records = {};
+        std::copy_n(records, count, s_scan_cache_records.begin());
+        s_scan_cache_count = count;
+        s_scan_cache_json = std::move(json);
+        s_scan_cache_ready = true;
+        s_scan_cache_error = ESP_OK;
+        xSemaphoreGive(s_state_mutex);
+    }
+    s_scan_running.store(false, std::memory_order_release);
+    s_scan_refresh_pending.store(false, std::memory_order_release);
+    s_scan_cleanup_retry_pending.store(false, std::memory_order_release);
+    return true;
+}
+
+static void wifi_scan_collect_once()
+{
+    uint16_t count = 0;
+    esp_err_t err = ESP_OK;
+    {
+        WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS), true);
+        if (!operation) {
+            schedule_scan_cleanup(ESP_ERR_TIMEOUT);
+            return;
+        }
+        uint16_t total = 0;
+        err = esp_wifi_scan_get_ap_num(&total);
+        count = std::min<uint16_t>(total, WIFI_SCAN_RECORD_LIMIT);
+        if (err == ESP_OK && count) {
+            err = esp_wifi_scan_get_ap_records(&count, s_scan_collect_records.data());
+        }
+        const esp_err_t clear_err = esp_wifi_clear_ap_list();
+        if (err == ESP_OK && clear_err != ESP_OK) err = clear_err;
+    }
+    s_scan_running.store(false, std::memory_order_release);
+    if (err != ESP_OK) {
+        if (!finish_scan_refresh_error(err, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+            schedule_scan_cleanup(err);
+        }
+        return;
+    }
+    // Build the cache JSON after releasing the driver gate; a string allocation cannot strand scan ownership.
+    std::string cache_json = wifi_scan_records_json(s_scan_collect_records.data(), count);
+    if (!finish_scan_refresh_success(
+            s_scan_collect_records.data(), count, std::move(cache_json),
+            pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+        schedule_scan_cleanup(ESP_ERR_TIMEOUT);
+    }
+}
+
+static void scan_cleanup_timer_cb(void*)
+{
+    if (!s_scan_refresh_pending.load(std::memory_order_acquire)) return;
+    WifiDriverOperation operation(0, true);
+    if (!operation) {
+        schedule_scan_cleanup(static_cast<esp_err_t>(s_scan_cleanup_error.load(std::memory_order_relaxed)));
+        return;
+    }
+    esp_wifi_clear_ap_list();
+    if (!finish_scan_refresh_error(
+            static_cast<esp_err_t>(s_scan_cleanup_error.load(std::memory_order_relaxed)),
+            pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+        schedule_scan_cleanup(static_cast<esp_err_t>(s_scan_cleanup_error.load(std::memory_order_relaxed)));
+    }
 }
 
 static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event_id, void* event_data)
@@ -423,13 +871,12 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE &&
         s_scan_refresh_pending.load(std::memory_order_acquire)) {
         if (xTaskCreate(wifi_scan_collect_task, "idf_wifi_scan", 4096, nullptr, 2, nullptr) != pdPASS) {
-            esp_wifi_clear_ap_list();
-            finish_scan_refresh_error(ESP_ERR_NO_MEM);
+            schedule_scan_cleanup(ESP_ERR_NO_MEM);
         }
         return;
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (sta_can_connect()) esp_wifi_connect();
+        if (sta_can_connect()) wifi_connect_now();
         return;
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
@@ -440,6 +887,11 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         }
         // Disable auto-reconnect while switching credentials; apply the new configuration after the caller sees this event.
         if (!s_sta_configured.load(std::memory_order_relaxed)) return;
+        int64_t outage_expected = -1;
+        if (s_sta_outage_since_us.compare_exchange_strong(
+                outage_expected, esp_timer_get_time(), std::memory_order_relaxed)) {
+            s_sta_outage_generation.fetch_add(1, std::memory_order_relaxed);
+        }
         // Reconnect immediately after the first few drops, then back off to the 15s watchdog.
         // This avoids a tight connection storm disrupting the provisioning AP and scans on bad credentials or weak signal.
         int streak = s_disconnect_streak.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -449,7 +901,7 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             log_wifi_disconnect_once(ev->reason, ev->rssi);
         }
         if (streak <= 3 && sta_can_connect()) {
-            esp_wifi_connect();
+            wifi_connect_now();
             ESP_LOGW(TAG, "STA disconnected; reconnecting immediately (attempt %d)", streak);
         } else {
             ESP_LOGW(TAG, "STA disconnected %d consecutive times; switching to timed reconnect", streak);
@@ -461,6 +913,22 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
         s_candidate_attempt.store(0, std::memory_order_relaxed);
+        const TickType_t callback_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+        if (s_provisioning.load(std::memory_order_acquire)) {
+            const uint32_t generation = s_provisioning_generation.load(std::memory_order_acquire);
+            if (generation != 0) {
+                s_provisioning_validation_generation.store(generation, std::memory_order_release);
+            }
+        }
+        if (!reset_recovery_state(false, false, callback_timeout)) {
+            if (s_provisioning.load(std::memory_order_acquire) &&
+                s_provisioning_validation_generation.load(std::memory_order_acquire) == 0) {
+                s_provisioning_validation_generation.store(
+                    s_provisioning_generation.load(std::memory_order_acquire), std::memory_order_release);
+            }
+            schedule_ap_close(1000);
+            return;
+        }
         ESP_LOGI(TAG, "STA acquired IP: " IPSTR, IP2STR(&event->ip_info.ip));
         if (!s_suppress_next_connect_log.exchange(false, std::memory_order_relaxed)) {
             idf_logf("WiFi connected, IP=" IPSTR, IP2STR(&event->ip_info.ip));
@@ -475,33 +943,54 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
             xEventGroupClearBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
             xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         }
-        ApState ap = ap_state_snapshot();
+        ApState ap;
+        if (!ap_state_snapshot(ap, callback_timeout)) {
+            if (s_provisioning.load(std::memory_order_acquire) &&
+                s_provisioning_validation_generation.load(std::memory_order_acquire) == 0) {
+                s_provisioning_validation_generation.store(
+                    s_provisioning_generation.load(std::memory_order_acquire), std::memory_order_release);
+            }
+            schedule_ap_close(1000);
+            return;
+        }
+        if (s_provisioning.load(std::memory_order_acquire) &&
+            s_provisioning_validation_generation.load(std::memory_order_acquire) == 0) {
+            s_provisioning_validation_generation.store(
+                s_provisioning_generation.load(std::memory_order_acquire), std::memory_order_release);
+        }
         if (ap.mode && s_has_sta_credentials.load(std::memory_order_relaxed)) {
             if (s_provisioning.load(std::memory_order_acquire)) {
-                const ProvisioningTarget target = provisioning_target_snapshot();
-                wifi_ap_record_t connected_ap = {};
-                std::array<uint8_t, 6> connected_bssid = {};
-                bool matched = false;
-                if (target.active && esp_wifi_sta_get_ap_info(&connected_ap) == ESP_OK) {
-                    memcpy(connected_bssid.data(), connected_ap.bssid, connected_bssid.size());
-                    matched = idf_wifi_provision_target_matches(
-                        target.ssid, target.bssidSet, target.bssid,
-                        reinterpret_cast<const char*>(connected_ap.ssid), connected_bssid);
+                ProvisioningTarget target;
+                if (!provisioning_target_snapshot(target, callback_timeout)) {
+                    schedule_ap_close(1000);
+                    return;
                 }
-                if (matched && complete_provisioning_target(target.generation)) {
+                WifiDriverOperation operation(0);
+                ProvisioningValidationResult result = ProvisioningValidationResult::NoAction;
+                const uint32_t validation_generation =
+                    s_provisioning_validation_generation.load(std::memory_order_acquire);
+                if (target.active && validation_generation != 0) {
+                    result = operation ? validate_provisioning_target_locked(validation_generation)
+                                       : ProvisioningValidationResult::Retry;
+                }
+                if (result == ProvisioningValidationResult::Matched) {
                     // Close the AP only when this submitted target gets an IP; fallback to old credentials is not provisioning success.
                     schedule_ap_close(AP_PROVISION_HOLD_MS);
                     idf_logf("Provisioning connection succeeded; AP closes in %lu seconds",
                              static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
+                } else if (result == ProvisioningValidationResult::Retry && !ap.manual) {
+                    s_provisioning_validation_generation.store(validation_generation, std::memory_order_release);
+                    schedule_ap_close(1000);
                 } else {
+                    s_provisioning_validation_generation.store(0, std::memory_order_release);
                     ESP_LOGW(TAG, "Ignoring GOT_IP from a non-current provisioning target; keeping AP open");
                 }
             } else if (!ap.manual) {
-                if (esp_wifi_set_mode(WIFI_MODE_STA) == ESP_OK) {
-                    set_ap_state(false, false, std::string());
-                    idf_log_line("STA reconnected; provisioning AP closed");
-                }
+                schedule_ap_close(1);  // Defer until the driver boundary is available; timer rechecks manual state.
             }
+        } else if (s_provisioning.load(std::memory_order_acquire) &&
+                   s_provisioning_validation_generation.load(std::memory_order_acquire) != 0) {
+            schedule_ap_close(1000);
         }
     }
 }
@@ -509,46 +998,96 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
 // After STA gets an IP, remember its credentials like a phone. idf_config_note_wifi_connected writes only
 // new networks or password changes. Run this in a one-shot task because the event stack is small and NVS
 // writes must not block the event loop.
-static void wifi_remember_task(void*)
+static void wifi_remember_once()
 {
     wifi_config_t cfg = {};
-    if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0]) {
+    WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS));
+    if (operation && esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK && cfg.sta.ssid[0]) {
         char ssid[33] = {};
         char pass[65] = {};
         memcpy(ssid, cfg.sta.ssid, sizeof(cfg.sta.ssid));
         memcpy(pass, cfg.sta.password, sizeof(cfg.sta.password));
         idf_config_note_wifi_connected(ssid, pass);
     }
+}
+
+static void wifi_remember_task(void*)
+{
+    wifi_remember_once();
     vTaskDelete(nullptr);
 }
 
 // A 15s reconnect watchdog recovers when any disconnect-to-reconnect event step fails and no later event fires.
-// With multiple saved networks, rescan because the device may have moved. Runtime drops only reconnect or rescan;
-// never open a provisioning AP automatically on an unattended device, which would expand the attack surface.
+// With multiple saved networks, rescan because the device may have moved. Open the existing provisioning AP only
+// after a bounded outage so a device can recover without serial access.
 static void reconnect_watchdog_cb(void*)
 {
-    if (!s_started.load(std::memory_order_relaxed) || !sta_can_connect()) return;
+    if (!s_started.load(std::memory_order_relaxed)) return;
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    if (s_scan_cleanup_retry_pending.load(std::memory_order_acquire) &&
+        s_scan_refresh_pending.load(std::memory_order_acquire)) {
+        scan_cleanup_timer_cb(nullptr);
+    }
+    if (s_ap_close_pending.load(std::memory_order_acquire)) {
+        ap_close_timer_cb(nullptr);
+    }
+    retry_recovery_claim_completion(driver_timeout);
+    if (!sta_can_connect()) return;
     if (s_sta_connected.load(std::memory_order_relaxed)) return;
+    const int64_t now_us = esp_timer_get_time();
+    int64_t outage_since_us = s_sta_outage_since_us.load(std::memory_order_relaxed);
+    uint32_t outage_generation = s_sta_outage_generation.load(std::memory_order_relaxed);
+    if (outage_since_us < 0) {
+        int64_t expected = -1;
+        if (s_sta_outage_since_us.compare_exchange_strong(
+                expected, now_us, std::memory_order_relaxed)) {
+            outage_generation = s_sta_outage_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+        } else {
+            outage_generation = s_sta_outage_generation.load(std::memory_order_relaxed);
+        }
+    }
     static uint32_t tick = 0;  // esp_timer callbacks run serially.
     ++tick;
+    ApState ap;
+    if (!ap_state_snapshot(ap, driver_timeout)) return;
     // Slow to 60s while the provisioning AP is open because STA connection attempts disrupt AP clients and scans.
-    if (ap_state_snapshot().mode && (tick % 4) != 0) return;
+    if (ap.mode && (tick % 4) != 0) return;
     if (s_provisioning.load(std::memory_order_acquire)) {
         // During provisioning, retry only the applied driver configuration; do not select a saved network as a false success.
-        esp_err_t err = esp_wifi_connect();
+        esp_err_t err = wifi_connect_now();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(TAG, "Could not start provisioning reconnect: %s", esp_err_to_name(err));
         }
         return;
     }
+
+    // Claim recovery before launching a selector. The claim and selector-start gate share one mutex, so a selector
+    // that is already running defers recovery, while a newly-started selector cannot race a claimed AP start.
+    const int64_t action_now_us = esp_timer_get_time();
+    const RecoveryClaim recovery_claim = claim_recovery_ap_if_due(action_now_us, outage_generation, driver_timeout);
+    if (recovery_claim.claimed) {
+        WifiDriverOperation operation(driver_timeout);
+        const bool driver_locked = static_cast<bool>(operation);
+        esp_err_t ap_err = ESP_ERR_TIMEOUT;
+        if (operation && recovery_claim_is_current(recovery_claim, driver_timeout)) {
+            ap_err = start_provisioning_ap_locked(false, driver_timeout);
+        } else if (operation) {
+            ap_err = ESP_ERR_INVALID_STATE;
+        }
+        finish_recovery_ap_claim(recovery_claim, ap_err, driver_locked, driver_timeout);
+        if (ap_err != ESP_OK) {
+            ESP_LOGW(TAG, "Recovery provisioning AP failed to start: %s", esp_err_to_name(ap_err));
+        }
+    }
+
     if (idf_config_wifi_network_count() > 1 ||
         s_current_profile_open.load(std::memory_order_relaxed)) {
         start_wifi_select_once();  // Scan for about 2-3s in a small task without blocking esp_timer.
-        return;
-    }
-    esp_err_t err = esp_wifi_connect();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
-        ESP_LOGW(TAG, "Watchdog reconnect failed to start: %s", esp_err_to_name(err));
+    } else {
+        esp_err_t err = wifi_connect_now();
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            ESP_LOGW(TAG, "Watchdog reconnect failed to start: %s", esp_err_to_name(err));
+        }
     }
 }
 
@@ -586,7 +1125,12 @@ static void dns_captive_task(void*)
         int len = recvfrom(sock, req, sizeof(req), 0, reinterpret_cast<sockaddr*>(&from), &from_len);
         // Yield after immediate errors such as ENOMEM; otherwise the missing receive timeout creates a busy loop.
         if (len < 0 && errno != EWOULDBLOCK && errno != EAGAIN) vTaskDelay(pdMS_TO_TICKS(200));
-        if (!ap_state_snapshot().mode) {
+        ApState ap;
+        if (!ap_state_snapshot(ap, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (!ap.mode) {
             // Release port 53 and exit about 10s after provisioning ends; recreate on next provisioning.
             if (++ap_off_seconds >= 10) break;
             continue;
@@ -674,7 +1218,9 @@ static bool mdns_query_matches_host(const uint8_t* packet, int len, int offset,
 // Advertise the AP IP on the AP subnet and the STA IP elsewhere.
 static bool mdns_pick_ip(uint32_t from_addr, uint8_t out[4])
 {
-    bool ap = ap_state_snapshot().mode;
+    ApState ap_state;
+    if (!ap_state_snapshot(ap_state, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) return false;
+    bool ap = ap_state.mode;
     if (ap && (from_addr & inet_addr("255.255.255.0")) == inet_addr("192.168.1.0")) {
         out[0] = 192; out[1] = 168; out[2] = 1; out[3] = 1;
         return true;
@@ -808,7 +1354,10 @@ static void mdns_sms_task(void*)
         return 0;
     };
     auto ap_addr = []() -> uint32_t {
-        return ap_state_snapshot().mode ? inet_addr("192.168.1.1") : 0;
+        ApState ap;
+        return ap_state_snapshot(ap, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS)) && ap.mode
+                   ? inet_addr("192.168.1.1")
+                   : 0;
     };
     // Leave then rejoin for interface/IP changes and periodic IGMP reports; repeated ADD only increments references.
     auto refresh_membership = [&](uint32_t& tracked, uint32_t cur, bool force) -> bool {
@@ -962,9 +1511,10 @@ static esp_err_t configure_ap_netif(void)
     return err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED ? ESP_OK : err;
 }
 
-static esp_err_t start_provisioning_ap(bool manual)
+static esp_err_t start_provisioning_ap_locked(bool manual, TickType_t state_timeout)
 {
-    ApState ap = ap_state_snapshot();
+    ApState ap;
+    if (!ap_state_snapshot(ap, state_timeout)) return ESP_ERR_TIMEOUT;
     if (ap.mode) {
         if (manual && !ap.manual) {
             set_ap_state(true, true, ap.ssid);
@@ -1009,7 +1559,7 @@ static esp_err_t start_provisioning_ap(bool manual)
         idf_logf("Provisioning AP failed: could not set AP parameters: %s", esp_err_to_name(err));
         return err;
     }
-    if (sta_can_connect()) ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+    if (sta_can_connect()) ESP_ERROR_CHECK_WITHOUT_ABORT(wifi_connect_locked());
     set_ap_state(true, manual, ssid);
     start_dns_task_once();
     ESP_LOGW(TAG, "%s: %s, http://192.168.1.1/",
@@ -1017,6 +1567,14 @@ static esp_err_t start_provisioning_ap(bool manual)
     idf_logf("%s: %s, http://192.168.1.1/",
              manual ? "BOOT long press started provisioning AP" : "Provisioning AP started", ssid);
     return ESP_OK;
+}
+
+static esp_err_t start_provisioning_ap(bool manual)
+{
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    WifiDriverOperation operation(driver_timeout);
+    if (!operation) return ESP_ERR_TIMEOUT;
+    return start_provisioning_ap_locked(manual, driver_timeout);
 }
 
 static void provision_button_task(void*)
@@ -1059,8 +1617,9 @@ static bool wifi_profile_password_valid(const std::string& pass)
 
 // Apply credentials and start STA without waiting. Open networks bind the scanned open BSSID; the driver
 // rejects same-name open APs for secured networks to prevent evil-twin downgrade.
-static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass,
-                                        const wifi_ap_record_t* ap = nullptr)
+static esp_err_t wifi_apply_and_connect_locked(const std::string& ssid, const std::string& pass,
+                                               const wifi_ap_record_t* ap,
+                                               TickType_t state_timeout)
 {
     if (ssid.empty() || ssid.size() > MAX_WIFI_SSID_BYTES || !wifi_profile_password_valid(pass)) {
         return ESP_ERR_INVALID_ARG;
@@ -1080,18 +1639,45 @@ static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::stri
         sta_config.sta.channel = ap->primary;
     }
 
-    esp_err_t err = esp_wifi_set_mode(ap_state_snapshot().mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
+    ApState ap_state;
+    if (!ap_state_snapshot(ap_state, state_timeout)) return ESP_ERR_TIMEOUT;
+    esp_err_t err = esp_wifi_set_mode(ap_state.mode ? WIFI_MODE_APSTA : WIFI_MODE_STA);
     if (err != ESP_OK) return err;
     err = esp_wifi_set_config(WIFI_IF_STA, &sta_config);
     if (err != ESP_OK) return err;
     s_current_profile_open.store(pass.empty(), std::memory_order_relaxed);
     s_sta_configured.store(true, std::memory_order_relaxed);
-    return esp_wifi_connect();
+    return wifi_connect_locked();
 }
 
-static esp_err_t wifi_disconnect_quietly()
+static esp_err_t wifi_apply_and_connect(const std::string& ssid, const std::string& pass,
+                                        const wifi_ap_record_t* ap = nullptr)
 {
-    s_sta_configured.store(false, std::memory_order_relaxed);
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    WifiDriverOperation operation(driver_timeout);
+    if (!operation) return ESP_ERR_TIMEOUT;
+    return wifi_apply_and_connect_locked(
+        ssid, pass, ap, driver_timeout);
+}
+
+static esp_err_t wifi_apply_and_connect_if_current(const std::string& ssid, const std::string& pass,
+                                                   const wifi_ap_record_t* ap,
+                                                   uint32_t captured_generation)
+{
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    WifiDriverOperation operation(driver_timeout);
+    if (!operation) return ESP_ERR_TIMEOUT;
+    if (!idf_wifi_selector_can_apply(
+            captured_generation, s_provisioning_generation.load(std::memory_order_acquire),
+            s_provisioning.load(std::memory_order_acquire))) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return wifi_apply_and_connect_locked(
+        ssid, pass, ap, driver_timeout);
+}
+
+static esp_err_t wifi_disconnect_driver_locked()
+{
     if (s_wifi_event_group) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT);
     }
@@ -1106,40 +1692,61 @@ static esp_err_t wifi_disconnect_quietly()
     return (bits & WIFI_DISCONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
+static esp_err_t wifi_disconnect_quietly()
+{
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    WifiDriverOperation operation(driver_timeout);
+    if (!operation) return ESP_ERR_TIMEOUT;
+    if (!reset_recovery_state(
+            true, true, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+        ESP_LOGW(TAG, "WiFi recovery AP transition did not settle; skipping concurrent disconnect");
+        return ESP_ERR_TIMEOUT;
+    }
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    return wifi_disconnect_driver_locked();
+}
+
 static esp_err_t wifi_scan_candidates(
     const std::vector<IdfWifiNetwork>& nets,
     std::vector<IdfWifiCandidate>& candidates,
     std::array<wifi_ap_record_t, IDF_MAX_WIFI_NETWORKS>& best_by_profile)
 {
-    wifi_scan_config_t scan_cfg = {};
-    esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
-    if (err != ESP_OK) return public_scan_error(err);
-
-    uint16_t total = 0;
-    err = esp_wifi_scan_get_ap_num(&total);
-    if (err != ESP_OK) {
-        esp_wifi_clear_ap_list();
-        return err;
-    }
     std::array<bool, IDF_MAX_WIFI_NETWORKS> matched = {};
-    wifi_ap_record_t rec = {};
-    for (uint16_t r = 0; r < total; ++r) {
-        err = esp_wifi_scan_get_ap_record(&rec);
+    WifiScanLease lease;
+    if (!lease) return ESP_ERR_INVALID_STATE;
+    {
+        WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS), true);
+        if (!operation) return ESP_ERR_TIMEOUT;
+        wifi_scan_config_t scan_cfg = {};
+        esp_err_t err = esp_wifi_scan_start(&scan_cfg, true);
+        if (err != ESP_OK) return public_scan_error(err);
+
+        uint16_t total = 0;
+        err = esp_wifi_scan_get_ap_num(&total);
         if (err != ESP_OK) {
             esp_wifi_clear_ap_list();
             return err;
         }
-        const char* seen = reinterpret_cast<const char*>(rec.ssid);
-        for (size_t i = 0; i < nets.size(); ++i) {
-            if (nets[i].ssid == seen && wifi_profile_password_valid(nets[i].pass) &&
-                idf_wifi_profile_matches_auth(nets[i].pass.empty(), rec.authmode) &&
-                (!matched[i] || rec.rssi > best_by_profile[i].rssi)) {
-                matched[i] = true;
-                best_by_profile[i] = rec;
+        wifi_ap_record_t rec = {};
+        for (uint16_t r = 0; r < total; ++r) {
+            err = esp_wifi_scan_get_ap_record(&rec);
+            if (err != ESP_OK) {
+                esp_wifi_clear_ap_list();
+                return err;
+            }
+            const char* seen = reinterpret_cast<const char*>(rec.ssid);
+            for (size_t i = 0; i < nets.size(); ++i) {
+                if (nets[i].ssid == seen && wifi_profile_password_valid(nets[i].pass) &&
+                    idf_wifi_profile_matches_auth(nets[i].pass.empty(), rec.authmode) &&
+                    (!matched[i] || rec.rssi > best_by_profile[i].rssi)) {
+                    matched[i] = true;
+                    best_by_profile[i] = rec;
+                }
             }
         }
+        esp_wifi_clear_ap_list();
     }
-    esp_wifi_clear_ap_list();
+    lease.release();
 
     candidates.clear();
     candidates.reserve(nets.size());
@@ -1157,12 +1764,9 @@ static esp_err_t wifi_scan_candidates(
 
 // Scan saved WiFi networks instead of blind fixed-order attempts (issue #9). Pick the strongest present match;
 // if none are visible, rotate through hidden or absent networks without serial 20s scan waits.
-static std::atomic<bool> s_select_running{false};
 static void wifi_select_task(void*)
 {
     do {
-        WifiScanLease lease;
-        if (!lease) break;
         uint32_t generation = s_provisioning_generation.load(std::memory_order_acquire);
         if (!idf_wifi_selector_can_apply(
                 generation, s_provisioning_generation.load(std::memory_order_acquire),
@@ -1196,9 +1800,10 @@ static void wifi_select_task(void*)
                 s_provisioning.load(std::memory_order_acquire))) {
             break;
         }
-        esp_err_t err = wifi_apply_and_connect(
+        esp_err_t err = wifi_apply_and_connect_if_current(
             net.ssid, net.pass,
-            candidate.scanned ? &best_by_profile[candidate.profileIndex] : nullptr);
+            candidate.scanned ? &best_by_profile[candidate.profileIndex] : nullptr,
+            generation);
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(TAG, "Connection failed to start after network selection: %s", esp_err_to_name(err));
         }
@@ -1210,12 +1815,22 @@ static void wifi_select_task(void*)
 static void start_wifi_select_once(void)
 {
     bool expected = false;
-    if (!s_select_running.compare_exchange_strong(expected, true, std::memory_order_relaxed)) return;
+    if (s_recovery_mutex && xSemaphoreTake(
+            s_recovery_mutex, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS)) == pdTRUE) {
+        if (s_recovery_ap_inflight ||
+            !s_select_running.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+            xSemaphoreGive(s_recovery_mutex);
+            return;
+        }
+        xSemaphoreGive(s_recovery_mutex);
+    } else if (!s_select_running.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        return;
+    }
     // 4096: scan records are on the heap, but esp_wifi scan APIs and log formatting still need stack headroom.
     if (xTaskCreate(wifi_select_task, "idf_wifi_sel", 4096, nullptr, 2, nullptr) != pdPASS) {
         s_select_running.store(false, std::memory_order_relaxed);
         idf_log_line("WiFi selection task failed to start; connecting with current configuration");
-        if (sta_can_connect()) esp_wifi_connect();
+        if (sta_can_connect()) wifi_connect_now();
     }
 }
 
@@ -1267,6 +1882,16 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
 
     s_state_mutex = xSemaphoreCreateMutex();
     if (!s_state_mutex) return ESP_ERR_NO_MEM;
+    s_recovery_mutex = xSemaphoreCreateMutex();
+    if (!s_recovery_mutex) {
+        cleanup_wifi_start_resources(false, false, false);
+        return ESP_ERR_NO_MEM;
+    }
+    s_wifi_driver_mutex = xSemaphoreCreateMutex();
+    if (!s_wifi_driver_mutex) {
+        cleanup_wifi_start_resources(false, false, false);
+        return ESP_ERR_NO_MEM;
+    }
 
     s_wifi_event_group = xEventGroupCreate();
     if (!s_wifi_event_group) {
@@ -1365,9 +1990,26 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
             .skip_unhandled_events = true,
         };
         if (esp_timer_create(&targs, &s_reconnect_timer) == ESP_OK) {
-            esp_timer_start_periodic(s_reconnect_timer, 15ULL * 1000 * 1000);
+            if (esp_timer_start_periodic(s_reconnect_timer, 15ULL * 1000 * 1000) != ESP_OK) {
+                esp_timer_delete(s_reconnect_timer);
+                s_reconnect_timer = nullptr;
+                idf_log_line("Could not start WiFi reconnect watchdog");
+            }
         } else {
             idf_log_line("Could not create WiFi reconnect watchdog");
+        }
+    }
+
+    if (!s_scan_cleanup_timer) {
+        const esp_timer_create_args_t targs = {
+            .callback = &scan_cleanup_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wifi_scan_cleanup",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&targs, &s_scan_cleanup_timer) != ESP_OK) {
+            idf_log_line("Could not create WiFi scan cleanup timer");
         }
     }
 
@@ -1412,20 +2054,25 @@ esp_err_t idf_wifi_reconnect(void)
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (!sta_can_connect()) return ESP_ERR_INVALID_STATE;
     esp_err_t err = wifi_disconnect_quietly();
+    if (err != ESP_OK) {
+        s_sta_configured.store(false, std::memory_order_relaxed);
+        return err;
+    }
     s_sta_configured.store(true, std::memory_order_relaxed);
-    if (err != ESP_OK) return err;
     s_disconnect_streak.store(0, std::memory_order_relaxed);
     if (s_current_profile_open.load(std::memory_order_relaxed)) {
         start_wifi_select_once();
         return ESP_OK;
     }
-    return esp_wifi_connect();
+    return wifi_connect_now();
 }
 
 esp_err_t idf_wifi_set_tx_power(uint8_t quarter_dbm)
 {
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (quarter_dbm < 8 || quarter_dbm > 84) return ESP_ERR_INVALID_ARG;
+    WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS));
+    if (!operation) return ESP_ERR_TIMEOUT;
     return esp_wifi_set_max_tx_power(static_cast<int8_t>(quarter_dbm));
 }
 
@@ -1435,25 +2082,19 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     if (ssid.empty() || ssid.size() > MAX_WIFI_SSID_BYTES || !wifi_profile_password_valid(pass)) {
         return ESP_ERR_INVALID_ARG;
     }
-    WifiScanLease lease;
-    if (!lease) return ESP_ERR_INVALID_STATE;
-    if (s_ap_close_timer) esp_timer_stop(s_ap_close_timer);
-
-    // Keep APSTA so the page remains connected; the IP event schedules delayed AP shutdown.
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (err != ESP_OK) return err;
-
     wifi_ap_record_t ap = {};
     const wifi_ap_record_t* selected = nullptr;
     if (pass.empty()) {
         std::vector<wifi_ap_record_t> cached_records;
         bool cache_ready = false;
-        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
-            cached_records.assign(s_scan_cache_records.begin(),
-                                  s_scan_cache_records.begin() + s_scan_cache_count);
-            cache_ready = s_scan_cache_ready;
-            xSemaphoreGive(s_state_mutex);
+        const TickType_t state_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+        if (!s_state_mutex || xSemaphoreTake(s_state_mutex, state_timeout) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
         }
+        cached_records.assign(s_scan_cache_records.begin(),
+                              s_scan_cache_records.begin() + s_scan_cache_count);
+        cache_ready = s_scan_cache_ready;
+        xSemaphoreGive(s_state_mutex);
         std::vector<IdfWifiScannedAp> scanned;
         scanned.reserve(cached_records.size());
         for (const wifi_ap_record_t& record : cached_records) {
@@ -1480,27 +2121,47 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
         if (!selected) return ESP_ERR_NOT_FOUND;
     }
 
-    wifi_config_t previous_config = {};
-    bool previous_config_valid =
-        esp_wifi_get_config(WIFI_IF_STA, &previous_config) == ESP_OK && previous_config.sta.ssid[0];
+    const TickType_t driver_timeout = pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS);
+    WifiDriverOperation operation(driver_timeout);
+    if (!operation) return ESP_ERR_TIMEOUT;
+
     bool previous_has_credentials = s_has_sta_credentials.load(std::memory_order_relaxed);
     bool previous_configured = s_sta_configured.load(std::memory_order_relaxed);
     bool previous_open = s_current_profile_open.load(std::memory_order_relaxed);
-    ProvisioningTarget previous_target = provisioning_target_snapshot();
+    ProvisioningTarget previous_target;
+    if (!provisioning_target_snapshot(previous_target, driver_timeout)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    wifi_config_t previous_config = {};
+    bool previous_config_valid =
+        esp_wifi_get_config(WIFI_IF_STA, &previous_config) == ESP_OK && previous_config.sta.ssid[0];
+    esp_err_t err = ESP_OK;
+
+    if (!reset_recovery_state(true, true, driver_timeout)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    // Invalidate the old provisioning generation before disconnecting so a queued old GOT_IP cannot close the current AP.
+    s_sta_configured.store(false, std::memory_order_relaxed);
+    if (replace_provisioning_target(ProvisioningTarget(), driver_timeout) == 0) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     auto restore_previous = [&]() {
         if (previous_config_valid) esp_wifi_set_config(WIFI_IF_STA, &previous_config);
         s_has_sta_credentials.store(previous_has_credentials, std::memory_order_relaxed);
         s_sta_configured.store(previous_configured, std::memory_order_relaxed);
         s_current_profile_open.store(previous_open, std::memory_order_relaxed);
-        replace_provisioning_target(previous_target);
-        if (previous_has_credentials && previous_configured) esp_wifi_connect();
+        replace_provisioning_target(previous_target, driver_timeout);
+        if (previous_has_credentials && previous_configured) wifi_connect_locked();
     };
 
-    // Invalidate the old provisioning generation before disconnecting so a queued old GOT_IP cannot close the current AP.
-    s_sta_configured.store(false, std::memory_order_relaxed);
-    replace_provisioning_target(ProvisioningTarget());
-    err = wifi_disconnect_quietly();
+    err = wifi_disconnect_driver_locked();
+    if (err != ESP_OK) {
+        restore_previous();
+        return err;
+    }
+    // Keep APSTA so the page remains connected; the IP event schedules delayed AP shutdown.
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         restore_previous();
         return err;
@@ -1509,10 +2170,14 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     ProvisioningTarget target;
     target.active = true;
     target.ssid = ssid;
-    uint32_t generation = replace_provisioning_target(target);
+    uint32_t generation = replace_provisioning_target(target, driver_timeout);
+    if (generation == 0) {
+        restore_previous();
+        return ESP_ERR_TIMEOUT;
+    }
 
     if (pass.empty()) {
-        if (!bind_provisioning_bssid(generation, ap.bssid)) {
+        if (!bind_provisioning_bssid(generation, ap.bssid, driver_timeout)) {
             restore_previous();
             return ESP_ERR_INVALID_STATE;
         }
@@ -1522,7 +2187,7 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     s_has_sta_credentials.store(true, std::memory_order_relaxed);
     s_disconnect_streak.store(0, std::memory_order_relaxed);
     s_candidate_attempt.store(0, std::memory_order_relaxed);
-    err = wifi_apply_and_connect(ssid, pass, selected);
+    err = wifi_apply_and_connect_locked(ssid, pass, selected, driver_timeout);
     if (err != ESP_OK) {
         restore_previous();
         return err;
@@ -1532,17 +2197,17 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     return err;
 }
 
-static std::string wifi_scan_records_json(const std::vector<wifi_ap_record_t>& records)
+static std::string wifi_scan_records_json(const wifi_ap_record_t* records, size_t count)
 {
     std::string json;
     json.reserve(1024);
     json += "[";
     bool first = true;
-    for (size_t i = 0; i < records.size(); ++i) {
+    for (size_t i = 0; i < count; ++i) {
         const char* ssid = reinterpret_cast<const char*>(records[i].ssid);
         if (!ssid[0]) continue;
         bool duplicate = false;
-        for (size_t k = 0; k < records.size(); ++k) {
+        for (size_t k = 0; k < count; ++k) {
             if (k == i) continue;
             const char* other = reinterpret_cast<const char*>(records[k].ssid);
             if (strcmp(ssid, other) != 0) continue;
@@ -1569,30 +2234,7 @@ static std::string wifi_scan_records_json(const std::vector<wifi_ap_record_t>& r
 
 static void wifi_scan_collect_task(void*)
 {
-    uint16_t total = 0;
-    esp_err_t err = esp_wifi_scan_get_ap_num(&total);
-    uint16_t count = std::min<uint16_t>(total, WIFI_SCAN_RECORD_LIMIT);
-    std::vector<wifi_ap_record_t> records(count);
-    if (err == ESP_OK && count) err = esp_wifi_scan_get_ap_records(&count, records.data());
-    if (err != ESP_OK || count == 0) esp_wifi_clear_ap_list();
-
-    if (err == ESP_OK) {
-        records.resize(count);
-        std::string json = wifi_scan_records_json(records);
-        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
-            s_scan_cache_records = {};
-            std::copy(records.begin(), records.end(), s_scan_cache_records.begin());
-            s_scan_cache_count = count;
-            s_scan_cache_json = std::move(json);
-            s_scan_cache_ready = true;
-            s_scan_cache_error = ESP_OK;
-            xSemaphoreGive(s_state_mutex);
-        }
-        s_scan_running.store(false, std::memory_order_release);
-        s_scan_refresh_pending.store(false, std::memory_order_release);
-    } else {
-        finish_scan_refresh_error(err);
-    }
+    wifi_scan_collect_once();
     vTaskDelete(nullptr);
 }
 
@@ -1601,8 +2243,12 @@ esp_err_t idf_wifi_scan_request(void)
     if (!s_started.load(std::memory_order_relaxed)) return ESP_ERR_INVALID_STATE;
     if (s_scan_refresh_pending.load(std::memory_order_acquire)) return ESP_OK;
 
+    // Async scans need both the cleanup timer and watchdog fallback before claiming global scan ownership.
+    if (!s_scan_cleanup_timer || !s_reconnect_timer) return ESP_ERR_NO_MEM;
     WifiScanLease lease;
     if (!lease) return ESP_ERR_INVALID_STATE;
+    WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS), true);
+    if (!operation) return ESP_ERR_TIMEOUT;
     wifi_mode_t mode = WIFI_MODE_NULL;
     esp_err_t err = esp_wifi_get_mode(&mode);
     if (err != ESP_OK) return err;
@@ -1616,7 +2262,8 @@ esp_err_t idf_wifi_scan_request(void)
     err = esp_wifi_scan_start(&scan_cfg, false);
     if (err != ESP_OK) {
         s_scan_refresh_pending.store(false, std::memory_order_release);
-        if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+        if (s_state_mutex && xSemaphoreTake(
+                s_state_mutex, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS)) == pdTRUE) {
             s_scan_cache_error = public_scan_error(err);
             xSemaphoreGive(s_state_mutex);
         }
@@ -1630,7 +2277,8 @@ IdfWifiScanSnapshot idf_wifi_scan_get_snapshot(void)
 {
     IdfWifiScanSnapshot snapshot;
     snapshot.busy = s_scan_refresh_pending.load(std::memory_order_acquire);
-    if (s_state_mutex && xSemaphoreTake(s_state_mutex, portMAX_DELAY) == pdTRUE) {
+    if (s_state_mutex && xSemaphoreTake(
+            s_state_mutex, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS)) == pdTRUE) {
         snapshot.json = s_scan_cache_json;
         snapshot.ready = s_scan_cache_ready;
         snapshot.error = s_scan_cache_error;
@@ -1650,27 +2298,35 @@ esp_err_t idf_wifi_scan_json(std::string& out_json)
 
 bool idf_wifi_is_ap_mode(void)
 {
-    return ap_state_snapshot().mode;
+    ApState ap;
+    return ap_state_snapshot(ap, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS)) && ap.mode;
 }
 
 IdfWifiStatus idf_wifi_get_status(void)
 {
     IdfWifiStatus s;
-    ApState ap_state = ap_state_snapshot();
-    s.apMode = ap_state.mode;
-    s.apSsid = ap_state.ssid;
-    if (ap_state.mode) s.apIp = "192.168.1.1";
+    ApState ap_state;
+    if (ap_state_snapshot(ap_state, pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS))) {
+        s.apMode = ap_state.mode;
+        s.apSsid = ap_state.ssid;
+        if (ap_state.mode) s.apIp = "192.168.1.1";
+    }
 
     uint8_t mac[6] = {};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) s.mac = mac_to_string(mac);
 
     wifi_ap_record_t ap = {};
-    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-        s.staConnected = true;
-        s.ssid = reinterpret_cast<const char*>(ap.ssid);
-        s.rssi = ap.rssi;
-        s.channel = ap.primary;
-        s.bssid = mac_to_string(ap.bssid);
+    WifiDriverOperation operation(pdMS_TO_TICKS(WIFI_RECOVERY_SYNC_TIMEOUT_MS));
+    if (operation) {
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            s.staConnected = true;
+            s.ssid = reinterpret_cast<const char*>(ap.ssid);
+            s.rssi = ap.rssi;
+            s.channel = ap.primary;
+            s.bssid = mac_to_string(ap.bssid);
+        }
+    } else {
+        s.staConnected = s_sta_connected.load(std::memory_order_relaxed);
     }
 
     esp_netif_ip_info_t ip = {};
