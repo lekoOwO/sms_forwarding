@@ -1,3 +1,8 @@
+set(OTA_PUBLIC_KEY_FILE "ota_public_key.der.b64")
+if(SMS_OTA_TEST_KEY)
+  set(OTA_PUBLIC_KEY_FILE "${SMS_OTA_TEST_PUBLIC_KEY}")
+endif()
+
 idf_component_register(
   SRCS "idf_web.cpp" "idf_web_core.cpp" "idf_web_crypto.cpp"
        "idf_web_ota_core.cpp" "idf_web_ota.cpp"
@@ -21,5 +26,5 @@ idf_component_register(
     mbedtls
     nvs_flash
     web_assets
-  EMBED_TXTFILES "ota_public_key.der.b64"
+  EMBED_TXTFILES "${OTA_PUBLIC_KEY_FILE}"
 )

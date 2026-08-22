@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -24,6 +25,13 @@ ROOT = Path(__file__).resolve().parents[1]
 IDF_HELPER = ROOT / "tools" / "idf.sh"
 BASELINE_CHECK = ROOT / "tools" / "check_idf_baseline.py"
 DEFAULT_APP_IMAGE = ROOT / "build" / "idf" / "sms_forwarding_idf.bin"
+OTA_TEST_PROFILE_DIR = ROOT / "build" / "idf-ota-test"
+OTA_TEST_IMAGE = OTA_TEST_PROFILE_DIR / "sms_forwarding_idf.bin"
+OTA_TEST_PRIVATE_KEY = OTA_TEST_PROFILE_DIR / "ota_test_private.pem"
+OTA_TEST_PUBLIC_DER = OTA_TEST_PROFILE_DIR / "ota_test_public.der"
+OTA_TEST_PUBLIC_KEY = OTA_TEST_PROFILE_DIR / "ota_test_public_key.der.b64"
+OTA_TEST_SIGNER = ROOT / "scripts" / "sign-ota-release.py"
+OTA_TEST_VERSION = "1.1.4-dev-test"
 APP_IMAGE_RELATIVE_PATHS = (
     Path("build/idf/sms_forwarding_idf.bin"),
     Path("build/idf-usb-recovery/sms_forwarding_idf.bin"),
@@ -220,6 +228,139 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _run_ota_key_command(command: list[str], stage: str) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, check=False)
+    except (FileNotFoundError, OSError) as exc:
+        raise usb_recovery.DeviceError(f"{stage} unavailable") from exc
+    if result.returncode:
+        raise usb_recovery.DeviceError(f"{stage} failed")
+    return result
+
+
+def _ota_test_profile_root() -> Path:
+    expected = ROOT / "build" / "idf-ota-test"
+    profile = OTA_TEST_PROFILE_DIR
+    if profile.absolute() != expected.absolute():
+        raise usb_recovery.DeviceError("OTA test profile must use build/idf-ota-test")
+    build_root = ROOT / "build"
+    if build_root.is_symlink() or (build_root.exists() and not build_root.is_dir()):
+        raise usb_recovery.DeviceError("OTA test profile base must be a regular directory")
+    if profile.is_symlink():
+        raise usb_recovery.DeviceError("OTA test profile directory must not be a symlink")
+    profile.mkdir(parents=True, exist_ok=True)
+    if profile.is_symlink():
+        raise usb_recovery.DeviceError("OTA test profile directory must not be a symlink")
+    if not profile.is_dir():
+        raise usb_recovery.DeviceError("OTA test profile must be a regular directory")
+    return profile.resolve(strict=True)
+
+
+def _validate_ota_test_material(path: Path, label: str, *, required: bool) -> Path:
+    profile = _ota_test_profile_root()
+    candidate = path if path.is_absolute() else ROOT / path
+    if candidate.is_symlink():
+        raise usb_recovery.DeviceError(f"{label} must not be a symlink")
+    if candidate.exists() and not candidate.is_file():
+        raise usb_recovery.DeviceError(f"{label} must be a regular file")
+    try:
+        resolved = candidate.resolve(strict=required)
+    except FileNotFoundError as exc:
+        raise usb_recovery.DeviceError(f"{label} is unavailable") from exc
+    try:
+        resolved.relative_to(profile)
+    except ValueError as exc:
+        raise usb_recovery.DeviceError(
+            f"{label} must stay inside build/idf-ota-test"
+        ) from exc
+    if required and not candidate.is_file():
+        raise usb_recovery.DeviceError(f"{label} must be a regular file")
+    return candidate
+
+
+def _ensure_ota_test_keypair() -> tuple[Path, Path, str]:
+    _ota_test_profile_root()
+    private_key = _validate_ota_test_material(
+        OTA_TEST_PRIVATE_KEY, "OTA test private key", required=False
+    )
+    if not private_key.exists():
+        temporary = _validate_ota_test_material(
+            private_key.with_suffix(".tmp"), "OTA test private key temporary", required=False
+        )
+        if temporary.exists():
+            temporary.unlink()
+        _run_ota_key_command([
+            "openssl", "genpkey", "-algorithm", "EC",
+            "-pkeyopt", "ec_paramgen_curve:P-256", "-out", str(temporary),
+        ], "OTA test key generation")
+        temporary.chmod(0o600)
+        temporary.replace(private_key)
+    private_key = _validate_ota_test_material(
+        private_key, "OTA test private key", required=True
+    )
+    private_key.chmod(0o600)
+    derived = _run_ota_key_command([
+        "openssl", "pkey", "-in", str(private_key),
+        "-pubout", "-outform", "DER",
+    ], "OTA test public key derivation")
+    if not derived.stdout:
+        raise usb_recovery.DeviceError("OTA test public key derivation returned no key")
+    public_der = _validate_ota_test_material(
+        OTA_TEST_PUBLIC_DER, "OTA test public DER", required=False
+    )
+    public_key = _validate_ota_test_material(
+        OTA_TEST_PUBLIC_KEY, "OTA test public key", required=False
+    )
+    public_der.write_bytes(derived.stdout)
+    public_key.write_text(
+        base64.b64encode(derived.stdout).decode("ascii") + "\n", encoding="ascii"
+    )
+    return private_key, public_key, hashlib.sha256(derived.stdout).hexdigest()
+
+
+def _ota_test_build_environment(public_key: Path) -> dict[str, str]:
+    public_key = _validate_ota_test_material(public_key, "OTA test public key", required=True)
+    env = os.environ.copy()
+    env.update({
+        "SMS_USB_RECOVERY": "1",
+        "SMS_OTA_TEST_KEY": "1",
+        "SMS_OTA_TEST_PUBLIC_KEY": str(public_key),
+        "FIRMWARE_IS_RELEASE": "0",
+    })
+    return env
+
+
+def resolve_ota_test_image(path: Path) -> Path:
+    candidate = path if path.is_absolute() else ROOT / path
+    if candidate.is_symlink():
+        raise ValueError("OTA test image must not be a symlink")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"OTA test image does not exist: {candidate}") from exc
+    if resolved != OTA_TEST_IMAGE.resolve():
+        raise ValueError("OTA test image must be the OTA test build artifact")
+    if not candidate.is_file():
+        raise ValueError("OTA test image must be a regular file")
+    return resolved
+
+
+def resolve_ota_test_output(path: Path) -> Path:
+    candidate = path if path.is_absolute() else ROOT / path
+    try:
+        relative = candidate.resolve().relative_to(ROOT.resolve())
+    except ValueError as exc:
+        raise ValueError("OTA test package output must stay inside the repository") from exc
+    if not relative.parts or relative.parts[0] not in {"build", "dist"}:
+        raise ValueError("OTA test package output must stay in build/ or dist/")
+    if candidate.suffix != ".smsota":
+        raise ValueError("OTA test package output must use the .smsota suffix")
+    if candidate.exists() and candidate.is_symlink():
+        raise ValueError("OTA test package output must not be a symlink")
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    return candidate
 
 
 def resolve_app_image(path: Path) -> Path:
@@ -936,6 +1077,8 @@ def _build_command(args: argparse.Namespace) -> int:
         raise ValueError("--release cannot be combined with usb-dev")
     env = os.environ.copy()
     env["SMS_USB_RECOVERY"] = "1" if usb_dev else "0"
+    env["SMS_OTA_TEST_KEY"] = "0"
+    env["SMS_OTA_TEST_PUBLIC_KEY"] = ""
     env["FIRMWARE_IS_RELEASE"] = "1" if args.release else "0"
     try:
         result = subprocess.run(
@@ -944,6 +1087,52 @@ def _build_command(args: argparse.Namespace) -> int:
     except (FileNotFoundError, OSError) as exc:
         raise usb_recovery.DeviceError("tools/idf.sh could not be started") from exc
     return result.returncode
+
+
+def _ota_test_package_command(args: argparse.Namespace) -> int:
+    private_key, public_key, public_fingerprint = _ensure_ota_test_keypair()
+    output = resolve_ota_test_output(Path(args.output))
+    try:
+        result = subprocess.run(
+            [str(IDF_HELPER), "build"], cwd=ROOT,
+            env=_ota_test_build_environment(public_key), check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise usb_recovery.DeviceError("tools/idf.sh could not be started") from exc
+    if result.returncode:
+        return result.returncode
+    image = resolve_ota_test_image(OTA_TEST_IMAGE)
+
+    size = image.stat().st_size
+    if not 0 < size <= APP_MAX_SIZE:
+        raise ValueError(f"OTA test image must be 1..{APP_MAX_SIZE} bytes")
+    image_digest = sha256_file(image)
+    if args.sha256 and (
+        len(args.sha256) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in args.sha256)
+        or args.sha256.lower() != image_digest
+    ):
+        raise ValueError("--sha256 pin does not match OTA test image")
+
+    result = _run_process([
+        sys.executable, str(OTA_TEST_SIGNER), str(image), str(output),
+        "--private-key", str(private_key),
+        "--version", args.version, "--counter", str(args.counter),
+        "--expected-public-sha256", public_fingerprint,
+    ], stage="OTA test signer")
+    if result.returncode:
+        raise usb_recovery.DeviceError("OTA test signer failed")
+    print(json.dumps({
+        "action": "ota-test-package",
+        "counter": args.counter,
+        "image": str(image),
+        "image_sha256": image_digest,
+        "output": str(output),
+        "package_sha256": sha256_file(output),
+        "profile": "usb-dev-test-key",
+        "version": args.version,
+    }, sort_keys=True))
+    return 0
 
 
 def _reset_command(args: argparse.Namespace) -> int:
@@ -1057,6 +1246,17 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--usb-dev", action="store_true", help="enable the USB recovery build")
     build.add_argument("--release", action="store_true", help="explicitly build release firmware")
 
+    ota_test = commands.add_parser(
+        "ota-test-package", help="build and sign a non-production USB OTA test package"
+    )
+    ota_test.add_argument(
+        "--output", default="dist/sms-forwarder-dev-test.smsota",
+        help="ignored .smsota output path inside the repository",
+    )
+    ota_test.add_argument("--counter", type=int, default=1)
+    ota_test.add_argument("--version", default=OTA_TEST_VERSION)
+    ota_test.add_argument("--sha256", "--sha256-pin", dest="sha256", default="", help="optional SHA-256 image pin")
+
     state = commands.add_parser("state", help="read sanitized device state")
     state.add_argument("--json", action="store_true", help="write the default JSON state format")
 
@@ -1091,6 +1291,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "build":
             return _build_command(args)
+        if args.command == "ota-test-package":
+            if not 0 < args.counter <= 0xFFFFFFFF:
+                raise ValueError("--counter must be a non-zero uint32")
+            if not 0 < len(args.version.encode("ascii")) <= 32 or any(
+                char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-"
+                for char in args.version
+            ):
+                raise ValueError("--version must be 1-32 safe ASCII characters")
+            return _ota_test_package_command(args)
         if args.command == "state":
             deadline = time.monotonic() + CONTAINER_TIMEOUT
             state = _state(resolve_serial_device(args.device), deadline=deadline)

@@ -85,6 +85,7 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertEqual(calls[0][0], [str(ROOT / "tools" / "idf.sh"), "build"])
         self.assertEqual(calls[0][1]["cwd"], ROOT)
         self.assertEqual(calls[0][1]["env"]["SMS_USB_RECOVERY"], "0")
+        self.assertEqual(calls[0][1]["env"]["SMS_OTA_TEST_KEY"], "0")
         self.assertEqual(calls[0][1]["env"]["FIRMWARE_IS_RELEASE"], "0")
 
     def test_external_process_oserror_is_not_reflected(self):

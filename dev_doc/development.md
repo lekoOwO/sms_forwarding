@@ -100,6 +100,26 @@ CLI 不會新增 scan，沒有 populated cache 時會 fail closed。`state` 維�
 5-byte 回應、預設等待 5 秒並最多重試 3 次；`wifi-provision` 預設等待 90
 秒。
 
+### Dev signed OTA test package
+
+要在沒有 production private key 的情況測試 signed OTA，可使用：
+
+```sh
+python3 tools/device.py ota-test-package
+```
+
+此命令固定使用 `FIRMWARE_IS_RELEASE=0`、`SMS_USB_RECOVERY=1` 與
+`SMS_OTA_TEST_KEY=1`，輸出預設為被忽略的
+`dist/sms-forwarder-dev-test.smsota`。`--counter` 預設為 `1`，`--version`
+預設為 `1.1.4-dev-test`，`--sha256` 可提供 build image 的 SHA-256 pin。
+命令先在被忽略的 `build/idf-ota-test/` 固定 profile 路徑建立或重用
+ephemeral P-256 private key，並把對應 public key 路徑傳給 CMake。private key 使用 mode 0600，
+不進入 firmware、merged image、release workflow 或 package。命令只建置、
+簽署與輸出 hash，不會上傳或重新啟動裝置。這是 NON-PRODUCTION profile；
+其 counter 使用獨立的 `ota_test_meta` NVS namespace，不會改變 production
+`ota_meta` floor。production public-key fingerprint
+`a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735` 不會變更。
+
 ## 建置 Web UI
 
 第一次建置或 lockfile 變更後，安裝固定依賴：

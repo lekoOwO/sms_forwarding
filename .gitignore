@@ -9,6 +9,7 @@ __pycache__/
 !/build/AGENTS.md
 /build-codex/
 /build-codex2/
+/dist/
 /sdkconfig
 /sdkconfig.old
 /dependencies.lock

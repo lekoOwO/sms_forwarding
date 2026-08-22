@@ -118,6 +118,10 @@ bootloader、partition table、`appcfg` 與 `coredump` 不由 Web OTA 寫入。
 OTA metadata 會寫入 `otadata` 與 NVS。
 
 目前 source 與 build check 已涵蓋 public-key signature、replay counter 與 rollback 設定。
+只有 `SMS_OTA_TEST_KEY=1` 的非 release USB recovery build 會嵌入
+ignored build profile 產生的 NON-PRODUCTION public key，並使用獨立的
+`ota_test_meta` NVS namespace；正式版與一般開發版仍嵌入 production key，
+並使用 `ota_meta`。
 `components/idf_web/OTA_RUNTIME_READY` 仍不存在；matching private key 與硬體 rollback/replay evidence 也未具備。
 因此目前不能宣稱 signed OTA 已達到 READY。
 

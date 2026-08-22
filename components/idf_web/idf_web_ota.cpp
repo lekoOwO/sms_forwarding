@@ -14,13 +14,25 @@
 
 namespace {
 
+#ifndef SMS_OTA_TEST_KEY
+#define SMS_OTA_TEST_KEY 0
+#endif
+#if SMS_OTA_TEST_KEY
+static constexpr const char* OTA_NAMESPACE = "ota_test_meta";
+#else
 static constexpr const char* OTA_NAMESPACE = "ota_meta";
+#endif
 static constexpr const char* KEY_ACCEPTED = "accepted";
 static constexpr const char* KEY_PENDING = "pending";
 static constexpr const char* KEY_PENDING_ADDRESS = "pendingAddr";
 
+#if SMS_OTA_TEST_KEY
+extern const uint8_t ota_public_key_b64_start[] asm("_binary_ota_test_public_key_der_b64_start");
+extern const uint8_t ota_public_key_b64_end[] asm("_binary_ota_test_public_key_der_b64_end");
+#else
 extern const uint8_t ota_public_key_b64_start[] asm("_binary_ota_public_key_der_b64_start");
 extern const uint8_t ota_public_key_b64_end[] asm("_binary_ota_public_key_der_b64_end");
+#endif
 
 struct RuntimeContext {
     esp_ota_handle_t handle = 0;

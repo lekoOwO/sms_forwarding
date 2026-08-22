@@ -171,6 +171,7 @@ jobs:
           python3 components/idf_wifi/test/test_wifi_security.py
           python3 tools/test_idf_baseline.py
           python3 tools/test_device.py
+          python3 tools/test_ota_test_profile.py
           python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
           python3 components/idf_web/test/test_openapi_conformance.py
@@ -182,6 +183,7 @@ jobs:
           RELEASE_BUILD=0
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then RELEASE_BUILD=1; fi
           export FIRMWARE_IS_RELEASE="$RELEASE_BUILD"
+          export SMS_OTA_TEST_KEY=0
           ./tools/idf.sh build
 
       - name: Check ESP-IDF baseline and firmware size
@@ -189,6 +191,9 @@ jobs:
 
       - name: Build USB recovery development firmware
         shell: bash
+        env:
+          SMS_OTA_TEST_KEY: 0
+          SMS_OTA_TEST_PUBLIC_KEY: ""
         run: SMS_USB_RECOVERY=1 FIRMWARE_IS_RELEASE=0 ./tools/idf.sh build
 
       - name: Verify USB recovery build guard
