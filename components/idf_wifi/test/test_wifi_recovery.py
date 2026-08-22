@@ -290,7 +290,7 @@ int main() {
         self.assertIn("start_provisioning_ap_locked(false, driver_timeout)", watchdog)
         self.assertIn("ap.mode", watchdog)
         self.assertIn("s_provisioning.load", watchdog)
-        self.assertIn("!sta_can_connect()) return;", watchdog)
+        self.assertIn("s_has_sta_credentials.load(std::memory_order_relaxed)", watchdog)
 
         ap_start = watchdog.index("start_provisioning_ap_locked(false, driver_timeout)")
         self.assertLess(watchdog.index("claim_recovery_ap_if_due"), ap_start)
@@ -345,6 +345,231 @@ int main() {
             "static std::string wifi_scan_records_json", 1
         )[0]
         self.assertIn("return ESP_ERR_TIMEOUT", provision_timeout)
+
+    def test_disconnect_fast_path_requires_no_link_or_pending_attempt(self):
+        disconnect = SOURCE.split("static esp_err_t wifi_disconnect_driver_locked", 1)[1].split(
+            "static esp_err_t wifi_disconnect_quietly", 1
+        )[0]
+        self.assertNotIn("if (!s_sta_connected.load(std::memory_order_relaxed)) return ESP_OK;", disconnect)
+        self.assertIn("s_sta_link_connected.load(std::memory_order_relaxed)", disconnect)
+        self.assertIn("s_sta_connecting.load(std::memory_order_relaxed)", disconnect)
+
+        connected = SOURCE.split(
+            "if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED)", 1
+        )[1].split("if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)", 1)[0]
+        disconnected = SOURCE.split(
+            "if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)", 1
+        )[1].split("if (event_base == IP_EVENT", 1)[0]
+        self.assertIn("s_sta_link_connected.store(true", connected)
+        self.assertIn("s_sta_connecting.store(false", connected)
+        self.assertIn("s_sta_link_connected.store(false", disconnected)
+        self.assertIn("s_sta_connecting.store(false", disconnected)
+
+    BOOT_PROFILE_HARNESS = r'''
+#include <array>
+#include <cassert>
+
+struct BootModel {
+    bool ap = false;
+    bool selector = false;
+    bool sta_configured = false;
+
+    void start(const std::array<bool, 3>& saved) {
+        int count = 0;
+        for (bool present : saved) count += present ? 1 : 0;
+        if (count == 0) {
+            ap = true;
+            return;
+        }
+        if (count > 1 || !saved[0]) {
+            selector = true;
+            return;
+        }
+        sta_configured = true;
+    }
+
+    void selector_apply(const std::array<bool, 3>& saved) {
+        if (!selector) return;
+        for (bool present : saved) {
+            if (present) {
+                sta_configured = true;
+                return;
+            }
+        }
+    }
+};
+
+int main() {
+    BootModel persisted_profile;
+    persisted_profile.start({false, true, false});
+    assert(persisted_profile.selector);
+    assert(!persisted_profile.ap);
+    persisted_profile.selector_apply({false, true, false});
+    assert(persisted_profile.sta_configured);
+
+    BootModel unconfigured;
+    unconfigured.start({false, false, false});
+    assert(unconfigured.ap);
+    assert(!unconfigured.selector);
+    assert(!unconfigured.sta_configured);
+}
+'''
+
+    def test_boot_selects_a_persisted_profile_from_any_saved_slot(self):
+        startup = SOURCE.split("esp_err_t idf_wifi_start", 1)[1].split(
+            "esp_err_t idf_wifi_resync_ntp", 1
+        )[0]
+        self.assertIn("int saved_networks = 0", startup)
+        self.assertIn("s_has_sta_credentials.store(saved_networks > 0", startup)
+        self.assertIn("if (saved_networks == 0)", startup)
+        self.assertNotIn("if (config.wifiNetworks[0].ssid.empty())", startup)
+        with tempfile.TemporaryDirectory(prefix="idf-wifi-boot-profile-") as temp_dir:
+            temp = Path(temp_dir)
+            harness = temp / "wifi_boot_profile_test.cpp"
+            binary = temp / "wifi_boot_profile_test"
+            harness.write_text(self.BOOT_PROFILE_HARNESS, encoding="utf-8")
+            subprocess.run(
+                ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)],
+                check=True,
+            )
+            subprocess.run([str(binary)], check=True)
+
+    SELECTOR_RETRY_HARNESS = r'''
+#include <cassert>
+
+struct SelectorRetryModel {
+    bool saved_profiles = false;
+    bool provisioning = false;
+    bool connected = false;
+    int selector_runs = 0;
+
+    void watchdog_tick() {
+        if (!saved_profiles || provisioning || connected) return;
+        ++selector_runs;
+    }
+};
+
+int main() {
+    SelectorRetryModel failed_scan;
+    failed_scan.saved_profiles = true;
+    failed_scan.watchdog_tick();
+    failed_scan.watchdog_tick();
+    assert(failed_scan.selector_runs == 2);
+
+    SelectorRetryModel provisioning;
+    provisioning.saved_profiles = true;
+    provisioning.provisioning = true;
+    provisioning.watchdog_tick();
+    assert(provisioning.selector_runs == 0);
+
+    SelectorRetryModel empty;
+    empty.watchdog_tick();
+    assert(empty.selector_runs == 0);
+}
+'''
+
+    def test_selector_retry_uses_saved_profiles_and_starts_after_sta_mode(self):
+        watchdog = SOURCE.split("static void reconnect_watchdog_cb", 1)[1].split(
+            "static void dns_captive_task", 1
+        )[0]
+        self.assertIn("s_has_sta_credentials.load(std::memory_order_relaxed)", watchdog)
+        self.assertNotIn("if (!sta_can_connect()) return;", watchdog)
+        self.assertIn("!s_sta_configured.load(std::memory_order_relaxed)", watchdog)
+        startup = SOURCE.split("esp_err_t idf_wifi_start", 1)[1].split(
+            "esp_err_t idf_wifi_resync_ntp", 1
+        )[0]
+        self.assertLess(
+            startup.index("esp_wifi_set_mode(WIFI_MODE_STA)"),
+            startup.index("esp_wifi_start()"),
+        )
+        self.assertLess(
+            startup.index("esp_wifi_start()"),
+            startup.index("connect_sta_begin(config)"),
+        )
+        with tempfile.TemporaryDirectory(prefix="idf-wifi-selector-retry-") as temp_dir:
+            temp = Path(temp_dir)
+            harness = temp / "wifi_selector_retry_test.cpp"
+            binary = temp / "wifi_selector_retry_test"
+            harness.write_text(self.SELECTOR_RETRY_HARNESS, encoding="utf-8")
+            subprocess.run(
+                ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)],
+                check=True,
+            )
+            subprocess.run([str(binary)], check=True)
+
+    PROVISION_CLOSE_HARNESS = r'''
+#include <cassert>
+
+struct ProvisioningCloseModel {
+    bool provisioning = true;
+    bool target_active = true;
+    bool validation_pending = true;
+    bool ap_mode = true;
+
+    void got_ip(bool target_matches) {
+        if (!provisioning) return;
+        if (!target_matches) {
+            validation_pending = false;
+            return;
+        }
+        provisioning = false;
+        target_active = false;
+        validation_pending = false;
+    }
+
+    bool close_timer() {
+        if (validation_pending) return false;
+        if (!provisioning && ap_mode) {
+            ap_mode = false;
+            return true;
+        }
+        return false;
+    }
+};
+
+int main() {
+    ProvisioningCloseModel matched;
+    matched.got_ip(true);
+    assert(!matched.provisioning);
+    assert(!matched.target_active);
+    assert(!matched.validation_pending);
+    assert(matched.close_timer());
+    assert(!matched.ap_mode);
+
+    ProvisioningCloseModel fallback;
+    fallback.got_ip(false);
+    assert(fallback.provisioning);
+    assert(fallback.target_active);
+    assert(!fallback.close_timer());
+    assert(fallback.ap_mode);
+}
+'''
+
+    def test_matched_provisioning_clears_validation_marker_before_ap_close(self):
+        got_ip = SOURCE.split(
+            "if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)", 1
+        )[1].split("// After STA gets an IP", 1)[0]
+        got_ip_matched = got_ip.split(
+            "if (result == ProvisioningValidationResult::Matched)", 1
+        )[1].split("} else if", 1)[0]
+        close_timer = SOURCE.split("static void ap_close_timer_cb(void*)", 1)[1].split(
+            "static void schedule_ap_close", 1
+        )[0]
+        close_timer_matched = close_timer.split(
+            "} else if (result == ProvisioningValidationResult::Matched)", 1
+        )[1].split("} else", 1)[0]
+        for section in (got_ip_matched, close_timer_matched):
+            self.assertIn("s_provisioning_validation_generation.store(0", section)
+        with tempfile.TemporaryDirectory(prefix="idf-wifi-provision-close-") as temp_dir:
+            temp = Path(temp_dir)
+            harness = temp / "wifi_provision_close_test.cpp"
+            binary = temp / "wifi_provision_close_test"
+            harness.write_text(self.PROVISION_CLOSE_HARNESS, encoding="utf-8")
+            subprocess.run(
+                ["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(harness), "-o", str(binary)],
+                check=True,
+            )
+            subprocess.run([str(binary)], check=True)
 
     DRIVER_OPERATION_HARNESS = r'''
 #include <cassert>
@@ -1296,7 +1521,7 @@ int main() {
         )[0]
         self.assertLess(
             watchdog.index("retry_recovery_claim_completion"),
-            watchdog.index("if (!sta_can_connect()) return;"),
+            watchdog.index("if (!s_has_sta_credentials.load(std::memory_order_relaxed)) return;"),
         )
 
         with tempfile.TemporaryDirectory(prefix="idf-wifi-claim-boundary-") as temp_dir:

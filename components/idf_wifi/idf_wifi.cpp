@@ -62,6 +62,8 @@ static std::atomic<bool> s_mdns_task_started{false};
 static std::atomic<bool> s_button_task_started{false};
 static std::atomic<bool> s_sntp_started{false};
 static std::atomic<bool> s_sta_connected{false};
+static std::atomic<bool> s_sta_link_connected{false};
+static std::atomic<bool> s_sta_connecting{false};
 static std::atomic<bool> s_current_profile_open{false};
 static std::atomic<bool> s_scan_running{false};
 static std::atomic<bool> s_scan_refresh_pending{false};
@@ -127,7 +129,12 @@ private:
 
 static esp_err_t wifi_connect_locked()
 {
-    return esp_wifi_connect();
+    s_sta_connecting.store(true, std::memory_order_relaxed);
+    const esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        s_sta_connecting.store(false, std::memory_order_relaxed);
+    }
+    return err;
 }
 
 // Event callbacks must not wait behind a task that is synchronously changing mode/configuration.
@@ -336,6 +343,7 @@ static void ap_close_timer_cb(void*)
             s_provisioning_validation_generation.store(validation_generation, std::memory_order_release);
             schedule_ap_close(1000);
         } else if (result == ProvisioningValidationResult::Matched) {
+            s_provisioning_validation_generation.store(0, std::memory_order_release);
             schedule_ap_close(AP_PROVISION_HOLD_MS);
             idf_logf("Provisioning connection succeeded; AP closes in %lu seconds",
                      static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
@@ -646,6 +654,8 @@ static void cleanup_wifi_start_resources(bool wifi_inited,
     s_has_sta_credentials.store(false, std::memory_order_relaxed);
     s_sta_configured.store(false, std::memory_order_relaxed);
     s_sta_connected.store(false, std::memory_order_relaxed);
+    s_sta_link_connected.store(false, std::memory_order_relaxed);
+    s_sta_connecting.store(false, std::memory_order_relaxed);
     s_current_profile_open.store(false, std::memory_order_relaxed);
     s_scan_running.store(false, std::memory_order_relaxed);
     s_scan_refresh_pending.store(false, std::memory_order_relaxed);
@@ -880,7 +890,14 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
         if (sta_can_connect()) wifi_connect_now();
         return;
     }
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        s_sta_link_connected.store(true, std::memory_order_relaxed);
+        s_sta_connecting.store(false, std::memory_order_relaxed);
+        return;
+    }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_sta_link_connected.store(false, std::memory_order_relaxed);
+        s_sta_connecting.store(false, std::memory_order_relaxed);
         s_sta_connected.store(false, std::memory_order_relaxed);
         if (s_wifi_event_group) {
             xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
@@ -911,6 +928,8 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
     }
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         auto* event = static_cast<ip_event_got_ip_t*>(event_data);
+        s_sta_link_connected.store(true, std::memory_order_relaxed);
+        s_sta_connecting.store(false, std::memory_order_relaxed);
         s_sta_connected.store(true, std::memory_order_relaxed);
         s_disconnect_streak.store(0, std::memory_order_relaxed);
         s_candidate_attempt.store(0, std::memory_order_relaxed);
@@ -976,6 +995,7 @@ static void wifi_event_handler(void*, esp_event_base_t event_base, int32_t event
                 }
                 if (result == ProvisioningValidationResult::Matched) {
                     // Close the AP only when this submitted target gets an IP; fallback to old credentials is not provisioning success.
+                    s_provisioning_validation_generation.store(0, std::memory_order_release);
                     schedule_ap_close(AP_PROVISION_HOLD_MS);
                     idf_logf("Provisioning connection succeeded; AP closes in %lu seconds",
                              static_cast<unsigned long>(AP_PROVISION_HOLD_MS / 1000));
@@ -1033,7 +1053,9 @@ static void reconnect_watchdog_cb(void*)
         ap_close_timer_cb(nullptr);
     }
     retry_recovery_claim_completion(driver_timeout);
-    if (!sta_can_connect()) return;
+    // A failed boot selector leaves s_sta_configured false, but saved profiles still make another
+    // bounded selector attempt meaningful.  Keep the provisioning branch gated by the applied config.
+    if (!s_has_sta_credentials.load(std::memory_order_relaxed)) return;
     if (s_sta_connected.load(std::memory_order_relaxed)) return;
     const int64_t now_us = esp_timer_get_time();
     int64_t outage_since_us = s_sta_outage_since_us.load(std::memory_order_relaxed);
@@ -1055,6 +1077,7 @@ static void reconnect_watchdog_cb(void*)
     if (ap.mode && (tick % 4) != 0) return;
     if (s_provisioning.load(std::memory_order_acquire)) {
         // During provisioning, retry only the applied driver configuration; do not select a saved network as a false success.
+        if (!s_sta_configured.load(std::memory_order_relaxed)) return;
         esp_err_t err = wifi_connect_now();
         if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
             ESP_LOGW(TAG, "Could not start provisioning reconnect: %s", esp_err_to_name(err));
@@ -1082,7 +1105,8 @@ static void reconnect_watchdog_cb(void*)
     }
 
     if (idf_config_wifi_network_count() > 1 ||
-        s_current_profile_open.load(std::memory_order_relaxed)) {
+        s_current_profile_open.load(std::memory_order_relaxed) ||
+        !s_sta_configured.load(std::memory_order_relaxed)) {
         start_wifi_select_once();  // Scan for about 2-3s in a small task without blocking esp_timer.
     } else {
         esp_err_t err = wifi_connect_now();
@@ -1685,8 +1709,17 @@ static esp_err_t wifi_disconnect_driver_locked()
     esp_err_t err = esp_wifi_disconnect();
     if (err != ESP_OK) {
         // Offline state has no event to await; if connected state still fails, preserve old configuration for caller recovery.
-        return s_sta_connected.load(std::memory_order_relaxed) ? err : ESP_OK;
+        const bool driver_active =
+            s_sta_connected.load(std::memory_order_relaxed) ||
+            s_sta_link_connected.load(std::memory_order_relaxed) ||
+            s_sta_connecting.load(std::memory_order_relaxed);
+        return driver_active ? err : ESP_OK;
     }
+    const bool driver_active =
+        s_sta_connected.load(std::memory_order_relaxed) ||
+        s_sta_link_connected.load(std::memory_order_relaxed) ||
+        s_sta_connecting.load(std::memory_order_relaxed);
+    if (!driver_active) return ESP_OK;
     if (!s_wifi_event_group) return ESP_ERR_INVALID_STATE;
     EventBits_t bits = xEventGroupWaitBits(
         s_wifi_event_group, WIFI_DISCONNECTED_BIT, pdTRUE, pdFALSE, pdMS_TO_TICKS(1500));
@@ -1899,7 +1932,11 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         cleanup_wifi_start_resources(false, false, false);
         return ESP_ERR_NO_MEM;
     }
-    s_has_sta_credentials.store(!config.wifiNetworks[0].ssid.empty(), std::memory_order_relaxed);
+    int saved_networks = 0;
+    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+        if (!config.wifiNetworks[i].ssid.empty()) ++saved_networks;
+    }
+    s_has_sta_credentials.store(saved_networks > 0, std::memory_order_relaxed);
 
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif = esp_netif_create_default_wifi_ap();
@@ -1955,6 +1992,13 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         return err;
     }
     ip_event_registered = true;
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(err));
+        idf_logf("WiFi mode configuration failed: %s", esp_err_to_name(err));
+        cleanup_wifi_start_resources(wifi_inited, wifi_event_registered, ip_event_registered);
+        return err;
+    }
     err = esp_wifi_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
@@ -2014,7 +2058,7 @@ esp_err_t idf_wifi_start(const IdfConfig& config)
         }
     }
 
-    if (config.wifiNetworks[0].ssid.empty()) {
+    if (saved_networks == 0) {
         ESP_LOGW(TAG, "WiFi is not configured; entering provisioning AP");
         idf_log_line("WiFi is not configured; entering provisioning AP");
         return start_provisioning_ap(false);
