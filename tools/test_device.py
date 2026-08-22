@@ -1584,6 +1584,9 @@ class _FakeTransferClient:
         if method == "GET" and parsed.path == "/api/config/export" and query.get("id") == ["12"]:
             return device.WebResponse(200, {"content-type": "application/vnd.sms-forwarding.config"}, state.config)
         if method == "POST" and parsed.path == "/api/ota/start":
+            if state.ota_start_error:
+                status, code, detail = state.ota_start_error
+                return self._action(status, False, code, {"secret": "body-secret"}, detail)
             fields = urllib.parse.parse_qs(body.decode())
             state.job_kind = "ota"
             state.manifest, state.signature = fields["manifest"][0], fields["signature"][0]
@@ -1597,8 +1600,8 @@ class _FakeTransferClient:
         return device.WebResponse(404, {}, b"{}")
 
     @staticmethod
-    def _action(status, success, code, data=None):
-        return device.WebResponse(status, {"content-type": "application/json"}, json.dumps({"success": success, "code": code, "data": data or {}, "detail": ""}).encode())
+    def _action(status, success, code, data=None, detail=""):
+        return device.WebResponse(status, {"content-type": "application/json"}, json.dumps({"success": success, "code": code, "data": data or {}, "detail": detail}).encode())
 
 
 class WebTransferTest(unittest.TestCase):
@@ -1609,7 +1612,7 @@ class WebTransferTest(unittest.TestCase):
         return result, output.getvalue(), errors.getvalue()
 
     def serve(self):
-        state = type("State", (), {"requests": [], "config": _config_fixture(), "job_kind": "backup", "job_mode": "success", "wrong_status": False, "chunks": [], "manifest": "", "signature": ""})()
+        state = type("State", (), {"requests": [], "config": _config_fixture(), "job_kind": "backup", "job_mode": "success", "wrong_status": False, "ota_start_error": None, "chunks": [], "manifest": "", "signature": ""})()
         return state, "fake-host"
 
     def test_ota_dry_run_does_not_use_network_and_rejects_bad_hash(self):
@@ -1660,6 +1663,37 @@ class WebTransferTest(unittest.TestCase):
             self.assertEqual([offset for offset, _ in server.chunks], [0, 8192])
             self.assertEqual(base64.b64decode(server.chunks[0][1]), (b"firmware" * 2000)[:8192])
             self.assertNotIn("secret", output + error)
+
+    def test_ota_action_error_exposes_status_and_code_only(self):
+        server, host = self.serve()
+        server.ota_start_error = (
+            400,
+            "ACTION_OTA_SIGNATURE_INVALID",
+            "detail-secret signature=010203 manifest=private-manifest",
+        )
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_WEB_PASSWORD": "secret"}, clear=True):
+            package = pathlib.Path(temp) / "update.smsota"
+            package.write_bytes(_ota_fixture())
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, output, error = self.run_main([
+                    "ota-upload", str(package), "--host", host, "--user", "alice",
+                    "--live", "--confirm-host", host,
+                ])
+        self.assertNotEqual(result, 0)
+        self.assertEqual(error.strip(), "OTA start returned HTTP 400 (ACTION_OTA_SIGNATURE_INVALID)")
+        self.assertEqual(server.chunks, [])
+        self.assertNotIn("detail-secret", output + error)
+        self.assertNotIn("010203", output + error)
+        self.assertNotIn("private-manifest", output + error)
+        self.assertNotIn("body-secret", output + error)
+        self.assertNotIn("secret", output + error)
+
+    def test_malformed_action_error_stays_generic(self):
+        response = device.WebResponse(400, {"content-type": "application/json"}, b"not-json")
+        with self.assertRaisesRegex(device.DeviceTransferError, "OTA start returned unexpected HTTP status"):
+            device._action(response, "OTA start", 201)
 
     def test_live_transfers_reject_wrong_status_and_failed_or_timed_out_job(self):
         server, host = self.serve()

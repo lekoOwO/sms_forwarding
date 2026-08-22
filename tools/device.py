@@ -410,8 +410,8 @@ def _validate_passphrase(value: str) -> str:
     return value
 
 
-def _json_object(response: WebResponse, stage: str, expected_status: int) -> dict[str, object]:
-    if response.status != expected_status:
+def _json_object(response: WebResponse, stage: str, expected_status: int, *, check_status: bool = True) -> dict[str, object]:
+    if check_status and response.status != expected_status:
         raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
     try:
         value = json.loads(response.body.decode("utf-8"))
@@ -423,9 +423,21 @@ def _json_object(response: WebResponse, stage: str, expected_status: int) -> dic
 
 
 def _action(response: WebResponse, stage: str, expected_status: int) -> dict[str, object]:
-    value = _json_object(response, stage, expected_status)
+    error_status = response.status != expected_status
+    if error_status and not 400 <= response.status <= 599:
+        raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
+    try:
+        value = _json_object(response, stage, expected_status, check_status=not error_status)
+    except DeviceTransferError:
+        if error_status:
+            raise DeviceTransferError(f"{stage} returned unexpected HTTP status") from None
+        raise
     if set(value) != {"success", "code", "data", "detail"} or not isinstance(value["success"], bool) or not isinstance(value["code"], str) or not isinstance(value["data"], dict) or not isinstance(value["detail"], str):
+        if error_status:
+            raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
         raise DeviceTransferError(f"{stage} returned invalid action result")
+    if error_status:
+        raise DeviceTransferError(f"{stage} returned HTTP {response.status} ({value['code']})")
     return value
 
 
