@@ -484,7 +484,7 @@ int main() {
     wifi_config = function_body(source, "handle_wifi_config")
     assert wifi_config.index("reject_oversized_body(req)") < wifi_config.index("check_auth(req)")
     assert "connect_err = idf_wifi_provision_connect" in wifi_config
-    assert wifi_config.index("idf_wifi_provision_connect") < wifi_config.index("idf_config_save_wifi")
+    assert wifi_config.index("idf_config_save_wifi") < wifi_config.index("idf_wifi_provision_connect")
     assert '"400 Bad Request"' in wifi_config
     assert '"409 Conflict"' in wifi_config
     assert '"500 Internal Server Error"' in wifi_config

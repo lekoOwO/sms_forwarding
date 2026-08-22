@@ -3104,30 +3104,34 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
     std::string ssid_s = field_text(fields, "ssid");
     std::string pass_s = field_text(fields, "pass");
     set_json_no_cache(req);
-    if (ap_mode) {
-        // In provisioning AP mode, connect in place with APSTA and no restart; /apstatus exposes the IP.
-        // The device closes the AP after a delay once connected (see idf_wifi_provision_connect).
-        esp_err_t connect_err = idf_wifi_provision_connect(ssid_s, pass_s);
-        if (connect_err != ESP_OK) {
-            if (connect_err == ESP_ERR_INVALID_ARG) {
-                httpd_resp_set_status(req, "400 Bad Request");
-                std::string msg = "{\"success\":false,\"message\":\"Invalid WiFi configuration\"}";
-                return httpd_resp_send(req, msg.c_str(), msg.size());
-            }
-            httpd_resp_set_status(req,
-                connect_err == ESP_ERR_NOT_FOUND || connect_err == ESP_ERR_INVALID_STATE
-                    ? "409 Conflict" : "500 Internal Server Error");
-            std::string msg = "{\"success\":false,\"message\":\"WiFi configuration was not saved because connection startup failed; try again\"}";
-            return httpd_resp_send(req, msg.c_str(), msg.size());
-        }
-        // ESP_OK only means the connection request was accepted; authentication completes asynchronously in the WiFi event task.
-    }
-    esp_err_t err = idf_config_save_wifi(ssid_s, pass_s);
-    if (err != ESP_OK) {
+    const bool valid_password = pass_s.empty() ||
+        (pass_s.size() >= 8 && pass_s.size() <= MAX_WIFI_PASSWORD_BYTES &&
+         std::all_of(pass_s.begin(), pass_s.end(), [](unsigned char ch) {
+             return ch >= 0x20 && ch <= 0x7E;
+         }));
+    if (ssid_s.empty() || ssid_s.size() > MAX_WIFI_SSID_BYTES || !valid_password ||
+        ssid_s.find('\0') != std::string::npos) {
+        httpd_resp_set_status(req, "400 Bad Request");
         std::string msg = "{\"success\":false,\"message\":\"Invalid WiFi configuration\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
+    // Persist the exact provisioning slot before touching the runtime driver.
+    esp_err_t err = idf_config_save_wifi_profile(0, ssid_s, pass_s, pass_s.empty(), false);
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        std::string msg = "{\"success\":false,\"message\":\"WiFi configuration could not be saved; retry\"}";
+        return httpd_resp_send(req, msg.c_str(), msg.size());
+    }
     if (ap_mode) {
+        // ESP_OK only means startup was accepted; authentication completes asynchronously.
+        const esp_err_t connect_err = idf_wifi_provision_connect(ssid_s, pass_s);
+        if (connect_err != ESP_OK) {
+            httpd_resp_set_status(req,
+                connect_err == ESP_ERR_NOT_FOUND || connect_err == ESP_ERR_INVALID_STATE
+                    ? "409 Conflict" : "500 Internal Server Error");
+            std::string msg = "{\"success\":false,\"message\":\"WiFi credentials were saved, but connection startup failed; credentials retained and AP remains available\"}";
+            return httpd_resp_send(req, msg.c_str(), msg.size());
+        }
         std::string msg = "{\"success\":true,\"message\":\"Saved; connecting\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
