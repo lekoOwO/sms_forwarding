@@ -74,12 +74,15 @@ public:
     void clear_urcs() { urcs_.clear(); }
 
 private:
-    static std::string trim(std::string_view raw)
+    static std::string trim(std::string_view raw, bool spaces_only)
     {
+        const auto trim_char = [spaces_only](unsigned char ch) {
+            return ch == ' ' || (!spaces_only && std::isspace(ch));
+        };
         size_t start = 0;
         size_t end = raw.size();
-        while (start < end && std::isspace(static_cast<unsigned char>(raw[start]))) ++start;
-        while (end > start && std::isspace(static_cast<unsigned char>(raw[end - 1]))) --end;
+        while (start < end && trim_char(static_cast<unsigned char>(raw[start]))) ++start;
+        while (end > start && trim_char(static_cast<unsigned char>(raw[end - 1]))) --end;
         return std::string(raw.substr(start, end - start));
     }
 
@@ -121,7 +124,7 @@ private:
     void flush_line()
     {
         if (carry_.empty()) return;
-        std::string line = trim(carry_);
+        std::string line = trim(carry_, response_prefix_ == "+CEREG:");
         carry_.clear();
         if (line.empty()) return;
 
@@ -134,10 +137,9 @@ private:
         bool unsolicited_text = is_unsolicited_text(line);
         bool solicited = is_final(line);
         if (!solicited && !response_prefix_.empty() && starts_with(line, response_prefix_)) {
-            // CPOL and CGDCONT are list queries; every matching line is part of
-            // the bounded response. Other fixed queries keep the first line only
-            // so an interleaved same-prefix URC does not reach USB.
-            solicited = allow_multiple_response_lines_ || !expected_line_seen_;
+            // Keep every CEREG line so its strict parser can reject duplicates.
+            solicited = allow_multiple_response_lines_ || !expected_line_seen_ ||
+                        response_prefix_ == "+CEREG:";
             expected_line_seen_ = true;
         }
         // ATI returns bounded free-form model/firmware lines. Other fixed

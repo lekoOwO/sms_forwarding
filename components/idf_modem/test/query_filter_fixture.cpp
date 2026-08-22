@@ -171,16 +171,39 @@ int main()
     int cereg_stat = -1;
     assert(idf_modem_parse_cereg_status("\r\n+CEREG: 0,11\r\nOK\r\n", cereg_stat));
     assert(cereg_stat == 11); // 3GPP RLOS-only must remain observable.
-    for (int expected = 0; expected <= 11; ++expected) {
-        const std::string query = "+CEREG: 0," + std::to_string(expected);
+    for (int expected : {0, 1, 2, 3, 4, 5, 11}) {
+        const std::string query = "\r\n+CEREG: 0," + std::to_string(expected) + "\r\nOK\r\n";
         assert(idf_modem_parse_cereg_status(query, cereg_stat));
         assert(cereg_stat == expected);
     }
-    assert(idf_modem_parse_cereg_status("+CEREG: 11,\"0011\",\"00FF\"", cereg_stat));
-    assert(cereg_stat == 11); // URC form uses the first field as stat.
-    assert(idf_modem_parse_cereg_status("+CEREG: 0,5,\"0011\"", cereg_stat));
-    assert(cereg_stat == 5); // Query form uses the second field as stat.
-    assert(!idf_modem_parse_cereg_status("+CEREG: 12", cereg_stat));
+    for (int unsupported : {6, 7, 8, 9, 10}) {
+        const std::string query = "\r\n+CEREG: 0," + std::to_string(unsupported) + "\r\nOK\r\n";
+        assert(!idf_modem_parse_cereg_status(query, cereg_stat));
+    }
+    assert(idf_modem_parse_cereg_status(
+        "\r\n+CEREG: 2,5,\"ABCD\",\"12345678\",7\r\nOK\r\n", cereg_stat));
+    assert(cereg_stat == 5);
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,12\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,1\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,1\r\n\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\r\nOK\r\n+CEREG: 2\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\r\n+CEREG: 2\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"1234\",7\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",8\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,01,\"ABCD\",\"12345678\",7\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",07\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status(
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\vOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG:\t0,1\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,\t1\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,1\v\r\nOK\r\n", cereg_stat));
+    assert(!idf_modem_parse_cereg_status("+CEREG: 0,1\f\r\nOK\r\n", cereg_stat));
     assert(idf_modem_data_activation_allowed(1));
     assert(!idf_modem_data_activation_allowed(5));
     assert(!idf_modem_data_activation_allowed(11));
@@ -387,14 +410,41 @@ int main()
         shaped.feed(input.data(), input.size());
         assert(shaped.response().find(query.command) == std::string::npos);
         assert(shaped.response().find(query.expected) != std::string::npos);
-        assert(shaped.response().find(query.duplicate) == std::string::npos);
+        if (std::string(query.command) == "AT+CEREG?") {
+            assert(shaped.response().find(query.duplicate) != std::string::npos);
+            assert(shaped.urcs().find(query.duplicate) == std::string::npos);
+        } else {
+            assert(shaped.response().find(query.duplicate) == std::string::npos);
+            assert(shaped.urcs().find(query.duplicate) != std::string::npos);
+        }
         assert(shaped.response().find("+CMT:") == std::string::npos);
         assert(shaped.response().find("00112233445566778899AABBCCDDEEFF") == std::string::npos);
         assert(shaped.response().find("+OTHER:") == std::string::npos);
         assert(shaped.response().find("RING") == std::string::npos);
-        assert(shaped.urcs().find(query.duplicate) != std::string::npos);
         assert(shaped.urcs().find("+CMT:") != std::string::npos);
         assert(shaped.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
+    }
+
+    IdfModemQueryResponseFilter cereg_filter("AT+CEREG?", "+CEREG:", "", false);
+    const std::string cereg_interleaved =
+        "AT+CEREG?\r\n+CEREG: 0,1\r\n"
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\r\nOK\r\n";
+    cereg_filter.feed(cereg_interleaved.data(), cereg_interleaved.size());
+    cereg_filter.flush_pending();
+    assert(cereg_filter.response().find("+CEREG: 0,1") != std::string::npos);
+    assert(cereg_filter.response().find("+CEREG: 2,1") != std::string::npos);
+    assert(!idf_modem_parse_cereg_status(cereg_filter.response(), cereg_stat));
+
+    for (const std::string malformed : {
+             "AT+CEREG?\r\n\t+CEREG: 0,1\r\nOK\r\n",
+             "AT+CEREG?\r\n+CEREG: 0,1\t\r\nOK\r\n",
+             "AT+CEREG?\r\n\v+CEREG: 0,1\r\nOK\r\n",
+             "AT+CEREG?\r\n+CEREG: 0,1\f\r\nOK\r\n",
+         }) {
+        IdfModemQueryResponseFilter malformed_filter("AT+CEREG?", "+CEREG:", "", false);
+        malformed_filter.feed(malformed.data(), malformed.size());
+        malformed_filter.flush_pending();
+        assert(!idf_modem_parse_cereg_status(malformed_filter.response(), cereg_stat));
     }
 
     IdfModemQueryResponseFilter cimi("AT+CIMI", "", "", false);
