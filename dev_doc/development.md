@@ -48,18 +48,18 @@ python3 tools/usb_recovery.py --device /dev/serial/by-id/usb-... wifi-provision 
 
 日常裝置操作請使用 `tools/device.py`。它是單一入口：`build` 預設建立 production
 映像，`build --usb-dev` 建立 USB recovery 映像；`state`（可加 `--json`）與 `diag` 只輸出
-去識別化 JSON，`reset` 與 `flash-app0` 預設 dry-run。實際 reset 必須使用
-`--live --confirm <by-id basename>`；reset 與 app0 flash 使用原生 USB Serial/JTAG
+去識別化 JSON，`reset` 與 `flash-app`（`flash-app0` 相容命令）預設 dry-run。實際 reset 必須使用
+`--live --confirm <by-id basename>`；reset 與 app slot flash 使用原生 USB Serial/JTAG
 唯一固定的 `--before usb_reset --after hard_reset` sequence；reset 之後再 probe state。
-實際 app0 flash 會先執行 baseline check，
+實際 app slot flash 會先執行 baseline check，`flash-app --slot` 只接受 `app0` 或 `app1`；
 只接受 `build/idf/sms_forwarding_idf.bin` 或
 `build/idf-usb-recovery/sms_forwarding_idf.bin` 的 regular non-symlink app image，
-固定寫入 `0x10000` 且不超過 `0x1e0000`；app0-only flash 不會修改 `nvs`、`appcfg` 或
+固定寫入 app0 `0x10000` 或 app1 `0x1f0000`，且不超過 `0x1e0000`；app-only flash 不會修改 `nvs`、`appcfg` 或
 `otadata`。Live flash 另須提供相符的
 `--sha256 <64-hex-digest>` pin，完成後輸出 SHA-256。
 `diag --raw` 必須明確指定，資料只寫到 stdout，不會寫入 evidence。
 裝置路徑可由 `SMS_DEVICE` 提供；沒有明確 `/dev/serial/by-id/` 路徑時會 fail closed。
-若 host 沒有 `esptool.py`，`reset` 與 live `flash-app0` 會使用既有 pinned
+若 host 沒有 `esptool.py`，`reset` 與 live app slot flash 會使用既有 pinned
 ESP-IDF 5.5.4 image；工具先解析 exact `/dev/serial/by-id/` symlink 並驗證其
 target 是 character device，再以該 resolved target 映射為 container 內的單一
 `/dev/sms-device`。container 使用 `--pull=never`、`--network=none`、read-only
@@ -74,7 +74,7 @@ deadline；host 無法取得 tty 時，`diag all` 使用單一 development-only 
 state backend 保留 5 秒單次 timeout，外層最多提供 30 秒以涵蓋既有 retries。
 
 `tools/usb_recovery.py` 是既有的 USB recovery protocol backend 與低階測試 CLI；
-目前仍用它執行 `wifi-provision`，一般 build、state、診斷、reset 與 app0 flash
+目前仍用它執行 `wifi-provision`，一般 build、state、診斷、reset 與 app slot flash
 請走 `tools/device.py`。`build --usb-dev` 會使用 `sdkconfig.usb-recovery`、
 `build/idf-usb-recovery` 與 `build/sdkconfig-usb-recovery`。管理資料只走 ESP-IDF USB Serial/JTAG
 driver；UART0 保留一般 console，USB secondary console 會關閉。CLI 只接受
@@ -144,10 +144,12 @@ ephemeral P-256 private key，並把對應 public key 路徑傳給 CMake。priva
 
 ```sh
 python3 tools/device.py --device /dev/serial/by-id/usb-... ota-state
-python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app0 \
+python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app0 \
   build/idf-ota-test/sms_forwarding_idf.bin --live \
   --sha256 <64-hex-image-sha256> --confirm <by-id-basename>
 ```
+
+需要寫入 app1 時，只將 `--slot app0` 改為 `--slot app1`；其餘安全檢查相同。
 
 `ota-state` 只回報 app0/app1 offset、映像狀態與目前 OTA metadata；回報格式錯誤、
 未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。尚未完成實機 rollback、

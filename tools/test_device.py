@@ -936,6 +936,8 @@ class DeviceCommandTest(unittest.TestCase):
             self.assertEqual(result, 0)
             run.assert_not_called()
             plan = json.loads(output)
+            self.assertEqual(plan["action"], "flash-app0")
+            self.assertEqual(plan["slot"], "app0")
             self.assertEqual(plan["offset"], "0x10000")
             self.assertEqual(plan["max_size"], 0x1E0000)
 
@@ -958,6 +960,64 @@ class DeviceCommandTest(unittest.TestCase):
             usb_image.write_bytes(b"firmware")
             with mock.patch.object(device, "ROOT", root):
                 self.assertEqual(device.validate_app0_image(usb_image), len(b"firmware"))
+
+    def test_flash_app1_dry_run_uses_fixed_slot_and_rejects_arbitrary_offset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device.subprocess, "run") as run:
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                ])
+            self.assertEqual(result, 0)
+            run.assert_not_called()
+            plan = json.loads(output)
+            self.assertEqual(plan["action"], "flash-app")
+            self.assertEqual(plan["slot"], "app1")
+            self.assertEqual(plan["offset"], "0x1F0000")
+            self.assertEqual(plan["max_size"], 0x1E0000)
+
+            with self.assertRaises(SystemExit):
+                device.build_parser().parse_args([
+                    "--device", DEVICE, "flash-app", "--slot", "app2", str(image),
+                ])
+            with self.assertRaises(SystemExit):
+                device.build_parser().parse_args([
+                    "--device", DEVICE, "flash-app", "--slot", "app1",
+                    "--offset", "0x1234", str(image),
+                ])
+
+    def test_live_flash_app1_writes_fixed_slot(self):
+        events = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = device.sha256_file(image)
+
+            def fake_run(command, **kwargs):
+                events.append((command, kwargs))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "resolve_esptool", return_value="host"), \
+                    mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(device, "confirm_basename", return_value=None):
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                    "--live", "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertEqual(result, 0)
+        esptool = events[-1][0]
+        self.assertIn("0x1F0000", esptool)
+        self.assertEqual(json.loads(output)["slot"], "app1")
 
     def test_live_flash_runs_baseline_before_hash_and_fixed_write(self):
         events = []

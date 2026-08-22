@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""安全的 ESP-IDF build、診斷、reset 與 app0 工具。"""
+"""安全的 ESP-IDF build、診斷、reset 與 app slot 工具。"""
 
 from __future__ import annotations
 
@@ -47,6 +47,10 @@ CONTAINER_PYTHON = "/opt/esp/python_env/idf5.5_py3.12_env/bin/python"
 CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
 APP_OFFSET = 0x10000
+APP_SLOT_OFFSETS = {
+    "app0": APP_OFFSET,
+    "app1": 0x1F0000,
+}
 APP_MAX_SIZE = 0x1E0000
 CONFIG_MAX_BYTES = 32828
 CONFIG_HEADER_BYTES = 44
@@ -1721,16 +1725,21 @@ def _flash_command(args: argparse.Namespace) -> int:
     device_path = resolve_device(args.device)
     if args.image and args.image_option:
         raise ValueError("choose one app image")
+    try:
+        offset = APP_SLOT_OFFSETS[args.slot]
+    except KeyError:
+        raise ValueError("slot must be app0 or app1") from None
     image = Path(args.image_option or args.image or str(DEFAULT_APP_IMAGE))
     image = resolve_app_image(image)
     size = validate_app0_image(image)
     plan = {
-        "action": "flash-app0",
+        "action": "flash-app0" if args.command == "flash-app0" else "flash-app",
         "device": device_path,
         "image": str(image),
         "live": bool(args.live),
         "max_size": APP_MAX_SIZE,
-        "offset": f"0x{APP_OFFSET:X}",
+        "offset": f"0x{offset:X}",
+        "slot": args.slot,
         "size": size,
     }
     if not args.live:
@@ -1756,7 +1765,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         "--after",
         "hard_reset",
         "write_flash",
-        f"0x{APP_OFFSET:X}",
+        f"0x{offset:X}",
         str(image),
     ]
     _run_esptool(arguments, device, RESET_TIMEOUT, image=image)
@@ -1823,14 +1832,23 @@ def build_parser() -> argparse.ArgumentParser:
     reset.add_argument("--live", action="store_true", help="perform the reset")
     reset.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
 
-    flash = commands.add_parser("flash-app0", help="flash only the app0 slot")
+    flash = commands.add_parser("flash-app", help="flash one fixed app slot")
     flash.add_argument("image", nargs="?")
     flash.add_argument("--image", dest="image_option")
+    flash.add_argument("--slot", choices=tuple(APP_SLOT_OFFSETS), required=True)
     flash.add_argument("--live", action="store_true", help="perform the flash")
     flash.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
     flash.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
 
-    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash):
+    flash0 = commands.add_parser("flash-app0", help="flash only the app0 slot")
+    flash0.add_argument("image", nargs="?")
+    flash0.add_argument("--image", dest="image_option")
+    flash0.add_argument("--live", action="store_true", help="perform the flash")
+    flash0.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
+    flash0.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
+    flash0.set_defaults(slot="app0")
+
+    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash, flash0):
         command.add_argument(
             "--device",
             default=argparse.SUPPRESS,
