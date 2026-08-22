@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import contextlib
+import base64
+import hashlib
 import io
 import json
 import os
 import pathlib
+import struct
 import sys
 import subprocess
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 
@@ -1524,6 +1528,160 @@ class DeviceCommandTest(unittest.TestCase):
             result, _ = self.run_main(["--device", DEVICE, "diag", "iccid"])
         self.assertNotEqual(result, 0)
         run.assert_not_called()
+
+
+def _config_fixture() -> bytes:
+    return (
+        b"SMSCFG01" + struct.pack("<HBBI", 1, 1, 1, 210000) + bytes(28) + bytes(16)
+    )
+
+
+def _ota_fixture(image: bytes = b"firmware" * 2000) -> bytes:
+    manifest = json.dumps({
+        "format": 1,
+        "releaseCounter": 7,
+        "sha256": hashlib.sha256(image).hexdigest(),
+        "size": len(image),
+        "target": "esp32c3",
+        "version": "test-ota",
+    }, sort_keys=True, separators=(",", ":")).encode("ascii")
+    signature = bytes(range(1, 33))
+    return b"SMSOTA1\n" + struct.pack(">I", len(manifest)) + manifest + struct.pack(">H", len(signature)) + signature + image
+
+
+class _FakeTransferClient:
+    state = None
+
+    def __init__(self, host, user, password, timeout=device.WEB_REQUEST_TIMEOUT):
+        if host != "fake-host" or user != "alice" or password != "secret":
+            raise AssertionError("fake auth mismatch")
+
+    def request(self, method, path, *, body=b"", headers=None, max_bytes=16384):
+        state = self.state
+        headers = headers or {}
+        state.requests.append((method, path, headers, body))
+        if method == "GET" and path == "/api/config":
+            return device.WebResponse(200, {"content-type": "application/json"}, b'{"csrfToken":"0123456789abcdef0123456789abcdef"}')
+        if headers.get("X-CSRF-Token") != "0123456789abcdef0123456789abcdef" and method == "POST":
+            return device.WebResponse(403, {}, b"{}")
+        parsed = urllib.parse.urlsplit(path)
+        query = urllib.parse.parse_qs(parsed.query)
+        if method == "POST" and parsed.path == "/api/config/export":
+            if state.wrong_status:
+                return device.WebResponse(500, {}, b"{}")
+            state.job_kind = "backup"
+            return self._action(202, True, "ACTION_JOB_ACCEPTED", {"jobId": 9})
+        if method == "GET" and parsed.path == "/api/jobs":
+            if state.job_mode == "timeout":
+                body = b'{"id":9,"type":"job","state":"running"}'
+            elif state.job_mode == "failed":
+                body = b'{"id":9,"type":"job","state":"failed","result":{"success":false,"code":"ACTION_JOB_FAILED","data":{},"detail":""}}'
+            else:
+                code = "ACTION_CONFIG_EXPORT_READY" if state.job_kind == "backup" else "ACTION_OTA_READY"
+                data = {"exportId": 12} if state.job_kind == "backup" else {}
+                body = json.dumps({"id": 9, "type": state.job_kind, "state": "succeeded", "result": {"success": True, "code": code, "data": data, "detail": ""}}).encode()
+            return device.WebResponse(200, {"content-type": "application/json"}, body)
+        if method == "GET" and parsed.path == "/api/config/export" and query.get("id") == ["12"]:
+            return device.WebResponse(200, {"content-type": "application/vnd.sms-forwarding.config"}, state.config)
+        if method == "POST" and parsed.path == "/api/ota/start":
+            fields = urllib.parse.parse_qs(body.decode())
+            state.job_kind = "ota"
+            state.manifest, state.signature = fields["manifest"][0], fields["signature"][0]
+            return self._action(201, True, "ACTION_OTA_UPLOAD_STARTED", {"uploadId": 4, "chunkSize": 8192, "nextOffset": 0})
+        if method == "POST" and parsed.path == "/api/ota/chunk":
+            state.chunks.append((int(query["offset"][0]), body.decode()))
+            raw = base64.b64decode(body, validate=True)
+            return self._action(200, True, "ACTION_OTA_CHUNK_OK", {"nextOffset": int(query["offset"][0]) + len(raw)})
+        if method == "POST" and parsed.path == "/api/ota/finish":
+            return self._action(202, True, "ACTION_JOB_ACCEPTED", {"jobId": 9})
+        return device.WebResponse(404, {}, b"{}")
+
+    @staticmethod
+    def _action(status, success, code, data=None):
+        return device.WebResponse(status, {"content-type": "application/json"}, json.dumps({"success": success, "code": code, "data": data or {}, "detail": ""}).encode())
+
+
+class WebTransferTest(unittest.TestCase):
+    def run_main(self, argv):
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            result = device.main(argv)
+        return result, output.getvalue(), errors.getvalue()
+
+    def serve(self):
+        state = type("State", (), {"requests": [], "config": _config_fixture(), "job_kind": "backup", "job_mode": "success", "wrong_status": False, "chunks": [], "manifest": "", "signature": ""})()
+        return state, "fake-host"
+
+    def test_ota_dry_run_does_not_use_network_and_rejects_bad_hash(self):
+        with tempfile.TemporaryDirectory() as temp:
+            package = pathlib.Path(temp) / "update.smsota"
+            package.write_bytes(_ota_fixture())
+            with mock.patch.object(device, "WebClient", side_effect=AssertionError("dry-run network")):
+                result, output, error = self.run_main(["ota-upload", str(package), "--host", "fake-host"])
+            self.assertEqual(result, 0)
+            self.assertIn("package_sha256", output)
+            self.assertNotIn("secret", output + error)
+            package.write_bytes(package.read_bytes()[:-1] + b"!")
+            result, _, error = self.run_main(["ota-upload", str(package)])
+            self.assertNotEqual(result, 0)
+            self.assertNotIn("secret", error)
+
+    def test_backup_live_uses_basic_csrf_and_writes_exclusive_mode600(self):
+        server, host = self.serve()
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": "a-passphrase-12"}, clear=True):
+            output_path = pathlib.Path(temp) / "backup.smscfg"
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, output, error = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
+            self.assertEqual(result, 0, error)
+            self.assertEqual(output_path.read_bytes(), _config_fixture())
+            self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
+            self.assertTrue(any(item[0:2] == ("POST", "/api/config/export") for item in server.requests))
+            self.assertNotIn("secret", output + error)
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, _, _ = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
+            self.assertNotEqual(result, 0)
+
+    def test_ota_live_uploads_8192_chunks_and_requires_exact_confirmation(self):
+        server, host = self.serve()
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_WEB_PASSWORD": "secret"}, clear=True):
+            package = pathlib.Path(temp) / "update.smsota"
+            package.write_bytes(_ota_fixture())
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, output, error = self.run_main([
+                    "ota-upload", str(package), "--host", host, "--user", "alice",
+                    "--live", "--confirm-host", host,
+                ])
+            self.assertEqual(result, 0, error)
+            self.assertIn("ACTION_OTA_READY", output)
+            self.assertEqual([offset for offset, _ in server.chunks], [0, 8192])
+            self.assertEqual(base64.b64decode(server.chunks[0][1]), (b"firmware" * 2000)[:8192])
+            self.assertNotIn("secret", output + error)
+
+    def test_live_transfers_reject_wrong_status_and_failed_or_timed_out_job(self):
+        server, host = self.serve()
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": "a-passphrase-12"}, clear=True):
+            output_path = pathlib.Path(temp) / "backup.smscfg"
+            server.wrong_status = True
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, _, error = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
+            self.assertNotEqual(result, 0)
+            self.assertNotIn("secret", error)
+            server.wrong_status = False
+            server.job_mode = "failed"
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, _, _ = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
+            self.assertNotEqual(result, 0)
+            server.job_mode = "timeout"
+            with mock.patch.object(device, "JOB_POLL_INTERVAL", 0), mock.patch.object(device, "JOB_TIMEOUT", 0.01):
+                with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                    result, _, _ = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
+            self.assertNotEqual(result, 0)
 
 
 if __name__ == "__main__":

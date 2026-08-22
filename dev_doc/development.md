@@ -91,6 +91,24 @@ USB 恢復是開發功能；`FIRMWARE_IS_RELEASE=1 SMS_USB_RECOVERY=1` 會在 CM
 CRSM 或任意 AT 文字。
 USB recovery 不接受任意 AT 命令。正式版不編譯 `main/usb_recovery.cpp`。
 
+Web 設定備份與簽章 OTA 也使用同一個入口。密碼只從 `SMS_WEB_PASSWORD` 或 mode 0600
+的 `--password-file` 讀取；備份 passphrase 只從 `SMS_CONFIG_PASSPHRASE` 或 mode 0600
+的 `--passphrase-file` 讀取，兩者不會寫入輸出：
+
+```sh
+SMS_WEB_PASSWORD='<local-secret>' SMS_CONFIG_PASSPHRASE='<local-passphrase>' \
+  python3 tools/device.py backup-config /path/to/config.smscfg --host 192.168.20.30
+python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30
+python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30 \
+  --live --confirm-host 192.168.20.30
+```
+
+`backup-config --dry-run` 只檢查輸出目標；`ota-upload` 預設只解析套件並輸出 hash、
+counter、version、大小與 host，不連線。備份輸出必須是不存在的新路徑，工具會以 mode 0600
+建立並在寫入前檢查 `SMSCFG01` header 與 32,828-byte 上限。OTA live 會先取得 CSRF token，
+以 8,192-byte chunk 上傳並輪詢有界 job；只有 terminal `ACTION_OTA_READY` 才算成功，工具不會
+手動 reset。兩個命令都不會解密備份、不會輸出 credential、passphrase、signature 或 image body。
+
 WiFi 配網會送出帶有非敏感 nonce 的版本化非同步請求。USB 先回覆已接受，
 再由單一受控工作執行 NVS 寫入與連線啟動；USB CLI 只送出一次，之後以
 nonce 輪詢唯讀狀態，因此遺失已接受回覆時不會重送憑證。狀態會分開表示

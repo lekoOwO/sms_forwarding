@@ -5,15 +5,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import hashlib
 import json
 import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -44,6 +48,17 @@ CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
 APP_OFFSET = 0x10000
 APP_MAX_SIZE = 0x1E0000
+CONFIG_MAX_BYTES = 32828
+CONFIG_HEADER_BYTES = 44
+CONFIG_TAG_BYTES = 16
+OTA_MAGIC = b"SMSOTA1\n"
+OTA_MAX_MANIFEST_BYTES = 512
+OTA_CHUNK_BYTES = 8192
+WEB_REQUEST_TIMEOUT = 10.0
+JOB_TIMEOUT = 45.0
+JOB_POLL_INTERVAL = 0.75
+DEFAULT_WEB_HOST = "192.168.20.30"
+DEFAULT_WEB_USER = "admin"
 RESET_TIMEOUT = 90.0
 STATE_TIMEOUT = 5.0
 DIAG_INNER_TIMEOUT = 3.0
@@ -229,6 +244,404 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+class DeviceTransferError(ValueError):
+    """固定且不洩漏敏感資料的 Web transfer 錯誤。"""
+
+
+@dataclass(frozen=True)
+class WebEndpoint:
+    scheme: str
+    hostname: str
+    port: int
+
+
+@dataclass(frozen=True)
+class OtaPackage:
+    manifest: str
+    signature_hex: str
+    firmware: bytes
+    counter: int
+    version: str
+    package_sha256: str
+
+
+@dataclass(frozen=True)
+class WebResponse:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+def _parse_web_host(value: str) -> WebEndpoint:
+    if not value or value != value.strip() or any(char in value for char in "\r\n"):
+        raise DeviceTransferError("host is invalid")
+    text = value if "://" in value else f"http://{value}"
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        hostname = parsed.hostname
+        port = parsed.port
+    except (ValueError, UnicodeError):
+        raise DeviceTransferError("host is invalid") from None
+    if parsed.scheme not in {"http", "https"} or not hostname or parsed.path not in {"", "/"} or parsed.query or parsed.fragment or parsed.username is not None or parsed.password is not None:
+        raise DeviceTransferError("host is invalid")
+    if any(char.isspace() for char in hostname) or any(char in hostname for char in "\r\n/"):
+        raise DeviceTransferError("host is invalid")
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    if not 1 <= port <= 65535:
+        raise DeviceTransferError("host is invalid")
+    return WebEndpoint(parsed.scheme, hostname, port)
+
+
+class WebClient:
+    def __init__(self, host: str, user: str, password: str, timeout: float = WEB_REQUEST_TIMEOUT):
+        self.endpoint = _parse_web_host(host)
+        if not user or any(char in user for char in ":\r\n"):
+            raise DeviceTransferError("user is invalid")
+        if any(char in password for char in "\r\n"):
+            raise DeviceTransferError("password is invalid")
+        try:
+            encoded = f"{user}:{password}".encode("utf-8")
+        except UnicodeEncodeError:
+            raise DeviceTransferError("credentials are invalid") from None
+        self._authorization = "Basic " + base64.b64encode(encoded).decode("ascii")
+        self.timeout = timeout
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes = b"",
+        headers: dict[str, str] | None = None,
+        max_bytes: int = 16384,
+    ) -> WebResponse:
+        if not path.startswith("/") or "\r" in path or "\n" in path:
+            raise DeviceTransferError("request path is invalid")
+        request_headers = {
+            "Authorization": self._authorization,
+            "Accept": "application/json",
+            "Cache-Control": "no-store",
+        }
+        if headers:
+            request_headers.update(headers)
+        connection_type = http.client.HTTPSConnection if self.endpoint.scheme == "https" else http.client.HTTPConnection
+        connection = None
+        try:
+            connection = connection_type(self.endpoint.hostname, self.endpoint.port, timeout=self.timeout)
+            connection.request(method, path, body=body, headers=request_headers)
+            response = connection.getresponse()
+            payload = response.read(max_bytes + 1)
+            if len(payload) > max_bytes:
+                raise DeviceTransferError("HTTP response exceeded the bounded size")
+            return WebResponse(
+                response.status,
+                {key.lower(): value for key, value in response.getheaders()},
+                payload,
+            )
+        except DeviceTransferError:
+            raise
+        except (OSError, TimeoutError, http.client.HTTPException):
+            raise DeviceTransferError("Web request failed") from None
+        finally:
+            if connection is not None:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+
+
+def _reject_symlink_components_any(path: Path) -> None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor or "/")
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise DeviceTransferError("path must not contain symlinks")
+        except OSError:
+            raise DeviceTransferError("path is unavailable") from None
+
+
+def _regular_file(path: Path, label: str, *, mode600: bool = False) -> Path:
+    _reject_symlink_components_any(path)
+    try:
+        info = path.lstat()
+    except OSError:
+        raise DeviceTransferError(f"{label} is unavailable") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise DeviceTransferError(f"{label} must be a regular file")
+    if mode600 and stat.S_IMODE(info.st_mode) != 0o600:
+        raise DeviceTransferError(f"{label} must use mode 600")
+    return path
+
+
+def _read_secret(env_name: str, file_value: str | None, label: str) -> str:
+    if file_value:
+        path = _regular_file(Path(file_value), label, mode600=True)
+        try:
+            if path.stat().st_size > 4096:
+                raise DeviceTransferError(f"{label} is too large")
+            data = path.read_bytes()
+        except OSError:
+            raise DeviceTransferError(f"{label} is unavailable") from None
+        if data.endswith(b"\n"):
+            data = data[:-1]
+            if data.endswith(b"\r"):
+                data = data[:-1]
+        try:
+            value = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DeviceTransferError(f"{label} is invalid") from None
+    else:
+        value = os.environ.get(env_name)
+        if value is None or value == "":
+            raise DeviceTransferError(f"{env_name} or --{label.replace(' ', '-')} is required")
+    if not value or any(char in value for char in "\r\n"):
+        raise DeviceTransferError(f"{label} is invalid")
+    return value
+
+
+def _validate_passphrase(value: str) -> str:
+    if not 12 <= len(value.encode("utf-8")) <= 128:
+        raise DeviceTransferError("configuration passphrase is invalid")
+    return value
+
+
+def _json_object(response: WebResponse, stage: str, expected_status: int) -> dict[str, object]:
+    if response.status != expected_status:
+        raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
+    try:
+        value = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise DeviceTransferError(f"{stage} returned invalid JSON") from None
+    if not isinstance(value, dict):
+        raise DeviceTransferError(f"{stage} returned invalid JSON")
+    return value
+
+
+def _action(response: WebResponse, stage: str, expected_status: int) -> dict[str, object]:
+    value = _json_object(response, stage, expected_status)
+    if set(value) != {"success", "code", "data", "detail"} or not isinstance(value["success"], bool) or not isinstance(value["code"], str) or not isinstance(value["data"], dict) or not isinstance(value["detail"], str):
+        raise DeviceTransferError(f"{stage} returned invalid action result")
+    return value
+
+
+def _positive_int(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= 0xFFFFFFFF:
+        raise DeviceTransferError(f"{label} is invalid")
+    return value
+
+
+def _csrf(client: WebClient) -> str:
+    snapshot = _json_object(client.request("GET", "/api/config", max_bytes=16384), "config snapshot", 200)
+    token = snapshot.get("csrfToken")
+    if not isinstance(token, str) or not 1 <= len(token.encode("utf-8")) < 40 or any(ord(char) < 0x20 or ord(char) > 0x7e for char in token):
+        raise DeviceTransferError("config snapshot returned an invalid CSRF token")
+    return token
+
+
+def _post_form(client: WebClient, path: str, token: str, values: dict[str, object], stage: str, status: int) -> dict[str, object]:
+    encoded = urllib.parse.urlencode({key: str(value) for key, value in values.items()}).encode("ascii")
+    return _action(client.request("POST", path, body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "application/x-www-form-urlencoded"}, max_bytes=4096), stage, status)
+
+
+def _job(client: WebClient, job_id: int, token: str, timeout: float | None = None) -> dict[str, object]:
+    timeout = JOB_TIMEOUT if timeout is None else timeout
+    deadline = time.monotonic() + timeout
+    while True:
+        response = client.request("GET", f"/api/jobs?id={job_id}", headers={"X-CSRF-Token": token}, max_bytes=4096)
+        value = _json_object(response, "job status", 200)
+        if set(value) not in ({"id", "type", "state"}, {"id", "type", "state", "result"}):
+            raise DeviceTransferError("job status is invalid")
+        if value.get("id") != job_id or not isinstance(value.get("type"), str) or value.get("state") not in {"queued", "running", "succeeded", "failed"}:
+            raise DeviceTransferError("job status is invalid")
+        state = value["state"]
+        if state in {"succeeded", "failed"}:
+            result = value.get("result")
+            if not isinstance(result, dict) or set(result) != {"success", "code", "data", "detail"} or not isinstance(result["success"], bool) or not isinstance(result["code"], str) or not isinstance(result["data"], dict) or not isinstance(result["detail"], str):
+                raise DeviceTransferError("job result is invalid")
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise DeviceTransferError("job polling timed out")
+        time.sleep(min(JOB_POLL_INTERVAL, remaining))
+
+
+def _parse_ota_package(path: Path) -> OtaPackage:
+    if path.suffix != ".smsota":
+        raise DeviceTransferError("OTA package must use the .smsota suffix")
+    _regular_file(path, "OTA package")
+    try:
+        size = path.stat().st_size
+        if size <= len(OTA_MAGIC) + 4 + 2 or size > APP_MAX_SIZE + OTA_MAX_MANIFEST_BYTES + 2 + 72 + len(OTA_MAGIC) + 4:
+            raise DeviceTransferError("OTA package size is invalid")
+        package = path.read_bytes()
+    except OSError:
+        raise DeviceTransferError("OTA package is unavailable") from None
+    if len(package) != size or not package.startswith(OTA_MAGIC):
+        raise DeviceTransferError("OTA package is invalid")
+    if len(package) < len(OTA_MAGIC) + 4:
+        raise DeviceTransferError("OTA package is truncated")
+    manifest_size = struct.unpack_from(">I", package, len(OTA_MAGIC))[0]
+    manifest_start = len(OTA_MAGIC) + 4
+    signature_size_offset = manifest_start + manifest_size
+    if not 1 <= manifest_size <= OTA_MAX_MANIFEST_BYTES or signature_size_offset + 2 > len(package):
+        raise DeviceTransferError("OTA manifest is invalid")
+    try:
+        manifest_bytes = package[manifest_start:signature_size_offset]
+        manifest = manifest_bytes.decode("ascii")
+    except UnicodeDecodeError:
+        raise DeviceTransferError("OTA manifest is invalid") from None
+    signature_size = struct.unpack_from(">H", package, signature_size_offset)[0]
+    firmware_start = signature_size_offset + 2 + signature_size
+    if not 8 <= signature_size <= 72 or firmware_start > len(package):
+        raise DeviceTransferError("OTA signature is invalid")
+    signature = package[signature_size_offset + 2:firmware_start]
+    firmware = package[firmware_start:]
+    try:
+        manifest_value = json.loads(manifest, parse_constant=lambda _value: (_ for _ in ()).throw(ValueError()))
+    except (ValueError, json.JSONDecodeError):
+        raise DeviceTransferError("OTA manifest is invalid") from None
+    if not isinstance(manifest_value, dict) or set(manifest_value) != {"format", "releaseCounter", "sha256", "size", "target", "version"}:
+        raise DeviceTransferError("OTA manifest is invalid")
+    try:
+        canonical = json.dumps(manifest_value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise DeviceTransferError("OTA manifest is invalid") from None
+    if canonical != manifest_bytes:
+        raise DeviceTransferError("OTA manifest is not canonical")
+    counter = manifest_value["releaseCounter"]
+    image_size = manifest_value["size"]
+    digest = manifest_value["sha256"]
+    version = manifest_value["version"]
+    if not isinstance(manifest_value["format"], int) or isinstance(manifest_value["format"], bool) or manifest_value["format"] != 1 or not isinstance(counter, int) or isinstance(counter, bool) or not 0 < counter <= 0xFFFFFFFF or not isinstance(image_size, int) or isinstance(image_size, bool) or not 0 < image_size <= APP_MAX_SIZE or manifest_value["target"] != "esp32c3" or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(version, str) or not 0 < len(version) <= 32 or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._+-" for char in version) or image_size != len(firmware) or hashlib.sha256(firmware).hexdigest() != digest:
+        raise DeviceTransferError("OTA manifest does not match firmware")
+    return OtaPackage(manifest, signature.hex(), firmware, counter, version, hashlib.sha256(package).hexdigest())
+
+
+def _validate_config_backup(data: bytes) -> bytes:
+    if not CONFIG_HEADER_BYTES + CONFIG_TAG_BYTES <= len(data) <= CONFIG_MAX_BYTES or len(data) < CONFIG_HEADER_BYTES or data[:8] != b"SMSCFG01":
+        raise DeviceTransferError("configuration export is invalid")
+    version, kdf, cipher, iterations = struct.unpack_from("<HBBI", data, 8)
+    if (version, kdf, cipher, iterations) != (1, 1, 1, 210000):
+        raise DeviceTransferError("configuration export header is invalid")
+    return data
+
+
+def _exclusive_atomic_write(path: Path, data: bytes) -> None:
+    _validate_output_target(path)
+    temporary_name = None
+    descriptor = -1
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(prefix=".smscfg-", dir=path.parent)
+        temporary = Path(temporary_name)
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(data)
+            stream.flush()
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        temporary_name = None
+    except FileExistsError:
+        raise DeviceTransferError("output already exists") from None
+    except OSError:
+        raise DeviceTransferError("could not write output") from None
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if temporary_name:
+            try:
+                Path(temporary_name).unlink()
+            except OSError:
+                pass
+
+
+def _validate_output_target(path: Path) -> None:
+    _reject_symlink_components_any(path.parent)
+    try:
+        parent_info = path.parent.lstat()
+    except OSError:
+        raise DeviceTransferError("output parent is unavailable") from None
+    if not stat.S_ISDIR(parent_info.st_mode) or path.parent.is_symlink():
+        raise DeviceTransferError("output parent must be a regular directory")
+    _reject_symlink_components_any(path)
+    if path.exists() or path.is_symlink():
+        raise DeviceTransferError("output already exists")
+
+
+def _backup_command(args: argparse.Namespace) -> int:
+    if bool(args.output) == bool(args.output_option):
+        raise DeviceTransferError("one explicit output path is required")
+    output = Path(args.output_option or args.output)
+    _validate_output_target(output)
+    if args.dry_run:
+        print(json.dumps({"action": "backup-config", "host": args.host, "output": str(output), "live": False}, sort_keys=True))
+        return 0
+    passphrase = _validate_passphrase(_read_secret("SMS_CONFIG_PASSPHRASE", args.passphrase_file, "passphrase file"))
+    password = _read_secret("SMS_WEB_PASSWORD", args.password_file, "password file")
+    client = WebClient(args.host, args.user, password)
+    token = _csrf(client)
+    accepted = _post_form(client, "/api/config/export", token, {"passphrase": passphrase}, "config export", 202)
+    if accepted["success"] is not True:
+        raise DeviceTransferError("configuration export was rejected")
+    job_id = _positive_int(accepted["data"].get("jobId"), "export job id")
+    result = _job(client, job_id, token)
+    if result["success"] is not True:
+        raise DeviceTransferError("configuration export job failed")
+    export_id = _positive_int(result["data"].get("exportId"), "export id")
+    downloaded = client.request("GET", f"/api/config/export?id={export_id}", headers={"X-CSRF-Token": token, "Accept": "application/vnd.sms-forwarding.config"}, max_bytes=CONFIG_MAX_BYTES)
+    if downloaded.status != 200 or downloaded.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/vnd.sms-forwarding.config":
+        raise DeviceTransferError("configuration download returned an unexpected response")
+    _exclusive_atomic_write(output, _validate_config_backup(downloaded.body))
+    print(json.dumps({"action": "backup-config", "host": args.host, "output": str(output), "bytes": len(downloaded.body), "live": True}, sort_keys=True))
+    return 0
+
+
+def _ota_upload_command(args: argparse.Namespace) -> int:
+    if bool(args.package) == bool(args.package_option):
+        raise DeviceTransferError("one OTA package path is required")
+    package = _parse_ota_package(Path(args.package_option or args.package))
+    plan = {"action": "ota-upload", "host": args.host, "counter": package.counter, "version": package.version, "size": len(package.firmware), "package_sha256": package.package_sha256, "live": bool(args.live)}
+    if not args.live:
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+    if args.confirm_host != args.host:
+        raise DeviceTransferError("--confirm-host must exactly match --host")
+    password = _read_secret("SMS_WEB_PASSWORD", args.password_file, "password file")
+    client = WebClient(args.host, args.user, password)
+    token = _csrf(client)
+    accepted = _post_form(client, "/api/ota/start", token, {"manifest": package.manifest, "signature": package.signature_hex}, "OTA start", 201)
+    if accepted["success"] is not True or accepted["code"] != "ACTION_OTA_UPLOAD_STARTED":
+        raise DeviceTransferError("OTA start was rejected")
+    data = accepted["data"]
+    upload_id = _positive_int(data.get("uploadId"), "OTA upload id")
+    if data.get("chunkSize") != OTA_CHUNK_BYTES or data.get("nextOffset") != 0:
+        raise DeviceTransferError("OTA start returned invalid transfer bounds")
+    offset = 0
+    while offset < len(package.firmware):
+        chunk = package.firmware[offset:offset + OTA_CHUNK_BYTES]
+        encoded = base64.b64encode(chunk)
+        result = _action(client.request("POST", f"/api/ota/chunk?id={upload_id}&offset={offset}", body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "text/plain"}, max_bytes=4096), "OTA chunk", 200)
+        if result["success"] is not True or result["code"] != "ACTION_OTA_CHUNK_OK" or result["data"].get("nextOffset") != offset + len(chunk):
+            raise DeviceTransferError("OTA chunk was rejected")
+        offset += len(chunk)
+    finished = _post_form(client, f"/api/ota/finish?id={upload_id}", token, {}, "OTA finish", 202)
+    if finished["success"] is not True:
+        raise DeviceTransferError("OTA finish was rejected")
+    job_id = _positive_int(finished["data"].get("jobId"), "OTA job id")
+    result = _job(client, job_id, token)
+    if result["success"] is not True or result["code"] != "ACTION_OTA_READY":
+        raise DeviceTransferError("OTA validation failed")
+    plan["code"] = "ACTION_OTA_READY"
+    print(json.dumps(plan, sort_keys=True))
+    return 0
 
 
 def _run_ota_key_command(command: list[str], stage: str) -> subprocess.CompletedProcess[bytes]:
@@ -1365,6 +1778,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="build the isolated dev image that rolls back during pending verification",
     )
 
+    backup = commands.add_parser("backup-config", help="export an encrypted configuration backup")
+    backup.add_argument("output", nargs="?", help="new .smscfg output path")
+    backup.add_argument("--output", dest="output_option", default=None, help="new .smscfg output path")
+    backup.add_argument("--host", default=DEFAULT_WEB_HOST)
+    backup.add_argument("--user", default=DEFAULT_WEB_USER)
+    backup.add_argument("--password-file", default=None)
+    backup.add_argument("--passphrase-file", default=None)
+    backup.add_argument("--dry-run", action="store_true", help="validate the output target without contacting the device")
+
+    ota_upload = commands.add_parser("ota-upload", help="upload a signed .smsota package through Web OTA")
+    ota_upload.add_argument("package", nargs="?", help="existing signed .smsota package")
+    ota_upload.add_argument("--package", dest="package_option", default=None, help="existing signed .smsota package")
+    ota_upload.add_argument("--host", default=DEFAULT_WEB_HOST)
+    ota_upload.add_argument("--user", default=DEFAULT_WEB_USER)
+    ota_upload.add_argument("--password-file", default=None)
+    ota_upload.add_argument("--live", action="store_true", help="start the upload after exact host confirmation")
+    ota_upload.add_argument("--confirm-host", default=None)
+
     state = commands.add_parser("state", help="read sanitized device state")
     state.add_argument("--json", action="store_true", help="write the default JSON state format")
 
@@ -1410,6 +1841,10 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 raise ValueError("--version must be 1-32 safe ASCII characters")
             return _ota_test_package_command(args)
+        if args.command == "backup-config":
+            return _backup_command(args)
+        if args.command == "ota-upload":
+            return _ota_upload_command(args)
         if args.command == "state":
             deadline = time.monotonic() + CONTAINER_TIMEOUT
             state = _state(resolve_serial_device(args.device), deadline=deadline)
