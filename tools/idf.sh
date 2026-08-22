@@ -9,6 +9,7 @@ sms_usb_recovery="${SMS_USB_RECOVERY:-0}"
 release_firmware="${FIRMWARE_IS_RELEASE:-0}"
 ota_test_key="${SMS_OTA_TEST_KEY:-0}"
 ota_test_public_key="${SMS_OTA_TEST_PUBLIC_KEY:-}"
+ota_test_fail_health="${SMS_OTA_TEST_FAIL_HEALTH:-0}"
 export SDKCONFIG_DEFAULTS="$repo_root/sdkconfig.defaults"
 
 if [[ "$sms_usb_recovery" != "0" && "$sms_usb_recovery" != "1" ]]; then
@@ -23,6 +24,10 @@ if [[ "$ota_test_key" != "0" && "$ota_test_key" != "1" ]]; then
   echo "SMS_OTA_TEST_KEY must be 0 or 1" >&2
   exit 2
 fi
+if [[ "$ota_test_fail_health" != "0" && "$ota_test_fail_health" != "1" ]]; then
+  echo "SMS_OTA_TEST_FAIL_HEALTH must be 0 or 1" >&2
+  exit 2
+fi
 if [[ "$ota_test_key" == "1" && "$release_firmware" == "1" ]]; then
   echo "SMS_OTA_TEST_KEY cannot be enabled in a release firmware" >&2
   exit 2
@@ -31,11 +36,21 @@ if [[ "$ota_test_key" == "1" && "$sms_usb_recovery" != "1" ]]; then
   echo "SMS_OTA_TEST_KEY requires USB recovery development profile" >&2
   exit 2
 fi
+if [[ "$ota_test_fail_health" == "1" &&
+      ("$release_firmware" != "0" || "$sms_usb_recovery" != "1" || "$ota_test_key" != "1") ]]; then
+  echo "SMS_OTA_TEST_FAIL_HEALTH requires non-release USB recovery with the OTA test key" >&2
+  exit 2
+fi
 if [[ "$ota_test_key" == "1" ]]; then
-  ota_test_profile_dir="$repo_root/build/idf-ota-test"
+  ota_test_key_dir="$repo_root/build/idf-ota-test"
+  ota_test_profile_dir="$ota_test_key_dir"
+  if [[ "$ota_test_fail_health" == "1" ]]; then
+    ota_test_profile_dir="$repo_root/build/idf-ota-test-fail-health"
+  fi
   if [[ -L "$repo_root/build" || ! -d "$repo_root/build"
+        || -L "$ota_test_key_dir" || ! -d "$ota_test_key_dir"
         || -L "$ota_test_profile_dir" || ! -d "$ota_test_profile_dir" ]]; then
-    echo "SMS_OTA_TEST_KEY requires a real build/idf-ota-test directory" >&2
+    echo "SMS_OTA_TEST_KEY requires real OTA test build directories" >&2
     exit 2
   fi
   if [[ -z "$ota_test_public_key" || -L "$ota_test_public_key" || ! -f "$ota_test_public_key" ]]; then
@@ -45,19 +60,19 @@ if [[ "$ota_test_key" == "1" ]]; then
   repo_real="$(realpath -e -- "$repo_root")"
   profile_real="$(realpath -e -- "$ota_test_profile_dir")"
   public_real="$(realpath -e -- "$ota_test_public_key")"
-  if [[ "$profile_real" != "$repo_real/build/idf-ota-test" ]]; then
-    echo "SMS_OTA_TEST_KEY profile must resolve to build/idf-ota-test" >&2
+  if [[ "$public_real" != "$repo_real/build/idf-ota-test"/* ]]; then
+    echo "SMS_OTA_TEST_PUBLIC_KEY must stay inside build/idf-ota-test" >&2
     exit 2
   fi
-  case "$public_real" in
-    "$profile_real"/*) ;;
-    *)
-      echo "SMS_OTA_TEST_PUBLIC_KEY must stay inside build/idf-ota-test" >&2
-      exit 2
-      ;;
-  esac
-  build_dir="$repo_root/build/idf-ota-test"
+  if [[ "$profile_real" != "$repo_real/build/$(basename "$ota_test_profile_dir")" ]]; then
+    echo "SMS_OTA_TEST_KEY profile must resolve to its fixed OTA test directory" >&2
+    exit 2
+  fi
+  build_dir="$ota_test_profile_dir"
   sdkconfig="$repo_root/build/sdkconfig-ota-test"
+  if [[ "$ota_test_fail_health" == "1" ]]; then
+    sdkconfig="$repo_root/build/sdkconfig-ota-test-fail-health"
+  fi
   export SDKCONFIG_DEFAULTS="$SDKCONFIG_DEFAULTS;$repo_root/sdkconfig.usb-recovery"
 elif [[ "$sms_usb_recovery" == "1" ]]; then
   build_dir="$repo_root/build/idf-usb-recovery"
@@ -68,7 +83,8 @@ fi
 idf_args=(-B "$build_dir" -D "SDKCONFIG=$sdkconfig"
   -D "SDKCONFIG_DEFAULTS=$SDKCONFIG_DEFAULTS"
   -D "FIRMWARE_IS_RELEASE=$release_firmware" -D "SMS_USB_RECOVERY=$sms_usb_recovery"
-  -D "SMS_OTA_TEST_KEY=$ota_test_key" -D "SMS_OTA_TEST_PUBLIC_KEY=$ota_test_public_key")
+  -D "SMS_OTA_TEST_KEY=$ota_test_key" -D "SMS_OTA_TEST_FAIL_HEALTH=$ota_test_fail_health"
+  -D "SMS_OTA_TEST_PUBLIC_KEY=$ota_test_public_key")
 
 if [[ -z "${IDF_PATH:-}" || ! -f "$IDF_PATH/export.sh" ]]; then
   echo "IDF_PATH must point to ESP-IDF ${expected_idf_version}" >&2

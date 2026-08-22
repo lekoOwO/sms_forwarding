@@ -120,6 +120,32 @@ ephemeral P-256 private key，並把對應 public key 路徑傳給 CMake。priva
 `ota_meta` floor。production public-key fingerprint
 `a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735` 不會變更。
 
+若要測試 app0 直接燒錄，先確認 `build/idf-ota-test/CMakeCache.txt` 同時顯示
+`FIRMWARE_IS_RELEASE=0`、`SMS_USB_RECOVERY=1` 與 `SMS_OTA_TEST_KEY=1`，再使用
+固定 image、SHA-256 與裝置名稱確認：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... ota-state
+python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app0 \
+  build/idf-ota-test/sms_forwarding_idf.bin --live \
+  --sha256 <64-hex-image-sha256> --confirm <by-id-basename>
+```
+
+`ota-state` 只回報 app0/app1 offset、映像狀態與目前 OTA metadata；回報格式錯誤、
+未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。尚未完成實機 rollback、
+replay 與 signed OTA 證據前，停止於 host build/package 與唯讀 `ota-state`；不要執行
+實機 flash、Web upload 或宣稱 signed OTA READY。
+
+要建立故意在 pending verification 回復的獨立開發映像，使用同一個 ignored ephemeral
+key，但不同的 build/cache 目錄：
+
+```sh
+python3 tools/device.py ota-test-package --fail-health --counter <non-zero-uint32>
+```
+
+此命令只建置與簽署，不會上傳或重新啟動裝置；`build/idf-ota-test/` 的一般 test-key
+映像不會被覆蓋。
+
 ## 建置 Web UI
 
 第一次建置或 lockfile 變更後，安裝固定依賴：

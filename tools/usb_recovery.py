@@ -30,12 +30,14 @@ COMMAND_WIFI_PROVISION = 0x02
 COMMAND_WIFI_PROVISION_ASYNC = 0x03
 COMMAND_WIFI_PROVISION_STATUS = 0x04
 COMMAND_MODEM_QUERY = 0x05
+COMMAND_OTA_STATE = 0x06
 RESPONSE_MASK = 0x80
 RESPONSE_STATE = COMMAND_STATE | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION = COMMAND_WIFI_PROVISION | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION_ASYNC = COMMAND_WIFI_PROVISION_ASYNC | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION_STATUS = COMMAND_WIFI_PROVISION_STATUS | RESPONSE_MASK
 RESPONSE_MODEM_QUERY = COMMAND_MODEM_QUERY | RESPONSE_MASK
+RESPONSE_OTA_STATE = COMMAND_OTA_STATE | RESPONSE_MASK
 QUERY_ATI = 0x01
 QUERY_CPIN = 0x02
 QUERY_CEREG = 0x03
@@ -78,6 +80,7 @@ REQUEST_COMMANDS = frozenset((
     COMMAND_WIFI_PROVISION_ASYNC,
     COMMAND_WIFI_PROVISION_STATUS,
     COMMAND_MODEM_QUERY,
+    COMMAND_OTA_STATE,
 ))
 RESPONSE_COMMANDS = frozenset((
     RESPONSE_STATE,
@@ -85,6 +88,7 @@ RESPONSE_COMMANDS = frozenset((
     RESPONSE_WIFI_PROVISION_ASYNC,
     RESPONSE_WIFI_PROVISION_STATUS,
     RESPONSE_MODEM_QUERY,
+    RESPONSE_OTA_STATE,
 ))
 ALL_COMMANDS = REQUEST_COMMANDS | RESPONSE_COMMANDS
 
@@ -130,6 +134,18 @@ MAX_PAYLOAD = 100
 MAX_ASYNC_PROVISION_PAYLOAD = 104
 MAX_QUERY_PAYLOAD = 1
 MAX_QUERY_RESPONSE = 96
+APP0_OFFSET = 0x10000
+APP1_OFFSET = 0x1F0000
+OTA_IMAGE_STATE_OTHER = 0
+OTA_IMAGE_STATE_PENDING_VERIFY = 1
+OTA_IMAGE_STATE_VALID = 2
+OTA_IMAGE_STATE_NAMES = {
+    OTA_IMAGE_STATE_OTHER: "other",
+    OTA_IMAGE_STATE_PENDING_VERIFY: "pending-verify",
+    OTA_IMAGE_STATE_VALID: "valid",
+}
+OTA_STATE_STRUCT = struct.Struct("<IBBIII")
+OTA_STATE_PAYLOAD_SIZE = OTA_STATE_STRUCT.size
 HEADER = struct.Struct("<2sBBHB")
 HEADER_SIZE = HEADER.size
 CRC_SIZE = 2
@@ -233,6 +249,8 @@ def _max_payload(command: int) -> int:
         return MAX_ASYNC_PROVISION_PAYLOAD
     if command == COMMAND_MODEM_QUERY:
         return MAX_QUERY_PAYLOAD
+    if command == COMMAND_OTA_STATE:
+        return 0
     return MAX_PAYLOAD
 
 
@@ -1073,6 +1091,70 @@ def decode_state_payload(payload: bytes) -> dict[str, object]:
     return state
 
 
+def decode_ota_state_payload(payload: bytes) -> dict[str, object]:
+    if len(payload) != OTA_STATE_PAYLOAD_SIZE:
+        raise DeviceError("malformed OTA state response")
+    active_offset, image_state, pending_verify, accepted, pending, pending_address = (
+        OTA_STATE_STRUCT.unpack(payload)
+    )
+    if active_offset not in {APP0_OFFSET, APP1_OFFSET}:
+        raise DeviceError("malformed OTA state response")
+    state_name = OTA_IMAGE_STATE_NAMES.get(image_state)
+    if state_name is None or pending_verify not in (0, 1):
+        raise DeviceError("malformed OTA state response")
+    if pending_address not in {0, APP0_OFFSET, APP1_OFFSET}:
+        raise DeviceError("malformed OTA state response")
+    if bool(pending_verify) != (image_state == OTA_IMAGE_STATE_PENDING_VERIFY):
+        raise DeviceError("malformed OTA state response")
+    return {
+        "active_offset": active_offset,
+        "image_state": state_name,
+        "pending_verify": bool(pending_verify),
+        "accepted": accepted,
+        "pending": pending,
+        "pending_address": pending_address,
+    }
+
+
+def validate_ota_state(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {
+        "active_offset", "image_state", "pending_verify",
+        "accepted", "pending", "pending_address",
+    }:
+        raise DeviceError("malformed OTA state response")
+    active_offset = value["active_offset"]
+    image_state = value["image_state"]
+    pending_verify = value["pending_verify"]
+    accepted = value["accepted"]
+    pending = value["pending"]
+    pending_address = value["pending_address"]
+    if (
+        not isinstance(active_offset, int) or isinstance(active_offset, bool)
+        or active_offset not in {APP0_OFFSET, APP1_OFFSET}
+        or not isinstance(image_state, str)
+        or image_state not in OTA_IMAGE_STATE_NAMES.values()
+        or not isinstance(pending_verify, bool)
+        or pending_verify != (image_state == "pending-verify")
+        or not all(
+            isinstance(counter, int) and not isinstance(counter, bool)
+            and 0 <= counter <= 0xFFFFFFFF
+            for counter in (accepted, pending)
+        )
+        or not isinstance(pending_address, int)
+        or isinstance(pending_address, bool)
+        or pending_address not in {0, APP0_OFFSET, APP1_OFFSET}
+    ):
+        raise DeviceError("malformed OTA state response")
+    return {
+        "active_offset": active_offset,
+        "image_state": image_state,
+        "pending_verify": pending_verify,
+        "accepted": accepted,
+        "pending": pending,
+        "pending_address": pending_address,
+    }
+
+
 def decode_provision_status_payload(payload: bytes) -> dict[str, int]:
     if len(payload) != PROVISION_STATUS_PAYLOAD:
         raise DeviceError("malformed WiFi provision status")
@@ -1306,6 +1388,16 @@ def _state_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ota_state_command(args: argparse.Namespace) -> int:
+    timeout = validate_timeout(STATE_TIMEOUT if args.timeout is None else args.timeout)
+    internal = {"internal_container": True} if getattr(args, "internal_container", False) else {}
+    response = run_transaction(
+        args.device, timeout, COMMAND_OTA_STATE, b"", **internal,
+    )
+    print(json.dumps(decode_ota_state_payload(response.payload), sort_keys=True))
+    return 0
+
+
 def _query_command(args: argparse.Namespace) -> int:
     query_name = args.query_option or args.query_name
     if not query_name:
@@ -1429,6 +1521,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--internal-container", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("state")
+    commands.add_parser("ota-state")
     wifi = commands.add_parser(
         "wifi-provision",
         help="provision a network; an open network requires a populated Web scan cache",
@@ -1450,6 +1543,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "state":
             return _state_command(args)
+        if args.command == "ota-state":
+            return _ota_state_command(args)
         if args.command == "query":
             return _query_command(args)
         if args.command == "diag-batch":

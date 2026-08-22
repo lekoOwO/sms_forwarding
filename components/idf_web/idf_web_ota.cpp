@@ -17,6 +17,18 @@ namespace {
 #ifndef SMS_OTA_TEST_KEY
 #define SMS_OTA_TEST_KEY 0
 #endif
+#ifndef SMS_OTA_TEST_FAIL_HEALTH
+#define SMS_OTA_TEST_FAIL_HEALTH 0
+#endif
+#ifndef FIRMWARE_IS_RELEASE
+#define FIRMWARE_IS_RELEASE 0
+#endif
+#ifndef SMS_USB_RECOVERY
+#define SMS_USB_RECOVERY 0
+#endif
+#if SMS_OTA_TEST_FAIL_HEALTH && (FIRMWARE_IS_RELEASE || !SMS_USB_RECOVERY || !SMS_OTA_TEST_KEY)
+#error "SMS_OTA_TEST_FAIL_HEALTH requires the non-release USB OTA test profile"
+#endif
 #if SMS_OTA_TEST_KEY
 static constexpr const char* OTA_NAMESPACE = "ota_test_meta";
 #else
@@ -214,6 +226,37 @@ IdfWebOtaPlatform make_platform()
             store_pending, clear_pending_metadata, set_boot};
 }
 
+esp_err_t read_ota_state(IdfWebOtaState* output)
+{
+    if (!output) return ESP_ERR_INVALID_ARG;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!running) return ESP_ERR_INVALID_STATE;
+    esp_ota_img_states_t raw_state;
+    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    output->active_offset = running->address;
+    output->image_state = raw_state == ESP_OTA_IMG_PENDING_VERIFY
+        ? IdfWebOtaImageState::PendingVerify
+        : raw_state == ESP_OTA_IMG_VALID ? IdfWebOtaImageState::Valid
+                                         : IdfWebOtaImageState::Other;
+    output->pending_verify = output->image_state == IdfWebOtaImageState::PendingVerify;
+    output->accepted = 0;
+    output->pending = 0;
+    output->pending_address = 0;
+
+    nvs_handle_t handle = 0;
+    const esp_err_t opened = nvs_open(OTA_NAMESPACE, NVS_READONLY, &handle);
+    if (opened == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    if (opened != ESP_OK) return opened;
+    const bool ok = read_counter(handle, KEY_ACCEPTED, output->accepted) &&
+                    read_counter(handle, KEY_PENDING, output->pending) &&
+                    read_counter(handle, KEY_PENDING_ADDRESS, output->pending_address);
+    nvs_close(handle);
+    return ok ? ESP_OK : ESP_ERR_NVS_TYPE_MISMATCH;
+}
+
 bool lock(TickType_t ticks = portMAX_DELAY)
 {
     return s_mutex && xSemaphoreTake(s_mutex, ticks) == pdTRUE;
@@ -353,6 +396,11 @@ bool idf_web_ota_restart_pending()
     return result;
 }
 
+esp_err_t idf_web_ota_get_state(IdfWebOtaState* output)
+{
+    return read_ota_state(output);
+}
+
 esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
                                    bool deadline_expired)
 {
@@ -363,6 +411,15 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
     IdfWebOtaImageState state = raw_state == ESP_OTA_IMG_PENDING_VERIFY
         ? IdfWebOtaImageState::PendingVerify
         : raw_state == ESP_OTA_IMG_VALID ? IdfWebOtaImageState::Valid : IdfWebOtaImageState::Other;
+
+#if SMS_OTA_TEST_FAIL_HEALTH
+    if (state == IdfWebOtaImageState::PendingVerify) {
+        // The development test intentionally rolls back in the bootloader;
+        // it does not read or write OTA metadata.
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+        return ESP_FAIL;
+    }
+#endif
 
     nvs_handle_t handle = 0;
     if (nvs_open(OTA_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {

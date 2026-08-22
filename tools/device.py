@@ -35,6 +35,7 @@ OTA_TEST_VERSION = "1.1.4-dev-test"
 APP_IMAGE_RELATIVE_PATHS = (
     Path("build/idf/sms_forwarding_idf.bin"),
     Path("build/idf-usb-recovery/sms_forwarding_idf.bin"),
+    Path("build/idf-ota-test/sms_forwarding_idf.bin"),
 )
 ESPTOOL = os.environ.get("ESPTOOL", "esptool.py")
 IDF_IMAGE = EXPECTED_IDF_IMAGE
@@ -320,29 +321,47 @@ def _ensure_ota_test_keypair() -> tuple[Path, Path, str]:
     return private_key, public_key, hashlib.sha256(derived.stdout).hexdigest()
 
 
-def _ota_test_build_environment(public_key: Path) -> dict[str, str]:
+def _ota_test_build_environment(public_key: Path, *, fail_health: bool = False) -> dict[str, str]:
     public_key = _validate_ota_test_material(public_key, "OTA test public key", required=True)
     env = os.environ.copy()
     env.update({
         "SMS_USB_RECOVERY": "1",
         "SMS_OTA_TEST_KEY": "1",
         "SMS_OTA_TEST_PUBLIC_KEY": str(public_key),
+        "SMS_OTA_TEST_FAIL_HEALTH": "1" if fail_health else "0",
         "FIRMWARE_IS_RELEASE": "0",
     })
     return env
 
 
-def resolve_ota_test_image(path: Path) -> Path:
+def _ota_test_build_dir(*, fail_health: bool) -> Path:
+    _ota_test_profile_root()
+    profile = ROOT / "build" / (
+        "idf-ota-test-fail-health" if fail_health else "idf-ota-test"
+    )
+    if profile.is_symlink():
+        raise usb_recovery.DeviceError("OTA test build directory must not be a symlink")
+    if profile.exists() and not profile.is_dir():
+        raise usb_recovery.DeviceError("OTA test build directory must be a directory")
+    profile.mkdir(parents=True, exist_ok=True)
+    return profile.resolve(strict=True)
+
+
+def resolve_ota_test_image(path: Path, *, fail_health: bool = False) -> Path:
     candidate = path if path.is_absolute() else ROOT / path
+    _reject_symlink_components(candidate)
     if candidate.is_symlink():
         raise ValueError("OTA test image must not be a symlink")
     try:
         resolved = candidate.resolve(strict=True)
     except FileNotFoundError as exc:
         raise ValueError(f"OTA test image does not exist: {candidate}") from exc
-    if resolved != OTA_TEST_IMAGE.resolve():
+    expected = ROOT / "build" / (
+        "idf-ota-test-fail-health" if fail_health else "idf-ota-test"
+    ) / "sms_forwarding_idf.bin"
+    if resolved != expected.resolve():
         raise ValueError("OTA test image must be the OTA test build artifact")
-    if not candidate.is_file():
+    if not _is_regular_file(candidate):
         raise ValueError("OTA test image must be a regular file")
     return resolved
 
@@ -363,19 +382,69 @@ def resolve_ota_test_output(path: Path) -> Path:
     return candidate
 
 
+def _is_regular_file(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _reject_symlink_components(path: Path) -> None:
+    root = ROOT.absolute()
+    candidate = path.absolute()
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("app image must stay inside the repository") from exc
+    current = root
+    for part in relative.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("app image must not use symlinked paths")
+
+
+def _ota_test_profile_cache_is_verified(profile: Path) -> bool:
+    cache = profile / "CMakeCache.txt"
+    if cache.is_symlink() or not _is_regular_file(cache):
+        return False
+    expected = {
+        "FIRMWARE_IS_RELEASE": "0",
+        "SMS_USB_RECOVERY": "1",
+        "SMS_OTA_TEST_KEY": "1",
+    }
+    found: dict[str, str] = {}
+    try:
+        lines = cache.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError):
+        return False
+    for line in lines:
+        for key in expected:
+            prefix = f"{key}:"
+            if line.startswith(prefix) and "=" in line:
+                value = line.split("=", 1)[1]
+                if key in found and found[key] != value:
+                    return False
+                found[key] = value
+    return found == expected
+
+
 def resolve_app_image(path: Path) -> Path:
     candidate = path if path.is_absolute() else ROOT / path
-    if candidate.is_symlink():
-        raise ValueError("app image must not be a symlink")
+    _reject_symlink_components(candidate)
+    if candidate.is_symlink() or not _is_regular_file(candidate):
+        raise ValueError("app image must be a regular file")
     try:
         resolved = candidate.resolve(strict=True)
     except FileNotFoundError as exc:
         raise ValueError(f"app image does not exist: {candidate}") from exc
-    allowed = {(ROOT / relative).resolve() for relative in APP_IMAGE_RELATIVE_PATHS}
-    if resolved not in allowed:
+    allowed = {(ROOT / relative).resolve() for relative in APP_IMAGE_RELATIVE_PATHS[:2]}
+    ota_test_image = ROOT / "build" / "idf-ota-test" / "sms_forwarding_idf.bin"
+    if resolved == ota_test_image.resolve():
+        profile = ota_test_image.parent
+        if not _ota_test_profile_cache_is_verified(profile):
+            raise ValueError("OTA test image requires a verified dev profile cache")
+    elif resolved not in allowed:
         raise ValueError("app image must be the repository app0 build artifact")
-    if not candidate.is_file():
-        raise ValueError("app image must be a regular file")
     return resolved
 
 
@@ -410,6 +479,7 @@ def _host_transport_unavailable(error: BaseException) -> bool:
 def _container_recovery(
     device: SerialDevice, timeout: float, query: str | None = None,
     *, caller_timeout: float | None = None, deadline: float | None = None,
+    command: int = usb_recovery.COMMAND_STATE,
 ) -> bytes | dict[str, object]:
     if deadline is not None and caller_timeout is None:
         caller_timeout = _remaining(deadline)
@@ -424,7 +494,7 @@ def _container_recovery(
         "--timeout", str(timeout), "--internal-container",
     ]
     if query is None:
-        arguments.append("state")
+        arguments.append("ota-state" if command == usb_recovery.COMMAND_OTA_STATE else "state")
     else:
         arguments.extend(("query", query, "--raw"))
     result = _run_process(
@@ -896,6 +966,32 @@ def _state(
         )  # type: ignore[return-value]
 
 
+def _ota_state(
+    device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
+    container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
+) -> dict[str, object]:
+    try:
+        transaction_args = {}
+        if deadline is not None:
+            transaction_args["deadline"] = deadline
+        response = usb_recovery.run_transaction(
+            device.by_id, timeout, usb_recovery.COMMAND_OTA_STATE, b"", **transaction_args
+        )
+        return usb_recovery.decode_ota_state_payload(response.payload)
+    except usb_recovery.CommandError:
+        raise
+    except (usb_recovery.DeviceError, OSError, ImportError) as error:
+        if not _host_transport_unavailable(error):
+            raise
+        if deadline is not None:
+            container_timeout = min(container_timeout, _remaining(deadline))
+        result = _container_recovery(
+            device, timeout, caller_timeout=container_timeout, deadline=deadline,
+            command=usb_recovery.COMMAND_OTA_STATE,
+        )
+        return usb_recovery.validate_ota_state(result)
+
+
 def _try_resolve_exact_device(device_path: str) -> SerialDevice | None:
     try:
         device = resolve_serial_device(device_path)
@@ -1079,6 +1175,7 @@ def _build_command(args: argparse.Namespace) -> int:
     env["SMS_USB_RECOVERY"] = "1" if usb_dev else "0"
     env["SMS_OTA_TEST_KEY"] = "0"
     env["SMS_OTA_TEST_PUBLIC_KEY"] = ""
+    env["SMS_OTA_TEST_FAIL_HEALTH"] = "0"
     env["FIRMWARE_IS_RELEASE"] = "1" if args.release else "0"
     try:
         result = subprocess.run(
@@ -1091,17 +1188,23 @@ def _build_command(args: argparse.Namespace) -> int:
 
 def _ota_test_package_command(args: argparse.Namespace) -> int:
     private_key, public_key, public_fingerprint = _ensure_ota_test_keypair()
+    _ota_test_build_dir(fail_health=args.fail_health)
     output = resolve_ota_test_output(Path(args.output))
     try:
         result = subprocess.run(
             [str(IDF_HELPER), "build"], cwd=ROOT,
-            env=_ota_test_build_environment(public_key), check=False,
+            env=_ota_test_build_environment(public_key, fail_health=args.fail_health), check=False,
         )
     except (FileNotFoundError, OSError) as exc:
         raise usb_recovery.DeviceError("tools/idf.sh could not be started") from exc
     if result.returncode:
         return result.returncode
-    image = resolve_ota_test_image(OTA_TEST_IMAGE)
+    image = resolve_ota_test_image(
+        ROOT / "build" / (
+            "idf-ota-test-fail-health" if args.fail_health else "idf-ota-test"
+        ) / "sms_forwarding_idf.bin",
+        fail_health=args.fail_health,
+    )
 
     size = image.stat().st_size
     if not 0 < size <= APP_MAX_SIZE:
@@ -1130,6 +1233,7 @@ def _ota_test_package_command(args: argparse.Namespace) -> int:
         "output": str(output),
         "package_sha256": sha256_file(output),
         "profile": "usb-dev-test-key",
+        "fail_health": bool(args.fail_health),
         "version": args.version,
     }, sort_keys=True))
     return 0
@@ -1256,9 +1360,15 @@ def build_parser() -> argparse.ArgumentParser:
     ota_test.add_argument("--counter", type=int, default=1)
     ota_test.add_argument("--version", default=OTA_TEST_VERSION)
     ota_test.add_argument("--sha256", "--sha256-pin", dest="sha256", default="", help="optional SHA-256 image pin")
+    ota_test.add_argument(
+        "--fail-health", action="store_true",
+        help="build the isolated dev image that rolls back during pending verification",
+    )
 
     state = commands.add_parser("state", help="read sanitized device state")
     state.add_argument("--json", action="store_true", help="write the default JSON state format")
+
+    commands.add_parser("ota-state", help="read safe signed OTA state")
 
     diag = commands.add_parser("diag", help="run fixed read-only modem diagnostics")
     diag.add_argument("query_name", nargs="?", choices=(*QUERY_NAMES, "all"))
@@ -1277,7 +1387,7 @@ def build_parser() -> argparse.ArgumentParser:
     flash.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
     flash.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
 
-    for command in (commands.choices["state"], diag, reset, flash):
+    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash):
         command.add_argument(
             "--device",
             default=argparse.SUPPRESS,
@@ -1303,6 +1413,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "state":
             deadline = time.monotonic() + CONTAINER_TIMEOUT
             state = _state(resolve_serial_device(args.device), deadline=deadline)
+            print(json.dumps(state, sort_keys=True))
+            return 0
+        if args.command == "ota-state":
+            deadline = time.monotonic() + CONTAINER_TIMEOUT
+            state = _ota_state(resolve_serial_device(args.device), deadline=deadline)
             print(json.dumps(state, sort_keys=True))
             return 0
         if args.command == "diag":

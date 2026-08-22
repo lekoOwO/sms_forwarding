@@ -28,6 +28,7 @@
 #include "idf_config.h"
 #include "idf_log.h"
 #include "idf_modem.h"
+#include "idf_web_ota.h"
 #include "idf_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
@@ -42,6 +43,7 @@ constexpr uint8_t kCommandWifiProvision = 0x02;
 constexpr uint8_t kCommandWifiProvisionAsync = 0x03;
 constexpr uint8_t kCommandWifiProvisionStatus = 0x04;
 constexpr uint8_t kCommandModemQuery = 0x05;
+constexpr uint8_t kCommandOtaState = 0x06;
 constexpr uint8_t kResponseMask = 0x80;
 constexpr size_t kHeaderSize = 7;
 constexpr size_t kCrcSize = 2;
@@ -55,6 +57,7 @@ constexpr size_t kParserCapacity = kMaxFrame * 2;
 constexpr TickType_t kIoTimeout = pdMS_TO_TICKS(2000);
 constexpr TickType_t kParserIdleTimeout = pdMS_TO_TICKS(1000);
 constexpr size_t kProvisionStatusPayload = 11;
+constexpr size_t kOtaStatePayload = 18;
 
 enum class Status : uint8_t {
     Ok = 0,
@@ -104,6 +107,7 @@ static void secure_zero(void* data, size_t length)
 static size_t command_payload_limit(uint8_t command)
 {
     if (command == kCommandModemQuery) return kMaxQueryRequestPayload;
+    if (command == kCommandOtaState) return 0;
     return command == kCommandWifiProvisionAsync ? kMaxAsyncPayload : kMaxLegacyPayload;
 }
 
@@ -111,7 +115,7 @@ static bool request_command(uint8_t command)
 {
     return command == kCommandState || command == kCommandWifiProvision ||
            command == kCommandWifiProvisionAsync || command == kCommandWifiProvisionStatus ||
-           command == kCommandModemQuery;
+           command == kCommandModemQuery || command == kCommandOtaState;
 }
 
 static uint16_t crc16(const uint8_t* bytes, size_t length)
@@ -445,6 +449,22 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
     return Status::Ok;
 }
 
+static Status ota_state(const Frame& frame, uint8_t* output, size_t* output_length)
+{
+    if (frame.payload_length != 0) return Status::InvalidArg;
+    IdfWebOtaState state;
+    const esp_err_t err = idf_web_ota_get_state(&state);
+    if (err != ESP_OK) return map_error(err);
+    write_u32(output, state.active_offset);
+    output[4] = static_cast<uint8_t>(state.image_state);
+    output[5] = state.pending_verify ? 1 : 0;
+    write_u32(output + 6, state.accepted);
+    write_u32(output + 10, state.pending);
+    write_u32(output + 14, state.pending_address);
+    *output_length = 1 + kOtaStatePayload;
+    return Status::Ok;
+}
+
 static size_t state_payload(uint8_t* output)
 {
     const IdfWifiStatus wifi = idf_wifi_get_status();
@@ -499,6 +519,8 @@ static void handle_frame(const Frame& frame)
         status = provision_wifi_status(frame, payload + 1, &payload_length);
     } else if (frame.command == kCommandModemQuery) {
         status = modem_query(frame, payload + 1, &payload_length);
+    } else if (frame.command == kCommandOtaState) {
+        status = ota_state(frame, payload + 1, &payload_length);
     }
     payload[0] = static_cast<uint8_t>(status);
     (void)write_frame(static_cast<uint8_t>(frame.command | kResponseMask), frame.sequence,
