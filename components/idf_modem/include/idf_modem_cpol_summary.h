@@ -89,12 +89,12 @@ inline bool idf_modem_cpol_fields(std::string_view line, unsigned& index, unsign
     size_t count = 0;
     size_t start = 0;
     bool quoted = false;
-    for (size_t index = 0; index <= line.size(); ++index) {
-        if (index < line.size() && line[index] == '"') quoted = !quoted;
-        if (index != line.size() && (line[index] != ',' || quoted)) continue;
+    for (size_t field_offset = 0; field_offset <= line.size(); ++field_offset) {
+        if (field_offset < line.size() && line[field_offset] == '"') quoted = !quoted;
+        if (field_offset != line.size() && (line[field_offset] != ',' || quoted)) continue;
         if (count >= fields.size()) return false;
-        fields[count++] = idf_modem_cpol_trim(line.substr(start, index - start));
-        start = index + 1;
+        fields[count++] = idf_modem_cpol_trim(line.substr(start, field_offset - start));
+        start = field_offset + 1;
     }
     if (quoted || (count != 3 && count != 7)) return false;
     if (!idf_modem_cpol_number(fields[0], 65535, index) ||

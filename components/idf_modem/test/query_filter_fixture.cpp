@@ -268,7 +268,8 @@ int main()
     };
 
     OwnerDispatchFixture reset_race;
-    assert(!reset_race.dispatch(false, true, false));
+    const bool reset_race_dispatched = reset_race.dispatch(false, true, false);
+    assert(!reset_race_dispatched);
     assert(reset_race.completed);
     assert(reset_race.state == OwnerDispatchFixture::State::done);
     assert(reset_race.cancelled);
@@ -276,20 +277,23 @@ int main()
     assert(reset_race.uart_writes == 0); // queued query is cancelled before UART
 
     OwnerDispatchFixture reset_flag;
-    assert(!reset_flag.dispatch(false, true, true));
+    const bool reset_flag_dispatched = reset_flag.dispatch(false, true, true);
+    assert(!reset_flag_dispatched);
     assert(reset_flag.completed);
     assert(reset_flag.cancelled);
     assert(reset_flag.uart_writes == 0); // reset request wins over a stale ready flag
 
     OwnerDispatchFixture recovered_query;
-    assert(recovered_query.dispatch(false, false, true)); // reset recovery resumes queries
+    const bool recovered_query_dispatched = recovered_query.dispatch(false, false, true);
+    assert(recovered_query_dispatched); // reset recovery resumes queries
     assert(recovered_query.completed);
     assert(recovered_query.state == OwnerDispatchFixture::State::done);
     assert(!recovered_query.cancelled);
     assert(recovered_query.uart_writes == 1);
 
     OwnerDispatchFixture priority_cnma;
-    assert(priority_cnma.dispatch(true, true, false));
+    const bool priority_cnma_dispatched = priority_cnma.dispatch(true, true, false);
+    assert(priority_cnma_dispatched);
     assert(priority_cnma.completed);
     assert(priority_cnma.uart_writes == 1); // Priority CNMA work bypasses the normal reset gate.
 

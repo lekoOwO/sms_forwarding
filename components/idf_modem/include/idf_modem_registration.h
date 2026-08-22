@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <string_view>
 
@@ -58,9 +59,9 @@ inline bool idf_modem_cereg_hex_field(std::string_view& text, size_t digits)
 inline bool idf_modem_parse_cereg_line(std::string_view line, int& stat)
 {
     constexpr std::string_view token = "+CEREG:";
-    for (unsigned char ch : line) {
-        if (ch < 0x20 || (ch >= 0x7F && ch <= 0x9F)) return false;
-    }
+    if (!std::all_of(line.begin(), line.end(), [](unsigned char ch) {
+            return ch >= 0x20 && !(ch >= 0x7F && ch <= 0x9F);
+        })) return false;
     idf_modem_trim_cereg_ascii(line);
     if (line.size() < token.size() || line.substr(0, token.size()) != token) return false;
     line.remove_prefix(token.size());

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <string>
@@ -94,10 +95,9 @@ private:
     static bool looks_like_pdu(std::string_view line)
     {
         if (line.size() < 4 || (line.size() & 1) != 0) return false;
-        for (unsigned char ch : line) {
-            if (!std::isxdigit(ch)) return false;
-        }
-        return true;
+        return std::all_of(line.begin(), line.end(), [](unsigned char ch) {
+            return std::isxdigit(ch);
+        });
     }
 
     static bool is_final(std::string_view line)
