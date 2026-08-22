@@ -169,6 +169,8 @@ jobs:
           python3 components/idf_push/test/test_push_runtime.py
           python3 components/idf_sms/test/test_sms_retention_policy.py
           python3 components/idf_wifi/test/test_wifi_security.py
+          python3 tools/test_idf_baseline.py
+          python3 tools/test_device.py
           python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
           python3 components/idf_web/test/test_openapi_conformance.py
