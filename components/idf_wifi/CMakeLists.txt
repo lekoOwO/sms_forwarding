@@ -12,3 +12,5 @@ idf_component_register(
     idf_logbuf
     lwip
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE "-fexceptions")

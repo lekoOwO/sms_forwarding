@@ -72,7 +72,10 @@ def check_idf_pins() -> None:
         fail("local helper does not enforce its ESP-IDF version")
     if f'expected_idf_version="{EXPECTED_IDF}"' not in shell_helper:
         fail("POSIX helper does not pin its ESP-IDF version")
-    if 'idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build' not in workflow:
+    if (
+        'idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build' not in workflow
+        and './tools/idf.sh build' not in workflow
+    ):
         fail("CI build command is not deterministic")
 
 

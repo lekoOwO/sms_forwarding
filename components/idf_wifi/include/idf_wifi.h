@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <string>
 
 #include "esp_err.h"
@@ -46,3 +47,5 @@ bool idf_wifi_is_ap_mode(void);
 // Save WiFi and connect in place with APSTA without restarting; close the AP after a delay on success.
 // Used by Web /wificonfig in AP mode while the provisioning page polls /apstatus for the assigned IP.
 esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string& pass);
+esp_err_t idf_wifi_provision_connect(const char* ssid, size_t ssid_length,
+                                     const char* pass, size_t pass_length);

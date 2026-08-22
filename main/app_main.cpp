@@ -16,6 +16,9 @@
 #include "idf_wifi.h"
 #include "nvs_flash.h"
 #include "web_assets.h"
+#if SMS_USB_RECOVERY
+#include "usb_recovery.h"
+#endif
 
 static const char* TAG = "sms_idf";
 static bool s_http_live = false;
@@ -73,6 +76,9 @@ extern "C" void app_main(void)
         return;
     }
 
+#if SMS_USB_RECOVERY
+    log_start_result("USB recovery", idf_usb_recovery_start());
+#endif
     // Web, config, WiFi, push, modem, and SMS use the native ESP-IDF runtime.
     ESP_LOGI(TAG, "ESP-IDF port bootstrap started");
     idf_logf("ESP-IDF migration build started: %s", IDF_FW_VERSION);

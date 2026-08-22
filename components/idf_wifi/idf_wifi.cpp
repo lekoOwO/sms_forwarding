@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <new>
 #include <array>
 #include <atomic>
 #include <utility>
@@ -2196,6 +2197,17 @@ esp_err_t idf_wifi_provision_connect(const std::string& ssid, const std::string&
     idf_logf("Saved WiFi in provisioning AP and connecting: %s", ssid.c_str());
     return err;
 }
+
+esp_err_t idf_wifi_provision_connect(const char* ssid, size_t ssid_length,
+                                     const char* pass, size_t pass_length) try
+{
+    if (!ssid || !pass || ssid_length == 0 || ssid_length > MAX_WIFI_SSID_BYTES ||
+        (pass_length != 0 && (pass_length < 8 || pass_length > MAX_WIFI_PASSWORD_BYTES))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return idf_wifi_provision_connect(std::string(ssid, ssid_length), std::string(pass, pass_length));
+}
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
 static std::string wifi_scan_records_json(const wifi_ap_record_t* records, size_t count)
 {

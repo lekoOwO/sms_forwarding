@@ -805,6 +805,17 @@ esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass)
 }
 catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
 
+esp_err_t idf_config_save_wifi(const char* ssid, size_t ssid_length,
+                               const char* pass, size_t pass_length) try
+{
+    if (!ssid || !pass || ssid_length == 0 || ssid_length > MAX_WIFI_SSID_BYTES ||
+        (pass_length != 0 && (pass_length < 8 || pass_length > MAX_WIFI_PASSWORD_BYTES))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return idf_config_save_wifi(std::string(ssid, ssid_length), std::string(pass, pass_length));
+}
+catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
+
 esp_err_t idf_config_note_wifi_connected(const std::string& ssid, const std::string& pass) try
 {
     if (ssid.empty() || ssid.size() > 32 || pass.size() > 64) return ESP_ERR_INVALID_ARG;

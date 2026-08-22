@@ -5,6 +5,28 @@ expected_idf_version="5.5.4"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/build/idf"
 sdkconfig="$repo_root/build/sdkconfig"
+sms_usb_recovery="${SMS_USB_RECOVERY:-0}"
+release_firmware="${FIRMWARE_IS_RELEASE:-0}"
+export SDKCONFIG_DEFAULTS="$repo_root/sdkconfig.defaults"
+
+if [[ "$sms_usb_recovery" != "0" && "$sms_usb_recovery" != "1" ]]; then
+  echo "SMS_USB_RECOVERY must be 0 or 1" >&2
+  exit 2
+fi
+if [[ "$release_firmware" != "0" && "$release_firmware" != "1" ]]; then
+  echo "FIRMWARE_IS_RELEASE must be 0 or 1" >&2
+  exit 2
+fi
+
+if [[ "$sms_usb_recovery" == "1" ]]; then
+  build_dir="$repo_root/build/idf-usb-recovery"
+  sdkconfig="$repo_root/build/sdkconfig-usb-recovery"
+  export SDKCONFIG_DEFAULTS="$SDKCONFIG_DEFAULTS;$repo_root/sdkconfig.usb-recovery"
+fi
+
+idf_args=(-B "$build_dir" -D "SDKCONFIG=$sdkconfig"
+  -D "SDKCONFIG_DEFAULTS=$SDKCONFIG_DEFAULTS"
+  -D "FIRMWARE_IS_RELEASE=$release_firmware" -D "SMS_USB_RECOVERY=$sms_usb_recovery")
 
 if [[ -z "${IDF_PATH:-}" || ! -f "$IDF_PATH/export.sh" ]]; then
   echo "IDF_PATH must point to ESP-IDF ${expected_idf_version}" >&2
@@ -19,13 +41,26 @@ if [[ "$idf_version" != *"$expected_idf_version"* ]]; then
   exit 2
 fi
 
+refresh_sdkconfig() {
+  if [[ -f "$sdkconfig" ]] && grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' "$sdkconfig"; then
+    return
+  fi
+  echo "Regenerating ${sdkconfig} from ESP-IDF defaults (old file is preserved as .old)" >&2
+  idf.py "${idf_args[@]}" set-target esp32c3
+}
+
 case "${1:-build}" in
   build)
-    idf.py -B "$build_dir" -D "SDKCONFIG=$sdkconfig" build
+    refresh_sdkconfig
+    idf.py "${idf_args[@]}" build
     python3 "$repo_root/tools/check_idf_baseline.py" --build-dir "$build_dir"
     ;;
-  reconfigure|clean|fullclean)
-    idf.py -B "$build_dir" -D "SDKCONFIG=$sdkconfig" "$1"
+  reconfigure)
+    refresh_sdkconfig
+    idf.py "${idf_args[@]}" reconfigure
+    ;;
+  clean|fullclean)
+    idf.py "${idf_args[@]}" "$1"
     ;;
   *)
     echo "usage: $0 [build|reconfigure|clean|fullclean]" >&2

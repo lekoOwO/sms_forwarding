@@ -155,6 +155,8 @@ esp_err_t idf_config_load(void);
 IdfConfigLoadStatus idf_config_last_load_status(void);
 // Put a new or updated network in slot 0. Remove the oldest entry if the list is full.
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
+esp_err_t idf_config_save_wifi(const char* ssid, size_t ssid_length,
+                               const char* pass, size_t pass_length);
 // Save the Web WiFi list. If preserve_blank_pass is true, blank passwords remain unchanged.
 esp_err_t idf_config_save_wifi_networks(const IdfWifiNetwork nets[IDF_MAX_WIFI_NETWORKS],
                                         bool preserve_blank_pass, uint8_t wifi_tx_power_quarter_dbm);
