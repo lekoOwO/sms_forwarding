@@ -38,6 +38,9 @@ constexpr size_t kHeaderBytes = 20;
 constexpr size_t kMarkerBytes = 20;
 constexpr uint8_t CONFIG_STATE_MIGRATING = 1;
 constexpr uint8_t CONFIG_STATE_READY = 2;
+constexpr char kDefaultPushChannelNames[IDF_MAX_PUSH_CHANNELS][10] = {
+    "Channel 1", "Channel 2", "Channel 3", "Channel 4", "Channel 5",
+};
 
 enum class DecodeResult : uint8_t {
     Invalid,
@@ -307,9 +310,8 @@ void syncLegacyMirrors(IdfConfig& value)
     if (!value.webAccounts[0].password.empty()) value.webPass = value.webAccounts[0].password;
 }
 
-IdfConfig defaults()
+void applyDefaults(IdfConfig& value)
 {
-    IdfConfig value;
     value.roamingEnabled = false;
     value.webAccounts[0].username = IDF_DEFAULT_WEB_USER;
     value.webAccounts[0].password = IDF_DEFAULT_WEB_PASS;
@@ -321,11 +323,24 @@ IdfConfig defaults()
     value.kaTrafficKB = DEFAULT_KEEPALIVE_TRAFFIC_KB;
     value.hbHour = 9;
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-        char name[24];
-        snprintf(name, sizeof(name), "Channel %d", i + 1);
-        value.pushChannels[i].name = name;
+        value.pushChannels[i].name = kDefaultPushChannelNames[i];
     }
-    return value;
+}
+
+void initializeDefaults(IdfConfig& value)
+{
+    std::unique_ptr<IdfConfig> initialized(new IdfConfig);
+    applyDefaults(*initialized);
+    static_assert(noexcept(value = std::move(*initialized)),
+                  "IdfConfig default publication must not allocate");
+    value = std::move(*initialized);
+}
+
+IdfConfig defaults()
+{
+    std::unique_ptr<IdfConfig> value(new IdfConfig);
+    applyDefaults(*value);
+    return std::move(*value);
 }
 
 bool semanticallyValid(const IdfConfig& value, bool portable = false)
@@ -641,7 +656,7 @@ bool overlayLegacyConnectivity(IdfConfig& value)
 
 bool loadLegacy(IdfConfig& value, bool& existed)
 {
-    value = defaults();
+    initializeDefaults(value);
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open("sms_config", NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
@@ -843,7 +858,7 @@ bool decodePush(Reader& reader, IdfPushChannel& channel, bool legacyV1, uint8_t 
 
 bool decodeV1(Reader& reader, IdfConfig& value)
 {
-    value = defaults();
+    initializeDefaults(value);
     uint32_t port = 0;
     if (!reader.u32(port) || port > std::numeric_limits<int>::max()) return false;
     value.smtpPort = static_cast<int>(port);
@@ -866,7 +881,7 @@ bool decodeV1(Reader& reader, IdfConfig& value)
 
 bool decodeV2Common(Reader& reader, IdfConfig& value, uint8_t maxType)
 {
-    value = defaults();
+    initializeDefaults(value);
     uint32_t port = 0;
     if (!reader.u32(port) || port > std::numeric_limits<int>::max()) return false;
     value.smtpPort = static_cast<int>(port);
@@ -911,7 +926,7 @@ bool decodeV4(Reader& reader, IdfConfig& value)
 
 bool decodeV5(Reader& reader, IdfConfig& value)
 {
-    value = defaults();
+    initializeDefaults(value);
     uint32_t raw = 0;
     if (!reader.u32(raw) || raw > std::numeric_limits<int>::max()) return false;
     value.smtpPort = static_cast<int>(raw);
@@ -1392,7 +1407,7 @@ esp_err_t saveState(nvs_handle_t nvs, uint8_t state)
 
 void idf_config_storage_factory_reset(IdfConfig& out)
 {
-    out = defaults();
+    initializeDefaults(out);
 }
 
 esp_err_t idf_config_storage_encode_portable(const IdfConfig& source, uint8_t* output,
@@ -1427,62 +1442,63 @@ IdfPortableConfigStatus idf_config_storage_decode_portable(const uint8_t* bytes,
                                                            const IdfConfig& target,
                                                            IdfConfig& output)
 {
-    IdfConfig decoded;
+    std::unique_ptr<IdfConfig> decoded(new IdfConfig);
+    IdfConfig& value = *decoded;
     uint16_t schema = 0;
     uint32_t generation = 0;
-    const DecodeResult result = decodeBlob(bytes, length, decoded, schema, generation);
+    const DecodeResult result = decodeBlob(bytes, length, value, schema, generation);
     if (result == DecodeResult::Unsupported) return IdfPortableConfigStatus::UnsupportedVersion;
     if (result != DecodeResult::Valid || generation != 0) return IdfPortableConfigStatus::Invalid;
 
     if (schema < 4) {
-        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) decoded.wifiNetworks[i] = target.wifiNetworks[i];
-        decoded.networkMode = target.networkMode;
-        decoded.heartbeatEnable = target.heartbeatEnable;
-        decoded.heartbeatInterval = target.heartbeatInterval;
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) value.wifiNetworks[i] = target.wifiNetworks[i];
+        value.networkMode = target.networkMode;
+        value.heartbeatEnable = target.heartbeatEnable;
+        value.heartbeatInterval = target.heartbeatInterval;
     }
     if (schema < 5) {
-        decoded.emailEnabled = target.emailEnabled;
-        decoded.pushEnabled = target.pushEnabled;
-        decoded.forwardRules = target.forwardRules;
-        decoded.kaEnabled = target.kaEnabled;
-        decoded.kaIntervalDays = target.kaIntervalDays;
-        decoded.kaAction = target.kaAction;
-        decoded.kaTarget = target.kaTarget;
-        decoded.kaUrl = target.kaUrl;
-        decoded.tzOffsetMin = target.tzOffsetMin;
-        decoded.ntpServer = target.ntpServer;
-        decoded.rebootEnabled = target.rebootEnabled;
-        decoded.rebootHour = target.rebootHour;
-        decoded.smsHealthEnabled = target.smsHealthEnabled;
-        decoded.smsHealthHour = target.smsHealthHour;
-        decoded.smsHealthNotify = target.smsHealthNotify;
-        decoded.netLedEnabled = target.netLedEnabled;
-        decoded.callNotifyEnabled = target.callNotifyEnabled;
-        decoded.dataEnabled = target.dataEnabled;
-        decoded.apn = target.apn;
-        decoded.operatorPlmn = target.operatorPlmn;
-        for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) decoded.schedTasks[i] = target.schedTasks[i];
+        value.emailEnabled = target.emailEnabled;
+        value.pushEnabled = target.pushEnabled;
+        value.forwardRules = target.forwardRules;
+        value.kaEnabled = target.kaEnabled;
+        value.kaIntervalDays = target.kaIntervalDays;
+        value.kaAction = target.kaAction;
+        value.kaTarget = target.kaTarget;
+        value.kaUrl = target.kaUrl;
+        value.tzOffsetMin = target.tzOffsetMin;
+        value.ntpServer = target.ntpServer;
+        value.rebootEnabled = target.rebootEnabled;
+        value.rebootHour = target.rebootHour;
+        value.smsHealthEnabled = target.smsHealthEnabled;
+        value.smsHealthHour = target.smsHealthHour;
+        value.smsHealthNotify = target.smsHealthNotify;
+        value.netLedEnabled = target.netLedEnabled;
+        value.callNotifyEnabled = target.callNotifyEnabled;
+        value.dataEnabled = target.dataEnabled;
+        value.apn = target.apn;
+        value.operatorPlmn = target.operatorPlmn;
+        for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) value.schedTasks[i] = target.schedTasks[i];
     }
-    if (schema < 6) decoded.kaTrafficKB = target.kaTrafficKB;
+    if (schema < 6) value.kaTrafficKB = target.kaTrafficKB;
 
-    decoded.deviceName = target.deviceName;
-    decoded.hostname = target.hostname;
-    for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) decoded.webAccounts[i] = target.webAccounts[i];
-    decoded.wifiTxPowerQuarterDbm = target.wifiTxPowerQuarterDbm;
-    decoded.kaProfile = target.kaProfile;
-    decoded.kaLastTime = target.kaLastTime;
-    decoded.roamingEnabled = target.roamingEnabled;
-    decoded.phoneNumber = target.phoneNumber;
+    value.deviceName = target.deviceName;
+    value.hostname = target.hostname;
+    for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) value.webAccounts[i] = target.webAccounts[i];
+    value.wifiTxPowerQuarterDbm = target.wifiTxPowerQuarterDbm;
+    value.kaProfile = target.kaProfile;
+    value.kaLastTime = target.kaLastTime;
+    value.roamingEnabled = target.roamingEnabled;
+    value.phoneNumber = target.phoneNumber;
     for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
-        decoded.simCredentials[i] = target.simCredentials[i];
+        value.simCredentials[i] = target.simCredentials[i];
     }
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
-        decoded.schedTasks[i].profile = target.schedTasks[i].profile;
-        decoded.schedTasks[i].lastRun = target.schedTasks[i].lastRun;
+        value.schedTasks[i].profile = target.schedTasks[i].profile;
+        value.schedTasks[i].lastRun = target.schedTasks[i].lastRun;
     }
-    syncLegacyMirrors(decoded);
-    if (!semanticallyValid(decoded)) return IdfPortableConfigStatus::Invalid;
-    output = std::move(decoded);
+    syncLegacyMirrors(value);
+    if (!semanticallyValid(value)) return IdfPortableConfigStatus::Invalid;
+    output = std::move(value);
     return IdfPortableConfigStatus::Ok;
 }
 

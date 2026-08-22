@@ -253,6 +253,26 @@ int main() {
     require(factory.webAccounts[0].username == IDF_DEFAULT_WEB_USER);
     require(factory.webAccounts[0].password == IDF_DEFAULT_WEB_PASS);
     require(!factory.roamingEnabled);
+    const char* default_channel_names[IDF_MAX_PUSH_CHANNELS] = {
+        "Channel 1", "Channel 2", "Channel 3", "Channel 4", "Channel 5",
+    };
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        require(factory.pushChannels[i].name == default_channel_names[i]);
+    }
+
+    IdfConfig reset_target = defaults();
+    reset_target.smtpServer = "preserved";
+    fail_allocation_after = 0;
+    bool reset_oom = false;
+    try {
+        idf_config_storage_factory_reset(reset_target);
+    } catch (const std::bad_alloc&) {
+        reset_oom = true;
+    }
+    fail_allocation_after = -1;
+    require(reset_oom && reset_target.smtpServer == "preserved");
+    idf_config_storage_factory_reset(reset_target);
+    require(reset_target.pushChannels[0].name == default_channel_names[0]);
 
     fake_legacy_open = true;
     fake_legacy_strings["wifiSSID"] = "develop-wifi";
@@ -414,6 +434,20 @@ int main() {
     require(portable_decoded.simCredentials[0].iccid == portable_target.simCredentials[0].iccid);
     require(portable_decoded.schedTasks[0].profile == portable_target.schedTasks[0].profile);
     require(portable_decoded.schedTasks[0].lastRun == portable_target.schedTasks[0].lastRun);
+
+    IdfConfig decode_output = defaults();
+    decode_output.smtpServer = "unchanged";
+    const uint8_t malformed_portable[kHeaderBytes] = {};
+    fail_allocation_after = 0;
+    bool decode_oom = false;
+    try {
+        (void)idf_config_storage_decode_portable(malformed_portable, sizeof(malformed_portable),
+                                                 portable_target, decode_output);
+    } catch (const std::bad_alloc&) {
+        decode_oom = true;
+    }
+    fail_allocation_after = -1;
+    require(decode_oom && decode_output.smtpServer == "unchanged");
 
     std::vector<uint8_t> portable_nonzero_generation = portable;
     writeHeader(portable_nonzero_generation, CONFIG_SCHEMA_VERSION, 1, kHeaderBytes);

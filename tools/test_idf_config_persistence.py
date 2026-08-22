@@ -35,6 +35,11 @@ class AtomicSlotModel:
 
 
 class ConfigPersistenceTest(unittest.TestCase):
+    def test_defaults_do_not_use_formatters(self) -> None:
+        storage = STORAGE.read_text(encoding="utf-8")
+        defaults = storage[storage.index("IdfConfig defaults()"):storage.index("\nbool semanticallyValid")]
+        self.assertNotRegex(defaults, r"\b(?:v?printf|v?s(?:n)?printf|v?fprintf|v?asprintf)\s*\(")
+
     def test_power_cut_keeps_a_whole_old_or_new_slot(self) -> None:
         for cut, expected in (("blob_commit", b"old"), ("marker_commit", b"new")):
             storage = AtomicSlotModel()
@@ -67,6 +72,15 @@ class ConfigPersistenceTest(unittest.TestCase):
         config = SOURCE.read_text(encoding="utf-8")
         header = HEADER.read_text(encoding="utf-8")
         cmake = CMAKE.read_text(encoding="utf-8")
+
+        portable_decode_start = storage.index("IdfPortableConfigStatus idf_config_storage_decode_portable")
+        portable_decode = storage[portable_decode_start:storage.index("\nesp_err_t idf_config_storage_save", portable_decode_start)]
+        self.assertNotIn("    IdfConfig decoded;", portable_decode)
+        self.assertIn("std::unique_ptr<IdfConfig> decoded(new IdfConfig);", portable_decode)
+        self.assertNotIn("value = defaults();", storage)
+        self.assertNotIn("out = defaults();", storage)
+        self.assertGreaterEqual(storage.count("initializeDefaults(value);"), 4)
+        self.assertIn("initializeDefaults(out);", storage)
 
         # MRK2 is the shipped 20-byte marker; schema remains in CFG2's header.
         self.assertIn("constexpr size_t kMarkerBytes = 20", storage)
