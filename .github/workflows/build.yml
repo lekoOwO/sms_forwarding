@@ -169,6 +169,7 @@ jobs:
           python3 components/idf_push/test/test_push_runtime.py
           python3 components/idf_sms/test/test_sms_retention_policy.py
           python3 components/idf_wifi/test/test_wifi_security.py
+          python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
           python3 components/idf_web/test/test_openapi_conformance.py
           python3 components/idf_web/test/test_ota_runtime.py
@@ -176,14 +177,21 @@ jobs:
       - name: Build firmware
         shell: bash
         run: |
-          . "$IDF_PATH/export.sh"
           RELEASE_BUILD=0
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then RELEASE_BUILD=1; fi
           export FIRMWARE_IS_RELEASE="$RELEASE_BUILD"
-          idf.py -B build/idf -D SDKCONFIG=build/sdkconfig build
+          ./tools/idf.sh build
 
       - name: Check ESP-IDF baseline and firmware size
         run: python3 tools/check_idf_baseline.py --build-dir build/idf
+
+      - name: Build USB recovery development firmware
+        shell: bash
+        run: SMS_USB_RECOVERY=1 FIRMWARE_IS_RELEASE=0 ./tools/idf.sh build
+
+      - name: Verify USB recovery build guard
+        shell: bash
+        run: SMS_USB_RECOVERY_REQUIRE_BUILD=1 python3 tools/test_usb_recovery.py
 
       - name: Package full USB image
         shell: bash
