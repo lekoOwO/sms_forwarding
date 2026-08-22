@@ -17,6 +17,11 @@ main/app_main.cpp
   └─ web_assets      內嵌 gzip Web UI
 ```
 
+開發版可選擇啟用 `main/usb_recovery.cpp`。設定載入成功後、WiFi 啟動前，韌體立即啟動
+USB recovery。它是 USB Serial/JTAG 的唯一管理資料 owner，只提供狀態、WiFi 配網與
+固定 17 個唯讀 modem query ID（`0x01` 至 `0x11`）；不接受任意 AT 命令。正式版不編譯
+此來源。一般 USB console 輸出不等於 recovery endpoint。
+
 `idf_modem` 是 UART1 的唯一 owner。其他元件透過有界 command queue 執行 AT 操作。
 
 HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作。這些操作使用現有 worker 與背景工作。
@@ -26,8 +31,8 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 `app_main()` 依序執行下列動作：
 
 1. 初始化預設 NVS、RAM 日誌、收件匣、network interface 與 event loop。
-2. 從 `appcfg` NVS 載入設定。已提交但損壞的設定會 fail closed。
-3. 啟動 WiFi、推送 worker、管理 HTTP、模組 task 與簡訊 task。
+2. 從 `appcfg` NVS 載入設定。已提交但損壞的設定會 fail closed；開發版設定成功後立即啟動 USB recovery。
+3. 啟動 WiFi、推送 worker、管理 HTTP、模組 task 與簡訊 task。WiFi 會自動選擇並重連已保存的設定檔。
 4. 啟動 OTA health task。新映像必須在期限內通過 HTTP 與網路可達性檢查。
 
 設定載入失敗時，執行期服務不會使用預設管理帳密覆蓋既有資料。
@@ -57,9 +62,26 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 
 目前通知傳送只使用 WiFi。4G-only 模式會回傳 unsupported，混合模式在 WiFi 中斷時會 defer。
 
-在 CA provisioning 完成前，行動網路推送會 fail closed。GET 與 ntfy 僅支援 WiFi，漫遊傳送一律 fail closed。
+4G push 目前不支援。TLS 或網路註冊未經驗證時，4G push 會 fail closed。
+GET 與 ntfy 僅支援 WiFi，漫遊傳送與資料啟用維持 fail closed。
+現有實機證據沒有證明 4G data delivery 可用。
 
 心跳間隔可設定為 1 至 240 小時。時間未完成 NTP 同步時，scheduler 不會開始心跳計時。
+
+## 2026-08-22 實機證據
+
+這是單次去識別化硬體紀錄，不是通用的 modem protocol fact：
+
+- 板型：去識別化報告未記錄。
+- 模組：ML307A。
+- 輸入：`CPIN`、`CSQ`、`CESQ`、`CEREG`、`COPS`、`CGATT`、`CGACT`、`CGPADDR` 與 `ICCID` 查詢。
+- 結果：`CPIN` ready；`CSQ=31`；`CESQ` 約為 RSRP -70 dBm；`COPS` 使用 auto 選擇但 operator absent；原始註冊回覆只記錄 `+CEREG: 0,11`。
+  依 3GPP 定義，`stat=11` 是 RLOS-only；`n=0` 只控制 URC 詳細度。它不是 home、roaming 或 data-ready 狀態。
+  另見 `CGATT=0`、PDP inactive、no IP；ICCID 只保留 hash。
+- 識別資料已去識別化保存。
+
+這次結果表示 SIM 與 RF 路徑有回應，但尚未完成標準網路註冊與資料啟用。
+它不證明 4G 可用；韌體因此不會把 4G push、roaming 或 data activation 視為已成功。
 
 ## 設定與備份
 
@@ -83,13 +105,21 @@ API request、response、限制與狀態碼的唯一索引是 [openapi.json](ope
 
 ## 已簽章 OTA
 
-正式 Release 提供 `.smsota`。USB 完整映像使用 `.bin`，且不能上傳至 Web OTA。
+Release workflow 只有在 readiness gate 通過時才提供 `.smsota`。USB 完整映像使用 `.bin`，且不能上傳至 Web OTA。
 
 瀏覽器將 `.smsota` 拆成 manifest、P-256 簽章與 firmware payload。韌體依序驗證簽章、target、release counter、長度與 SHA-256。
 
 上傳使用 `/api/ota/start`、`/api/ota/chunk` 與 `/api/ota/finish`。Web API 不提供 raw firmware upload。
 
 新映像先進入 pending-verify 狀態。Health task 成功後才會確認映像，否則 bootloader 會回復上一版。
+
+Web OTA 會寫入下一個 OTA app slot，大小上限為 1,920 KiB。
+bootloader、partition table、`appcfg` 與 `coredump` 不由 Web OTA 寫入。
+OTA metadata 會寫入 `otadata` 與 NVS。
+
+目前 source 與 build check 已涵蓋 public-key signature、replay counter 與 rollback 設定。
+`components/idf_web/OTA_RUNTIME_READY` 仍不存在；matching private key 與硬體 rollback/replay evidence 也未具備。
+因此目前不能宣稱 signed OTA 已達到 READY。
 
 ## 分區
 

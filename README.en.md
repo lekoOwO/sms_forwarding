@@ -16,13 +16,15 @@ This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received
 - SMTP and up to five active push channels.
 - POST JSON, Bark, GET, DingTalk, PushPlus, ServerChan, Custom JSON, Feishu, Gotify, Telegram, Discord Webhook, and ntfy.
 - A separate name, title template, body template, forwarding rules, and test for each push channel.
-- Five saved WiFi profiles. The device scans and selects the available saved network with the strongest signal.
+- Five saved WiFi profiles. The device selects, connects to, and reconnects to an available saved profile.
+- Development builds can provide USB recovery after config load and before WiFi starts. Production builds exclude this path.
+- USB recovery accepts seventeen fixed read-only modem query IDs (`0x01` through `0x11`) and WiFi provisioning commands. Generic USB console output is not a recovery endpoint.
 - Heartbeat notifications at intervals from 1 through 240 hours. The timer starts after NTP time synchronization.
 - Encrypted `.smscfg` configuration export and portable restore to another device.
-- Signed `.smsota` web updates from project releases, replay protection, and rollback after an unsuccessful start.
+- Web OTA accepts signed `.smsota` packages only. Releases publish them only after the readiness gate passes.
 - A firmware version in the web footer. Releases show `releaseVersion (devBuild)`. Development firmware shows `devBuild`.
 
-> Notifications currently use WiFi only. The device stores 4G and mixed-mode choices, but cellular push fails closed until CA provisioning is complete. GET and ntfy are WiFi-only. Roaming delivery always fails closed.
+> Notifications currently use WiFi only. The device stores 4G and mixed-mode choices. 4G push fails closed without verified TLS and network registration. Current hardware evidence does not prove usable 4G data delivery. GET and ntfy are WiFi-only.
 
 ## Quick start
 
@@ -31,18 +33,19 @@ This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received
 3. If the device cannot find saved WiFi, connect to `SMS-Forwarder-XXXXXX`.
 4. Enter password `sms-forwarder-setup`. Then open `http://192.168.1.1`.
 5. After the device joins the router, sign in at the LAN address that the management page shows.
-6. Use username `admin` and password `admin123`. Then change the password immediately.
+6. Sign in with the management account. Change the default password immediately.
 7. Configure email or push channels. Use the channel test to confirm delivery.
 
 ### Later OTA updates
 
-Download `sms-forwarder-VERSION.smsota` from a stable release. Open System Settings → Firmware Update in the web UI, and select this file.
+Download `sms-forwarder-VERSION.smsota` from a release that passed the readiness gate. Open System Settings → Firmware Update in the web UI, and select this file.
 
-**Do not upload a `.bin` file through web OTA.** `.bin` is the full USB image. `.smsota` is the signed web OTA package.
+**Do not upload a `.bin` file through web OTA.** `.bin` is the full USB image flashed at `0x0`. `.smsota` is the signed Web OTA package.
+Web OTA writes one OTA app slot, up to 1,920 KiB. It does not write the bootloader, partition table, `appcfg`, or `coredump` regions. It stores OTA metadata in `otadata` and NVS.
 
 ## Hardware and wiring
 
-The verified combination is an ESP32-C3 Super Mini and an ML307R-DC. The device needs 4 MB flash, a Nano SIM, and a suitable antenna.
+The tested combination is an ESP32-C3 Super Mini and an ML307R-DC. The device needs 4 MB flash, a Nano SIM, and a suitable antenna.
 
 <img src="assets/photo.png" width="200" alt="ESP32-C3 and ML307R-DC SMS forwarder" />
 

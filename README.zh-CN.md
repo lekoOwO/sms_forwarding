@@ -16,13 +16,15 @@
 - 可以使用 SMTP，或同时启用最多五个推送通道。
 - 支持 POST JSON、Bark、GET、钉钉、PushPlus、Server 酱、自定义 JSON、飞书、Gotify、Telegram、Discord Webhook 和 ntfy。
 - 每个推送通道可以设置名称、标题模板、正文模板和转发规则，并可以单独测试。
-- 可以保存五组 WiFi 配置文件。设备会扫描并连接到可用且信号最佳的已保存网络。
+- 可以保存五组 WiFi 配置文件。设备会自动选择、连接并重连可用的已保存网络。
+- 开发版可以在配置加载成功后、WiFi 启动前提供 USB recovery；生产版不编译此路径。
+- USB recovery 只接受固定 17 个只读 modem query ID（`0x01` 至 `0x11`）和 WiFi 配网命令。普通 USB console 输出不等于 recovery endpoint。
 - 可以设置每 1 至 240 小时发送心跳通知。NTP 时间同步完成后，心跳计时才会开始。
 - 可以导出加密 `.smscfg` 配置备份，并将可移植配置恢复到另一台设备。
-- Web OTA 只接受 Release 提供的已签名 `.smsota` 包，并具备重放保护和启动失败回滚。
+- Web OTA 只接受已签名的 `.smsota` 包。Release 只有通过 readiness gate 才会发布此包。
 - Web 页脚会显示固件版本。正式版显示 `releaseVersion (devBuild)`，开发版显示 `devBuild`。
 
-> 通知目前只通过 WiFi 发送。设备会保存 4G 和混合模式选项，但移动网络推送在完成 CA provisioning 前会 fail closed。GET 和 ntfy 只支持 WiFi，漫游发送一律 fail closed。
+> 通知目前只通过 WiFi 发送。设备会保存 4G 和混合模式选项，但 TLS 或网络注册未经验证时，4G push 会 fail closed。现有硬件证据没有证明 4G 数据传送可用。GET 和 ntfy 只支持 WiFi。
 
 ## 快速开始
 
@@ -31,18 +33,19 @@
 3. 设备找不到已保存的 WiFi 时，连接到 `SMS-Forwarder-XXXXXX`。
 4. 输入密码 `sms-forwarder-setup`，然后打开 `http://192.168.1.1`。
 5. 设备连接到路由器后，使用管理页显示的局域网地址登录。
-6. 使用默认账号 `admin` 和密码 `admin123`，然后立即修改密码。
+6. 使用管理账号登录，然后立即修改默认密码。
 7. 配置电子邮件或推送通道，并使用通道测试确认发送结果。
 
 ### 后续 OTA 更新
 
-从正式 Release 下载 `sms-forwarder-VERSION.smsota`。在管理页打开“系统设置 → 固件更新”，然后选择此文件。
+从已通过 readiness gate 的 Release 下载 `sms-forwarder-VERSION.smsota`。在管理页打开“系统设置 → 固件更新”，然后选择此文件。
 
-**请勿将 `.bin` 文件上传到 Web OTA。** `.bin` 是 USB 完整镜像，`.smsota` 才是已签名的 Web OTA 包。
+**请勿将 `.bin` 文件上传到 Web OTA。** `.bin` 是从 `0x0` 烧录的 USB 完整镜像，`.smsota` 才是已签名的 Web OTA 包。
+Web OTA 会写入一个 OTA app slot，大小上限为 1,920 KiB。它不会写入 bootloader、partition table、`appcfg` 或 `coredump`，并会将 OTA metadata 写入 `otadata` 和 NVS。
 
 ## 硬件与接线
 
-已验证的组合是 ESP32-C3 Super Mini 与 ML307R-DC。设备需要 4 MB Flash、Nano SIM 和适合当地网络的天线。
+已测试的组合是 ESP32-C3 Super Mini 与 ML307R-DC。设备需要 4 MB Flash、Nano SIM 和适合当地网络的天线。
 
 <img src="assets/photo.png" width="200" alt="ESP32-C3 与 ML307R-DC 短信转发器" />
 
