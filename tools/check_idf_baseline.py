@@ -91,7 +91,60 @@ def check_license_notice() -> None:
         fail("third-party notice does not point to the rebuild command")
 
 
+def cmake_cache_value(cache: Path, key: str) -> str | None:
+    prefix = f"{key}:"
+    for line in cache.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix) and "=" in line:
+            return line.split("=", 1)[1]
+    return None
+
+
+def generated_sdkconfig_path(build_dir: Path) -> Path:
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        fail(f"build cache not found: {cache}")
+    raw_path = cmake_cache_value(cache, "SDKCONFIG")
+    if not raw_path:
+        fail(f"build cache does not identify SDKCONFIG: {cache}")
+
+    configured_home = cmake_cache_value(cache, "CMAKE_HOME_DIRECTORY")
+    path = Path(raw_path)
+    if not path.is_absolute() and configured_home:
+        path = Path(configured_home) / path
+    if path.exists():
+        return path
+
+    # Build artifacts may have been produced in a container whose checkout
+    # path differs from this checkout. Preserve the cache-relative path.
+    if configured_home:
+        try:
+            relative = path.relative_to(Path(configured_home))
+        except ValueError:
+            relative = None
+        if relative is not None:
+            mapped = ROOT / relative
+            if mapped.exists():
+                return mapped
+    fail(f"generated sdkconfig not found: {path}")
+
+
+def config_line_enabled(path: Path, expected: str) -> bool:
+    return any(line.strip() == expected for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def check_rollback_config(build_dir: Path) -> None:
+    sdkconfig = generated_sdkconfig_path(build_dir)
+    header = build_dir / "config" / "sdkconfig.h"
+    if not header.exists():
+        fail(f"generated sdkconfig header not found: {header}")
+    if not config_line_enabled(sdkconfig, "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y"):
+        fail(f"OTA build rollback is not enabled in generated sdkconfig: {sdkconfig}")
+    if not config_line_enabled(header, "#define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1"):
+        fail(f"OTA build rollback is not enabled in generated sdkconfig.h: {header}")
+
+
 def check_app_size(build_dir: Path) -> None:
+    check_rollback_config(build_dir)
     image = build_dir / "sms_forwarding_idf.bin"
     if not image.exists():
         fail(f"firmware image not found: {image}")
