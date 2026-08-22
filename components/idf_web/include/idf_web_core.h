@@ -100,5 +100,7 @@ struct IdfWebJobSlotMeta {
 };
 
 size_t idf_web_count_active_jobs(const IdfWebJobSlotMeta* slots, size_t count);
+size_t idf_web_count_visible_jobs(const IdfWebJobSlotMeta* slots, size_t count,
+                                  uint32_t now_ms, uint32_t ttl_ms);
 int idf_web_select_job_slot(const IdfWebJobSlotMeta* slots, size_t count,
                             uint32_t now_ms, uint32_t ttl_ms);

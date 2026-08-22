@@ -109,14 +109,56 @@ int main() {
     slots[0] = {1, IdfWebJobState::Running, 0};
     slots[1] = {2, IdfWebJobState::Done, 100};
     assert(idf_web_count_active_jobs(slots, 6) == 1);
+    slots[2] = {3, IdfWebJobState::Queued, 0};
+    assert(idf_web_count_active_jobs(slots, 6) == 2);
+    slots[0] = {1, IdfWebJobState::Done, 100};
+    slots[2] = {3, IdfWebJobState::Done, 100};
+    assert(idf_web_count_active_jobs(slots, 6) == 0);
+    slots[0] = {1, IdfWebJobState::Running, 0};
+    slots[2] = {};
     assert(idf_web_select_job_slot(slots, 6, 200, 1000) == 2);
     for (int i = 2; i < 6; ++i) slots[i] = {uint32_t(i + 1), IdfWebJobState::Running, 0};
-    // When all six slots are occupied, finished results yield to new work even
-    // before their normal TTL. Otherwise six quick reads stall the API for a minute.
-    assert(idf_web_select_job_slot(slots, 6, 200, 1000) == 1);
+    // An unexpired terminal result, including a restore result, must not be evicted.
+    assert(idf_web_select_job_slot(slots, 6, 200, 1000) == -1);
+    assert(idf_web_select_job_slot(slots, 6, 1099, 1000) == -1);
+    assert(idf_web_select_job_slot(slots, 6, 1100, 1000) == 1);
     slots[1] = {2, IdfWebJobState::Running, 0};
     slots[4] = {5, IdfWebJobState::Done, 0xfffffff0U};
     assert(idf_web_select_job_slot(slots, 6, 0x20U, 0x20U) == 4);
+
+    IdfWebJobSlotMeta visible[6] = {};
+    visible[0] = {11, IdfWebJobState::Done, 1000};
+    visible[1] = {12, IdfWebJobState::Queued, 0};
+    assert(idf_web_count_visible_jobs(visible, 6, 1059, 60) == 2);
+    assert(idf_web_count_visible_jobs(visible, 6, 1060, 60) == 1);
+    visible[1] = {13, IdfWebJobState::Running, 0};
+    assert(idf_web_count_visible_jobs(visible, 6, 1060, 60) == 1);
+
+    IdfWebJobSlotMeta lifecycle[6] = {};
+    lifecycle[0] = {42, IdfWebJobState::Queued, 0};
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 1000, 60) == 1);
+    lifecycle[0].state = IdfWebJobState::Running;
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 1000, 60) == 1);
+    lifecycle[0] = {42, IdfWebJobState::Done, 1000};
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 1059, 60) == 1);
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 1060, 60) == 0);
+    // The firmware uses esp_timer milliseconds and a 60-second TTL. A delayed
+    // first poll at 32 seconds must still see the completed result.
+    lifecycle[0] = {42, IdfWebJobState::Done, 100000};
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 132000, 60000) == 1);
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 159999, 60000) == 1);
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 160000, 60000) == 0);
+    lifecycle[0] = {42, IdfWebJobState::Done, 0xfffffff0U};
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 0x2bU, 60) == 1);
+    assert(idf_web_count_visible_jobs(lifecycle, 6, 0x2cU, 60) == 0);
+
+    IdfWebJobSlotMeta query_churn[6] = {};
+    query_churn[0] = {42, IdfWebJobState::Done, 1000};
+    for (uint32_t now = 1100; now < 10000; now += 100) {
+        query_churn[1] = {now, IdfWebJobState::Done, now};
+        assert(idf_web_count_active_jobs(query_churn, 6) == 0);
+        assert(idf_web_count_visible_jobs(query_churn, 6, now, 60000) >= 1);
+    }
 
     const std::string log_snapshot =
         R"({"seq":5,"lines":["one","two","three","four","fi\"ve"]})";
@@ -190,12 +232,14 @@ int main() {
     assert(transfer.mode == IdfWebTransferMode::Restore && transfer.id == 8 && transfer.bytes.size == 0);
     assert(!idf_web_transfer_cancel_upload(transfer, 99));
     assert(transfer.mode == IdfWebTransferMode::Restore && transfer.id == 8);
+    assert(!idf_web_transfer_start(transfer, IdfWebTransferMode::Restore, 13, 100, 25));
     assert(append_transfer(transfer, 8, 0, std::vector<uint8_t>(60, 1), 8192));
     IdfWebOwnedBytes uploaded;
     assert(!idf_web_transfer_take_complete(transfer, 8, uploaded));
     assert(append_transfer(transfer, 8, 60, std::vector<uint8_t>(40, 2), 8192));
     assert(idf_web_transfer_take_complete(transfer, 8, uploaded));
     assert(uploaded.size == 100 && transfer.mode == IdfWebTransferMode::Restore);
+    assert(!idf_web_transfer_start(transfer, IdfWebTransferMode::Restore, 14, 100, 30));
     assert(!append_transfer(transfer, 8, 0, std::vector<uint8_t>(10, 1), 8192));
     assert(transfer.mode == IdfWebTransferMode::Restore && transfer.id == 8);
     assert(!idf_web_transfer_cancel_upload(transfer, 8));
@@ -304,6 +348,34 @@ int main() {
     assert "idf_push_heartbeat_tick();" in scheduler
     assert "hb_last_day" not in scheduler
     assert "cfg.hbEnabled" not in scheduler
+    assert "system_idle_for_maintenance())" in scheduler
+    assert "system_idle_for_maintenance(true)" in scheduler
+    assert "restore_restart_due(maintenance_now_ms)" in scheduler
+    assert 'system_idle_for_maintenance(false, true)' in scheduler
+    assert 'schedule_restart_or_now("restore_restart")' in scheduler
+    assert "s_restore_restart_pending.store(false" in scheduler
+    maintenance = function_body(source, "system_idle_for_maintenance")
+    assert "api_jobs_active()" in maintenance
+    assert "api_jobs_visible()" in maintenance
+    assert "include_done" in maintenance
+    assert "backup_transfer_active()" in maintenance
+    assert "ota_active()" in maintenance
+    assert "restore_restart_pending()" in maintenance
+    restore_due = function_body(source, "restore_restart_due")
+    assert "now_ms - s_restore_restart_completed_ms.load" in restore_due
+    assert "API_JOB_TTL_MS" in restore_due
+    enqueue = source[source.rindex("static esp_err_t enqueue_api_job("):]
+    busy = enqueue[enqueue.index("if ((ota_active()") : enqueue.index("if (!s_api_job_mutex")]
+    assert "if (backup_job) backup_clear_claim();" in busy
+    assert "if (slot_index < 0)" in enqueue
+    assert "ACTION_JOB_QUEUE_FULL" in enqueue
+    restore_start = function_body(source, "handle_config_restore_start")
+    assert "restore_restart_pending()" in restore_start
+    restart_guard = function_body(source, "reject_restart_while_backup_active")
+    assert "api_jobs_active()" in restart_guard
+    assert "ota_active()" in restart_guard
+    assert "restore_restart_pending()" in restart_guard
+    assert "system_idle_for_maintenance(true)" in source
 
     query = function_body(source, "run_query_job")
     assert '"sinr"' not in query
@@ -349,6 +421,49 @@ int main() {
     api_job = function_body(source, "handle_api_job")
     assert "API_JOB_TTL_MS" in api_job
     assert "now_ms - slot.meta.completed_ms" in api_job
+    restore_finish = function_body(source, "handle_config_restore_finish")
+    assert 'enqueue_api_job(req, "backup_restore", passphrase, std::move(encrypted))' in restore_finish
+    restore_job = function_body(source, "run_backup_restore_job")
+    assert "backup_clear_claim()" not in restore_job
+    backup_clear = function_body(source, "backup_clear_claim")
+    assert "idf_web_transfer_clear(s_backup_transfer)" in backup_clear
+    assert "s_api_jobs" not in backup_clear
+    task = function_body(source, "api_job_task")
+    assert "slot.meta.id == job.meta.id" in task
+    assert "slot.meta.state = IdfWebJobState::Done" in task
+    assert 'job.input.type == "backup_restore" && completion_success' in task
+    assert "s_restore_restart_completed_ms.store(slot.meta.completed_ms" in task
+    assert "s_restore_restart_pending.store(true" in task
+    assert '"API job start id=%u restore=%u"' in task
+    assert '"API job done id=%u ok=%u completed_ms=%u stack_hwm=%u"' in task
+    assert '"API job completion mismatch id=%u slot_id=%u slot_state=%u"' in task
+    assert '"API restore decrypt id=%u result=%u"' in restore_job
+    assert '"API restore config id=%u err=%d status=%u"' in restore_job
+    assert '"API job accepted id=%u restore=%u"' in source
+    assert 'if (job.input.type == "backup_restore") backup_clear_claim();' in task
+    assert task.index("xSemaphoreGive(s_api_job_mutex);") < task.index(
+        'if (job.input.type == "backup_restore") backup_clear_claim();')
+    assert '"API job lookup miss id=%u state=%u age_ms=%u expired=%u"' in api_job
+    scan_lock = api_job.split("xSemaphoreTake(s_api_job_mutex, portMAX_DELAY);", 1)[1].split(
+        "xSemaphoreGive(s_api_job_mutex);", 1)[0]
+    assert "s_last_restore_job.job_id == id && !s_last_restore_job.lookup_logged" in scan_lock
+    assert "restore_lifecycle_miss = s_last_restore_job" in scan_lock
+    assert "xSemaphoreTake(s_api_job_mutex" not in api_job[api_job.index("if (!found) {"):]
+    assert "struct ApiRestoreLifecycleSnapshot" in source
+    for field in (
+        "job_id", "phases", "decrypt_result", "config_err", "config_status",
+        "done_id", "done_state", "completed_ms", "stack_hwm", "mismatch_id",
+        "mismatch_state", "lookup_logged",
+    ):
+        assert field in source
+    assert "RESTORE_PHASE_ACCEPTED" in source
+    assert "RESTORE_PHASE_STARTED" in source
+    assert "RESTORE_PHASE_DECRYPT" in source
+    assert "RESTORE_PHASE_CONFIG" in source
+    assert "RESTORE_PHASE_DONE" in source
+    assert "RESTORE_PHASE_MISMATCH" in source
+    assert '"API restore lifecycle miss id=%u p=%u d=%u ce=%d cs=%u di=%u ds=%u "' in api_job
+    assert "s_last_restore_job = ApiRestoreLifecycleSnapshot();" in source
     log = function_body(source, "handle_empty_log")
     assert 'get_query_param(req, "cursor"' in log
     assert 'get_query_param(req, "limit"' in log
@@ -373,6 +488,16 @@ int main() {
     assert '"400 Bad Request"' in wifi_config
     assert '"409 Conflict"' in wifi_config
     assert '"500 Internal Server Error"' in wifi_config
+
+    restore_start = function_body(source, "handle_config_restore_start")
+    assert "backup_transfer_active()" in restore_start
+
+    web_start = function_body(source, "idf_web_start")
+    scheduler = web_start[web_start.index("if (!s_scheduler_started)"):]
+    assert "httpd_stop(s_server);" in scheduler
+    assert "s_server = nullptr;" in scheduler
+    assert "return ESP_ERR_NO_MEM;" in scheduler
+    assert scheduler.index("httpd_stop(s_server);") < scheduler.index("return ESP_ERR_NO_MEM;")
 
     assert "static bool keepalive_traffic_preflight" in source
     keepalive = function_body(source, "keepalive_task")

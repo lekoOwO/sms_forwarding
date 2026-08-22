@@ -336,6 +336,19 @@ size_t idf_web_count_active_jobs(const IdfWebJobSlotMeta* slots, size_t count)
     }));
 }
 
+size_t idf_web_count_visible_jobs(const IdfWebJobSlotMeta* slots, size_t count,
+                                  uint32_t now_ms, uint32_t ttl_ms)
+{
+    if (!slots || count == 0) return 0;
+    return static_cast<size_t>(std::count_if(slots, slots + count,
+        [now_ms, ttl_ms](const IdfWebJobSlotMeta& slot) {
+            if (slot.state == IdfWebJobState::Queued || slot.state == IdfWebJobState::Running) {
+                return true;
+            }
+            return slot.state == IdfWebJobState::Done && now_ms - slot.completed_ms < ttl_ms;
+        }));
+}
+
 int idf_web_select_job_slot(const IdfWebJobSlotMeta* slots, size_t count,
                             uint32_t now_ms, uint32_t ttl_ms)
 {
@@ -343,16 +356,10 @@ int idf_web_select_job_slot(const IdfWebJobSlotMeta* slots, size_t count,
         if (slots[i].state == IdfWebJobState::Empty) return static_cast<int>(i);
     }
 
-    int oldest_done = -1;
-    uint32_t oldest_age = 0;
     for (size_t i = 0; i < count; ++i) {
         if (slots[i].state != IdfWebJobState::Done) continue;
         uint32_t age = now_ms - slots[i].completed_ms;
         if (age >= ttl_ms) return static_cast<int>(i);
-        if (oldest_done < 0 || age > oldest_age) {
-            oldest_done = static_cast<int>(i);
-            oldest_age = age;
-        }
     }
-    return oldest_done;
+    return -1;
 }

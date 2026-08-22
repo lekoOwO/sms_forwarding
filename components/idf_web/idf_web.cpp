@@ -61,11 +61,49 @@ static constexpr uint32_t BACKUP_TTL_MS = 120000;
 static constexpr size_t BACKUP_CHUNK_BYTES = 8192;
 static constexpr uint32_t OTA_TTL_MS = 120000;
 static std::atomic<bool> s_device_restart_pending{false};
+static std::atomic<bool> s_restore_restart_pending{false};
+static std::atomic<uint32_t> s_restore_restart_completed_ms{0};
+
+static constexpr uint32_t RESTORE_PHASE_ACCEPTED = 1U << 0;
+static constexpr uint32_t RESTORE_PHASE_STARTED = 1U << 1;
+static constexpr uint32_t RESTORE_PHASE_DECRYPT = 1U << 2;
+static constexpr uint32_t RESTORE_PHASE_CONFIG = 1U << 3;
+static constexpr uint32_t RESTORE_PHASE_DONE = 1U << 4;
+static constexpr uint32_t RESTORE_PHASE_MISMATCH = 1U << 5;
+static constexpr uint32_t RESTORE_FIELD_UNKNOWN = UINT32_MAX;
+
+struct ApiRestoreLifecycleSnapshot {
+    uint32_t job_id = 0;
+    uint32_t phases = 0;
+    uint32_t decrypt_result = RESTORE_FIELD_UNKNOWN;
+    int32_t config_err = INT32_MIN;
+    uint32_t config_status = RESTORE_FIELD_UNKNOWN;
+    uint32_t done_id = 0;
+    uint32_t done_state = 0;
+    uint32_t completed_ms = 0;
+    uint32_t stack_hwm = 0;
+    uint32_t mismatch_id = 0;
+    uint32_t mismatch_state = 0;
+    bool lookup_logged = false;
+};
+
+static ApiRestoreLifecycleSnapshot s_last_restore_job;
 
 static bool device_restart_pending()
 {
     return s_device_restart_pending.load(std::memory_order_relaxed) ||
            idf_web_ota_restart_pending();
+}
+
+static bool restore_restart_pending()
+{
+    return s_restore_restart_pending.load(std::memory_order_acquire);
+}
+
+static bool restore_restart_due(uint32_t now_ms)
+{
+    return restore_restart_pending() &&
+           now_ms - s_restore_restart_completed_ms.load(std::memory_order_acquire) >= API_JOB_TTL_MS;
 }
 
 struct ApiJob {
@@ -116,6 +154,39 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
 static std::string run_save_job(const std::string& body);
 static bool valid_ussd_code(const std::string& code);
 static bool run_ussd(const std::string& code, std::string& resp_out);
+
+static void restore_lifecycle_mark_locked(uint32_t job_id, uint32_t phase)
+{
+    if (s_last_restore_job.job_id == job_id) s_last_restore_job.phases |= phase;
+}
+
+static void restore_lifecycle_reset_locked(uint32_t job_id)
+{
+    s_last_restore_job = ApiRestoreLifecycleSnapshot();
+    s_last_restore_job.job_id = job_id;
+    s_last_restore_job.phases = RESTORE_PHASE_ACCEPTED;
+}
+
+static void restore_lifecycle_decrypt(uint32_t job_id, uint32_t result)
+{
+    if (!s_api_job_mutex || xSemaphoreTake(s_api_job_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (s_last_restore_job.job_id == job_id) {
+        s_last_restore_job.decrypt_result = result;
+        s_last_restore_job.phases |= RESTORE_PHASE_DECRYPT;
+    }
+    xSemaphoreGive(s_api_job_mutex);
+}
+
+static void restore_lifecycle_config(uint32_t job_id, int32_t err, uint32_t status)
+{
+    if (!s_api_job_mutex || xSemaphoreTake(s_api_job_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (s_last_restore_job.job_id == job_id) {
+        s_last_restore_job.config_err = err;
+        s_last_restore_job.config_status = status;
+        s_last_restore_job.phases |= RESTORE_PHASE_CONFIG;
+    }
+    xSemaphoreGive(s_api_job_mutex);
+}
 
 static bool request_is_on_ap_interface(httpd_req_t* req)
 {
@@ -1054,6 +1125,17 @@ static bool api_jobs_active()
     return active;
 }
 
+static bool api_jobs_visible()
+{
+    if (!s_api_job_mutex || xSemaphoreTake(s_api_job_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return true;
+    IdfWebJobSlotMeta metas[API_JOB_SLOTS];
+    for (size_t i = 0; i < API_JOB_SLOTS; ++i) metas[i] = s_api_jobs[i].meta;
+    const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+    const bool visible = idf_web_count_visible_jobs(metas, API_JOB_SLOTS, now_ms, API_JOB_TTL_MS) != 0;
+    xSemaphoreGive(s_api_job_mutex);
+    return visible;
+}
+
 static bool ota_active()
 {
     idf_web_ota_expire(web_now_ms(), OTA_TTL_MS);
@@ -1121,23 +1203,27 @@ static std::string run_backup_export_job(const std::string& passphrase)
                          "\"exportId\":" + std::to_string(export_id));
 }
 
-static std::string run_backup_restore_job(const std::string& passphrase,
+static std::string run_backup_restore_job(uint32_t job_id, const std::string& passphrase,
                                           IdfWebOwnedBytes& encrypted)
 {
     IdfWebOwnedBytes plaintext;
     const IdfWebCryptoResult crypto = idf_web_decrypt_backup(
         encrypted.data.get(), encrypted.size, passphrase, plaintext);
+    restore_lifecycle_decrypt(job_id, static_cast<uint32_t>(crypto));
+    idf_logf("API restore decrypt id=%u result=%u", static_cast<unsigned>(job_id),
+             static_cast<unsigned>(crypto));
     idf_web_secure_clear(encrypted);
     if (crypto != IdfWebCryptoResult::Ok) {
         idf_web_secure_clear(plaintext);
-        backup_clear_claim();
         return action_result(false, crypto == IdfWebCryptoResult::InvalidPassphrase ?
             "ACTION_CONFIG_PASSPHRASE_INVALID" : "ACTION_CONFIG_RESTORE_INVALID");
     }
     IdfPortableConfigStatus status = IdfPortableConfigStatus::Invalid;
     const esp_err_t err = idf_config_restore_portable(plaintext.data.get(), plaintext.size, &status);
+    restore_lifecycle_config(job_id, static_cast<int32_t>(err), static_cast<uint32_t>(status));
+    idf_logf("API restore config id=%u err=%d status=%u", static_cast<unsigned>(job_id),
+             static_cast<int>(err), static_cast<unsigned>(status));
     idf_web_secure_clear(plaintext);
-    backup_clear_claim();
     if (err == ESP_OK) return action_result(true, "ACTION_CONFIG_RESTORED");
     if (status == IdfPortableConfigStatus::UnsupportedVersion) {
         return action_result(false, "ACTION_CONFIG_RESTORE_INVALID", {}, "unsupportedVersion");
@@ -1367,8 +1453,13 @@ static void api_job_task(void* raw)
         job.input.type = slot.input.type;
         job.input.payload = std::move(slot.input.payload);
         job.binary = std::move(slot.binary);
+        if (job.input.type == "backup_restore") {
+            restore_lifecycle_mark_locked(slot.meta.id, RESTORE_PHASE_STARTED);
+        }
         xSemaphoreGive(s_api_job_mutex);
     }
+    idf_logf("API job start id=%u restore=%u", static_cast<unsigned>(job.meta.id),
+             job.input.type == "backup_restore" ? 1U : 0U);
 
     const bool needs_modem = job.input.type == "at" || job.input.type == "flight" ||
                              job.input.type == "modem" || job.input.type == "ping";
@@ -1385,30 +1476,74 @@ static void api_job_task(void* raw)
         else if (job.input.type == "wifi") result = run_wifi_job(job.input.payload);
         else if (job.input.type == "save") result = run_save_job(job.input.payload);
         else if (job.input.type == "backup_export") result = run_backup_export_job(job.input.payload);
-        else if (job.input.type == "backup_restore") result = run_backup_restore_job(job.input.payload, job.binary);
+        else if (job.input.type == "backup_restore") {
+            result = run_backup_restore_job(job.meta.id, job.input.payload, job.binary);
+        }
         else if (job.input.type == "ota_finish") result = run_ota_finish_job(job.input.payload);
         else result = action_result(false, "ACTION_JOB_FAILED");
         if (needs_modem) api_job_modem_end();
     }
+    uint32_t stack_hwm_bytes = 0;
     if (job.input.type == "backup_export" || job.input.type == "backup_restore" ||
         job.input.type == "ota_finish") {
+        stack_hwm_bytes = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
         idf_logf("Configuration encryption task stack remaining: %u bytes",
-                 static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+                 static_cast<unsigned>(stack_hwm_bytes));
     }
     clear_api_job_sensitive(job);
     if (result.size() > 2048) result = action_result(false, "ACTION_JOB_FAILED");
     const bool ota_success = job.input.type == "ota_finish" &&
                              result.find("\"success\":true") != std::string::npos;
 
+    bool completed = false;
+    bool completion_success = false;
+    bool completion_mismatch = false;
+    uint32_t completed_ms = 0;
+    uint32_t current_slot_id = 0;
+    IdfWebJobState current_slot_state = IdfWebJobState::Empty;
     if (s_api_job_mutex && xSemaphoreTake(s_api_job_mutex, portMAX_DELAY) == pdTRUE) {
         ApiJob& slot = s_api_jobs[index];
         if (slot.meta.id == job.meta.id) {
+            completion_success = result.find("\"success\":true") != std::string::npos;
             slot.result = std::move(result);
-            slot.success = slot.result.find("\"success\":true") != std::string::npos;
+            slot.success = completion_success;
             slot.meta.completed_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
             slot.meta.state = IdfWebJobState::Done;
+            if (job.input.type == "backup_restore" && s_last_restore_job.job_id == job.meta.id) {
+                s_last_restore_job.done_id = job.meta.id;
+                s_last_restore_job.done_state = static_cast<uint32_t>(slot.meta.state);
+                s_last_restore_job.completed_ms = slot.meta.completed_ms;
+                s_last_restore_job.stack_hwm = stack_hwm_bytes;
+                s_last_restore_job.phases |= RESTORE_PHASE_DONE;
+            }
+            if (job.input.type == "backup_restore" && completion_success) {
+                s_restore_restart_completed_ms.store(slot.meta.completed_ms, std::memory_order_release);
+                s_restore_restart_pending.store(true, std::memory_order_release);
+            }
+            completed = true;
+            completed_ms = slot.meta.completed_ms;
+        } else {
+            if (job.input.type == "backup_restore" && s_last_restore_job.job_id == job.meta.id) {
+                s_last_restore_job.mismatch_id = slot.meta.id;
+                s_last_restore_job.mismatch_state = static_cast<uint32_t>(slot.meta.state);
+                s_last_restore_job.phases |= RESTORE_PHASE_MISMATCH;
+            }
+            completion_mismatch = true;
+            current_slot_id = slot.meta.id;
+            current_slot_state = slot.meta.state;
         }
         xSemaphoreGive(s_api_job_mutex);
+    }
+    if (job.input.type == "backup_restore") backup_clear_claim();
+    if (completed) {
+        idf_logf("API job done id=%u ok=%u completed_ms=%u stack_hwm=%u",
+                 static_cast<unsigned>(job.meta.id),
+                 completion_success ? 1U : 0U,
+                 static_cast<unsigned>(completed_ms), static_cast<unsigned>(stack_hwm_bytes));
+    } else if (completion_mismatch) {
+        idf_logf("API job completion mismatch id=%u slot_id=%u slot_state=%u",
+                 static_cast<unsigned>(job.meta.id), static_cast<unsigned>(current_slot_id),
+                 static_cast<unsigned>(current_slot_state));
     }
     if (ota_success) {
         auto reboot = [](void*) {
@@ -1429,9 +1564,11 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
     const bool backup_job = strcmp(type, "backup_export") == 0 || strcmp(type, "backup_restore") == 0;
     const bool crypto_job = backup_job || strcmp(type, "ota_finish") == 0;
     const bool ota_job = strcmp(type, "ota_finish") == 0;
+    const bool restore_job = strcmp(type, "backup_restore") == 0;
     if ((ota_active() && !ota_job) ||
-        (device_restart_pending() && strcmp(type, "query") != 0)) {
+        ((device_restart_pending() || restore_restart_pending()) && strcmp(type, "query") != 0)) {
         idf_web_secure_clear(binary);
+        if (backup_job) backup_clear_claim();
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_BUSY\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1465,6 +1602,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
     slot.input = idf_web_own_job_input(type, arg.data(), arg.size());
     slot.binary = std::move(binary);
     uint32_t id = slot.meta.id;
+    if (restore_job) restore_lifecycle_reset_locked(id);
     xSemaphoreGive(s_api_job_mutex);
 
     if (xTaskCreate(api_job_task, "idf_web_job", crypto_job ? 8192 : 6144,
@@ -1484,6 +1622,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
     snprintf(response, sizeof(response),
              "{\"success\":true,\"code\":\"ACTION_JOB_ACCEPTED\",\"data\":{\"jobId\":%u},\"detail\":\"\"}",
              static_cast<unsigned>(id));
+    idf_logf("API job accepted id=%u restore=%u", static_cast<unsigned>(id), restore_job ? 1U : 0U);
     httpd_resp_set_status(req, "202 Accepted");
     return httpd_resp_sendstr(req, response);
 }
@@ -1503,12 +1642,20 @@ static esp_err_t handle_api_job(httpd_req_t* req)
     std::string type;
     std::string result;
     bool found = false;
+    IdfWebJobState observed_state = IdfWebJobState::Empty;
+    uint32_t observed_completed_ms = 0;
+    bool observed_expired = false;
+    bool emit_restore_lifecycle_miss = false;
+    ApiRestoreLifecycleSnapshot restore_lifecycle_miss;
     xSemaphoreTake(s_api_job_mutex, portMAX_DELAY);
     const uint32_t now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
     for (ApiJob& slot : s_api_jobs) {
         if (slot.meta.id == id && slot.meta.state != IdfWebJobState::Empty) {
+            observed_state = slot.meta.state;
+            observed_completed_ms = slot.meta.completed_ms;
             if (slot.meta.state == IdfWebJobState::Done &&
                 now_ms - slot.meta.completed_ms >= API_JOB_TTL_MS) {
+                observed_expired = true;
                 clear_api_job_sensitive(slot);
                 slot = ApiJob();
                 break;
@@ -1521,8 +1668,33 @@ static esp_err_t handle_api_job(httpd_req_t* req)
             break;
         }
     }
+    if (!found && s_last_restore_job.job_id == id && !s_last_restore_job.lookup_logged) {
+        s_last_restore_job.lookup_logged = true;
+        restore_lifecycle_miss = s_last_restore_job;
+        emit_restore_lifecycle_miss = true;
+    }
     xSemaphoreGive(s_api_job_mutex);
     if (!found) {
+        const uint32_t age_ms = observed_state == IdfWebJobState::Done
+            ? now_ms - observed_completed_ms : 0;
+        idf_logf("API job lookup miss id=%u state=%u age_ms=%u expired=%u",
+                 static_cast<unsigned>(id), static_cast<unsigned>(observed_state),
+                 static_cast<unsigned>(age_ms), observed_expired ? 1U : 0U);
+        if (emit_restore_lifecycle_miss) {
+            idf_logf("API restore lifecycle miss id=%u p=%u d=%u ce=%d cs=%u di=%u ds=%u "
+                     "cm=%u h=%u mi=%u ms=%u",
+                     static_cast<unsigned>(restore_lifecycle_miss.job_id),
+                     static_cast<unsigned>(restore_lifecycle_miss.phases),
+                     static_cast<unsigned>(restore_lifecycle_miss.decrypt_result),
+                     static_cast<int>(restore_lifecycle_miss.config_err),
+                     static_cast<unsigned>(restore_lifecycle_miss.config_status),
+                     static_cast<unsigned>(restore_lifecycle_miss.done_id),
+                     static_cast<unsigned>(restore_lifecycle_miss.done_state),
+                     static_cast<unsigned>(restore_lifecycle_miss.completed_ms),
+                     static_cast<unsigned>(restore_lifecycle_miss.stack_hwm),
+                     static_cast<unsigned>(restore_lifecycle_miss.mismatch_id),
+                     static_cast<unsigned>(restore_lifecycle_miss.mismatch_state));
+        }
         httpd_resp_set_status(req, "404 Not Found");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_JOB_NOT_FOUND\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1557,7 +1729,9 @@ static esp_err_t send_backup_result(httpd_req_t* req, const char* status, bool s
 
 static bool reject_restart_while_backup_active(httpd_req_t* req)
 {
-    if (!backup_transfer_active() && !ota_active() && !device_restart_pending()) return false;
+    if (!backup_transfer_active() && !ota_active() && !device_restart_pending() &&
+        !restore_restart_pending() &&
+        !api_jobs_active()) return false;
     send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     return true;
 }
@@ -1597,7 +1771,7 @@ static esp_err_t handle_config_export(httpd_req_t* req)
     if (req->method != HTTP_POST) {
         return send_backup_result(req, "405 Method Not Allowed", false, "ACTION_INPUT_INVALID");
     }
-    if (ota_active() || device_restart_pending()) {
+    if (ota_active() || device_restart_pending() || restore_restart_pending()) {
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
@@ -1636,7 +1810,8 @@ static esp_err_t handle_config_restore_start(httpd_req_t* req)
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
-    if (ota_active() || device_restart_pending()) {
+    if (ota_active() || device_restart_pending() || restore_restart_pending() ||
+        backup_transfer_active()) {
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
@@ -1814,7 +1989,7 @@ static esp_err_t handle_ota_start(httpd_req_t* req)
 {
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
-    if (device_restart_pending() || ota_active() || backup_transfer_active() ||
+    if (device_restart_pending() || restore_restart_pending() || ota_active() || backup_transfer_active() ||
         api_jobs_active() || cellular_job_active()) {
         return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
@@ -3898,9 +4073,13 @@ static bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days
     return (now - last_ts) >= interval_days * 86400u;
 }
 
-static bool system_idle_for_maintenance()
+static bool system_idle_for_maintenance(bool include_done = false,
+                                         bool allow_restore_restart = false)
 {
+    const bool jobs_busy = include_done && !allow_restore_restart
+        ? api_jobs_visible() : api_jobs_active();
     return !backup_transfer_active() && !ota_active() && !device_restart_pending() &&
+           (allow_restore_restart || !restore_restart_pending()) && !jobs_busy &&
            !idf_push_busy() &&
            idf_push_forward_queue_depth() == 0 &&
            idf_push_retry_queue_depth() == 0 &&
@@ -4184,6 +4363,13 @@ static void scheduler_task(void*)
             esp_restart();
         }
 
+        const uint32_t maintenance_now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
+        if (restore_restart_due(maintenance_now_ms) && system_idle_for_maintenance(false, true)) {
+            idf_log_line("Configuration restore completed; restarting after API job TTL");
+            schedule_restart_or_now("restore_restart");
+            s_restore_restart_pending.store(false, std::memory_order_release);
+        }
+
         uint32_t now = static_cast<uint32_t>(time(nullptr));
         if (epoch_valid(now)) {
             IdfSchedulerView cfg = idf_config_get_scheduler_view();
@@ -4267,7 +4453,7 @@ static void scheduler_task(void*)
 
             uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
             if (cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
-                uptime_ms >= 7200000ULL && system_idle_for_maintenance()) {
+                uptime_ms >= 7200000ULL && system_idle_for_maintenance(true)) {
                 rb_last_day = day;
                 idf_log_line("Daily scheduled restart...");
                 vTaskDelay(pdMS_TO_TICKS(300));
@@ -4780,6 +4966,9 @@ static esp_err_t register_handler(httpd_handle_t server, const char* uri, int me
 esp_err_t idf_web_start(void)
 {
     if (s_server) return ESP_OK;
+    s_last_restore_job = ApiRestoreLifecycleSnapshot();
+    s_restore_restart_pending.store(false, std::memory_order_release);
+    s_restore_restart_completed_ms.store(0, std::memory_order_release);
     if (s_csrf_token.empty()) {
         uint8_t random[16];
         esp_fill_random(random, sizeof(random));
@@ -4884,6 +5073,9 @@ esp_err_t idf_web_start(void)
         } else {
             ESP_LOGW(TAG, "scheduler task start failed");
             idf_log_line("Scheduled-task scheduler failed to start");
+            httpd_stop(s_server);
+            s_server = nullptr;
+            return ESP_ERR_NO_MEM;
         }
     }
     ESP_LOGI(TAG, "ESP-IDF web server registered UI and bootstrap dynamic routes");
