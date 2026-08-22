@@ -1,4 +1,7 @@
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -23,6 +26,268 @@ def function_body(source: str, name: str) -> str:
 
 
 class UartOwnerContractTest(unittest.TestCase):
+    def test_dev_usb_query_is_fixed_id_and_uses_the_existing_owner_queue(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        self.assertIn("submit_owner_command", body)
+        self.assertNotIn("owner_uart_read", body)
+        self.assertNotIn("owner_uart_write", body)
+        self.assertIn("switch (query_id)", source)
+        query_map = function_body(source, "usb_query_command")
+        for command in (
+            '"ATI"', '"AT+CPIN?"', '"AT+CEREG?"', '"AT+COPS?"',
+            '"AT+CGATT?"', '"AT+CGACT?"', '"AT+CGPADDR"', '"AT+ICCID"',
+            '"AT+CSQ"', '"AT+CESQ"', '"AT+CFUN?"', '"AT+CREG?"',
+            '"AT+CGREG?"', '"AT+CEER"', '"AT+CIMI"', '"AT+CPOL?"',
+            '"AT+CGDCONT?"',
+        ):
+            self.assertEqual(query_map.count(command), 1, command)
+        self.assertIn("IDF_MODEM_ERR_BUSY", body)
+        self.assertIn("IDF_MODEM_USB_QUERY_TIMEOUT_MS", body)
+        self.assertIn("s_runtime_queue_ready", body)
+        self.assertIn("atReady", body)
+        self.assertNotIn("modemReady", body)
+        self.assertIn("idf_modem_usb_query_admission", body)
+        self.assertNotIn("idf_modem_at_idle", body)
+        self.assertIn("filter_urcs", source)
+        self.assertIn("response_prefix", source)
+
+    def test_usb_query_submits_busy_owner_to_bounded_queue(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("submit_owner_command", body)
+        self.assertIn("xSemaphoreTake(s_command_mutex", submit)
+        self.assertIn("slot_index < 0", submit)
+        self.assertIn("xQueueSend(queue, &slot_index, 0)", submit)
+        self.assertIn("result = ESP_ERR_TIMEOUT", submit)
+
+    def test_usb_query_busy_reason_is_captured_at_owner_boundary(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("busy_reason", body)
+        self.assertIn("IdfModemUsbQueryBusyReason::gate_closed", body)
+        for reason in ("gate_closed", "mutex_timeout", "slots_full", "queue_full"):
+            self.assertIn(
+                f"IdfModemUsbQueryBusyReason::{reason}", submit
+            )
+
+    def test_cpol_has_only_a_bounded_longer_owner_timeout(self):
+        source = SOURCE.read_text()
+        header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        self.assertIn("IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS = 5000", header)
+        self.assertIn("IDF_MODEM_USB_QUERY_TIMEOUT_MS = 1500", header)
+        self.assertIn("query_id == IDF_MODEM_USB_QUERY_CPOL", body)
+        self.assertIn("IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS", body)
+        self.assertIn("IDF_MODEM_USB_QUERY_TIMEOUT_MS", body)
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("request.timeout_ms + wait_margin_ms", submit)
+        self.assertIn("wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL", submit)
+
+    def test_oversized_dev_query_logs_only_bounded_metadata_before_clearing(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        oversize = body[body.index("response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE"):]
+        log = oversize[:oversize.index("response.clear()")]
+        self.assertIn("idf_logf", log)
+        self.assertIn("query_id", log)
+        self.assertIn("response.size()", log)
+        self.assertIn("static_cast<unsigned>(response.size())", log)
+        self.assertNotIn("bounded_actual_length", log)
+        self.assertNotIn("std::min", log)
+        self.assertNotIn("IDF_MODEM_USB_QUERY_MAX_RESPONSE + 1", log)
+        self.assertIn("IDF_MODEM_USB_QUERY_MAX_RESPONSE", log)
+        self.assertNotIn("response.c_str()", log)
+        self.assertNotIn("response.data()", log)
+        for forbidden in ("command", "operator", "apn", "plmn"):
+            self.assertNotIn(forbidden, log.lower())
+
+    def test_cpol_query_returns_compact_summary_before_generic_size_guard(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        summary = body.index("idf_modem_cpol_compact_summary")
+        generic_limit = body.index("response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE")
+        self.assertIn("query_id == IDF_MODEM_USB_QUERY_CPOL", body[:summary])
+        self.assertLess(summary, generic_limit)
+        self.assertIn("response = idf_modem_cpol_compact_summary(response)", body)
+        self.assertIn('"idf_modem_cpol_summary.h"', source)
+
+    def test_owner_submit_uses_one_absolute_deadline_for_all_waits(self):
+        source = SOURCE.read_text()
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("TickDeadline deadline(wait_ms)", submit)
+        self.assertGreaterEqual(submit.count("deadline.remaining_ticks()"), 3)
+        self.assertIn("timeout_ticks_ceil", source)
+        self.assertNotIn("xSemaphoreTake(s_command_mutex, portMAX_DELAY)", submit)
+
+    def test_usb_query_readiness_covers_locked_unregistered_and_reset_lifecycle(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        self.assertIn("status.atReady", body)
+        self.assertIn("s_runtime_queue_ready.load", body)
+        self.assertIn("s_reset_request", body)
+        owner_loop = function_body(source, "modem_task")
+        startup_queries = owner_loop.index("while (sim_ready && check_count++ < 30)")
+        queue_ready = owner_loop.index("s_runtime_queue_ready.store(true", 0, startup_queries)
+        self.assertLess(queue_ready, startup_queries)
+        registration = owner_loop.split("while (sim_ready && check_count++ < 30)", 1)[1].split(
+            "bool registered", 1
+        )[0]
+        self.assertLess(
+            registration.index("owner_process_one_command(false)"),
+            registration.index('send_ok("AT+CEREG?"'),
+        )
+        self.assertIn("s_runtime_queue_ready.store(false", source)
+        for lifecycle in ("handle_reset_request_if_any", "run_pending_reinit_if_recovered"):
+            body = function_body(source, lifecycle)
+            self.assertIn("s_runtime_queue_ready.store(true", body)
+
+    def test_dev_usb_query_is_compile_time_excluded_from_release(self):
+        source = SOURCE.read_text()
+        start = source.index("static const char* usb_query_command")
+        self.assertGreater(source.rfind("#if SMS_USB_RECOVERY", 0, start), 0)
+        self.assertIn("#endif", source[start:])
+        cmake = SOURCE.parent / "CMakeLists.txt"
+        self.assertIn("SMS_USB_RECOVERY", cmake.read_text())
+
+    def test_interleaved_urc_fixture_is_executable_and_keeps_urc_out_of_query(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the host URC fixture requires g++")
+        fixture = SOURCE.parent / "test" / "query_filter_fixture.cpp"
+        self.assertTrue(fixture.exists(), "missing executable query filter fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "query_filter_fixture"
+            compile_result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pthread",
+                 "-I", str(SOURCE.parent / "include"), str(fixture), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            run_result = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
+            self.assertEqual(
+                set(run_result.stdout.splitlines()),
+                {
+                    "query=runtime-gate outcome=busy-runtime-gate reason=gate_closed submit-calls=0",
+                    "query=not-ready outcome=not-ready reason=unknown submit-calls=0",
+                    "query=idle-collision outcome=submitted reason=unknown submit-calls=1",
+                    "query=mutex outcome=busy-command-mutex reason=mutex_timeout submit-calls=1",
+                    "query=slots outcome=busy-slots reason=slots_full submit-calls=1",
+                    "query=queue outcome=busy-queue reason=queue_full submit-calls=1",
+                    "query=owner outcome=timeout-owner reason=unknown submit-calls=1",
+                },
+            )
+
+    def test_reset_cancels_queued_normal_owner_slot_before_uart(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "owner_process_one_command")
+        self.assertIn("idf_modem_owner_command_allowed", body)
+        self.assertIn("s_reset_request.load", body)
+        self.assertIn("s_runtime_queue_ready.load", body)
+        self.assertIn("slot.result = ESP_ERR_INVALID_STATE", body)
+        self.assertIn("slot.state = OwnerCommandState::done", body)
+        self.assertIn("xSemaphoreGive(slot.completed)", body)
+        self.assertLess(
+            body.index("idf_modem_owner_command_allowed"),
+            body.index("slot.state = OwnerCommandState::running"),
+        )
+
+    def test_identity_change_logs_are_masked(self):
+        source = SOURCE.read_text()
+        self.assertIn("mask_identity", source)
+        identity = function_body(source, "sample_identity_once")
+        self.assertNotIn("after.imei.c_str()", identity)
+        self.assertNotIn("after.iccid.c_str()", identity)
+        self.assertNotIn("after.imsi.c_str()", identity)
+
+    def test_registration_state_gates_data_and_rlos_recovery(self):
+        source = SOURCE.read_text()
+        data_mode = function_body(source, "apply_configured_data_mode_once")
+        self.assertIn("idf_modem_data_activation_allowed", data_mode)
+        self.assertLess(data_mode.index("idf_modem_data_activation_allowed"),
+                        data_mode.index('"AT+CGACT=1,1"'))
+        startup = function_body(source, "apply_startup_data_mode")
+        self.assertIn("idf_modem_data_activation_allowed", startup)
+        owner_loop = function_body(source, "modem_task")
+        first_cereg = owner_loop.index('send_ok("AT+CEREG?"')
+        first_data_setup = owner_loop.index("apply_startup_data_mode(stat)")
+        self.assertLess(first_cereg, first_data_setup)
+        self.assertIn("stat == 11", owner_loop)
+        self.assertIn("rlos_only_seen", owner_loop)
+        self.assertIn("Continuing read-only registration probes", owner_loop)
+        self.assertIn("reg_patch.modemReady = (stat == 1 || stat == 5)", owner_loop)
+        self.assertIn("bool now_ready = (stat == 1 || stat == 5)", owner_loop)
+        self.assertIn("idf_modem_data_activation_allowed(idf_modem_get_status().ceregStat)", source)
+
+    def test_sms_health_keeps_rlos_restricted_without_reset(self):
+        source = SOURCE.read_text()
+        health = function_body(source, "idf_modem_sms_health_check")
+        self.assertIn("idf_modem_sms_health_reset_required", health)
+        self.assertIn('stat == 11 ? "restricted-rlos"', health)
+        self.assertIn("Registration unavailable; modem reset not requested", health)
+        self.assertIn("cereg_query_ok", health)
+
+    def test_identity_sampling_is_home_only_at_shared_entrypoint(self):
+        source = SOURCE.read_text()
+        identity = function_body(source, "sample_identity_once")
+        self.assertIn("idf_modem_identity_sampling_allowed", identity)
+        self.assertLess(identity.index("idf_modem_identity_sampling_allowed"),
+                        identity.index('"AT+COPS=3,0"'))
+        self.assertGreaterEqual(source.count("sample_identity_once(false, true)"), 3)
+
+    def test_reset_publishes_gate_before_recovery_side_effect(self):
+        source = SOURCE.read_text()
+        invalidate = function_body(source, "invalidate_registration_state")
+        self.assertIn("idf_modem_invalidate_registration_stat", invalidate)
+        self.assertIn("s_data_mode_retry_pending.store(false", invalidate)
+        self.assertIn("s_status.cellIp.clear()", invalidate)
+        reset = function_body(source, "idf_modem_request_reset")
+        self.assertIn("xSemaphoreTake(s_command_mutex, portMAX_DELAY)", reset)
+        self.assertIn("xSemaphoreGive(s_command_mutex)", reset)
+        self.assertIn("wake_owner_task", reset)
+        lock = reset.index("xSemaphoreTake(s_command_mutex, portMAX_DELAY)")
+        unlock = reset.index("xSemaphoreGive(s_command_mutex)", lock)
+        self.assertLess(lock, reset.index("s_runtime_queue_ready.store(false"))
+        self.assertLess(reset.index("s_runtime_queue_ready.store(false"), reset.index("s_reset_request.store"))
+        self.assertLess(reset.index("s_reset_request.store"), unlock)
+        self.assertLess(unlock, reset.index("invalidate_registration_state"))
+        self.assertLess(unlock, reset.index("set_phase"))
+        self.assertLess(unlock, reset.index("wake_owner_task"))
+        critical = reset[lock:unlock]
+        for forbidden in ("s_session_mutex", "submit_owner_command", "xQueue", "xSemaphoreTake(slot"):
+            self.assertNotIn(forbidden, critical)
+        for lifecycle in ("handle_reset_request_if_any", "run_pending_reinit_if_recovered", "modem_task"):
+            self.assertIn("invalidate_registration_state", function_body(source, lifecycle))
+        retry = function_body(source, "process_data_mode_retry")
+        self.assertIn("s_reset_request.load", retry)
+        self.assertIn("ceregStat < 0", retry)
+        operator = function_body(source, "apply_operator_if_configured")
+        self.assertIn("idf_modem_identity_sampling_allowed", operator)
+
+    def test_successful_sim_unlock_invalidates_before_sms_reopen(self):
+        source = SOURCE.read_text()
+        for lifecycle in ("handle_reset_request_if_any", "run_pending_reinit_if_recovered"):
+            body = function_body(source, lifecycle)
+            unlock = body.index("if (try_unlock_sim")
+            self.assertLess(
+                body.index("invalidate_registration_state", unlock),
+                body.index("configure_sms_and_registration", unlock),
+            )
+
+        owner = function_body(source, "modem_task")
+        startup = owner.index("if (sim_ready)")
+        self.assertLess(
+            owner.index("invalidate_registration_state", startup),
+            owner.index("configure_sms_and_registration", startup),
+        )
+        runtime_unlock = owner.split("if (unlock_request != 0)", 1)[1]
+        self.assertLess(
+            runtime_unlock.index("invalidate_registration_state"),
+            runtime_unlock.index("configure_sms_and_registration"),
+        )
+
     def test_only_owner_checked_wrappers_read_or_write_uart(self):
         source = SOURCE.read_text()
 

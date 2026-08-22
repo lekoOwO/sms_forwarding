@@ -10,3 +10,5 @@ idf_component_register(
     idf_logbuf
     nvs_flash
 )
+
+target_compile_definitions(${COMPONENT_LIB} PRIVATE SMS_USB_RECOVERY=${SMS_USB_RECOVERY_VALUE})

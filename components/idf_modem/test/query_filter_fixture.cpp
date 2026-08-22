@@ -1,0 +1,493 @@
+#include "idf_modem_query_filter.h"
+#include "idf_modem_cpol_summary.h"
+#include "idf_modem_registration.h"
+
+#include <cassert>
+#include <condition_variable>
+#include <cstdint>
+#include <iostream>
+#include <mutex>
+#include <string>
+#include <thread>
+
+struct ResetBarrierFixture {
+    std::mutex command_mutex;
+    std::mutex barrier_mutex;
+    std::condition_variable barrier;
+    bool owner_started = false;
+    bool owner_running = false;
+    bool owner_release = false;
+    bool reset_started = false;
+    bool reset_applied = false;
+    bool queue_ready = true;
+    bool reset_requested = false;
+    bool completed = false;
+    int completion_count = 0;
+    int uart_writes = 0;
+    int result = 0;
+
+    void signal(bool& flag)
+    {
+        {
+            std::lock_guard<std::mutex> lock(barrier_mutex);
+            flag = true;
+        }
+        barrier.notify_all();
+    }
+
+    void wait_for(bool& flag)
+    {
+        std::unique_lock<std::mutex> lock(barrier_mutex);
+        barrier.wait(lock, [&flag] { return flag; });
+    }
+
+    void dispatch_normal(bool priority, bool hold_running)
+    {
+        signal(owner_started);
+        std::unique_lock<std::mutex> lock(command_mutex);
+        if (!idf_modem_owner_command_allowed(priority, reset_requested, queue_ready)) {
+            result = 1;
+            completed = true;
+            ++completion_count;
+            return;
+        }
+        signal(owner_running);
+        if (hold_running) {
+            wait_for(owner_release);
+        }
+        lock.unlock();
+        ++uart_writes;
+        completed = true;
+        ++completion_count;
+    }
+
+    void request_reset()
+    {
+        signal(reset_started);
+        std::lock_guard<std::mutex> lock(command_mutex);
+        queue_ready = false;
+        reset_requested = true;
+        reset_applied = true;
+    }
+};
+
+enum class QueryOutcome {
+    not_ready,
+    busy_runtime_gate,
+    submitted,
+    busy_command_mutex,
+    busy_slots,
+    busy_queue,
+    timeout_owner,
+};
+
+static const char* query_outcome_name(QueryOutcome outcome)
+{
+    switch (outcome) {
+        case QueryOutcome::not_ready: return "not-ready";
+        case QueryOutcome::busy_runtime_gate: return "busy-runtime-gate";
+        case QueryOutcome::submitted: return "submitted";
+        case QueryOutcome::busy_command_mutex: return "busy-command-mutex";
+        case QueryOutcome::busy_slots: return "busy-slots";
+        case QueryOutcome::busy_queue: return "busy-queue";
+        case QueryOutcome::timeout_owner: return "timeout-owner";
+    }
+    return "unknown";
+}
+
+struct QuerySubmitFixture {
+    bool owner_queue_ready = true;
+    bool at_ready = true;
+    bool reset_requested = false;
+    bool command_mutex_available = true;
+    int free_slots = 4;
+    bool queue_accepts = true;
+    bool owner_completes = true;
+    int submit_calls = 0;
+    uint8_t reason = 0;
+
+    QueryOutcome run()
+    {
+        const IdfModemUsbQueryAdmission admission = idf_modem_usb_query_admission(
+            owner_queue_ready, at_ready, reset_requested);
+        if (admission == IdfModemUsbQueryAdmission::busy) {
+            reason = 1;
+            return QueryOutcome::busy_runtime_gate;
+        }
+        if (admission == IdfModemUsbQueryAdmission::not_ready) {
+            return QueryOutcome::not_ready;
+        }
+
+        // Submit through the existing owner queue after admission; do not reject an idle race.
+        ++submit_calls;
+        if (!command_mutex_available) {
+            reason = 2;
+            return QueryOutcome::busy_command_mutex;
+        }
+        if (free_slots == 0) {
+            reason = 3;
+            return QueryOutcome::busy_slots;
+        }
+        if (!queue_accepts) {
+            reason = 4;
+            return QueryOutcome::busy_queue;
+        }
+        return owner_completes ? QueryOutcome::submitted : QueryOutcome::timeout_owner;
+    }
+};
+
+static void print_query_case(const char* name, QuerySubmitFixture fixture)
+{
+    const QueryOutcome outcome = fixture.run();
+    const char* reason = fixture.reason == 1 ? "gate_closed" :
+                         fixture.reason == 2 ? "mutex_timeout" :
+                         fixture.reason == 3 ? "slots_full" :
+                         fixture.reason == 4 ? "queue_full" : "unknown";
+    std::cout << "query=" << name << " outcome=" << query_outcome_name(outcome)
+              << " reason=" << reason
+              << " submit-calls=" << fixture.submit_calls << '\n';
+}
+
+struct QueryTimeoutFixture {
+    static constexpr uint32_t normal_timeout_ms = 1500;
+    static constexpr uint32_t cpol_timeout_ms = 5000;
+
+    static bool completes(uint32_t command_duration_ms, uint32_t timeout_ms)
+    {
+        return command_duration_ms <= timeout_ms;
+    }
+};
+
+struct AbsoluteDeadlineFixture {
+    static uint32_t remaining(uint32_t start, uint32_t now, uint32_t span)
+    {
+        const uint32_t elapsed = now - start;
+        return elapsed >= span ? 0 : span - elapsed;
+    }
+};
+
+int main()
+{
+    int cereg_stat = -1;
+    assert(idf_modem_parse_cereg_status("\r\n+CEREG: 0,11\r\nOK\r\n", cereg_stat));
+    assert(cereg_stat == 11); // 3GPP RLOS-only must remain observable.
+    for (int expected = 0; expected <= 11; ++expected) {
+        const std::string query = "+CEREG: 0," + std::to_string(expected);
+        assert(idf_modem_parse_cereg_status(query, cereg_stat));
+        assert(cereg_stat == expected);
+    }
+    assert(idf_modem_parse_cereg_status("+CEREG: 11,\"0011\",\"00FF\"", cereg_stat));
+    assert(cereg_stat == 11); // URC form uses the first field as stat.
+    assert(idf_modem_parse_cereg_status("+CEREG: 0,5,\"0011\"", cereg_stat));
+    assert(cereg_stat == 5); // Query form uses the second field as stat.
+    assert(!idf_modem_parse_cereg_status("+CEREG: 12", cereg_stat));
+    assert(idf_modem_data_activation_allowed(1));
+    assert(!idf_modem_data_activation_allowed(5));
+    assert(!idf_modem_data_activation_allowed(11));
+    assert(!idf_modem_data_activation_allowed(0));
+    assert(!idf_modem_data_activation_allowed(-1));
+    assert(!idf_modem_sms_health_reset_required(true, true, true, true, true));
+    assert(!idf_modem_sms_health_reset_required(true, true, true, true, true));
+    assert(idf_modem_sms_health_reset_required(false, true, true, true, true));
+    assert(idf_modem_sms_health_reset_required(true, false, true, true, true));
+    assert(idf_modem_sms_health_reset_required(true, true, false, true, true));
+    assert(idf_modem_sms_health_reset_required(true, true, true, false, true));
+    assert(idf_modem_sms_health_reset_required(true, true, true, true, false));
+    assert(idf_modem_identity_sampling_allowed(1));
+    assert(!idf_modem_identity_sampling_allowed(5));
+    assert(!idf_modem_identity_sampling_allowed(11));
+    assert(!idf_modem_identity_sampling_allowed(0));
+    int stale_stat = 1;
+    idf_modem_invalidate_registration_stat(stale_stat);
+    assert(stale_stat == -1);
+    assert(!idf_modem_data_activation_allowed(stale_stat));
+    assert(!idf_modem_identity_sampling_allowed(stale_stat));
+
+    assert(!idf_modem_query_transport_ready(false, true, false));  // startup queue is closed
+    assert(idf_modem_query_transport_ready(true, true, false));   // SIM locked/unregistered
+    assert(!idf_modem_query_transport_ready(true, true, true));   // reset is in progress
+    assert(!idf_modem_query_transport_ready(true, false, false)); // AT transport is down
+
+    assert(idf_modem_usb_query_admission(false, true, false) ==
+           IdfModemUsbQueryAdmission::busy);       // runtime queue is not ready
+    assert(idf_modem_usb_query_admission(true, false, false) ==
+           IdfModemUsbQueryAdmission::not_ready);  // AT transport is down
+    assert(idf_modem_usb_query_admission(true, true, true) ==
+           IdfModemUsbQueryAdmission::not_ready);  // reset is in progress
+    // A briefly busy owner still uses the existing queue; the USB caller does not recheck idle.
+    assert(idf_modem_usb_query_admission(true, true, false) ==
+           IdfModemUsbQueryAdmission::submit);
+
+    struct OwnerDispatchFixture {
+        enum class State { queued, done };
+
+        State state = State::queued;
+        bool completed = false;
+        bool cancelled = false;
+        int uart_writes = 0;
+        int result = 0;
+
+        bool dispatch(bool priority, bool reset_requested, bool queue_ready)
+        {
+            assert(state == State::queued);
+            if (!idf_modem_owner_command_allowed(priority, reset_requested, queue_ready)) {
+                result = 1; // ESP_ERR_INVALID_STATE / NOT_READY in the firmware.
+                cancelled = true;
+                state = State::done;
+                completed = true;
+                return false;
+            }
+            ++uart_writes;
+            state = State::done;
+            completed = true;
+            return true;
+        }
+    };
+
+    OwnerDispatchFixture reset_race;
+    assert(!reset_race.dispatch(false, true, false));
+    assert(reset_race.completed);
+    assert(reset_race.state == OwnerDispatchFixture::State::done);
+    assert(reset_race.cancelled);
+    assert(reset_race.result != 0);
+    assert(reset_race.uart_writes == 0); // queued query is cancelled before UART
+
+    OwnerDispatchFixture reset_flag;
+    assert(!reset_flag.dispatch(false, true, true));
+    assert(reset_flag.completed);
+    assert(reset_flag.cancelled);
+    assert(reset_flag.uart_writes == 0); // reset request wins over a stale ready flag
+
+    OwnerDispatchFixture recovered_query;
+    assert(recovered_query.dispatch(false, false, true)); // reset recovery resumes queries
+    assert(recovered_query.completed);
+    assert(recovered_query.state == OwnerDispatchFixture::State::done);
+    assert(!recovered_query.cancelled);
+    assert(recovered_query.uart_writes == 1);
+
+    OwnerDispatchFixture priority_cnma;
+    assert(priority_cnma.dispatch(true, true, false));
+    assert(priority_cnma.completed);
+    assert(priority_cnma.uart_writes == 1); // Priority CNMA work bypasses the normal reset gate.
+
+    ResetBarrierFixture reset_first;
+    reset_first.command_mutex.lock();
+    std::thread reset_first_owner([&reset_first] { reset_first.dispatch_normal(false, false); });
+    reset_first.wait_for(reset_first.owner_started);
+    assert(reset_first.owner_started);
+    reset_first.queue_ready = false;
+    reset_first.reset_requested = true;
+    reset_first.command_mutex.unlock();
+    reset_first_owner.join();
+    assert(reset_first.completed);
+    assert(reset_first.completion_count == 1);
+    assert(reset_first.result == 1);
+    assert(reset_first.uart_writes == 0);
+
+    ResetBarrierFixture owner_first;
+    std::thread owner_first_owner([&owner_first] { owner_first.dispatch_normal(false, true); });
+    owner_first.wait_for(owner_first.owner_running);
+    assert(owner_first.owner_running);
+    std::thread owner_first_reset([&owner_first] { owner_first.request_reset(); });
+    owner_first.wait_for(owner_first.reset_started);
+    assert(!owner_first.reset_applied);
+    {
+        std::lock_guard<std::mutex> lock(owner_first.barrier_mutex);
+        owner_first.owner_release = true;
+    }
+    owner_first.barrier.notify_all();
+    owner_first_owner.join();
+    owner_first_reset.join();
+    assert(owner_first.completed);
+    assert(owner_first.completion_count == 1);
+    assert(owner_first.uart_writes == 1);
+    assert(owner_first.reset_applied);
+    assert(!owner_first.queue_ready);
+    assert(owner_first.reset_requested);
+
+    QuerySubmitFixture runtime_gate;
+    runtime_gate.owner_queue_ready = false;
+    print_query_case("runtime-gate", runtime_gate);
+    QuerySubmitFixture not_ready;
+    not_ready.at_ready = false;
+    print_query_case("not-ready", not_ready);
+    QuerySubmitFixture idle_collision;
+    print_query_case("idle-collision", idle_collision);
+    QuerySubmitFixture mutex_busy;
+    mutex_busy.command_mutex_available = false;
+    print_query_case("mutex", mutex_busy);
+    QuerySubmitFixture slots_busy;
+    slots_busy.free_slots = 0;
+    print_query_case("slots", slots_busy);
+    QuerySubmitFixture queue_busy;
+    queue_busy.queue_accepts = false;
+    print_query_case("queue", queue_busy);
+    QuerySubmitFixture owner_timeout;
+    owner_timeout.owner_completes = false;
+    print_query_case("owner", owner_timeout);
+
+    // CPOL needs the bounded 5s command window; normal fixed queries keep 1.5s.
+    assert(QueryTimeoutFixture::completes(2000, QueryTimeoutFixture::cpol_timeout_ms));
+    assert(!QueryTimeoutFixture::completes(5001, QueryTimeoutFixture::cpol_timeout_ms));
+    assert(QueryTimeoutFixture::completes(1499, QueryTimeoutFixture::normal_timeout_ms));
+    assert(!QueryTimeoutFixture::completes(1501, QueryTimeoutFixture::normal_timeout_ms));
+
+    // Every wait consumes the same budget; no second full wait is allowed.
+    assert(AbsoluteDeadlineFixture::remaining(0, 5500, 6000) == 500);
+    assert(AbsoluteDeadlineFixture::remaining(0, 6000, 6000) == 0);
+    assert(AbsoluteDeadlineFixture::remaining(0xFFFFFFFCU, 2, 10) == 4);
+    assert(AbsoluteDeadlineFixture::remaining(0xFFFFFFFCU, 6, 10) == 0);
+    assert(AbsoluteDeadlineFixture::remaining(0xFFFFFFFCU, 7, 10) == 0);
+
+    IdfModemQueryResponseFilter filter("AT+CPIN?", "+CPIN:", "", false);
+    const std::string interleaved =
+        "\r\n+CMT: \"+886900000\",145\r\n"
+        "00112233445566778899AABBCCDDEEFF\r\n"
+        "+CEREG: 2\r\n"
+        "+CPIN: READY\r\nOK\r\n";
+    filter.feed(interleaved.data(), interleaved.size());
+
+    assert(filter.response().find("+CPIN: READY") != std::string::npos);
+    assert(filter.response().find("OK") != std::string::npos);
+    assert(filter.response().find("+CMT:") == std::string::npos);
+    assert(filter.response().find("0011223344556677") == std::string::npos);
+    assert(filter.response().find("+CEREG:") == std::string::npos);
+    assert(filter.urcs().find("+CMT: \"+886900000\",145") != std::string::npos);
+    assert(filter.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
+    assert(filter.urcs().find("+CEREG: 2") != std::string::npos);
+
+    struct FixedQueryCase {
+        const char* command;
+        const char* prefix;
+        const char* expected;
+        const char* duplicate;
+    };
+    const FixedQueryCase fixed_queries[] = {
+        {"AT+CPIN?", "+CPIN:", "+CPIN: READY", "+CPIN: TEST"},
+        {"AT+CEREG?", "+CEREG:", "+CEREG: 1", "+CEREG: 5"},
+        {"AT+COPS?", "+COPS:", "+COPS: 0", "+COPS: 2"},
+        {"AT+CGATT?", "+CGATT:", "+CGATT: 1", "+CGATT: 0"},
+        {"AT+CGACT?", "+CGACT:", "+CGACT: 1,1", "+CGACT: 1,0"},
+        {"AT+CGPADDR", "+CGPADDR:", "+CGPADDR: 1,10.0.0.2", "+CGPADDR: 1,10.0.0.3"},
+        {"AT+ICCID", "+ICCID:", "+ICCID: 1234567890123456789", "+ICCID: 9876543210987654321"},
+        {"AT+CSQ", "+CSQ:", "+CSQ: 31,99", "+CSQ: 0,99"},
+        {"AT+CESQ", "+CESQ:", "+CESQ: 99,99,255,255,17,71", "+CESQ: 99,99,255,255,0,0"},
+        {"AT+CFUN?", "+CFUN:", "+CFUN: 1", "+CFUN: 0"},
+        {"AT+CREG?", "+CREG:", "+CREG: 0,1", "+CREG: 0,0"},
+        {"AT+CGREG?", "+CGREG:", "+CGREG: 0,1", "+CGREG: 0,0"},
+        {"AT+CEER", "+CEER:", "+CEER: 0", "+CEER: 1"},
+    };
+    for (const FixedQueryCase& query : fixed_queries) {
+        IdfModemQueryResponseFilter shaped(query.command, query.prefix, "", false);
+        const std::string input = std::string(query.command) + "\r\n"
+                                  "+CMT: \"sender\",145\r\n"
+                                  "00112233445566778899AABBCCDDEEFF\r\n"
+                                  "+OTHER: unsolicited\r\n" + query.expected + "\r\n"
+                                  + query.duplicate + "\r\nRING\r\nOK\r\n";
+        shaped.feed(input.data(), input.size());
+        assert(shaped.response().find(query.command) == std::string::npos);
+        assert(shaped.response().find(query.expected) != std::string::npos);
+        assert(shaped.response().find(query.duplicate) == std::string::npos);
+        assert(shaped.response().find("+CMT:") == std::string::npos);
+        assert(shaped.response().find("00112233445566778899AABBCCDDEEFF") == std::string::npos);
+        assert(shaped.response().find("+OTHER:") == std::string::npos);
+        assert(shaped.response().find("RING") == std::string::npos);
+        assert(shaped.urcs().find(query.duplicate) != std::string::npos);
+        assert(shaped.urcs().find("+CMT:") != std::string::npos);
+        assert(shaped.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
+    }
+
+    IdfModemQueryResponseFilter cimi("AT+CIMI", "", "", false);
+    const std::string cimi_response = "AT+CIMI\r\n460011234567890\r\nOK\r\n";
+    cimi.feed(cimi_response.data(), cimi_response.size());
+    assert(cimi.response().find("AT+CIMI") == std::string::npos);
+    assert(cimi.response().find("460011234567890") != std::string::npos);
+    assert(cimi.response().find("OK") != std::string::npos);
+
+    const FixedQueryCase multi_line_queries[] = {
+        {"AT+CPOL?", "+CPOL:", "+CPOL: 0,2,\"46000\"", "+CPOL: 1,2,\"46001\",1,0,0,1"},
+        {"AT+CGDCONT?", "+CGDCONT:", "+CGDCONT: 1,\"IP\",\"apn\",\"10.0.0.1\"",
+         "+CGDCONT: 2,\"IPV6\",\"\",\"::\""},
+    };
+    for (const FixedQueryCase& query : multi_line_queries) {
+        IdfModemQueryResponseFilter shaped(query.command, query.prefix, "", false);
+        const std::string input = std::string(query.command) + "\r\n" + query.expected + "\r\n" +
+                                  query.duplicate + "\r\nOK\r\n";
+        shaped.feed(input.data(), input.size());
+        assert(shaped.response().find(query.command) == std::string::npos);
+        assert(shaped.response().find(query.expected) != std::string::npos);
+        assert(shaped.response().find(query.duplicate) != std::string::npos);
+        assert(shaped.urcs().empty());
+    }
+
+    IdfModemQueryResponseFilter unsupported_ceer("AT+CEER", "+CEER:", "", false);
+    const std::string ceer_error = "AT+CEER\r\nERROR\r\n";
+    unsupported_ceer.feed(ceer_error.data(), ceer_error.size());
+    assert(unsupported_ceer.response().find("ERROR") != std::string::npos);
+
+    IdfModemQueryResponseFilter no_trailing_newline("AT+CPIN?", "+CPIN:", "", false);
+    const std::string short_final = "+CPIN: READY\r\nOK";
+    no_trailing_newline.feed(short_final.data(), short_final.size());
+    no_trailing_newline.flush_pending();
+    assert(no_trailing_newline.response().find("OK") != std::string::npos);
+
+    IdfModemQueryResponseFilter ati("ATI", "", "", false);
+    const std::string boot_urc = "\r\nATI\r\nRDY\r\nML307Y\r\nRevision: FW-1.2\r\nOK\r\n";
+    ati.feed(boot_urc.data(), boot_urc.size());
+    assert(ati.response().find("ATI") == std::string::npos);
+    assert(ati.response().find("RDY") == std::string::npos);
+    assert(ati.response().find("ML307Y") != std::string::npos);
+    assert(ati.response().find("Revision: FW-1.2") != std::string::npos);
+    assert(ati.urcs().find("RDY") != std::string::npos);
+
+    const std::string cpol_complete_input =
+        "+CPOL: 0,0,\"name\",1,0,1,0\r\n"
+        "+CPOL: 1,1,\"short\",0,1,1,0\r\n"
+        "+CPOL: 2,2,\"46000\",1,0,0,1\r\nOK\r\n";
+    const std::string cpol_complete = idf_modem_cpol_compact_summary(cpol_complete_input);
+    assert(cpol_complete.size() <= 96);
+    assert(cpol_complete.find("rec=3") != std::string::npos);
+    assert(cpol_complete.find("fmt=7,1,1,1") != std::string::npos);
+    assert(cpol_complete.find("rat=complete,2,1,2,1") != std::string::npos);
+    assert(cpol_complete.find("name") == std::string::npos);
+    assert(cpol_complete.find("46000") == std::string::npos);
+    assert(cpol_complete.find("OK\r\n") != std::string::npos);
+
+    const std::string cpol_no_rat = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,2,\"46000\"\r\nOK\r\n");
+    assert(cpol_no_rat.find("rat=missing,0,0,0,0") != std::string::npos);
+    const std::string cpol_mixed_rat = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,0,\"x\",1,0,0,0\r\n"
+        "+CPOL: 1,1,\"y\"\r\nOK\r\n");
+    assert(cpol_mixed_rat.find("rat=missing,1,0,0,0") != std::string::npos);
+    const std::string cpol_bad_count = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,2,\"x\",0\r\n"
+        "+CPOL: 1,2,\"x\",0,1,0\r\n"
+        "+CPOL: 2,2,\"x\",0,1,0,1,0\r\n"
+        "+CPOL: 4,2,\"x\",0,1\r\n"
+        "+CPOL: 3,2,\"\x01\"\r\nOK\r\n");
+    assert(cpol_bad_count.find("rec=0") != std::string::npos);
+    assert(cpol_bad_count.find("bad=5;fail=1") != std::string::npos);
+    const std::string cpol_non_boolean = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,0,\"x\",1,2,0,0\r\nOK\r\n");
+    assert(cpol_non_boolean.find("rec=0") != std::string::npos);
+    assert(cpol_non_boolean.find("bad=1;fail=1") != std::string::npos);
+    const std::string cpol_duplicate = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,0,\"x\"\r\n"
+        "+CPOL: 0,1,\"y\"\r\nOK\r\n");
+    assert(cpol_duplicate.find("rec=1") != std::string::npos);
+    assert(cpol_duplicate.find("bad=1;fail=1") != std::string::npos);
+    const std::string cpol_control = idf_modem_cpol_compact_summary(
+        "+CPOL: 0,0,\"\x01\"\r\nOK\r\n");
+    assert(cpol_control.find("rec=0") != std::string::npos);
+    assert(cpol_control.find("bad=1;fail=1") != std::string::npos);
+
+    std::string cpol_sample(514, 'x');
+    cpol_sample += "\r\nOK\r\n";
+    const std::string cpol_sample_summary = idf_modem_cpol_compact_summary(cpol_sample);
+    assert(cpol_sample.size() == 520);
+    assert(cpol_sample_summary.size() <= 96);
+    assert(cpol_sample_summary.find("len=520") != std::string::npos);
+    assert(cpol_sample_summary.find('x') == std::string::npos);
+    return 0;
+}

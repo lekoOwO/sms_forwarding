@@ -21,6 +21,11 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#if SMS_USB_RECOVERY
+#include "idf_modem_cpol_summary.h"
+#endif
+#include "idf_modem_query_filter.h"
+#include "idf_modem_registration.h"
 #include "idf_util.h"
 #include "nvs.h"
 
@@ -63,6 +68,8 @@ struct OwnerCommand {
     std::string url;
     IdfCellularHttpConfig cellular_config;
     uint32_t timeout_ms = 0;
+    bool filter_urcs = false;
+    std::string response_prefix;
 };
 
 struct OwnerCommandSlot {
@@ -93,14 +100,23 @@ static std::string s_urc_buffer;
 // by line so a split +CMT header and PDU do not enter the next AT response.
 static std::string s_uart_line_carry;
 static bool s_uart_wait_cmt_pdu = false;
+
+#if SMS_USB_RECOVERY
+static void set_query_busy_reason(uint8_t* output, uint8_t reason)
+{
+    if (output) *output = reason;
+}
+#else
+static void set_query_busy_reason(uint8_t*, uint8_t) {}
+#endif
 static int64_t s_uart_wait_cmt_until_us = 0;
 static bool s_started = false;
 // Before normal queue scheduling, accept only direct SMS acknowledgments.
 static std::atomic<bool> s_runtime_queue_ready{false};
 static std::atomic<int> s_reset_request{0};  // 1=AT soft reset, 2=EN hard reset; modem task executes
-static bool s_data_mode_retry_pending = false;
-static uint8_t s_data_mode_retry_count = 0;
-static TickType_t s_next_data_mode_retry = 0;
+static std::atomic<bool> s_data_mode_retry_pending{false};
+static std::atomic<uint8_t> s_data_mode_retry_count{0};
+static std::atomic<TickType_t> s_next_data_mode_retry{0};
 static std::atomic<int> s_logged_sms_storage_code{-1};  // -1=unknown, 0=MT, 1=ME, 2=SM
 static bool s_identity_static_attempted = false;
 static bool s_identity_network_attempted = false;
@@ -112,7 +128,8 @@ static std::string s_last_pin_attempt_key;
 
 void idf_modem_signal_event(void);
 
-static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
+static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
+                               bool filter_urcs = false, const char* response_prefix = nullptr);
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
                                      uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
@@ -121,9 +138,11 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
                                          const IdfCellularHttpConfig& config,
                                          IdfCellularHttpResult& result);
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
-                                      IdfCellularHttpResult* cellular_result, bool priority);
+                                      IdfCellularHttpResult* cellular_result, bool priority,
+                                      uint8_t* query_busy_reason = nullptr);
 static bool owner_process_one_command(bool priority);
 static void owner_drain_priority_commands();
+static void wake_owner_task();
 
 static void assert_owner_task()
 {
@@ -223,12 +242,24 @@ static bool parse_comma_longs(const std::string& text, long* values, int max_val
 }
 
 // Use an unsigned elapsed-time difference across the 49.7-day tick wrap.
+static TickType_t timeout_ticks_ceil(uint32_t milliseconds)
+{
+    if (milliseconds == 0) return 0;
+    const uint32_t tick_ms = portTICK_PERIOD_MS;
+    return static_cast<TickType_t>((milliseconds + tick_ms - 1U) / tick_ms);
+}
+
 struct TickDeadline {
     TickType_t start;
     TickType_t span;
-    explicit TickDeadline(uint32_t ms) : start(xTaskGetTickCount()), span(pdMS_TO_TICKS(ms)) {}
+    explicit TickDeadline(uint32_t ms) : start(xTaskGetTickCount()), span(timeout_ticks_ceil(ms)) {}
+    TickType_t remaining_ticks() const
+    {
+        const TickType_t elapsed = static_cast<TickType_t>(xTaskGetTickCount() - start);
+        return elapsed >= span ? 0 : static_cast<TickType_t>(span - elapsed);
+    }
     bool expired() const { return static_cast<TickType_t>(xTaskGetTickCount() - start) >= span; }
-    void restart(uint32_t ms) { start = xTaskGetTickCount(); span = pdMS_TO_TICKS(ms); }
+    void restart(uint32_t ms) { start = xTaskGetTickCount(); span = timeout_ticks_ceil(ms); }
 };
 
 // Final AT result: 1=OK, -1=ERROR/+CMS ERROR/+CME ERROR, 0=incomplete.
@@ -473,6 +504,23 @@ static void reset_identity_sampling_state(void)
     s_identity_network_attempted = false;
 }
 
+static void invalidate_registration_state(const char* phase, bool at_ready)
+{
+    s_data_mode_retry_pending.store(false, std::memory_order_release);
+    s_data_mode_retry_count.store(0, std::memory_order_relaxed);
+    s_next_data_mode_retry.store(0, std::memory_order_relaxed);
+    reset_identity_sampling_state();
+    if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    idf_modem_invalidate_registration_stat(s_status.ceregStat);
+    s_status.phase = phase;
+    s_status.atReady = at_ready;
+    s_status.modemReady = false;
+    s_status.signalFresh = false;
+    s_status.identityFresh = false;
+    s_status.cellIp.clear();
+    xSemaphoreGive(s_status_mutex);
+}
+
 static void set_status_cell_ip(const std::string& ip)
 {
     if (xSemaphoreTake(s_status_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
@@ -514,6 +562,13 @@ static void save_identity_cache(const std::string& imei, const std::string& icci
     if (err == ESP_OK && changed) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err == ESP_OK && changed) idf_log_line("modem identity written to cache");
+}
+
+static std::string mask_identity(const std::string& value)
+{
+    if (value.empty()) return "-";
+    if (value.size() <= 8) return "****";
+    return value.substr(0, 4) + "****" + value.substr(value.size() - 4);
 }
 
 static void append_urc_text(const std::string& text)
@@ -654,7 +709,8 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     out.append(reinterpret_cast<const char*>(data), len);
 }
 
-static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response)
+static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
+                               bool filter_urcs, const char* response_prefix)
 {
     assert_owner_task();
 
@@ -671,16 +727,44 @@ static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std:
     TickDeadline deadline(timeout_ms);
     uint8_t buf[128];
     std::string scan;  // Overlap window for truncated or split final result codes
+    IdfModemQueryResponseFilter query_filter(
+        cmd, response_prefix ? response_prefix : "", s_uart_line_carry, s_uart_wait_cmt_pdu);
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
         int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
         if (got > 0) {
-            preserve_uart_urcs(buf, static_cast<size_t>(got));
-            size_t room = MAX_RESPONSE > response.size() ? MAX_RESPONSE - response.size() : 0;
-            if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
-            scan.append(reinterpret_cast<const char*>(buf), got);
+            if (filter_urcs) {
+                query_filter.feed(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+                if (!query_filter.urcs().empty()) {
+                    append_urc_text(query_filter.urcs());
+                    query_filter.clear_urcs();
+                }
+                response = query_filter.response();
+                s_uart_line_carry = query_filter.carry();
+                s_uart_wait_cmt_pdu = query_filter.waiting_for_pdu();
+                scan = response;
+                if (!query_filter.carry().empty()) {
+                    scan += "\r\n";
+                    scan += query_filter.carry();
+                }
+            } else {
+                preserve_uart_urcs(buf, static_cast<size_t>(got));
+                size_t room = MAX_RESPONSE > response.size() ? MAX_RESPONSE - response.size() : 0;
+                if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
+                scan.append(reinterpret_cast<const char*>(buf), got);
+            }
             int final_code = at_final_result(scan);
             if (final_code != 0) {
+                if (filter_urcs) {
+                    query_filter.flush_pending();
+                    if (!query_filter.urcs().empty()) {
+                        append_urc_text(query_filter.urcs());
+                        query_filter.clear_urcs();
+                    }
+                    response = query_filter.response();
+                    s_uart_line_carry = query_filter.carry();
+                    s_uart_wait_cmt_pdu = query_filter.waiting_for_pdu();
+                }
                 ret = final_code > 0 ? ESP_OK : ESP_FAIL;
                 break;
             }
@@ -817,6 +901,105 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
     return submit_owner_command(request, &response, nullptr, priority);
 }
 
+#if SMS_USB_RECOVERY
+static const char* usb_query_command(uint8_t query_id)
+{
+    switch (query_id) {
+        case IDF_MODEM_USB_QUERY_ATI: return "ATI";
+        case IDF_MODEM_USB_QUERY_CPIN: return "AT+CPIN?";
+        case IDF_MODEM_USB_QUERY_CEREG: return "AT+CEREG?";
+        case IDF_MODEM_USB_QUERY_COPS: return "AT+COPS?";
+        case IDF_MODEM_USB_QUERY_CGATT: return "AT+CGATT?";
+        case IDF_MODEM_USB_QUERY_CGACT: return "AT+CGACT?";
+        case IDF_MODEM_USB_QUERY_CGPADDR: return "AT+CGPADDR";
+        case IDF_MODEM_USB_QUERY_ICCID: return "AT+ICCID";
+        case IDF_MODEM_USB_QUERY_CSQ: return "AT+CSQ";
+        case IDF_MODEM_USB_QUERY_CESQ: return "AT+CESQ";
+        case IDF_MODEM_USB_QUERY_CFUN: return "AT+CFUN?";
+        case IDF_MODEM_USB_QUERY_CREG: return "AT+CREG?";
+        case IDF_MODEM_USB_QUERY_CGREG: return "AT+CGREG?";
+        case IDF_MODEM_USB_QUERY_CEER: return "AT+CEER";
+        case IDF_MODEM_USB_QUERY_CIMI: return "AT+CIMI";
+        case IDF_MODEM_USB_QUERY_CPOL: return "AT+CPOL?";
+        case IDF_MODEM_USB_QUERY_CGDCONT: return "AT+CGDCONT?";
+        default: return nullptr;
+    }
+}
+
+static const char* usb_query_response_prefix(uint8_t query_id)
+{
+    switch (query_id) {
+        case IDF_MODEM_USB_QUERY_CPIN: return "+CPIN:";
+        case IDF_MODEM_USB_QUERY_CEREG: return "+CEREG:";
+        case IDF_MODEM_USB_QUERY_COPS: return "+COPS:";
+        case IDF_MODEM_USB_QUERY_CGATT: return "+CGATT:";
+        case IDF_MODEM_USB_QUERY_CGACT: return "+CGACT:";
+        case IDF_MODEM_USB_QUERY_CGPADDR: return "+CGPADDR:";
+        case IDF_MODEM_USB_QUERY_ICCID: return "+ICCID:";
+        case IDF_MODEM_USB_QUERY_CSQ: return "+CSQ:";
+        case IDF_MODEM_USB_QUERY_CESQ: return "+CESQ:";
+        case IDF_MODEM_USB_QUERY_CFUN: return "+CFUN:";
+        case IDF_MODEM_USB_QUERY_CREG: return "+CREG:";
+        case IDF_MODEM_USB_QUERY_CGREG: return "+CGREG:";
+        case IDF_MODEM_USB_QUERY_CEER: return "+CEER:";
+        case IDF_MODEM_USB_QUERY_CPOL: return "+CPOL:";
+        case IDF_MODEM_USB_QUERY_CGDCONT: return "+CGDCONT:";
+        case IDF_MODEM_USB_QUERY_ATI: return "";
+        case IDF_MODEM_USB_QUERY_CIMI: return "";
+        default: return nullptr;
+    }
+}
+
+esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* busy_reason)
+{
+    response.clear();
+    const char* command = usb_query_command(query_id);
+    if (!command) return ESP_ERR_INVALID_ARG;
+    const bool queue_ready = s_runtime_queue_ready.load(std::memory_order_acquire);
+    IdfModemStatus status = idf_modem_get_status();
+    switch (idf_modem_usb_query_admission(
+        queue_ready, status.atReady, s_reset_request.load(std::memory_order_acquire) != 0)) {
+        case IdfModemUsbQueryAdmission::busy:
+            set_query_busy_reason(
+                busy_reason, static_cast<uint8_t>(IdfModemUsbQueryBusyReason::gate_closed));
+            return IDF_MODEM_ERR_BUSY;
+        case IdfModemUsbQueryAdmission::not_ready:
+            return ESP_ERR_INVALID_STATE;
+        case IdfModemUsbQueryAdmission::submit:
+            break;
+    }
+    OwnerCommand request;
+    const uint32_t timeout_ms = query_id == IDF_MODEM_USB_QUERY_CPOL
+                                    ? IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS
+                                    : IDF_MODEM_USB_QUERY_TIMEOUT_MS;
+    request.kind = OwnerCommandKind::at;
+    request.command = command;
+    request.timeout_ms = timeout_ms;
+    request.filter_urcs = true;
+    request.response_prefix = usb_query_response_prefix(query_id);
+    esp_err_t err;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        err = owner_send_at(command, timeout_ms, response, true,
+                            request.response_prefix.c_str());
+    } else {
+        err = submit_owner_command(request, &response, nullptr, false, busy_reason);
+    }
+    if (err == ESP_OK && query_id == IDF_MODEM_USB_QUERY_CPOL) {
+        response = idf_modem_cpol_compact_summary(response);
+        return ESP_OK;
+    }
+    if (err == ESP_OK && response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE) {
+        idf_logf("USB modem query response too large: id=0x%02X length=%u limit=%u",
+                 static_cast<unsigned>(query_id),
+                 static_cast<unsigned>(response.size()),
+                 static_cast<unsigned>(IDF_MODEM_USB_QUERY_MAX_RESPONSE));
+        response.clear();
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return err;
+}
+#endif
+
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token,
                                   uint32_t timeout_ms, std::string& response)
 {
@@ -873,12 +1056,15 @@ static void wake_owner_task()
 }
 
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
-                                      IdfCellularHttpResult* cellular_result, bool priority)
+                                      IdfCellularHttpResult* cellular_result, bool priority,
+                                      uint8_t* query_busy_reason)
 {
     if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
         return ESP_ERR_INVALID_STATE;
     }
     if (!priority && !s_runtime_queue_ready.load(std::memory_order_acquire)) {
+        set_query_busy_reason(query_busy_reason,
+                              static_cast<uint8_t>(IdfModemUsbQueryBusyReason::gate_closed));
         return IDF_MODEM_ERR_BUSY;
     }
     if (!owner_request_bounded(request)) return ESP_ERR_INVALID_SIZE;
@@ -888,16 +1074,22 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     uint32_t wait_ms = request.kind == OwnerCommandKind::cellular_http
                            ? CELLULAR_HTTP_CALL_TIMEOUT_MS
                            : request.timeout_ms + wait_margin_ms;
+    TickDeadline deadline(wait_ms);
     if (!priority) {
         if (!s_session_mutex ||
-            xSemaphoreTakeRecursive(s_session_mutex, pdMS_TO_TICKS(wait_ms)) != pdTRUE) {
+            xSemaphoreTakeRecursive(s_session_mutex, deadline.remaining_ticks()) != pdTRUE) {
             return ESP_ERR_TIMEOUT;
         }
         session_held = true;
     }
 
-    if (xSemaphoreTake(s_command_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    TickType_t remaining = deadline.remaining_ticks();
+    TickType_t command_wait = std::min(remaining, timeout_ticks_ceil(100));
+    if (remaining == 0 || xSemaphoreTake(s_command_mutex, command_wait) != pdTRUE) {
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        if (deadline.expired()) return ESP_ERR_TIMEOUT;
+        set_query_busy_reason(query_busy_reason,
+                              static_cast<uint8_t>(IdfModemUsbQueryBusyReason::mutex_timeout));
         return IDF_MODEM_ERR_BUSY;
     }
     int slot_index = -1;
@@ -910,7 +1102,15 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     if (slot_index < 0) {
         xSemaphoreGive(s_command_mutex);
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        set_query_busy_reason(query_busy_reason,
+                              static_cast<uint8_t>(IdfModemUsbQueryBusyReason::slots_full));
         return IDF_MODEM_ERR_BUSY;
+    }
+
+    if (deadline.expired()) {
+        xSemaphoreGive(s_command_mutex);
+        if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        return ESP_ERR_TIMEOUT;
     }
 
     OwnerCommandSlot& slot = s_command_slots[slot_index];
@@ -925,14 +1125,21 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         reset_owner_slot(slot);
         xSemaphoreGive(s_command_mutex);
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        set_query_busy_reason(query_busy_reason,
+                              static_cast<uint8_t>(IdfModemUsbQueryBusyReason::queue_full));
         return IDF_MODEM_ERR_BUSY;
     }
     xSemaphoreGive(s_command_mutex);
     wake_owner_task();
 
-    BaseType_t completed = xSemaphoreTake(slot.completed, pdMS_TO_TICKS(wait_ms));
+    // Reserve one command-mutex window so an expiry can still mark the slot abandoned.
+    TickType_t completion_wait = deadline.remaining_ticks();
+    const TickType_t cleanup_wait = timeout_ticks_ceil(100);
+    if (completion_wait > cleanup_wait) completion_wait -= cleanup_wait;
+    else completion_wait = 0;
+    BaseType_t completed = xSemaphoreTake(slot.completed, completion_wait);
     esp_err_t result = ESP_ERR_TIMEOUT;
-    if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(s_command_mutex, deadline.remaining_ticks()) == pdTRUE) {
         if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
             result = slot.result;
             if (response) *response = slot.response;
@@ -1127,30 +1334,7 @@ static bool parse_csq(const std::string& resp, int& csq, int& ber)
 
 static bool parse_cereg(const std::string& resp, int& stat)
 {
-    size_t p = resp.find("+CEREG:");
-    if (p == std::string::npos) return false;
-    std::string line = line_containing(resp, p);
-    const char* token = strstr(line.c_str(), "+CEREG:");
-    if (!token) return false;
-    std::string rest = token + strlen("+CEREG:");
-    size_t comma = rest.find(',');
-    std::string first = idf_util_trim_copy(rest.substr(0, comma));
-    long first_value = -1;
-    if (!parse_long_token(first, first_value)) return false;
-
-    long status_value = first_value;
-    if (comma != std::string::npos) {
-        size_t second_end = rest.find(',', comma + 1);
-        std::string second = idf_util_trim_copy(rest.substr(
-            comma + 1, second_end == std::string::npos ? std::string::npos : second_end - comma - 1));
-        long second_value = -1;
-        // A query is +CEREG: <n>,<stat>. A URC is +CEREG: <stat>[,<tac>,...].
-        // Do not treat the quoted TAC in the second URC field as registration state.
-        if (parse_long_token(second, second_value)) status_value = second_value;
-    }
-    if (status_value < 0 || status_value > 5) return false;
-    stat = static_cast<int>(status_value);
-    return true;
+    return idf_modem_parse_cereg_status(resp, stat);
 }
 
 // Parse the line that contains the token. A CEREG=2 URC can share the response,
@@ -1691,12 +1875,15 @@ static bool model_skips_cgact(void)
 static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,
                                             uint32_t inactive_timeout_ms)
 {
+    const int cereg_stat = idf_modem_get_status().ceregStat;
+    if (!idf_modem_data_activation_allowed(cereg_stat)) {
+        // Home registration is the only state where this product may touch PDP data.
+        // RLOS/unknown/roaming states remain read-only and continue probing CEREG.
+        return true;
+    }
     std::string resp;
     std::string apn = idf_util_trim_copy(cfg.apn);
-    // Do not activate cellular data while roaming (CEREG=5) unless enabled.
-    // Startup can activate with unknown state. Enforce the policy after registration.
-    bool want_data = cfg.dataEnabled &&
-                     (cfg.roamingEnabled || idf_modem_get_status().ceregStat != 5);
+    bool want_data = cfg.dataEnabled;
     if (want_data) {
         if (!apn.empty() && apn_valid_for_at(apn)) {
             std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
@@ -1733,13 +1920,15 @@ static void enforce_roaming_data_policy(const IdfSimSettingsView& cfg, int stat)
 
 static void schedule_data_mode_retry(void)
 {
-    s_data_mode_retry_pending = true;
-    s_data_mode_retry_count = 0;
-    s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
+    s_data_mode_retry_pending.store(true, std::memory_order_release);
+    s_data_mode_retry_count.store(0, std::memory_order_relaxed);
+    s_next_data_mode_retry.store(xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS),
+                                 std::memory_order_relaxed);
 }
 
-static void apply_startup_data_mode(void)
+static void apply_startup_data_mode(int cereg_stat)
 {
+    if (!idf_modem_data_activation_allowed(cereg_stat)) return;
     if (model_skips_cgact()) {
         idf_log_line("this model skips startup CGACT setup");
         return;
@@ -1765,8 +1954,9 @@ static bool plmn_valid(const std::string& plmn)
     });
 }
 
-static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
+static void apply_operator_if_configured(const IdfSimSettingsView& cfg, int cereg_stat)
 {
+    if (!idf_modem_identity_sampling_allowed(cereg_stat)) return;
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
         idf_log_line("operator PLMN is invalid. COPS not sent at startup");
@@ -1783,21 +1973,28 @@ static void apply_operator_if_configured(const IdfSimSettingsView& cfg)
 
 static bool process_data_mode_retry(void)
 {
-    if (!s_data_mode_retry_pending) return false;
-    if (static_cast<int32_t>(xTaskGetTickCount() - s_next_data_mode_retry) < 0) return false;  // Wrap-safe.
+    if (!s_data_mode_retry_pending.load(std::memory_order_acquire)) return false;
+    if (s_reset_request.load(std::memory_order_acquire) != 0 ||
+        idf_modem_get_status().ceregStat < 0) {
+        s_data_mode_retry_pending.store(false, std::memory_order_release);
+        return false;
+    }
+    if (static_cast<int32_t>(xTaskGetTickCount() -
+                             s_next_data_mode_retry.load(std::memory_order_relaxed)) < 0) return false;  // Wrap-safe.
     if (!at_channel_idle_now()) return false;
 
-    ++s_data_mode_retry_count;
+    s_data_mode_retry_count.fetch_add(1, std::memory_order_relaxed);
     IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
     bool ok = apply_configured_data_mode_once(cfg, 8000, 3000);
     if (ok) {
-        s_data_mode_retry_pending = false;
+        s_data_mode_retry_pending.store(false, std::memory_order_release);
         idf_log_line(cfg.dataEnabled ? "background retry enabled cellular data" : "background retry disabled cellular data");
-    } else if (s_data_mode_retry_count >= MODEM_DATA_MODE_RETRY_MAX) {
-        s_data_mode_retry_pending = false;
+    } else if (s_data_mode_retry_count.load(std::memory_order_relaxed) >= MODEM_DATA_MODE_RETRY_MAX) {
+        s_data_mode_retry_pending.store(false, std::memory_order_release);
         idf_log_line("background CGACT retry failed. Current modem state retained");
     } else {
-        s_next_data_mode_retry = xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS);
+        s_next_data_mode_retry.store(xTaskGetTickCount() + pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS),
+                                     std::memory_order_relaxed);
         idf_log_line("background CGACT retry did not succeed. Retrying later");
     }
     return true;
@@ -1881,6 +2078,10 @@ static esp_err_t owner_cellular_http_get(const std::string& url,
 {
     assert_owner_task();
     result = IdfCellularHttpResult();
+    if (!idf_modem_data_activation_allowed(idf_modem_get_status().ceregStat)) {
+        result.message = "Cellular data requires home registration";
+        return ESP_ERR_INVALID_STATE;
+    }
     if (config.minPayloadBytes > IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES) {
         result.message = "Cellular HTTP payload threshold exceeds the safe UART runtime limit";
         return ESP_ERR_INVALID_SIZE;
@@ -1974,7 +2175,11 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
     assert_owner_task();
     switch (slot.request.kind) {
         case OwnerCommandKind::at:
-            return owner_send_at(slot.request.command, slot.request.timeout_ms, slot.response);
+            return owner_send_at(slot.request.command, slot.request.timeout_ms, slot.response,
+                                 slot.request.filter_urcs,
+                                 slot.request.response_prefix.empty()
+                                     ? nullptr
+                                     : slot.request.response_prefix.c_str());
         case OwnerCommandKind::until:
             return owner_send_at_until(slot.request.command, slot.request.token.c_str(),
                                        slot.request.timeout_ms, slot.response);
@@ -2007,19 +2212,33 @@ static bool owner_process_one_command(bool priority)
         xSemaphoreGive(s_command_mutex);
         return true;
     }
+
+    const bool reset_requested = s_reset_request.load(std::memory_order_acquire) != 0;
+    const bool runtime_queue_ready = s_runtime_queue_ready.load(std::memory_order_acquire);
+    if (!idf_modem_owner_command_allowed(priority, reset_requested, runtime_queue_ready)) {
+        slot.response.clear();
+        slot.cellular_result = IdfCellularHttpResult();
+        slot.result = ESP_ERR_INVALID_STATE;
+        slot.state = OwnerCommandState::done;
+        xSemaphoreGive(s_command_mutex);
+        xSemaphoreGive(slot.completed);
+        return true;
+    }
     slot.state = OwnerCommandState::running;
     xSemaphoreGive(s_command_mutex);
 
     esp_err_t result = execute_owner_command(slot);
     if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return true;
+    bool signal_completion = false;
     if (slot.state == OwnerCommandState::abandoned) {
         reset_owner_slot(slot);
     } else {
         slot.result = result;
         slot.state = OwnerCommandState::done;
-        xSemaphoreGive(slot.completed);
+        signal_completion = true;
     }
     xSemaphoreGive(s_command_mutex);
+    if (signal_completion) xSemaphoreGive(slot.completed);
     return true;
 }
 
@@ -2044,6 +2263,7 @@ static void sample_signal_once(void)
 
 static bool sample_identity_once(bool log_summary = false, bool include_network_fields = true)
 {
+    if (!idf_modem_identity_sampling_allowed(idf_modem_get_status().ceregStat)) return false;
     IdfModemStatus before = idf_modem_get_status();
     bool need_static = !s_identity_static_attempted ||
                        before.mfr.empty() ||
@@ -2137,13 +2357,11 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
     if (material_static_change) {
         ESP_LOGI(TAG, "identity changed imei=%s iccid=%s imsi=%s",
-                 after.imei.empty() ? "-" : after.imei.c_str(),
-                 after.iccid.empty() ? "-" : after.iccid.c_str(),
-                 after.imsi.empty() ? "-" : after.imsi.c_str());
+                 mask_identity(after.imei).c_str(), mask_identity(after.iccid).c_str(),
+                 mask_identity(after.imsi).c_str());
         idf_logf("modem identity changed IMEI=%s ICCID=%s IMSI=%s",
-                 after.imei.empty() ? "-" : after.imei.c_str(),
-                 after.iccid.empty() ? "-" : after.iccid.c_str(),
-                 after.imsi.empty() ? "-" : after.imsi.c_str());
+                 mask_identity(after.imei).c_str(), mask_identity(after.iccid).c_str(),
+                 mask_identity(after.imsi).c_str());
     }
     save_identity_cache(patch.imei, patch.iccid);
     return changed;
@@ -2344,29 +2562,32 @@ bool idf_modem_sms_health_check(std::string& summary)
 
     std::string resp;
     int stat = -1;
-    bool registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
-                      (stat == 1 || stat == 5);
+    bool cereg_query_ok = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat);
+    bool registered = cereg_query_ok && (stat == 1 || stat == 5);
     bool phase2 = false;
     bool pdu = false;
     bool cnmi = false;
     query_sms_receive_config(phase2, pdu, cnmi);
     bool storage = select_sms_storage();
+    bool sim_ready = idf_modem_get_status().simState == "ready";
     bool initially_ok = registered && phase2 && pdu && cnmi && storage;
 
     if (!phase2 || !pdu || !cnmi || !storage) {
         configure_sms_and_registration();
         stat = -1;
-        registered = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat) &&
-                     (stat == 1 || stat == 5);
+        cereg_query_ok = send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat);
+        registered = cereg_query_ok && (stat == 1 || stat == 5);
         query_sms_receive_config(phase2, pdu, cnmi);
         storage = select_sms_storage();
     }
 
     bool final_ok = registered && phase2 && pdu && cnmi && storage;
     char state[192];
+    const char* registration = registered ? "ok" :
+                               (cereg_query_ok && stat == 11 ? "restricted-rlos" : "unavailable");
     snprintf(state, sizeof(state),
              "registration=%s, Phase2+=%s, PDU=%s, CNMI=%s, storage=%s (carrier delivery not tested)",
-             registered ? "ok" : "error", phase2 ? "ok" : "error", pdu ? "ok" : "error",
+             registration, phase2 ? "ok" : "error", pdu ? "ok" : "error",
              cnmi ? "ok" : "error", storage ? "ok" : "error");
 
     if (initially_ok) {
@@ -2376,6 +2597,10 @@ bool idf_modem_sms_health_check(std::string& summary)
     }
     if (final_ok) {
         summary = std::string("Error found and repaired: ") + state;
+    } else if (!idf_modem_sms_health_reset_required(
+                   idf_modem_get_status().atReady, sim_ready, cereg_query_ok,
+                   phase2 && pdu && cnmi, storage)) {
+        summary = std::string("Registration unavailable; modem reset not requested: ") + state;
     } else {
         idf_modem_request_reset(true);
         summary = std::string("Error remains. Hard modem reset requested: ") + state;
@@ -2402,12 +2627,14 @@ static bool handle_reset_request_if_any(void)
     int request = s_reset_request.exchange(0, std::memory_order_relaxed);
     if (request == 0) return false;
 
+    s_runtime_queue_ready.store(false, std::memory_order_release);
+
     IdfModemStatus patch;
     patch.phase = "powering";
     patch.atReady = false;
     patch.modemReady = false;
     update_status(patch);
-    reset_identity_sampling_state();
+    invalidate_registration_state("powering", false);
     if (request == 2) {
         idf_log_line("performing hard modem reset");
         modem_power_cycle();
@@ -2430,10 +2657,13 @@ static bool handle_reset_request_if_any(void)
     patch.phase = "at_ready";
     update_status(patch);
     if (try_unlock_sim(false)) {
+        invalidate_registration_state("registering", true);
         configure_sms_and_registration();
         set_phase("registering");
-        apply_startup_data_mode();
+        // Data setup waits for the first valid CEREG result below.
     }
+    // AT transport is usable even when the SIM is locked or not registered.
+    s_runtime_queue_ready.store(true, std::memory_order_release);
     s_reinit_pending = false;
     return true;
 }
@@ -2442,6 +2672,7 @@ static bool handle_reset_request_if_any(void)
 static void run_pending_reinit_if_recovered(void)
 {
     if (!s_reinit_pending) return;
+    invalidate_registration_state("powering", false);
     if (!at_channel_idle_now()) return;
     if (!send_ok("AT", 700)) return;
     idf_log_line("modem AT recovered. Restoring SMS, registration, and data setup");
@@ -2452,10 +2683,12 @@ static void run_pending_reinit_if_recovered(void)
     patch.phase = "at_ready";
     update_status(patch);
     if (try_unlock_sim(false)) {
+        invalidate_registration_state("registering", true);
         configure_sms_and_registration();
         set_phase("registering");
-        apply_startup_data_mode();
+        // Data setup waits for a valid CEREG result after reset recovery.
     }
+    s_runtime_queue_ready.store(true, std::memory_order_release);
     s_reinit_pending = false;
 }
 
@@ -2463,6 +2696,7 @@ static void modem_task(void*)
 {
     s_owner_task = xTaskGetCurrentTaskHandle();
     owner_uart_flush();
+    invalidate_registration_state("powering", false);
     IdfModemStatus patch;
     patch.started = true;
     patch.phase = "powering";
@@ -2521,14 +2755,21 @@ static void modem_task(void*)
 
     bool sim_ready = try_unlock_sim(false);
     if (sim_ready) {
+        invalidate_registration_state("registering", true);
         configure_sms_and_registration();
         set_phase("registering");
-        apply_startup_data_mode();
+        // Data setup waits for a valid CEREG result after AT recovery.
     }
+
+    // The sole owner can now dispatch bounded AT requests. Registration is a
+    // separate modem state; CPIN/CEREG diagnostics must work while it is pending.
+    s_runtime_queue_ready.store(true, std::memory_order_release);
 
     int check_count = 0;
     int stat = -1;
     while (sim_ready && check_count++ < 30) {
+        while (owner_process_one_command(true)) {}
+        if (owner_process_one_command(false)) continue;
         std::string resp;
         if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
             IdfModemStatus reg_patch;
@@ -2545,12 +2786,12 @@ static void modem_task(void*)
     if (!sim_ready) {
         // try_unlock_sim records locked or absent state until hot swap or credential update.
     } else if (!registered) {
-        set_phase("failed");
+        set_phase("registering");
     } else {
         retry_sms_storage_if_pending();
+        apply_startup_data_mode(stat);
         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-        apply_operator_if_configured(cfg);
-        if (cfg.dataEnabled) sample_cell_ip_once();
+        apply_operator_if_configured(cfg, stat);
         enforce_roaming_data_policy(cfg, stat);
         // Sample overview data after registration. Web and WiFi are already available.
         sample_signal_once();
@@ -2566,11 +2807,11 @@ static void modem_task(void*)
     TickType_t last_health = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
+    bool rlos_only_seen = false;
     TickType_t last_sim_check = 0;
     int64_t sim_check_not_before_us = 0;  // Allow SIM and CPIN startup time after modem reset.
     int sim_present = -1;  // -1=unknown baseline, 0=absent, 1=present
     bool sms_reconfigure_pending = false;  // Reassert SMS after SIM or network recovery.
-    s_runtime_queue_ready.store(true, std::memory_order_release);
     while (true) {
         // Process direct SMS acknowledgments before caller commands. Run at most
         // one caller command per pass so the owner returns to URC and health work.
@@ -2588,6 +2829,7 @@ static void modem_task(void*)
             post_register_done = false;
             health_fail_count = 0;
             dereg_count = 0;
+            rlos_only_seen = false;
             last_health = 0;
             last_sim_check = now;  // Allow one full SIM initialization interval.
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
@@ -2603,9 +2845,10 @@ static void modem_task(void*)
                 sim_ready = try_unlock_sim(unlock_request == 2);
             }
             if (sim_ready && at_channel_idle_now()) {
+                invalidate_registration_state("registering", true);
                 configure_sms_and_registration();
                 set_phase("registering");
-                apply_startup_data_mode();
+                // Data setup waits for a valid CEREG result after SIM unlock.
                 registered = false;
                 post_register_done = false;
                 sms_reconfigure_pending = true;
@@ -2681,8 +2924,8 @@ static void modem_task(void*)
                         // registration. Always rerun storage selection after network recovery.
                         if (!sms_reconfigured_now) s_sms_storage_pending = !select_sms_storage();
                         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
-                        apply_operator_if_configured(cfg);
-                        if (cfg.dataEnabled) sample_cell_ip_once();
+                        apply_startup_data_mode(stat);
+                        apply_operator_if_configured(cfg, stat);
                         enforce_roaming_data_policy(cfg, stat);
                         sample_signal_once();
                         sample_signal_detail_once();
@@ -2694,20 +2937,29 @@ static void modem_task(void*)
                     registered = false;
                     post_register_done = false;
                     sms_reconfigure_pending = true;
-                    // Wait about five minutes before reset so cell reselection or roaming
-                    // registration can finish. Do not reset repeatedly when SIM is absent.
-                    if (sim_present == 0) {
+                    if (stat == 11) {
                         dereg_count = 0;
-                    } else if (++dereg_count >= 60) {
-                        dereg_count = 0;
-                        idf_log_line("modem remained unregistered. Requesting hard reset");
-                        s_reset_request.store(2, std::memory_order_relaxed);
+                        if (!rlos_only_seen) {
+                            idf_log_line("modem reports CEREG RLOS-only stat=11. Continuing read-only registration probes");
+                            rlos_only_seen = true;
+                        }
+                    } else {
+                        rlos_only_seen = false;
+                        // Wait about five minutes before reset so cell reselection or roaming
+                        // registration can finish. Do not reset repeatedly when SIM is absent.
+                        if (sim_present == 0) {
+                            dereg_count = 0;
+                        } else if (++dereg_count >= 60) {
+                            dereg_count = 0;
+                            idf_log_line("modem remained unregistered. Requesting hard reset");
+                            idf_modem_request_reset(true);
+                        }
                     }
                 }
             } else if (++health_fail_count >= 3) {
                 health_fail_count = 0;
                 idf_log_line("modem health probes failed repeatedly. Requesting hard reset");
-                s_reset_request.store(2, std::memory_order_relaxed);
+                idf_modem_request_reset(true);
             }
         }
         // Poll AT+CPIN? for SIM hot swaps. On insertion, reset the modem and clear
@@ -2734,6 +2986,7 @@ static void modem_task(void*)
                     idf_modem_request_reset(true);
                 } else {
                     idf_log_line("SIM removed");
+                    invalidate_registration_state("registering", true);
                     registered = false;
                     post_register_done = false;
                     sms_reconfigure_pending = true;
@@ -2856,9 +3109,14 @@ IdfModemStatus idf_modem_get_status(void)
 
 esp_err_t idf_modem_request_reset(bool hard_reset)
 {
-    if (!s_started) return ESP_ERR_INVALID_STATE;
-    s_reset_request.store(hard_reset ? 2 : 1, std::memory_order_relaxed);
+    if (!s_started || !s_command_mutex) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    s_runtime_queue_ready.store(false, std::memory_order_release);
+    s_reset_request.store(hard_reset ? 2 : 1, std::memory_order_release);
+    xSemaphoreGive(s_command_mutex);
+    invalidate_registration_state("powering", false);
     set_phase("powering");
+    wake_owner_task();
     return ESP_OK;
 }
 

@@ -1,11 +1,16 @@
 #pragma once
 
 #include <stdint.h>
+#include <stddef.h>
 
 #include <string>
 
 #include "esp_err.h"
 #include "idf_config.h"
+
+#ifndef SMS_USB_RECOVERY
+#define SMS_USB_RECOVERY 0
+#endif
 
 struct IdfModemStatus {
     bool started = false;
@@ -61,10 +66,45 @@ struct IdfCellularHttpConfig {
 // Return immediately when the fixed command slots are full. ESP_ERR_TIMEOUT means an enqueued command timed out.
 static constexpr esp_err_t IDF_MODEM_ERR_BUSY = static_cast<esp_err_t>(0x7201);
 
+enum class IdfModemUsbQueryBusyReason : uint8_t {
+    unknown = 0,
+    gate_closed = 1,
+    mutex_timeout = 2,
+    slots_full = 3,
+    queue_full = 4,
+};
+
+#if SMS_USB_RECOVERY
+static constexpr uint8_t IDF_MODEM_USB_QUERY_ATI = 0x01;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CPIN = 0x02;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CEREG = 0x03;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_COPS = 0x04;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CGATT = 0x05;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CGACT = 0x06;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CGPADDR = 0x07;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_ICCID = 0x08;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CSQ = 0x09;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CESQ = 0x0A;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CFUN = 0x0B;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CREG = 0x0C;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CGREG = 0x0D;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CEER = 0x0E;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CIMI = 0x0F;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CPOL = 0x10;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_CGDCONT = 0x11;
+static constexpr size_t IDF_MODEM_USB_QUERY_MAX_RESPONSE = 96;
+static constexpr uint32_t IDF_MODEM_USB_QUERY_TIMEOUT_MS = 1500;
+static constexpr uint32_t IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS = 5000;
+#endif
+
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
+#if SMS_USB_RECOVERY
+esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response,
+                              uint8_t* busy_reason = nullptr);
+#endif
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
 // Ask the modem task to recheck the SIM lock. allow_puk permits one user-confirmed PUK attempt.
