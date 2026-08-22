@@ -25,8 +25,9 @@ Minimum ESP-IDF: **v5.3+** — `components/idf_web` registers multi-method route
 Before committing Web UI changes, run:
 
 ```powershell
-python tools\build_web_assets.py
-python tools\build_web_assets.py --check
+npm --prefix web run check
+npm --prefix web run build
+node --test web/scripts/package.test.mjs
 ```
 
 CI builds the ESP-IDF firmware via `.github/workflows/build.yml`.
@@ -42,26 +43,22 @@ Project entrypoints:
 - `components/idf_web` owns `esp_http_server`, all Web/API routes, scheduler, keep-alive jobs, OTA upload, diagnostics, and status JSON.
 - `components/idf_wifi` owns STA/SoftAP provisioning, captive DNS, lightweight mDNS, SNTP, reconnect watchdog, and BOOT long-press provisioning.
 - `components/idf_config` persists config in NVS namespace `sms_config`; old NVS keys remain additive/compatible.
-- `components/web_assets` links generated gzip Web assets from `code/web_assets.cpp`; editable sources live in `code/web_src/`.
+- `components/web_assets` links generated gzip Web assets from `code/web_assets.cpp`; editable sources live in `web/`.
 
 Slow work must stay off request handlers where possible: use existing worker queues for push/email/modem/keep-alive work so SMS receive and Web refresh stay responsive.
 
 ## Web UI Assets
 
-Editable UI files live in `code/web_src/`:
+Editable UI sources live in `web/`. Run `npm --prefix web run check` and
+`npm --prefix web run build` after UI changes. The build updates generated
+`code/web_assets.h` and `code/web_assets.cpp`; do not hand-edit those files.
 
-- `index.html`
-- `app.css`
-- `app.js`
-- `panels/*.html`
-
-Generated assets are `code/web_assets.h` and `code/web_assets.cpp`. Do not hand-edit generated assets; run `python tools/build_web_assets.py` after editing `web_src`.
-
-New page placeholder flow: add `%TOKEN%` in a panel, render it in `code/web_src/app.js`, expose any dynamic value from `/config.json`, then regenerate assets.
+Keep page data and dynamic values in the Svelte routes and API helpers under
+`web/src/`, with matching config and locale keys where needed.
 
 ## Extension Conventions
 
-- **New push channel**: add type handling in `components/idf_push/idf_push.cpp`, add validation, then add the Web UI option and hint in `code/web_src/app.js`. `IDF_MAX_PUSH_CHANNELS` is 5.
+- **New push channel**: add type handling in `components/idf_push/idf_push.cpp`, add validation, then add the Web UI option and hint under `web/src/`. `IDF_MAX_PUSH_CHANNELS` is 5.
 - **New config field**: add to `IdfConfig`, load/save it in `components/idf_config/idf_config.cpp`, expose/parse it in Web config handlers, and keep the key additive with a default.
 - **New HTTP route**: add a handler in `components/idf_web/idf_web.cpp`, register it in `idf_web_start()`, and prefer bounded/streaming responses over large one-shot strings.
 - **Logging**: use `idf_log_line()` / `idf_logf()` for Web-visible logs. Logs are mirrored into the 120-entry ring buffer.
