@@ -21,6 +21,7 @@
 
 #include "driver/usb_serial_jtag.h"
 #include "esp_err.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "config_schema_generated.h"
@@ -92,6 +93,7 @@ static uint64_t s_provision_nonce = 0;
 static ProvisionState s_provision_state = ProvisionState::Idle;
 static ProvisionConnection s_provision_connection = ProvisionConnection::Unknown;
 static Status s_provision_error = Status::Ok;
+static uint32_t s_boot_id = 0;
 
 static void secure_zero(void* data, size_t length)
 {
@@ -244,6 +246,13 @@ static uint64_t read_u64(const uint8_t* bytes)
 }
 
 static void write_u64(uint8_t* bytes, uint64_t value)
+{
+    for (size_t i = 0; i < sizeof(value); ++i) {
+        bytes[i] = static_cast<uint8_t>(value >> (8U * i));
+    }
+}
+
+static void write_u32(uint8_t* bytes, uint32_t value)
 {
     for (size_t i = 0; i < sizeof(value); ++i) {
         bytes[i] = static_cast<uint8_t>(value >> (8U * i));
@@ -447,7 +456,8 @@ static size_t state_payload(uint8_t* output)
     if (!wifi.ip.empty() && inet_pton(AF_INET, wifi.ip.c_str(), ip) == 1) flags |= 0x08;
     output[0] = flags;
     memcpy(output + 1, ip, sizeof(ip));
-    return 1 + sizeof(ip);
+    write_u32(output + 1 + sizeof(ip), s_boot_id);
+    return 1 + sizeof(ip) + sizeof(s_boot_id);
 }
 
 static esp_err_t write_frame(uint8_t command, uint8_t sequence,
@@ -498,6 +508,8 @@ static void handle_frame(const Frame& frame)
 
 static void usb_recovery_task(void*)
 {
+    s_boot_id = esp_random();
+    if (s_boot_id == 0) s_boot_id = 1;
     FrameParser parser;
     Frame frame;
     uint8_t input[64] = {};

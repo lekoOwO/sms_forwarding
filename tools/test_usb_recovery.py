@@ -1234,7 +1234,7 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
 
         def fake_transaction(path, timeout, command, payload, **kwargs):
             calls.append((path, timeout, command, payload, kwargs))
-            return usb_recovery.Frame(usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00")
+            return usb_recovery.Frame(usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00")
 
         with mock.patch.dict(os.environ, {"SMS_DEVICE_IN_CONTAINER": "1"}), \
                 mock.patch.object(usb_recovery, "run_transaction", side_effect=fake_transaction):
@@ -1484,7 +1484,7 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         def fake_transaction(path, timeout, command, payload, **_kwargs):
             calls.append((path, timeout, command, payload))
             if command == usb_recovery.COMMAND_STATE:
-                return usb_recovery.Frame(command | usb_recovery.RESPONSE_MASK, 0, b"\x00\x00\x00\x00\x00")
+                return usb_recovery.Frame(command | usb_recovery.RESPONSE_MASK, 0, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00")
             if command == usb_recovery.COMMAND_WIFI_PROVISION_ASYNC:
                 return usb_recovery.Frame(command | usb_recovery.RESPONSE_MASK, 0, b"")
             return usb_recovery.Frame(
@@ -1536,9 +1536,13 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
                 sequence=0,
             )
 
-    def test_state_parser_keeps_legacy_payload_and_status_is_separate(self):
-        legacy = usb_recovery.decode_state_payload(b"\x00\x00\x00\x00\x00")
-        self.assertEqual(set(legacy), {"ap_mode", "credential_configured", "ip", "sta_connected"})
+    def test_state_parser_requires_a_nonzero_boot_id(self):
+        state = usb_recovery.decode_state_payload(b"\x00\x00\x00\x00\x00\x78\x56\x34\x12")
+        self.assertEqual(set(state), {"ap_mode", "credential_configured", "ip", "sta_connected", "boot_id"})
+        self.assertEqual(state["boot_id"], 0x12345678)
+        for payload in (b"\x00\x00\x00\x00\x00", b"\x00\x00\x00\x00\x00\x00\x00\x00\x00"):
+            with self.subTest(payload=payload), self.assertRaises(usb_recovery.DeviceError):
+                usb_recovery.decode_state_payload(payload)
 
         status = usb_recovery.decode_provision_status_payload(
             b"\x12\x34\x56\x78\x00\x00\x00\x00\x02\x00\x01"
@@ -1787,6 +1791,19 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
         self.assertIn("secure_zero(buffer_", source)
         self.assertIn("secure_zero(input, sizeof(input))", source)
         self.assertIn("idf_wifi_get_status().staConnected", source)
+
+    def test_state_payload_exposes_ephemeral_boot_id(self):
+        source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
+        payload = source.split("static size_t state_payload", 1)[1].split(
+            "static esp_err_t write_frame", 1
+        )[0]
+        task = source.split("static void usb_recovery_task", 1)[1]
+        self.assertIn('#include "esp_system.h"', source)
+        self.assertIn("static uint32_t s_boot_id = 0;", source)
+        self.assertIn("write_u32(output + 1 + sizeof(ip), s_boot_id)", payload)
+        self.assertIn("return 1 + sizeof(ip) + sizeof(s_boot_id);", payload)
+        self.assertIn("s_boot_id = esp_random();", task)
+        self.assertIn("if (s_boot_id == 0) s_boot_id = 1;", task)
 
     def test_recovery_artifact_has_enabled_definitions_and_entrypoint(self):
         compile_commands_path = RECOVERY_BUILD_DIR / "compile_commands.json"

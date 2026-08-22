@@ -137,6 +137,7 @@ MAX_FRAME = HEADER_SIZE + MAX_ASYNC_PROVISION_PAYLOAD + CRC_SIZE
 PARSER_BUFFER_SIZE = MAX_FRAME * 2
 PARSER_IDLE_TIMEOUT = 1.0
 STATE_TIMEOUT = 5.0
+STATE_PAYLOAD_SIZE = 9
 PROVISION_TIMEOUT = 90.0
 PROVISION_IDLE = 0
 PROVISION_PENDING = 1
@@ -1056,14 +1057,18 @@ def status_name(status: int) -> str:
 
 
 def decode_state_payload(payload: bytes) -> dict[str, object]:
-    if len(payload) < 5:
+    if len(payload) != STATE_PAYLOAD_SIZE:
         raise DeviceError("malformed state response")
     flags = payload[0]
+    boot_id = int.from_bytes(payload[5:9], "little")
+    if boot_id == 0:
+        raise DeviceError("malformed state response")
     state: dict[str, object] = {
         "ap_mode": bool(flags & 0x02),
         "credential_configured": bool(flags & 0x04),
         "ip": ".".join(str(part) for part in payload[1:5]) if flags & 0x08 else "",
         "sta_connected": bool(flags & 0x01),
+        "boot_id": boot_id,
     }
     return state
 

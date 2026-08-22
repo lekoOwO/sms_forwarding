@@ -35,7 +35,7 @@ CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
 APP_OFFSET = 0x10000
 APP_MAX_SIZE = 0x1E0000
-RESET_TIMEOUT = 45.0
+RESET_TIMEOUT = 90.0
 STATE_TIMEOUT = 5.0
 DIAG_INNER_TIMEOUT = 3.0
 CPOL_DIAG_INNER_TIMEOUT = 8.0
@@ -755,6 +755,53 @@ def _state(
         )  # type: ignore[return-value]
 
 
+def _try_resolve_exact_device(device_path: str) -> SerialDevice | None:
+    try:
+        device = resolve_serial_device(device_path)
+    except (OSError, ValueError):
+        return None
+    return device if device is not None and device.by_id == device_path else None
+
+
+def _reset_state_after_boot(
+    device_path: str, previous_boot_id: int, deadline: float,
+) -> dict[str, object]:
+    last_probe_error: usb_recovery.DeviceError | None = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last_probe_error is not None:
+                raise usb_recovery.DeviceError("USB device did not report a fresh boot id") from last_probe_error
+            raise usb_recovery.DeviceError("USB device did not return after reset")
+
+        device = _try_resolve_exact_device(device_path)
+        if device is not None:
+            probe_timeout = min(STATE_TIMEOUT, remaining / 3)
+            container_probe_timeout = min(CONTAINER_TIMEOUT, remaining)
+            try:
+                state = _state(
+                    device,
+                    probe_timeout,
+                    container_timeout=container_probe_timeout,
+                    deadline=deadline,
+                )
+                boot_id = state.get("boot_id")
+                if (
+                    isinstance(boot_id, int)
+                    and not isinstance(boot_id, bool)
+                    and 0 < boot_id <= 0xFFFFFFFF
+                    and boot_id != previous_boot_id
+                ):
+                    if deadline - time.monotonic() <= 0:
+                        raise usb_recovery.DeviceError("USB device timed out")
+                    return state
+                last_probe_error = usb_recovery.DeviceError("USB device boot id did not change")
+            except usb_recovery.DeviceError as error:
+                last_probe_error = error
+
+        time.sleep(min(0.05, remaining))
+
+
 def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes:
     payload = usb_recovery.encode_modem_query(query_name)
     busy_retries = 0
@@ -914,9 +961,16 @@ def _reset_command(args: argparse.Namespace) -> int:
     device = resolve_serial_device(device_path)
     confirm_basename(device_path, args.confirm)
     deadline = time.monotonic() + RESET_TIMEOUT
+    old_state = _state(device, deadline=deadline)
+    previous_boot_id = old_state.get("boot_id")
+    if (
+        not isinstance(previous_boot_id, int)
+        or isinstance(previous_boot_id, bool)
+        or not 0 < previous_boot_id <= 0xFFFFFFFF
+    ):
+        raise usb_recovery.DeviceError("USB state has an invalid boot id")
     run_esptool(device, _remaining(deadline))
-    probe_timeout = min(STATE_TIMEOUT, _remaining(deadline) / 3)
-    state = _state(device, probe_timeout, container_timeout=probe_timeout, deadline=deadline)
+    state = _reset_state_after_boot(device_path, previous_boot_id, deadline)
     print(json.dumps({
         "action": "reset",
         "device": device.by_id,

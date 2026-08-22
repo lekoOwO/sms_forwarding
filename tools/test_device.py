@@ -563,25 +563,34 @@ class DeviceCommandTest(unittest.TestCase):
         plan = json.loads(output)
         self.assertEqual(plan["mode"], "usb_reset")
         self.assertFalse(plan["live"])
-        self.assertEqual(plan["timeout"], 45.0)
+        self.assertEqual(plan["timeout"], 90.0)
 
     def test_live_reset_requires_exact_basename_and_probes_state(self):
         esptool_calls = []
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        resolve_results = iter((initial, fresh))
+        state_devices = []
+        states = iter((
+            {"sta_connected": True, "boot_id": 0x11111111},
+            {"sta_connected": True, "boot_id": 0x22222222},
+        ))
 
         def fake_run(command, **kwargs):
             esptool_calls.append((command, kwargs))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+        def fake_resolve(_path):
+            return next(resolve_results)
+
+        def fake_state(ref, *args, **kwargs):
+            state_devices.append(ref)
+            return next(states)
+
+        with mock.patch.object(device, "resolve_serial_device", side_effect=fake_resolve) as resolve, \
                 mock.patch.object(device, "resolve_esptool", return_value="host"), \
                 mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
-                mock.patch.object(
-                    device.usb_recovery,
-                    "run_transaction",
-                    return_value=usb_recovery.Frame(
-                        usb_recovery.RESPONSE_STATE, 0, b"\x01\x00\x00\x00\x00"
-                    ),
-                ):
+                mock.patch.object(device, "_state", side_effect=fake_state):
             result, output = self.run_main([
                 "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
             ])
@@ -595,23 +604,251 @@ class DeviceCommandTest(unittest.TestCase):
             "--after", "hard_reset",
             "chip_id",
         ])
+        self.assertEqual(resolve.call_args_list, [mock.call(DEVICE)] * 2)
+        self.assertEqual(state_devices, [initial, fresh])
         self.assertEqual(json.loads(output)["state"]["sta_connected"], True)
+
+    def test_live_reset_waits_for_a_new_boot_id_within_bounded_budget(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        clock = [100.0]
+        states = []
+
+        def resolve(_path):
+            return initial if not states else fresh
+
+        def probe(_ref, *_args, **kwargs):
+            states.append(clock[0])
+            if len(states) == 1:
+                return {"sta_connected": True, "boot_id": 0x11111111}
+            if len(states) == 2:
+                clock[0] += 30.0
+                return {"sta_connected": True, "boot_id": 0x11111111}
+            self.assertGreaterEqual(kwargs["container_timeout"], 20.0)
+            clock[0] += 20.0
+            return {"sta_connected": True, "boot_id": 0x22222222}
+
+        with mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", side_effect=probe), \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertEqual(result, 0)
+        self.assertLessEqual(clock[0] - 100.0, 90.0)
+
+    def test_live_reset_allows_slow_fresh_container_probe_within_bounded_budget(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        clock = [100.0]
+        resolve_count = [0]
+        probe_calls = []
+
+        def resolve(_path):
+            resolve_count[0] += 1
+            if resolve_count[0] == 1:
+                return initial
+            clock[0] = max(clock[0], 130.0)
+            return fresh
+
+        def probe(ref, timeout=None, *, container_timeout=0.0, deadline=None):
+            probe_calls.append((ref, timeout, container_timeout, deadline))
+            if ref is initial:
+                return {"sta_connected": True, "boot_id": 0x11111111}
+            if container_timeout < 20.0:
+                raise usb_recovery.DeviceError("fresh container probe budget is too small")
+            clock[0] += 20.0
+            return {"sta_connected": True, "boot_id": 0x22222222}
+
+        with mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", side_effect=probe), \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(probe_calls, [
+            (initial, None, 0.0, 190.0),
+            (fresh, 5.0, 30.0, 190.0),
+        ])
+        self.assertLessEqual(clock[0] - 100.0, 90.0)
+
+    def test_live_reset_fails_when_boot_id_does_not_change(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        clock = [100.0]
+
+        def now():
+            return clock[0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(device, "RESET_TIMEOUT", 0.2), \
+                mock.patch.object(device, "resolve_serial_device", return_value=initial), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", return_value={"sta_connected": True, "boot_id": 1}) as state, \
+                mock.patch.object(device.time, "monotonic", side_effect=now), \
+                mock.patch.object(device.time, "sleep", side_effect=advance), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertNotEqual(result, 0)
+        self.assertGreaterEqual(state.call_count, 2)
+        self.assertIn("boot id", error.getvalue())
+
+    def test_live_reset_fails_when_boot_id_is_missing(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        clock = [100.0]
+        results = iter((initial, fresh))
+
+        def resolve(_path):
+            return next(results, fresh)
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        calls = [0]
+
+        def state_probe(*_args, **_kwargs):
+            calls[0] += 1
+            return {"sta_connected": True, "boot_id": 1} if calls[0] == 1 else {
+                "sta_connected": True
+            }
+
+        with mock.patch.object(device, "RESET_TIMEOUT", 0.2), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", side_effect=state_probe) as state, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=advance), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertNotEqual(result, 0)
+        self.assertGreaterEqual(state.call_count, 2)
+
+    def test_live_reset_fails_when_boot_id_is_zero(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        clock = [100.0]
+        results = iter((initial, fresh))
+
+        def resolve(_path):
+            return next(results, fresh)
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        calls = [0]
+
+        def state_probe(*_args, **_kwargs):
+            calls[0] += 1
+            return {"sta_connected": True, "boot_id": 1} if calls[0] == 1 else {
+                "sta_connected": True, "boot_id": 0
+            }
+
+        with mock.patch.object(device, "RESET_TIMEOUT", 0.2), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", side_effect=state_probe) as state, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=advance), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertNotEqual(result, 0)
+        self.assertGreaterEqual(state.call_count, 2)
+
+    def test_live_reset_ignores_a_different_by_id_endpoint(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        other = device.SerialDevice("/dev/serial/by-id/other", "/dev/ttyACM1")
+        clock = [100.0]
+        results = iter((initial, other))
+
+        def resolve(_path):
+            return next(results, other)
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with mock.patch.object(device, "RESET_TIMEOUT", 0.2), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", return_value={"sta_connected": True, "boot_id": 1}) as state, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=advance), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertNotEqual(result, 0)
+        state.assert_called_once()
+
+    def test_live_reset_fails_on_ordinary_state_timeout(self):
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        clock = [100.0]
+        results = iter((initial, fresh))
+
+        def resolve(_path):
+            return next(results, fresh)
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        calls = [0]
+
+        def state_probe(ref, *args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {"sta_connected": True, "boot_id": 1}
+            raise usb_recovery.DeviceError("USB device timed out")
+
+        with mock.patch.object(device, "RESET_TIMEOUT", 0.2), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "run_esptool"), \
+                mock.patch.object(device, "_state", side_effect=state_probe) as state, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=advance), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            result, _ = self.run_main([
+                "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
+            ])
+        self.assertNotEqual(result, 0)
+        self.assertGreaterEqual(state.call_count, 2)
 
     def test_reset_falls_back_to_pinned_container_without_broad_device_access(self):
         calls = []
+        initial = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        resolve_results = iter((initial, fresh))
 
         def fake_run(command, **kwargs):
             calls.append((command, kwargs))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+        with mock.patch.object(device, "resolve_serial_device", side_effect=lambda _path: next(resolve_results)), \
                 mock.patch.object(device, "resolve_esptool", return_value="container"), \
                 mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
                 mock.patch.object(
                     device.usb_recovery,
                     "run_transaction",
-                    return_value=usb_recovery.Frame(
-                        usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00"
+                    side_effect=(
+                        usb_recovery.Frame(
+                            usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00"
+                        ),
+                        usb_recovery.Frame(
+                            usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00\x02\x00\x00\x00"
+                        ),
                     ),
                 ):
             result, _ = self.run_main([
@@ -642,6 +879,9 @@ class DeviceCommandTest(unittest.TestCase):
         error = io.StringIO()
         with mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
                 mock.patch.object(device, "resolve_esptool", return_value="host"), \
+                mock.patch.object(
+                    device, "_state", return_value={"sta_connected": False, "boot_id": 1}
+                ), \
                 mock.patch.object(
                     device.subprocess,
                     "run",
@@ -867,7 +1107,7 @@ class DeviceCommandTest(unittest.TestCase):
 
         def fake_transaction(path, timeout, command, payload, **kwargs):
             backend_calls.append((path, timeout, command, payload, kwargs))
-            return usb_recovery.Frame(usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00")
+            return usb_recovery.Frame(usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00")
 
         def fake_run(command, **kwargs):
             process_calls.append((command, kwargs))
@@ -1169,14 +1409,22 @@ class DeviceCommandTest(unittest.TestCase):
 
     def test_reset_container_probe_near_deadline_does_not_overrun(self):
         ref = device.SerialDevice(DEVICE, TARGET)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
         process_calls = []
-        clock = iter((100.0, 100.0, 144.0, 144.0, 144.0, 144.0))
+        clock = iter((100.0, 100.0, 100.0, *(144.0 for _ in range(20))))
 
         def fake_run(command, **kwargs):
             process_calls.append((command, kwargs))
-            return mock.Mock(returncode=0, stdout='{"sta_connected":false}\n', stderr=b"")
+            boot_id = 1 if len(process_calls) == 1 else 2
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"sta_connected": False, "boot_id": boot_id}) + "\n",
+                stderr=b"",
+            )
 
-        with mock.patch.object(device, "resolve_serial_device", return_value=ref), \
+        resolve_results = iter((ref, fresh))
+        with mock.patch.object(device, "resolve_serial_device", side_effect=lambda _path: next(resolve_results)), \
+                mock.patch.object(device, "RESET_TIMEOUT", 45.0), \
                 mock.patch.object(device, "confirm_basename", return_value=None), \
                 mock.patch.object(device, "run_esptool"), \
                 mock.patch.object(
@@ -1190,7 +1438,8 @@ class DeviceCommandTest(unittest.TestCase):
                 "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
             ])
         self.assertEqual(result, 0)
-        self.assertEqual(process_calls[0][1]["timeout"], 1.0 / 3.0)
+        self.assertEqual(len(process_calls), 2)
+        self.assertEqual(process_calls[1][1]["timeout"], 1.0)
 
     def test_state_json_flag_keeps_default_json_contract(self):
         ref = device.SerialDevice(DEVICE, TARGET)
@@ -1199,7 +1448,7 @@ class DeviceCommandTest(unittest.TestCase):
                     device.usb_recovery,
                     "run_transaction",
                     return_value=usb_recovery.Frame(
-                        usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00"
+                        usb_recovery.RESPONSE_STATE, 0, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00"
                     ),
                 ):
             result, output = self.run_main(["--device", DEVICE, "state", "--json"])
