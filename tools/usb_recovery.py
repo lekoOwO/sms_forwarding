@@ -684,7 +684,7 @@ def _sanitize_csq(payload: bytes) -> dict[str, object]:
     match = _CSQ.fullmatch(data[0])
     if match is None:
         return _invalid_query_response(QUERY_CSQ)
-    values = [_signal_value(token, *bounds) for token, bounds in zip(match.groups(), _CSQ_RANGES)]
+    values = [_signal_value(token, *bounds) for token, bounds in zip(match.groups(), _CSQ_RANGES, strict=True)]
     if any(value is None for value in values):
         return _invalid_query_response(QUERY_CSQ)
     (rssi, rssi_unknown), (ber, ber_unknown) = values  # type: ignore[misc]
@@ -704,14 +704,14 @@ def _sanitize_cesq(payload: bytes) -> dict[str, object]:
     match = _CESQ.fullmatch(data[0])
     if match is None:
         return _invalid_query_response(QUERY_CESQ)
-    parsed = [_signal_value(token, *bounds) for token, bounds in zip(match.groups(), _CESQ_RANGES)]
+    parsed = [_signal_value(token, *bounds) for token, bounds in zip(match.groups(), _CESQ_RANGES, strict=True)]
     if any(value is None for value in parsed):
         return _invalid_query_response(QUERY_CESQ)
     values = [value for value, _unknown in parsed]  # type: ignore[misc]
     unknown = {
         name: unknown_value
         for name, (_value, unknown_value) in zip(
-            ("rxlev", "ber", "rscp", "ecn0", "rsrq", "rsrp"), parsed
+            ("rxlev", "ber", "rscp", "ecn0", "rsrq", "rsrp"), parsed, strict=True
         )
     }
     return {
@@ -1475,7 +1475,7 @@ def _diag_batch_command(args: argparse.Namespace) -> int:
                 retries += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= BATCH_BUSY_DELAY:
-                    raise DeviceError("USB device timed out")
+                    raise DeviceError("USB device timed out") from None
                 time.sleep(BATCH_BUSY_DELAY)
     print(json.dumps(
         {"version": 1, "results": results},

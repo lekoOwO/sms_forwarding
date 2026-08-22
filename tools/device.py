@@ -846,7 +846,7 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             or len(location["fields"]) != 2
         ):
             return False
-        for field, length in zip(location["fields"], (4, 8)):
+        for field, length in zip(location["fields"], (4, 8), strict=True):
             if (
                 not isinstance(field, dict)
                 or set(field) != {"present", "length", "sha256"}
@@ -1062,7 +1062,7 @@ def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes
             busy_retries += 1
             remaining = _remaining(deadline)
             if remaining <= BUSY_DELAY:
-                raise usb_recovery.DeviceError("device operation timed out")
+                raise usb_recovery.DeviceError("device operation timed out") from None
             time.sleep(BUSY_DELAY)
         except (usb_recovery.DeviceError, OSError, ImportError) as error:
             if not _ALLOW_DIAG_CONTAINER_FALLBACK or not _host_transport_unavailable(error):
@@ -1081,7 +1081,7 @@ def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes
                 busy_retries += 1
                 remaining = _remaining(deadline)
                 if remaining <= BUSY_DELAY:
-                    raise usb_recovery.DeviceError("device operation timed out")
+                    raise usb_recovery.DeviceError("device operation timed out") from None
                 time.sleep(BUSY_DELAY)
 
 
@@ -1132,7 +1132,7 @@ def _diag_command(args: argparse.Namespace) -> int:
                 raise
             batch_results = _container_recovery_batch(device, names[completed:], deadline=deadline)
             if args.raw:
-                for name, payload in zip(names[:completed], raw_payloads):
+                for name, payload in zip(names[:completed], raw_payloads, strict=True):
                     results[name] = usb_recovery.sanitize_query_response(
                         usb_recovery.QUERY_COMMANDS[name][0], payload,
                     )

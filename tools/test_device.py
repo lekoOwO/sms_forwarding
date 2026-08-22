@@ -9,7 +9,6 @@ import json
 import os
 import pathlib
 import sys
-import stat
 import subprocess
 import tempfile
 import unittest
