@@ -9,6 +9,14 @@ ROOT = Path(__file__).resolve().parents[3]
 WEB = ROOT / "components/idf_web"
 
 
+def scheduler_keepalive_baseline_model(ka_enabled, ka_action, ka_last_valid):
+    """Model the scheduler's baseline write branch for a small executable matrix."""
+    writes = []
+    if ka_enabled and ka_action != 1 and not ka_last_valid:
+        writes.append("keepalive-last")
+    return writes
+
+
 def function_body(source: str, name: str) -> str:
     search = 0
     while True:
@@ -506,6 +514,62 @@ int main() {
     assert "IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB" in traffic_preflight
     assert "cfg.kaTrafficKB > static_cast<int>(IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB)" in traffic_preflight
     assert "Keepalive traffic exceeds the safe 512 KB UART runtime limit" in traffic_preflight
+
+    keepalive = function_body(source, "keepalive_task")
+    unsupported_keepalive = keepalive[keepalive.index("if (cfg.kaAction == 1)"):]
+    assert "Cellular HTTP keepalive is not supported" in unsupported_keepalive
+    assert unsupported_keepalive.index("Cellular HTTP keepalive is not supported") < unsupported_keepalive.index("keepalive_prepare_esim")
+    assert "idf_modem_cellular_http_get" not in keepalive
+
+    sched_action = function_body(source, "sched_run_action")
+    assert "idf_modem_cellular_http_get" not in sched_action
+    assert "Cellular HTTP scheduled tasks are not supported" in sched_action
+    scheduler = function_body(source, "scheduler_task")
+    assert "t.action == 1" in scheduler
+    assert scheduler.index("t.action == 1") < scheduler.index("start_sched_job")
+    assert "cfg.kaAction != 1" in scheduler
+    assert "if (cfg.kaEnabled && cfg.kaAction != 1 && !epoch_valid(cfg.kaLastTime))" in scheduler
+    for ka_enabled, ka_action, ka_last_valid, expected_writes in (
+        (True, 1, False, []),
+        (True, 1, True, []),
+        (True, 2, False, ["keepalive-last"]),
+        (False, 1, False, []),
+    ):
+        assert scheduler_keepalive_baseline_model(ka_enabled, ka_action, ka_last_valid) == expected_writes
+    sched_worker = function_body(source, "sched_task_worker")
+    assert "epoch_valid(now) && t.action != 1" in sched_worker
+    assert sched_worker.index("if (t.action == 1)") < sched_worker.index("esim_prepare_profile")
+    assert "t.action != 1 && (t.action != 0 || !ok)" in sched_worker
+    assert sched_worker.index("t.action != 1 && (t.action != 0 || !ok)") < sched_worker.index(
+        "enqueue_maintenance_notice"
+    )
+    sched_handler = function_body(source, "handle_schedtask")
+    assert "run_cfg.valid && run_cfg.task.action == 1" in sched_handler
+    assert sched_handler.index("run_cfg.valid && run_cfg.task.action == 1") < sched_handler.index("start_sched_job")
+    keepalive_handler = function_body(source, "handle_keepalive")
+    keepalive_reset = keepalive_handler.split('if (action == "reset")', 1)[1].split(
+        'if (action == "run")', 1
+    )[0]
+    assert "IdfKeepaliveRunView reset_cfg = idf_config_get_keepalive_run_view();" in keepalive_reset
+    assert "reset_cfg.kaAction == 1" in keepalive_reset
+    assert keepalive_reset.index("reset_cfg.kaAction == 1") < keepalive_reset.index(
+        "idf_config_set_keepalive_last"
+    )
+    sched_reset = sched_handler.split('if (action == "reset")', 1)[1].split(
+        "std::string message;", 1
+    )[0]
+    assert "IdfSchedRunView reset_cfg = idf_config_get_sched_run_view(index);" in sched_reset
+    assert "reset_cfg.valid && reset_cfg.task.action == 1" in sched_reset
+    assert sched_reset.index("reset_cfg.valid && reset_cfg.task.action == 1") < sched_reset.index(
+        "idf_config_set_sched_last"
+    )
+
+    ping_job = function_body(source, "run_ping_job")
+    assert "ACTION_PING_UNSUPPORTED" in ping_job
+    for forbidden in ("idf_modem_send_at", "AT+CGACT", "AT+MPING"):
+        assert forbidden not in ping_job
+    needs_modem = function_body(source, "api_job_task").split("const bool needs_modem", 1)[1].split(";", 1)[0]
+    assert 'job.input.type == "ping"' not in needs_modem
 
 
 if __name__ == "__main__":

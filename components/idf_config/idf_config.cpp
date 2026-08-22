@@ -1513,6 +1513,7 @@ IdfSchedulerView idf_config_get_scheduler_view(void)
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
     view.kaEnabled = s_config.kaEnabled;
     view.kaIntervalDays = s_config.kaIntervalDays;
+    view.kaAction = s_config.kaAction;
     view.kaTrafficKB = s_config.kaTrafficKB;
     view.kaLastTime = s_config.kaLastTime;
     view.tzOffsetMin = s_config.tzOffsetMin;

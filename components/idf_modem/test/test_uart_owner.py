@@ -7,6 +7,25 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "idf_modem.cpp"
+REPO_ROOT = SOURCE.parents[2]
+
+
+def production_cellular_http_call_sites():
+    sites = []
+    excluded_parts = {".git", "build", "dist", "test", "tests"}
+    for path in REPO_ROOT.rglob("*"):
+        if path.suffix not in {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp"}:
+            continue
+        if excluded_parts.intersection(path.parts):
+            continue
+        source = path.read_text(errors="replace")
+        for match in re.finditer(r"\bidf_modem_cellular_http_get\s*\(", source):
+            prefix = source[max(0, match.start() - 80):match.start()]
+            if re.search(r"\besp_err_t\s*$", prefix):
+                continue
+            line = source.count("\n", 0, match.start()) + 1
+            sites.append(f"{path.relative_to(REPO_ROOT)}:{line}")
+    return sites
 
 
 def function_body(source: str, name: str) -> str:
@@ -219,7 +238,6 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("Continuing read-only registration probes", owner_loop)
         self.assertIn("reg_patch.modemReady = (stat == 1 || stat == 5)", owner_loop)
         self.assertIn("bool now_ready = (stat == 1 || stat == 5)", owner_loop)
-        self.assertIn("idf_modem_data_activation_allowed(idf_modem_get_status().ceregStat)", source)
 
     def test_sms_health_keeps_rlos_restricted_without_reset(self):
         source = SOURCE.read_text()
@@ -317,7 +335,11 @@ class UartOwnerContractTest(unittest.TestCase):
             body = function_body(source, api)
             self.assertNotIn("owner_uart_read(", body)
             self.assertNotIn("owner_uart_write(", body)
-            self.assertIn("submit_owner_command", body)
+            if api == "idf_modem_cellular_http_get":
+                self.assertIn("ESP_ERR_NOT_SUPPORTED", body)
+                self.assertNotIn("submit_owner_command", body)
+            else:
+                self.assertIn("submit_owner_command", body)
 
         send_at = function_body(source, "owner_send_at")
         send_until = function_body(source, "owner_send_at_until")
@@ -338,11 +360,41 @@ class UartOwnerContractTest(unittest.TestCase):
             owner_loop.index("owner_process_one_command(false)"),
         )
 
-        http_bound = re.search(
-            r"CELLULAR_HTTP_CALL_TIMEOUT_MS\s*=\s*(\d+)UL", source
+    def test_cellular_http_public_entry_fails_closed_before_owner_or_uart(self):
+        source = SOURCE.read_text()
+        body = function_body(source, "idf_modem_cellular_http_get")
+        self.assertIn("result = IdfCellularHttpResult();", body)
+        self.assertIn('result.message = "Cellular HTTP is not supported";', body)
+        self.assertIn("return ESP_ERR_NOT_SUPPORTED;", body)
+        unsupported = body[:body.index("return ESP_ERR_NOT_SUPPORTED;")]
+        for forbidden in (
+            "submit_owner_command", "xTaskGetCurrentTaskHandle", "idf_modem_get_status",
+            "owner_cellular_http_get", "send_at_locked", "owner_uart_write", "idf_log",
+            "CEREG", "CGATT", "CGACT", "MHTTP", "url.c_str()",
+        ):
+            self.assertNotIn(forbidden, unsupported)
+
+    def test_cellular_http_owner_and_mhttp_implementation_are_removed(self):
+        source = SOURCE.read_text()
+        for forbidden in (
+            "OwnerCommandKind::cellular_http", "owner_cellular_http_get",
+            "CELLULAR_HTTP_CALL_TIMEOUT_MS", "MHTTPCREATE", "MHTTPREQUEST",
+            "MHTTPHEADER", "MHTTPURC",
+        ):
+            self.assertNotIn(forbidden, source)
+
+    def test_cellular_http_has_no_unapproved_production_callers_repo_wide(self):
+        # The public shape remains for a future secure implementation, but no
+        # production caller is currently allowed to reach this unsupported API.
+        allowed_terminal_callers = frozenset()
+        call_sites = production_cellular_http_call_sites()
+        unexpected = sorted(set(call_sites) - allowed_terminal_callers)
+        self.assertEqual(
+            unexpected,
+            [],
+            "new cellular HTTP production caller requires an explicit terminal allowlist entry: "
+            + ", ".join(unexpected),
         )
-        self.assertIsNotNone(http_bound)
-        self.assertGreaterEqual(int(http_bound.group(1)), 360_000)
 
 
 if __name__ == "__main__":

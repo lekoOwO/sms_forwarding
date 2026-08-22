@@ -117,6 +117,23 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertIn("begin_config_update", config)
         self.assertIn("finish_config_update", config)
 
+    def test_scheduler_view_exposes_only_the_keepalive_action_needed_by_scheduler(self) -> None:
+        header = HEADER.read_text(encoding="utf-8")
+        config = SOURCE.read_text(encoding="utf-8")
+        view = header.split("struct IdfSchedulerView", 1)[1].split("};", 1)[0]
+        populate_start = config.index("IdfSchedulerView idf_config_get_scheduler_view")
+        populate = config[populate_start:config.index("\nbool idf_config_get_push_channel", populate_start)]
+        self.assertIn("uint8_t kaAction = 1;", view)
+        self.assertIn("view.kaAction = s_config.kaAction;", populate)
+        self.assertNotIn("kaUrl", view)
+        self.assertNotIn("kaProfile", view)
+        self.assertNotIn("smtpPass", view)
+
+    def test_cellular_http_action_is_publicly_documented_as_unsupported(self) -> None:
+        header = HEADER.read_text(encoding="utf-8")
+        self.assertIn("1=cellular HTTP unsupported", header)
+        self.assertNotIn("1=cellular HTTP ping", header)
+
 
 if __name__ == "__main__":
     unittest.main()

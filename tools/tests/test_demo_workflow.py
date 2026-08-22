@@ -90,6 +90,14 @@ class DemoWorkflowTests(unittest.TestCase):
         request = api[api.index("async function requestJson"):api.index("export async function loadSnapshot")]
         self.assertLess(request.index("if (demoMode) return demoResponse"), request.index("fetch(path"))
 
+    def test_demo_does_not_offer_or_fake_cellular_ping(self):
+        page = (ROOT / "web" / "src" / "routes" / "+page.svelte").read_text(encoding="utf-8")
+        self.assertNotIn('action((value) => networkResult = value, "/ping"', page)
+        api = (ROOT / "web" / "src" / "lib" / "api.ts").read_text(encoding="utf-8")
+        self.assertIn('path === "/ping"', api)
+        self.assertIn('code: "ACTION_PING_UNSUPPORTED"', api)
+        self.assertIn("success: false", api)
+
 
 if __name__ == "__main__":
     unittest.main()

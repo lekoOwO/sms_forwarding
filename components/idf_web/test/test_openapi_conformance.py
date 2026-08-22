@@ -85,9 +85,14 @@ def main() -> None:
         "ACTION_CONFIG_SAVED", "ACTION_CONFIG_SAVE_FAILED", "ACTION_CONFIG_ACCOUNT_REQUIRED",
         "ACTION_SMS_PHONE_REQUIRED", "ACTION_SMS_CONTENT_REQUIRED", "ACTION_SMS_SENT", "ACTION_SMS_FAILED",
         "ACTION_PING_OK", "ACTION_PING_MODEM_ERROR", "ACTION_PING_UNREACHABLE", "ACTION_PING_TIMEOUT",
+        "ACTION_PING_UNSUPPORTED",
         "ACTION_WIFI_RESTARTING", "ACTION_AT_REJECTED", "ACTION_FLIGHT_FAILED",
     }
     assert required_codes <= action_codes
+    ping = SPEC["paths"]["/ping"]["post"]
+    assert "unsupported" in ping["summary"].lower()
+    assert "unsupported" in ping["description"].lower()
+    assert "enables the PDP context" not in ping["description"]
 
     config_update = SPEC["components"]["schemas"]["ConfigUpdate"]
     assert config_update["maxProperties"] == 51

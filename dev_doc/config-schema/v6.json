@@ -471,7 +471,8 @@
           "minimum": 0,
           "maximum": 3,
           "x-codecOrder": 22,
-          "default": 1
+          "default": 1,
+          "description": "Action 1 is retained for compatibility but is terminal unsupported; other values keep their stored action semantics."
         },
         "kaTarget": {
           "type": "string",
@@ -508,7 +509,7 @@
           "x-codecOrder": 43,
           "default": 1,
           "x-runtimeMax": 512,
-          "description": "Stored values up to 10000 KB are preserved. A cellular keepalive run fails closed above 512 KB because MHTTP payloads stream over the 115200-baud UART under a 90-second download deadline."
+          "description": "Stored values up to 10000 KB are preserved for configuration compatibility. Cellular HTTP keepalive is unsupported for every value; no cellular activation or transfer occurs."
         },
         "tzOffsetMin": {
           "type": "integer",
@@ -739,7 +740,8 @@
                 "minimum": 0,
                 "maximum": 3,
                 "x-codecOrder": 5,
-                "default": 0
+                "default": 0,
+                "description": "Action 1 is retained for compatibility but is terminal unsupported; 0, 2, and 3 select push, SMS, and USSD."
               },
               "target": {
                 "type": "string",

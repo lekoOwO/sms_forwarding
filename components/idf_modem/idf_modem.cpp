@@ -8,12 +8,10 @@
 
 #include <algorithm>
 #include <atomic>
-#include <iterator>
 
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -40,9 +38,6 @@ static constexpr int UART_RX_BUF = 4096;
 static constexpr int MODEM_POWERDOWN_MS = 1200;
 static constexpr int MODEM_POWERUP_MIN_MS = 1500;
 static constexpr int MODEM_POWERUP_MAX_MS = 6000;
-static constexpr uint32_t CELLULAR_KEEPALIVE_MIN_BYTES = 48UL * 1024UL;
-static constexpr uint32_t CELLULAR_HTTP_TIMEOUT_MS = 90000UL;
-static constexpr uint32_t CELLULAR_PDP_READY_TIMEOUT_MS = 12000UL;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
@@ -54,10 +49,8 @@ static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM hot-swap poll
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 static constexpr size_t OWNER_COMMAND_SLOTS = 4;
-// Allow two 90-second downloads, setup, cleanup, and PDP waits for HTTPS fallback.
-static constexpr uint32_t CELLULAR_HTTP_CALL_TIMEOUT_MS = 360000UL;
 
-enum class OwnerCommandKind : uint8_t { at, until, pdu, cellular_http };
+enum class OwnerCommandKind : uint8_t { at, until, pdu };
 enum class OwnerCommandState : uint8_t { free, queued, running, done, abandoned };
 
 struct OwnerCommand {
@@ -65,8 +58,6 @@ struct OwnerCommand {
     std::string command;
     std::string token;
     std::string pdu;
-    std::string url;
-    IdfCellularHttpConfig cellular_config;
     uint32_t timeout_ms = 0;
     bool filter_urcs = false;
     std::string response_prefix;
@@ -76,7 +67,6 @@ struct OwnerCommandSlot {
     OwnerCommandState state = OwnerCommandState::free;
     OwnerCommand request;
     std::string response;
-    IdfCellularHttpResult cellular_result;
     esp_err_t result = ESP_FAIL;
     SemaphoreHandle_t completed = nullptr;
 };
@@ -134,11 +124,8 @@ static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
                                      uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
                                 uint32_t timeout_ms, std::string& response);
-static esp_err_t owner_cellular_http_get(const std::string& url,
-                                         const IdfCellularHttpConfig& config,
-                                         IdfCellularHttpResult& result);
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
-                                      IdfCellularHttpResult* cellular_result, bool priority,
+                                      bool priority,
                                       uint8_t* query_busy_reason = nullptr);
 static bool owner_process_one_command(bool priority);
 static void owner_drain_priority_commands();
@@ -898,7 +885,7 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
         if (!priority) owner_drain_priority_commands();
         return result;
     }
-    return submit_owner_command(request, &response, nullptr, priority);
+    return submit_owner_command(request, &response, priority);
 }
 
 #if SMS_USB_RECOVERY
@@ -982,7 +969,7 @@ esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* 
         err = owner_send_at(command, timeout_ms, response, true,
                             request.response_prefix.c_str());
     } else {
-        err = submit_owner_command(request, &response, nullptr, false, busy_reason);
+        err = submit_owner_command(request, &response, false, busy_reason);
     }
     if (err == ESP_OK && query_id == IDF_MODEM_USB_QUERY_CPOL) {
         response = idf_modem_cpol_compact_summary(response);
@@ -1012,7 +999,7 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token,
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
         return owner_send_at_until(cmd, token, timeout_ms, response);
     }
-    return submit_owner_command(request, &response, nullptr, false);
+    return submit_owner_command(request, &response, false);
 }
 
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu,
@@ -1027,14 +1014,13 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu,
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
         return owner_send_pdu(cmgs_cmd, pdu, timeout_ms, response);
     }
-    return submit_owner_command(request, &response, nullptr, false);
+    return submit_owner_command(request, &response, false);
 }
 
 static void reset_owner_slot(OwnerCommandSlot& slot)
 {
     slot.request = OwnerCommand();
     slot.response.clear();
-    slot.cellular_result = IdfCellularHttpResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::free;
 }
@@ -1042,8 +1028,7 @@ static void reset_owner_slot(OwnerCommandSlot& slot)
 static bool owner_request_bounded(const OwnerCommand& request)
 {
     return request.command.size() <= 4096 && request.pdu.size() <= 4096 &&
-           request.token.size() <= 256 && request.url.size() <= 240 &&
-           request.cellular_config.apn.size() <= 96;
+           request.token.size() <= 256;
 }
 
 static void wake_owner_task()
@@ -1056,7 +1041,7 @@ static void wake_owner_task()
 }
 
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
-                                      IdfCellularHttpResult* cellular_result, bool priority,
+                                      bool priority,
                                       uint8_t* query_busy_reason)
 {
     if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
@@ -1071,9 +1056,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
 
     bool session_held = false;
     uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
-    uint32_t wait_ms = request.kind == OwnerCommandKind::cellular_http
-                           ? CELLULAR_HTTP_CALL_TIMEOUT_MS
-                           : request.timeout_ms + wait_margin_ms;
+    uint32_t wait_ms = request.timeout_ms + wait_margin_ms;
     TickDeadline deadline(wait_ms);
     if (!priority) {
         if (!s_session_mutex ||
@@ -1117,7 +1100,6 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     while (xSemaphoreTake(slot.completed, 0) == pdTRUE) {}
     slot.request = request;
     slot.response.clear();
-    slot.cellular_result = IdfCellularHttpResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::queued;
     QueueHandle_t queue = priority ? s_priority_command_queue : s_command_queue;
@@ -1143,13 +1125,11 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
             result = slot.result;
             if (response) *response = slot.response;
-            if (cellular_result) *cellular_result = slot.cellular_result;
             reset_owner_slot(slot);
         } else if (slot.state == OwnerCommandState::done) {
             // Prefer completion if its signal arrives with the caller timeout.
             result = slot.result;
             if (response) *response = slot.response;
-            if (cellular_result) *cellular_result = slot.cellular_result;
             reset_owner_slot(slot);
             xSemaphoreTake(slot.completed, 0);
         } else {
@@ -1434,267 +1414,6 @@ static std::string parse_cnum_phone(const std::string& resp)
     return normalize_msisdn(phone);
 }
 
-static bool starts_with(const std::string& text, const char* prefix)
-{
-    return text.rfind(prefix, 0) == 0;
-}
-
-static char hex_nibble(uint8_t value)
-{
-    value &= 0x0f;
-    return value < 10 ? static_cast<char>('0' + value)
-                      : static_cast<char>('A' + value - 10);
-}
-
-static std::string hex_encode_ascii(const std::string& text)
-{
-    std::string out;
-    out.reserve(text.size() * 2);
-    for (unsigned char ch : text) {
-        out += hex_nibble(ch >> 4);
-        out += hex_nibble(ch);
-    }
-    return out;
-}
-
-static bool parse_http_url(const std::string& raw_url, std::string& protocol,
-                           std::string& host, std::string& path, std::string& error)
-{
-    std::string url = idf_util_trim_copy(raw_url);
-    if (url.empty()) url = IDF_KEEPALIVE_DEFAULT_URL;
-    if (url.size() > 240) {
-        error = "Cellular HTTP URL is too long";
-        return false;
-    }
-
-    size_t proto_end = url.find("://");
-    if (proto_end == std::string::npos || proto_end == 0) {
-        error = "Cellular HTTP URL must start with http:// or https://";
-        return false;
-    }
-
-    protocol = url.substr(0, proto_end);
-    std::transform(protocol.begin(), protocol.end(), protocol.begin(),
-                   [](unsigned char ch) { return static_cast<char>(tolower(ch)); });
-    if (protocol != "http" && protocol != "https") {
-        error = "Cellular HTTP URL supports only HTTP and HTTPS";
-        return false;
-    }
-
-    size_t host_start = proto_end + 3;
-    size_t path_start = url.find('/', host_start);
-    if (path_start == std::string::npos) {
-        host = url.substr(host_start);
-        path = "/";
-    } else {
-        host = url.substr(host_start, path_start - host_start);
-        path = url.substr(path_start);
-    }
-    size_t hash = path.find('#');
-    if (hash != std::string::npos) path.resize(hash);
-    host = idf_util_trim_copy(host);
-    if (host.empty() || host.find('"') != std::string::npos ||
-        host.find(' ') != std::string::npos || path.find('"') != std::string::npos ||
-        path.find(' ') != std::string::npos) {
-        error = "Cellular HTTP URL contains invalid characters";
-        return false;
-    }
-    return true;
-}
-
-static void normalize_keepalive_payload_size(const std::string& host, std::string& path)
-{
-    if (host != "gg.incrafttime.top") return;
-    if (!starts_with(path, "/api/payload?")) return;
-    size_t pos = path.find("size=128684");
-    if (pos != std::string::npos) path.replace(pos, strlen("size=128684"), "size=64342");
-}
-
-static void append_no_cache_query(std::string& path)
-{
-    path += (path.find('?') == std::string::npos) ? '?' : '&';
-    char buf[48];
-    snprintf(buf, sizeof(buf), "t=%llu&r=%08x",
-             static_cast<unsigned long long>(esp_timer_get_time() / 1000ULL),
-             static_cast<unsigned>(esp_random()));
-    path += buf;
-}
-
-static esp_err_t send_at_locked(const std::string& cmd, uint32_t timeout_ms,
-                                std::string& response, size_t max_capture = 1400,
-                                uint32_t extra_read_ms = 50)
-{
-    assert_owner_task();
-    capture_pending_uart_locked(30);
-    std::string wire = cmd;
-    wire += "\r\n";
-    owner_uart_write(wire.data(), wire.size());
-
-    response.clear();
-    response.reserve(std::min<size_t>(max_capture, 512));
-    TickDeadline deadline(timeout_ms);
-    uint8_t buf[128];
-    esp_err_t ret = ESP_ERR_TIMEOUT;
-    while (!deadline.expired()) {
-        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
-        if (got > 0) {
-            preserve_uart_urcs(buf, static_cast<size_t>(got));
-            size_t room = max_capture > response.size() ? max_capture - response.size() : 0;
-            if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
-            int final_code = at_final_result(response);
-            if (final_code != 0) {
-                ret = final_code > 0 ? ESP_OK : ESP_FAIL;
-                // Set a total limit so continuous URCs cannot retain the AT lock indefinitely.
-                TickDeadline extra_hard(extra_read_ms * 4 + 200);
-                TickDeadline extra_deadline(extra_read_ms);
-                while (!extra_deadline.expired() && !extra_hard.expired()) {
-                    int more = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(15));
-                    if (more <= 0) continue;
-                    preserve_uart_urcs(buf, static_cast<size_t>(more));
-                    room = max_capture > response.size() ? max_capture - response.size() : 0;
-                    if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, more));
-                    extra_deadline.restart(extra_read_ms);
-                }
-                break;
-            }
-        }
-    }
-    return ret;
-}
-
-static int parse_mhttp_create_id(const std::string& resp)
-{
-    size_t p = resp.find("+MHTTPCREATE:");
-    if (p == std::string::npos) return -1;
-    p += strlen("+MHTTPCREATE:");
-    size_t end = resp.find_first_of("\r\n", p);
-    std::string token = resp.substr(p, end == std::string::npos ? std::string::npos : end - p);
-    size_t comma = token.find(',');
-    if (comma != std::string::npos) token.resize(comma);
-    long id = -1;
-    if (!parse_long_token(token, id) || id < 0 || id > 255) return -1;
-    return static_cast<int>(id);
-}
-
-static void parse_mhttp_head(const std::string& head, int http_id, IdfCellularHttpResult& result,
-                             bool& complete, bool& error)
-{
-    size_t comma = head.find(',');
-    if (comma == std::string::npos) return;
-    if (starts_with(head, "+MHTTPURC: \"header\"")) {
-        long nums[4];
-        int n = 0;
-        if (parse_comma_longs(head.substr(comma + 1), nums, 4, n) && n >= 2 && nums[0] == http_id) {
-            result.httpStatus = static_cast<int>(nums[1]);
-            idf_logf("cellular HTTP response status: %d", result.httpStatus);
-        }
-    } else if (starts_with(head, "+MHTTPURC: \"content\"")) {
-        long nums[5];
-        int n = 0;
-        if (parse_comma_longs(head.substr(comma + 1), nums, 5, n) && n >= 4 && nums[0] == http_id) {
-            result.expectedBytes = static_cast<uint32_t>(std::max<long>(0, nums[1]));
-            result.bytesRead = static_cast<uint32_t>(std::max<long>(0, nums[2]));
-            uint32_t current = static_cast<uint32_t>(std::max<long>(0, nums[3]));
-            if ((result.expectedBytes > 0 && result.bytesRead >= result.expectedBytes) || current == 0) {
-                complete = true;
-            }
-        }
-    } else if (starts_with(head, "+MHTTPURC: \"err\"")) {
-        long nums[3];
-        int n = 0;
-        if (parse_comma_longs(head.substr(comma + 1), nums, 3, n) && n >= 2 && nums[0] == http_id) {
-            result.mhttpError = static_cast<int>(nums[1]);
-            idf_logf("cellular HTTP error code: %d%s", result.mhttpError,
-                     result.mhttpError == 4 ? " (SSL handshake failed)" : "");
-            error = true;
-            complete = true;
-        }
-    }
-}
-
-static int comma_count(const std::string& text)
-{
-    return static_cast<int>(std::count(text.begin(), text.end(), ','));
-}
-
-static bool send_mhttp_header_locked(int http_id, bool more, const std::string& line)
-{
-    char head[64];
-    snprintf(head, sizeof(head), "AT+MHTTPHEADER=%d,%d,%u,\"",
-             http_id, more ? 1 : 0, static_cast<unsigned>(line.size()));
-    std::string cmd = head;
-    cmd += line;
-    cmd += "\"";
-    std::string resp;
-    return send_at_locked(cmd, 3000, resp) == ESP_OK;
-}
-
-static void append_sms_urc_line(const std::string& line)
-{
-    std::string text = line;
-    text += "\r\n";
-    append_urc_text(text);
-}
-
-static bool wait_mhttp_download_locked(int http_id, uint32_t timeout_ms, uint32_t min_payload_bytes,
-                                       IdfCellularHttpResult& result)
-{
-    TickDeadline deadline(timeout_ms);
-    std::string head;
-    head.reserve(280);
-    bool skipping_data = false;
-    bool append_next_sms_payload = false;
-    bool complete = false;
-    bool error = false;
-    uint8_t buf[128];
-
-    while (!deadline.expired() && !complete) {
-        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(120));
-        if (got <= 0) continue;
-        for (int i = 0; i < got && !complete; ++i) {
-            char ch = static_cast<char>(buf[i]);
-            if (skipping_data) {
-                if (ch == '\n') {
-                    skipping_data = false;
-                    head.clear();
-                }
-                continue;
-            }
-            if (ch == '\r' || ch == '\n') {
-                std::string line = idf_util_trim_copy(head);
-                if (!line.empty()) {
-                    if (starts_with(line, "+MHTTPURC: \"err\"")) {
-                        parse_mhttp_head(line, http_id, result, complete, error);
-                    } else if (append_next_sms_payload || starts_with(line, "+CMT:") || starts_with(line, "+CMTI:")) {
-                        append_sms_urc_line(line);
-                        append_next_sms_payload = starts_with(line, "+CMT:");
-                    } else if (line == "RING" || starts_with(line, "+CLIP:")) {
-                        // A keep-alive download can hold UART for 90 seconds.
-                        // Forward call lines that arrive during the full window.
-                        append_sms_urc_line(line);
-                    }
-                }
-                head.clear();
-                continue;
-            }
-            if (head.size() < 620) head += ch;  // Fits a maximum PDU line inserted during download.
-
-            int need_commas = 0;
-            if (starts_with(head, "+MHTTPURC: \"content\"")) need_commas = 5;
-            else if (starts_with(head, "+MHTTPURC: \"header\"")) need_commas = 4;
-            if (need_commas > 0 && comma_count(head) >= need_commas) {
-                parse_mhttp_head(head, http_id, result, complete, error);
-                skipping_data = true;
-                head.clear();
-            }
-        }
-    }
-
-    if (!complete) idf_log_line("cellular HTTP download timed out");
-    return !error && complete && result.httpStatus >= 200 && result.httpStatus < 400 &&
-           result.bytesRead >= min_payload_bytes;
-}
-
 static bool valid_ipv4_address(const std::string& value)
 {
     int parts = 0;
@@ -1746,24 +1465,6 @@ static bool sample_cell_ip_once(void)
         return true;
     }
     set_status_cell_ip("");
-    return false;
-}
-
-static bool wait_pdp_ready_locked(uint32_t timeout_ms, std::string& ip)
-{
-    TickDeadline deadline(timeout_ms);
-    while (!deadline.expired()) {
-        std::string resp;
-        if (send_at_locked("AT+CGPADDR=1", 3000, resp) == ESP_OK && parse_cgpaddr_ip(resp, ip)) {
-            IdfModemStatus patch;
-            patch.cellIp = ip;
-            update_status(patch);
-            idf_logf("cellular PDP ready. IP: %s", ip.c_str());
-            return true;
-        }
-        vTaskDelay(pdMS_TO_TICKS(700));
-    }
-    idf_log_line("cellular PDP timed out without a valid IP");
     return false;
 }
 
@@ -2000,174 +1701,15 @@ static bool process_data_mode_retry(void)
     return true;
 }
 
-static bool fetch_mhttp_once_locked(const std::string& protocol, const std::string& host,
-                                    const std::string& path, uint32_t min_payload_bytes,
-                                    IdfCellularHttpResult& result)
-{
-    for (int i = 0; i < 4; ++i) {
-        std::string ignored;
-        char cmd[24];
-        snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", i);
-        send_at_locked(cmd, 1000, ignored, 256, 10);
-    }
-
-    std::string create_cmd = "AT+MHTTPCREATE=\"";
-    create_cmd += protocol;
-    create_cmd += "://";
-    create_cmd += host;
-    create_cmd += "\"";
-    std::string resp;
-    if (send_at_locked(create_cmd, 10000, resp, 1600, 1200) != ESP_OK) {
-        result.message = "Cellular HTTP creation failed";
-        idf_logf("cellular HTTP creation failed: %s", resp.c_str());
-        return false;
-    }
-
-    int http_id = parse_mhttp_create_id(resp);
-    if (http_id < 0) {
-        result.message = "Cellular HTTP creation failed without a connection ID";
-        idf_logf("cellular HTTP creation failed: %s", resp.c_str());
-        return false;
-    }
-
-    char cmd[128];
-    if (protocol == "https") {
-        snprintf(cmd, sizeof(cmd), "AT+MHTTPCFG=\"ssl\",%d,1,0", http_id);
-        send_at_locked(cmd, 5000, resp);
-    }
-    snprintf(cmd, sizeof(cmd), "AT+MHTTPCFG=\"encoding\",%d,0,0", http_id);
-    send_at_locked(cmd, 3000, resp);
-    send_mhttp_header_locked(http_id, true, "Cache-Control: no-cache, no-store, must-revalidate");
-    send_mhttp_header_locked(http_id, false, "Pragma: no-cache");
-    snprintf(cmd, sizeof(cmd), "AT+MHTTPCFG=\"encoding\",%d,1,1", http_id);
-    send_at_locked(cmd, 3000, resp);
-
-    std::string request_cmd = "AT+MHTTPREQUEST=";
-    request_cmd += std::to_string(http_id);
-    request_cmd += ",1,0,";
-    request_cmd += hex_encode_ascii(path);
-    if (send_at_locked(request_cmd, 10000, resp) != ESP_OK) {
-        result.message = "Cellular HTTP request send failed";
-        idf_logf("cellular HTTP request send failed: %s", resp.c_str());
-        snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
-        send_at_locked(cmd, 2000, resp, 256, 20);
-        return false;
-    }
-
-    bool ok = wait_mhttp_download_locked(http_id, CELLULAR_HTTP_TIMEOUT_MS, min_payload_bytes, result);
-    snprintf(cmd, sizeof(cmd), "AT+MHTTPDEL=%d", http_id);
-    send_at_locked(cmd, 3000, resp, 256, 20);
-    if (ok) {
-        result.message = "Cellular HTTP payload downloaded";
-        idf_logf("cellular HTTP keep-alive complete: HTTP %d, downloaded about %u KB",
-                 result.httpStatus, static_cast<unsigned>(result.bytesRead / 1024UL));
-    } else {
-        if (result.message.empty()) result.message = "Cellular HTTP payload download failed";
-        idf_logf("cellular HTTP keep-alive failed: HTTP %d, downloaded about %u/%u KB",
-                 result.httpStatus,
-                 static_cast<unsigned>(result.bytesRead / 1024UL),
-                 static_cast<unsigned>(result.expectedBytes / 1024UL));
-    }
-    result.ok = ok;
-    return ok;
-}
-
-static esp_err_t owner_cellular_http_get(const std::string& url,
-                                         const IdfCellularHttpConfig& config,
-                                         IdfCellularHttpResult& result)
-{
-    assert_owner_task();
-    result = IdfCellularHttpResult();
-    if (!idf_modem_data_activation_allowed(idf_modem_get_status().ceregStat)) {
-        result.message = "Cellular data requires home registration";
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (config.minPayloadBytes > IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES) {
-        result.message = "Cellular HTTP payload threshold exceeds the safe UART runtime limit";
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    std::string protocol;
-    std::string host;
-    std::string path;
-    if (!parse_http_url(url, protocol, host, path, result.message)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    normalize_keepalive_payload_size(host, path);
-    append_no_cache_query(path);
-
-    idf_logf("starting cellular HTTP payload download: %s://%s%s",
-             protocol.c_str(), host.c_str(), path.c_str());
-
-    std::string resp;
-    std::string apn = idf_util_trim_copy(config.apn);
-    if (!apn.empty() && apn.find('"') == std::string::npos) {
-        std::string cmd = "AT+CGDCONT=1,\"IP\",\"";
-        cmd += apn;
-        cmd += "\"";
-        send_at_locked(cmd, 3000, resp);
-    }
-
-    idf_log_line("activating data connection (CGACT)...");
-    esp_err_t activate_err = send_at_locked("AT+CGACT=1,1", 10000, resp);
-    if (activate_err != ESP_OK) {
-        idf_logf("CGACT activation did not return OK. Waiting for PDP: %s", resp.c_str());
-    }
-
-    std::string ip;
-    bool pdp_ready = wait_pdp_ready_locked(CELLULAR_PDP_READY_TIMEOUT_MS, ip);
-    if (!pdp_ready) {
-        set_status_cell_ip("");
-        if (!config.dataEnabled) {
-            idf_log_line("closing PDP context (CGACT=0)...");
-            send_at_locked("AT+CGACT=0,1", 5000, resp);
-        }
-        result.message = "Cellular PDP did not get a valid IP. See the log";
-        return ESP_FAIL;
-    }
-    result.cellIp = ip;
-
-    const uint32_t min_payload_bytes = config.minPayloadBytes == 0 ? CELLULAR_KEEPALIVE_MIN_BYTES :
-                                       config.minPayloadBytes;
-    bool ok = fetch_mhttp_once_locked(protocol, host, path, min_payload_bytes, result);
-    if (!ok && protocol == "https" && result.mhttpError == 4) {
-        idf_log_line("HTTPS handshake failed. Retrying once with HTTP. Disable forced HTTPS redirects after HTTP 301");
-        IdfCellularHttpResult retry;
-        retry.cellIp = result.cellIp;
-        ok = fetch_mhttp_once_locked("http", host, path, min_payload_bytes, retry);
-        result = retry;
-    }
-
-    if (!config.dataEnabled) {
-        idf_log_line("closing PDP context (CGACT=0)...");
-        send_at_locked("AT+CGACT=0,1", 5000, resp);
-        set_status_cell_ip("");
-    }
-
-    if (result.message.empty()) {
-        result.message = ok ? "Cellular HTTP payload downloaded" : "Cellular HTTP payload download failed. See the log";
-    }
-    result.ok = ok;
-    return ok ? ESP_OK : ESP_FAIL;
-}
-
 esp_err_t idf_modem_cellular_http_get(const std::string& url,
                                       const IdfCellularHttpConfig& config,
                                       IdfCellularHttpResult& result)
 {
-    OwnerCommand request;
-    request.kind = OwnerCommandKind::cellular_http;
-    request.url = url;
-    request.cellular_config = config;
-    request.timeout_ms = CELLULAR_HTTP_CALL_TIMEOUT_MS;
-    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
-        return owner_cellular_http_get(url, config, result);
-    }
-    esp_err_t err = submit_owner_command(request, nullptr, &result, false);
-    if (err == IDF_MODEM_ERR_BUSY) result.message = "Modem command queue is full. Cellular HTTP did not run";
-    if (err == ESP_ERR_TIMEOUT) result.message = "Modem command timed out. Cellular HTTP did not complete";
-    if (err == ESP_ERR_INVALID_STATE) result.message = "Modem is not started";
-    return err;
+    (void)url;
+    (void)config;
+    result = IdfCellularHttpResult();
+    result.message = "Cellular HTTP is not supported";
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
@@ -2186,9 +1728,6 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
         case OwnerCommandKind::pdu:
             return owner_send_pdu(slot.request.command, slot.request.pdu.c_str(),
                                   slot.request.timeout_ms, slot.response);
-        case OwnerCommandKind::cellular_http:
-            return owner_cellular_http_get(slot.request.url, slot.request.cellular_config,
-                                           slot.cellular_result);
     }
     return ESP_ERR_INVALID_ARG;
 }
@@ -2217,7 +1756,6 @@ static bool owner_process_one_command(bool priority)
     const bool runtime_queue_ready = s_runtime_queue_ready.load(std::memory_order_acquire);
     if (!idf_modem_owner_command_allowed(priority, reset_requested, runtime_queue_ready)) {
         slot.response.clear();
-        slot.cellular_result = IdfCellularHttpResult();
         slot.result = ESP_ERR_INVALID_STATE;
         slot.state = OwnerCommandState::done;
         xSemaphoreGive(s_command_mutex);

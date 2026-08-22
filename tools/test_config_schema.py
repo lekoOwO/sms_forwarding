@@ -72,6 +72,13 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(config["kaTrafficKB"]["maximum"], 10000)
         self.assertEqual(config["kaTrafficKB"]["default"], 1)
         self.assertEqual(config["kaTrafficKB"]["x-runtimeMax"], 512)
+        self.assertIn("unsupported", config["kaTrafficKB"]["description"].lower())
+        self.assertNotIn("MHTTP", config["kaTrafficKB"]["description"])
+        self.assertIn("action 1", config["kaAction"]["description"].lower())
+        self.assertIn("unsupported", config["kaAction"]["description"].lower())
+        task_action = config["schedTasks"]["items"]["properties"]["action"]
+        self.assertIn("action 1", task_action["description"].lower())
+        self.assertIn("unsupported", task_action["description"].lower())
         self.assertEqual(
             schema["x-legacyMigration"],
             {
@@ -185,6 +192,27 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26756", header)
         self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6012", header)
         self.assertNotIn("MAX_MDNS_HOST_BYTES", header)
+
+    def test_generated_web_schema_has_no_drift(self) -> None:
+        manifest = json.loads((SCHEMA_DIR / "manifest.json").read_text(encoding="utf-8"))
+        schema = json.loads((SCHEMA_DIR / manifest["versions"][str(manifest["currentVersion"])]).read_text(encoding="utf-8"))
+        config = schema["properties"]["config"]["properties"]
+        generated = (ROOT / "web/src/lib/config-schema.generated.ts").read_text(encoding="utf-8")
+
+        self.assertIn(
+            f"CONFIG_SCHEMA_VERSION = {schema['properties']['schemaVersion']['const']} as const",
+            generated,
+        )
+        self.assertIn(f'"smtpSendTo": {config["smtpSendTo"]["x-maxUtf8Bytes"]}', generated)
+        self.assertIn(f'"adminPhone": {config["adminPhone"]["x-maxUtf8Bytes"]}', generated)
+        self.assertIn(
+            f"networkMode: {{ min: {config['networkMode']['minimum']}, max: {config['networkMode']['maximum']}, default: {config['networkMode']['default']} }}",
+            generated,
+        )
+        self.assertIn(
+            f"heartbeatInterval: {{ min: {config['heartbeatInterval']['minimum']}, max: {config['heartbeatInterval']['maximum']}, default: {config['heartbeatInterval']['default']} }}",
+            generated,
+        )
 
 
 if __name__ == "__main__":

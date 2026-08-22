@@ -50,9 +50,7 @@ struct IdfCellularHttpResult {
     std::string message;
 };
 
-// The MHTTP body is streamed over the 115200-baud UART and has a 90-second
-// download deadline. Keep the configurable schema range broad, but refuse a
-// keepalive threshold above this conservative runtime limit before activation.
+// Keep the legacy cellular traffic limit for configuration compatibility; the HTTP API is unsupported.
 static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB = 512;
 static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES =
     IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB * 1024UL;

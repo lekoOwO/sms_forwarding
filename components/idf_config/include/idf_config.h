@@ -51,8 +51,8 @@ struct IdfSchedTask {
     std::string profile;     // Target eSIM profile (ICCID or alias). Empty uses the current SIM.
     bool switchBack = true;  // Restore the previously active profile after the task
     int intervalDays = 30;   // Interval in days
-    uint8_t action = 0;      // 0=push alert, 1=cellular HTTP ping, 2=SMS, 3=USSD
-    std::string target;      // Ping URL, phone number, or USSD code
+    uint8_t action = 0;      // 0=push alert, 1=cellular HTTP unsupported, 2=SMS, 3=USSD
+    std::string target;      // Reserved HTTP target, phone number, or USSD code
     std::string payload;     // Push or SMS content
     uint32_t lastRun = 0;    // Base epoch. Zero means unset.
 };
@@ -392,6 +392,7 @@ struct IdfEmailSettingsView {
 struct IdfSchedulerView {
     bool kaEnabled = false;
     int kaIntervalDays = 175;
+    uint8_t kaAction = 1;
     int kaTrafficKB = 1;
     uint32_t kaLastTime = 0;
     int tzOffsetMin = 480;

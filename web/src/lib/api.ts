@@ -92,10 +92,13 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 			channel.bodyTemplate = init.body.get(`${prefix}template`) ?? "";
 		}
 	}
+	if (path === "/ping") return {
+		success: false, code: "ACTION_PING_UNSUPPORTED", data: {}, detail: ""
+	} as T;
 	const data = path.includes("ati") ? { manufacturer: "Demo Telecom", model: "Demo LTE-C3", revision: "1.0.0" }
 		: path.includes("signal") ? { signalDbm: -82, rssi: 16, ber: 0 } : {};
 	const code = path === "/save" ? "ACTION_CONFIG_SAVED" : path === "/sendsms" ? "ACTION_SMS_SENT"
-		: path === "/ping" ? "ACTION_PING_OK" : path.startsWith("/query") ? "ACTION_QUERY_OK"
+		: path.startsWith("/query") ? "ACTION_QUERY_OK"
 		: path.startsWith("/at") ? "ACTION_AT_OK" : "ACTION_MODEM_OK";
 	return { success: true, code, data, detail: "" } as T;
 }
