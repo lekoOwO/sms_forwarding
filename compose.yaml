@@ -1,6 +1,26 @@
 name: sms-forwarding
 
 services:
+  dev:
+    image: espressif/idf@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b
+    command:
+      - sleep
+      - infinity
+    init: true
+    network_mode: none
+    working_dir: /workspace
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
+
   mock-server:
     build:
       context: ./mock_server
