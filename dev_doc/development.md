@@ -118,16 +118,32 @@ Web 設定備份與簽章 OTA 也使用同一個入口。密碼只從 `SMS_WEB_P
 ```sh
 SMS_WEB_PASSWORD='<local-secret>' SMS_CONFIG_PASSPHRASE='<local-passphrase>' \
   python3 tools/device.py backup-config /path/to/config.smscfg --host 192.168.20.30
+SMS_CONFIG_PASSPHRASE='<local-passphrase>' \
+  python3 tools/device.py verify-config-backup /path/to/config.smscfg
 python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30
 python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30 \
   --live --confirm-host 192.168.20.30
 ```
 
-`backup-config --dry-run` 只檢查輸出目標；`ota-upload` 預設只解析套件並輸出 hash、
-counter、version、大小與 host，不連線。備份輸出必須是不存在的新路徑，工具會以 mode 0600
-建立並在寫入前檢查 `SMSCFG01` header 與 32,828-byte 上限。OTA live 會先取得 CSRF token，
-以 8,192-byte chunk 上傳並輪詢有界 job；只有 terminal `ACTION_OTA_READY` 才算成功，工具不會
-手動 reset。兩個命令都不會解密備份、不會輸出 credential、passphrase、signature 或 image body。
+`backup-config --dry-run` 只檢查輸出目標。設定備份必須使用不存在的新路徑。
+輸出 parent 必須是目前使用者控制的 trusted local directory。
+工具先以 mode 0600 建立暫存 ciphertext。工具在發布 final path 前執行本機驗證。
+驗證成功後，工具比對 inode，再以 exclusive hard link 發布設定備份。
+驗證失敗或 inode 改變時，工具移除暫存檔案，且不保留 final path。
+
+`verify-config-backup` 是純 offline 命令。此命令不建立 network client，也不連接裝置。
+本機 helper 會驗證 `SMSCFG01`、AES-GCM tag、CFG2 v6 header、generation、長度與 CRC。
+CLI 傳給 helper 時，passphrase 只透過 stdin 傳遞。
+child environment 不包含 `SMS_CONFIG_PASSPHRASE`、`SMS_WEB_PASSWORD` 或 `NODE_*` 變數。
+解密後的 CFG2 只存在 RAM。helper 不輸出或寫入 plaintext，並清除可清除的 sensitive buffer。
+成功輸出只包含 `bytes`、`envelopeVersion`、`schema` 與 `generation`。
+此結果只證明目前 v6 envelope 通過認證，且 CFG2 容器欄位一致。
+命令不執行還原，也不驗證完整欄位語意。結果不證明來源裝置或特定目標可套用。
+
+`ota-upload` 預設只解析套件並輸出 hash、counter、version、大小與 host，不連線。
+OTA live 會先取得 CSRF token，再以 8,192-byte chunk 上傳並輪詢有界 job。
+只有 terminal `ACTION_OTA_READY` 才算成功。工具不會手動 reset。
+這些命令不會輸出 credential、passphrase、signature、plaintext 或 image body。
 
 WiFi 配網會送出帶有非敏感 nonce 的版本化非同步請求。USB 先回覆已接受，
 再由單一受控工作執行 NVS 寫入與連線啟動；USB CLI 只送出一次，之後以
@@ -263,6 +279,7 @@ python3 scripts/generate-firmware-version.py --check
 
 ```sh
 python3 -m unittest tools/test_device.py tools/test_usb_recovery.py
+node --test tools/config_backup_verify.test.mjs
 python3 -m py_compile tools/device.py tools/test_device.py
 ```
 

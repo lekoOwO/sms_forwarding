@@ -27,6 +27,10 @@ import usb_recovery  # noqa: E402
 
 DEVICE = "/dev/serial/by-id/usb-test"
 TARGET = "/dev/ttyACM0"
+CONFIG_ENVELOPE_FIXTURE = json.loads(
+    (ROOT / "mock_server/test/fixtures/config-envelope-v6.json").read_text(encoding="utf-8")
+)
+CONFIG_PASSPHRASE = CONFIG_ENVELOPE_FIXTURE["passphrase"]
 
 
 class DevicePathTest(unittest.TestCase):
@@ -2539,9 +2543,7 @@ class DeviceCommandTest(unittest.TestCase):
 
 
 def _config_fixture() -> bytes:
-    return (
-        b"SMSCFG01" + struct.pack("<HBBI", 1, 1, 1, 210000) + bytes(28) + bytes(16)
-    )
+    return bytes.fromhex(CONFIG_ENVELOPE_FIXTURE["smscfgHex"])
 
 
 def _ota_fixture(image: bytes = b"firmware" * 2000) -> bytes:
@@ -2641,7 +2643,7 @@ class WebTransferTest(unittest.TestCase):
         server, host = self.serve()
         _FakeTransferClient.state = server
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
-                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": "a-passphrase-12"}, clear=True):
+                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE}, clear=True):
             output_path = pathlib.Path(temp) / "backup.smscfg"
             with mock.patch.object(device, "WebClient", _FakeTransferClient):
                 result, output, error = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
@@ -2653,6 +2655,244 @@ class WebTransferTest(unittest.TestCase):
             with mock.patch.object(device, "WebClient", _FakeTransferClient):
                 result, _, _ = self.run_main(["backup-config", str(output_path), "--host", host, "--user", "alice"])
             self.assertNotEqual(result, 0)
+
+    def test_backup_wrong_passphrase_does_not_publish_or_leave_temporary_file(self):
+        server, host = self.serve()
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {
+                    "SMS_WEB_PASSWORD": "secret",
+                    "SMS_CONFIG_PASSPHRASE": "wrong-passphrase-12",
+                }, clear=True):
+            output_path = pathlib.Path(temp) / "backup.smscfg"
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, output, error = self.run_main([
+                    "backup-config", str(output_path), "--host", host, "--user", "alice",
+                ])
+            self.assertNotEqual(result, 0)
+            self.assertFalse(output_path.exists())
+            self.assertEqual(list(pathlib.Path(temp).iterdir()), [])
+            self.assertNotIn("wrong-passphrase-12", output + error)
+
+    def test_backup_rejects_temporary_inode_swap_before_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "backup.smscfg"
+
+            def swap_temporary(path, _passphrase):
+                replacement = path.with_name("replacement.smscfg")
+                replacement.write_bytes(bytes(len(_config_fixture())))
+                replacement.chmod(0o600)
+                replacement.replace(path)
+                return {
+                    "bytes": len(_config_fixture()),
+                    "envelopeVersion": 1,
+                    "generation": 0,
+                    "schema": 6,
+                }
+
+            with mock.patch.object(
+                    device, "_run_config_backup_verifier", side_effect=swap_temporary):
+                with self.assertRaisesRegex(device.DeviceTransferError, "changed"):
+                    device._exclusive_atomic_write(
+                        output, _config_fixture(), CONFIG_PASSPHRASE,
+                    )
+            self.assertFalse(output.exists())
+            self.assertEqual(list(pathlib.Path(temp).iterdir()), [])
+
+    def test_backup_interrupt_after_link_removes_only_verified_final_inode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "backup.smscfg"
+            real_link = os.link
+
+            def link_then_interrupt(*args, **kwargs):
+                real_link(*args, **kwargs)
+                raise KeyboardInterrupt
+
+            with mock.patch.object(device, "_run_config_backup_verifier", return_value={
+                    "bytes": len(_config_fixture()),
+                    "envelopeVersion": 1,
+                    "generation": 0,
+                    "schema": 6,
+                }), mock.patch.object(device.os, "link", side_effect=link_then_interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    device._exclusive_atomic_write(
+                        output, _config_fixture(), CONFIG_PASSPHRASE,
+                    )
+            self.assertFalse(output.exists())
+            self.assertEqual(list(pathlib.Path(temp).iterdir()), [])
+
+    def test_backup_interrupt_after_final_lstat_removes_verified_final_inode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "backup.smscfg"
+            real_link = os.link
+            real_lstat = pathlib.Path.lstat
+            state = {"linked": False, "interrupted": False}
+
+            class InterruptedStat:
+                def __init__(self, value):
+                    self.st_dev = value.st_dev
+                    self.st_ino = value.st_ino
+
+                @property
+                def st_size(self):
+                    raise KeyboardInterrupt
+
+            def link_then_mark(*args, **kwargs):
+                real_link(*args, **kwargs)
+                state["linked"] = True
+
+            def interrupt_after_lstat(path):
+                value = real_lstat(path)
+                if path == output and state["linked"] and not state["interrupted"]:
+                    state["interrupted"] = True
+                    return InterruptedStat(value)
+                return value
+
+            with mock.patch.object(device, "_run_config_backup_verifier", return_value={
+                    "bytes": len(_config_fixture()),
+                    "envelopeVersion": 1,
+                    "generation": 0,
+                    "schema": 6,
+                }), mock.patch.object(device.os, "link", side_effect=link_then_mark), \
+                    mock.patch.object(pathlib.Path, "lstat", new=interrupt_after_lstat):
+                with self.assertRaises(KeyboardInterrupt):
+                    device._exclusive_atomic_write(
+                        output, _config_fixture(), CONFIG_PASSPHRASE,
+                    )
+            self.assertFalse(output.exists())
+            self.assertEqual(list(pathlib.Path(temp).iterdir()), [])
+
+    def test_backup_interrupt_does_not_remove_unrelated_final_inode(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = pathlib.Path(temp) / "backup.smscfg"
+
+            def replace_then_interrupt(_source, destination, **_kwargs):
+                pathlib.Path(destination).write_bytes(b"unrelated")
+                raise KeyboardInterrupt
+
+            with mock.patch.object(device, "_run_config_backup_verifier", return_value={
+                    "bytes": len(_config_fixture()),
+                    "envelopeVersion": 1,
+                    "generation": 0,
+                    "schema": 6,
+                }), mock.patch.object(device.os, "link", side_effect=replace_then_interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    device._exclusive_atomic_write(
+                        output, _config_fixture(), CONFIG_PASSPHRASE,
+                    )
+            self.assertEqual(output.read_bytes(), b"unrelated")
+            self.assertEqual(list(pathlib.Path(temp).iterdir()), [output])
+
+    def test_verify_backup_is_offline_and_outputs_only_safe_metadata(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE}, clear=True):
+            backup = pathlib.Path(temp) / "backup.smscfg"
+            backup.write_bytes(_config_fixture())
+            backup.chmod(0o600)
+            with mock.patch.object(device, "WebClient", side_effect=AssertionError("offline command used network")):
+                result, output, error = self.run_main(["verify-config-backup", str(backup)])
+            self.assertEqual(result, 0, error)
+            self.assertEqual(json.loads(output), {
+                "bytes": 860,
+                "envelopeVersion": 1,
+                "generation": 0,
+                "schema": 6,
+            })
+            self.assertNotIn(CONFIG_PASSPHRASE, output + error)
+            self.assertNotIn(str(backup), output + error)
+
+            link = pathlib.Path(temp) / "linked.smscfg"
+            link.symlink_to(backup)
+            result, _, _ = self.run_main(["verify-config-backup", str(link)])
+            self.assertNotEqual(result, 0)
+
+    def test_verifier_passes_secret_only_on_stdin_and_strips_secret_environment(self):
+        with tempfile.TemporaryDirectory() as temp:
+            backup = pathlib.Path(temp) / "backup.smscfg"
+            backup.write_bytes(_config_fixture())
+            verifier_input = []
+
+            def verifier(command, **kwargs):
+                self.assertEqual(command, [
+                    device.NODE,
+                    str(device.CONFIG_BACKUP_VERIFIER),
+                    str(backup),
+                ])
+                self.assertEqual(kwargs["input"], bytearray(CONFIG_PASSPHRASE, "utf-8"))
+                verifier_input.append(kwargs["input"])
+                self.assertNotIn(CONFIG_PASSPHRASE, " ".join(command))
+                self.assertNotIn("SMS_CONFIG_PASSPHRASE", kwargs["env"])
+                self.assertNotIn("SMS_WEB_PASSWORD", kwargs["env"])
+                self.assertFalse(any(key.startswith("NODE_") for key in kwargs["env"]))
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps({
+                        "bytes": 860,
+                        "envelopeVersion": 1,
+                        "generation": 0,
+                        "schema": 6,
+                    }).encode("utf-8"),
+                    b"",
+                )
+
+            with mock.patch.dict(os.environ, {
+                    "SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE,
+                    "SMS_WEB_PASSWORD": "web-secret",
+                    "NODE_OPTIONS": "--require=/tmp/read-secret.cjs",
+                    "NODE_V8_COVERAGE": "/tmp/node-coverage",
+                }, clear=True), mock.patch.object(device.subprocess, "run", side_effect=verifier):
+                metadata = device._run_config_backup_verifier(backup, CONFIG_PASSPHRASE)
+            self.assertEqual(metadata["schema"], 6)
+            self.assertEqual(verifier_input, [bytearray(len(CONFIG_PASSPHRASE.encode("utf-8")))])
+
+    def test_verify_backup_resolves_relative_path_from_callers_directory(self):
+        previous = pathlib.Path.cwd()
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE}, clear=True):
+            caller = pathlib.Path(temp) / "caller"
+            alias_root = pathlib.Path(temp) / "root"
+            caller.mkdir()
+            alias_root.mkdir()
+            caller.joinpath("backup.smscfg").write_bytes(_config_fixture())
+            invalid_alias = bytearray(_config_fixture())
+            invalid_alias[-1] ^= 1
+            alias_root.joinpath("backup.smscfg").write_bytes(invalid_alias)
+            try:
+                os.chdir(caller)
+                with mock.patch.object(device, "ROOT", alias_root):
+                    result, output, error = self.run_main([
+                        "verify-config-backup", "backup.smscfg",
+                    ])
+            finally:
+                os.chdir(previous)
+        self.assertEqual(result, 0, error)
+        self.assertEqual(json.loads(output)["schema"], 6)
+
+    def test_verify_backup_rejects_symlink_swap_after_regular_file_check(self):
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE}, clear=True):
+            backup = pathlib.Path(temp) / "backup.smscfg"
+            target = pathlib.Path(temp) / "target.smscfg"
+            backup.write_bytes(_config_fixture())
+            target.write_bytes(_config_fixture())
+            regular_file = device._regular_file
+
+            def swap_after_check(path, label, **kwargs):
+                result = regular_file(path, label, **kwargs)
+                path.unlink()
+                path.symlink_to(target)
+                return result
+
+            with mock.patch.object(device, "_regular_file", side_effect=swap_after_check):
+                result, output, error = self.run_main([
+                    "verify-config-backup", str(backup),
+                ])
+            self.assertNotEqual(result, 0)
+            self.assertEqual(output, "")
+            self.assertTrue(backup.is_symlink())
+            self.assertEqual(target.read_bytes(), _config_fixture())
+            self.assertNotIn(CONFIG_PASSPHRASE, error)
 
     def test_ota_live_uploads_8192_chunks_and_requires_exact_confirmation(self):
         server, host = self.serve()
@@ -2707,7 +2947,7 @@ class WebTransferTest(unittest.TestCase):
         server, host = self.serve()
         _FakeTransferClient.state = server
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
-                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": "a-passphrase-12"}, clear=True):
+                os.environ, {"SMS_WEB_PASSWORD": "secret", "SMS_CONFIG_PASSPHRASE": CONFIG_PASSPHRASE}, clear=True):
             output_path = pathlib.Path(temp) / "backup.smscfg"
             server.wrong_status = True
             with mock.patch.object(device, "WebClient", _FakeTransferClient):

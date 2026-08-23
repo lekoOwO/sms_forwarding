@@ -36,6 +36,8 @@ OTA_TEST_PRIVATE_KEY = OTA_TEST_PROFILE_DIR / "ota_test_private.pem"
 OTA_TEST_PUBLIC_DER = OTA_TEST_PROFILE_DIR / "ota_test_public.der"
 OTA_TEST_PUBLIC_KEY = OTA_TEST_PROFILE_DIR / "ota_test_public_key.der.b64"
 OTA_TEST_SIGNER = ROOT / "scripts" / "sign-ota-release.py"
+CONFIG_BACKUP_VERIFIER = ROOT / "tools" / "config_backup_verify.mjs"
+NODE = shutil.which("node") or "node"
 OTA_TEST_VERSION = "1.1.4-dev-test"
 APP_IMAGE_RELATIVE_PATHS = (
     Path("build/idf/sms_forwarding_idf.bin"),
@@ -63,6 +65,7 @@ BOOTLOADER_MAX_SIZE = 0x7000
 CONFIG_MAX_BYTES = 32828
 CONFIG_HEADER_BYTES = 44
 CONFIG_TAG_BYTES = 16
+CONFIG_VERIFY_TIMEOUT = 10.0
 OTA_MAGIC = b"SMSOTA1\n"
 OTA_MAX_MANIFEST_BYTES = 512
 OTA_CHUNK_BYTES = 8192
@@ -709,10 +712,64 @@ def _validate_config_backup(data: bytes) -> bytes:
     return data
 
 
-def _exclusive_atomic_write(path: Path, data: bytes) -> None:
+def _run_config_backup_verifier(path: Path, passphrase: str) -> dict[str, int]:
+    try:
+        verified_path = path.absolute()
+        before = verified_path.stat(follow_symlinks=False)
+    except OSError:
+        raise DeviceTransferError("configuration backup verification failed") from None
+    child_env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("NODE_") and key not in {
+            "SMS_CONFIG_PASSPHRASE", "SMS_WEB_PASSWORD",
+        }
+    }
+    secret = bytearray(passphrase, "utf-8")
+    try:
+        result = subprocess.run(
+            [NODE, str(CONFIG_BACKUP_VERIFIER), str(verified_path)],
+            cwd=ROOT,
+            env=child_env,
+            input=secret,
+            timeout=CONFIG_VERIFY_TIMEOUT,
+            check=False,
+            capture_output=True,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        raise DeviceTransferError("configuration backup verification failed") from None
+    finally:
+        secret[:] = b"\0" * len(secret)
+    if result.returncode != 0 or result.stderr:
+        raise DeviceTransferError("configuration backup verification failed")
+    try:
+        value = json.loads(result.stdout.decode("utf-8"))
+        after = verified_path.stat(follow_symlinks=False)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raise DeviceTransferError("configuration backup verification failed") from None
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev, after.st_ino, after.st_size,
+    ):
+        raise DeviceTransferError("configuration backup changed during verification")
+    size = after.st_size
+    if not isinstance(value, dict) or set(value) != {
+        "bytes", "envelopeVersion", "schema", "generation",
+    } or any(
+        not isinstance(value[key], int) or isinstance(value[key], bool) for key in value
+    ) or value != {
+        "bytes": size,
+        "envelopeVersion": 1,
+        "schema": 6,
+        "generation": 0,
+    }:
+        raise DeviceTransferError("configuration backup verification failed")
+    return value
+
+
+def _exclusive_atomic_write(path: Path, data: bytes, passphrase: str) -> dict[str, int]:
     _validate_output_target(path)
     temporary_name = None
     descriptor = -1
+    identity = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(prefix=".smscfg-", dir=path.parent)
         temporary = Path(temporary_name)
@@ -721,14 +778,32 @@ def _exclusive_atomic_write(path: Path, data: bytes) -> None:
             descriptor = -1
             stream.write(data)
             stream.flush()
+            created = os.fstat(stream.fileno())
+        metadata = _run_config_backup_verifier(temporary, passphrase)
+        current = temporary.lstat()
+        identity = (created.st_dev, created.st_ino, created.st_size)
+        if identity != (current.st_dev, current.st_ino, current.st_size):
+            raise DeviceTransferError("temporary output changed during verification")
         os.link(temporary, path, follow_symlinks=False)
+        final = path.lstat()
+        if identity != (final.st_dev, final.st_ino, final.st_size):
+            raise DeviceTransferError("published output changed during verification")
         temporary.unlink()
         temporary_name = None
+        return metadata
     except FileExistsError:
         raise DeviceTransferError("output already exists") from None
     except OSError:
         raise DeviceTransferError("could not write output") from None
     finally:
+        successful = sys.exc_info()[0] is None
+        if not successful and identity is not None:
+            try:
+                final = path.lstat()
+                if identity == (final.st_dev, final.st_ino, final.st_size):
+                    path.unlink()
+            except OSError:
+                pass
         if descriptor >= 0:
             try:
                 os.close(descriptor)
@@ -777,8 +852,17 @@ def _backup_command(args: argparse.Namespace) -> int:
     downloaded = client.request("GET", f"/api/config/export?id={export_id}", headers={"X-CSRF-Token": token, "Accept": "application/vnd.sms-forwarding.config"}, max_bytes=CONFIG_MAX_BYTES)
     if downloaded.status != 200 or downloaded.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/vnd.sms-forwarding.config":
         raise DeviceTransferError("configuration download returned an unexpected response")
-    _exclusive_atomic_write(output, _validate_config_backup(downloaded.body))
+    _exclusive_atomic_write(output, _validate_config_backup(downloaded.body), passphrase)
     print(json.dumps({"action": "backup-config", "host": args.host, "output": str(output), "bytes": len(downloaded.body), "live": True}, sort_keys=True))
+    return 0
+
+
+def _verify_backup_command(args: argparse.Namespace) -> int:
+    backup = _regular_file(Path(args.backup), "configuration backup")
+    passphrase = _validate_passphrase(
+        _read_secret("SMS_CONFIG_PASSPHRASE", args.passphrase_file, "passphrase file")
+    )
+    print(json.dumps(_run_config_backup_verifier(backup, passphrase), sort_keys=True))
     return 0
 
 
@@ -2335,6 +2419,12 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--passphrase-file", default=None)
     backup.add_argument("--dry-run", action="store_true", help="validate the output target without contacting the device")
 
+    verify_backup = commands.add_parser(
+        "verify-config-backup", help="verify a current v6 encrypted configuration backup offline"
+    )
+    verify_backup.add_argument("backup", help="existing .smscfg backup path")
+    verify_backup.add_argument("--passphrase-file", default=None)
+
     ota_upload = commands.add_parser("ota-upload", help="upload a signed .smsota package through Web OTA")
     ota_upload.add_argument("package", nargs="?", help="existing signed .smsota package")
     ota_upload.add_argument("--package", dest="package_option", default=None, help="existing signed .smsota package")
@@ -2420,6 +2510,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ota_test_package_command(args)
         if args.command == "backup-config":
             return _backup_command(args)
+        if args.command == "verify-config-backup":
+            return _verify_backup_command(args)
         if args.command == "ota-upload":
             return _ota_upload_command(args)
         if args.command == "flash-bootloader":

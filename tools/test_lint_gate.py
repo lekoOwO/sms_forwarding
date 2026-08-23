@@ -89,6 +89,7 @@ class LintGateTests(unittest.TestCase):
             "python3 components/idf_wifi/test/test_wifi_security.py",
             "python3 tools/test_idf_baseline.py",
             "python3 tools/test_device.py",
+            "node --test tools/config_backup_verify.test.mjs",
             "python3 tools/test_ota_test_profile.py",
             "python3 tools/test_ota_observability.py",
             "python3 tools/test_usb_recovery.py",
@@ -213,7 +214,7 @@ class LintGateTests(unittest.TestCase):
 
     def test_ci_host_contracts_reject_bypass_mutations(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        command = "python3 tools/test_ota_observability.py"
+        command = "node --test tools/config_backup_verify.test.mjs"
         step = "      - name: Run host contract tests\n        shell: bash\n        run: |"
         before_host = "      - name: Build and verify Web UI assets"
         build_firmware = "      - name: Build firmware"
