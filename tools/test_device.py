@@ -1070,7 +1070,7 @@ class DeviceCommandTest(unittest.TestCase):
         confirm.assert_called_once_with(DEVICE, "usb-test")
         transaction.assert_called_once_with(
             DEVICE, device.STATE_TIMEOUT, device.usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
-            b"", deadline=105.0,
+            b"", deadline=130.0,
         )
         self.assertEqual(json.loads(output)["status"], "completed")
 
@@ -1319,6 +1319,61 @@ class DeviceCommandTest(unittest.TestCase):
             process_calls[0][0][process_calls[0][0].index("--entrypoint") + 1],
             device.CONTAINER_PYTHON,
         )
+
+    def test_ota_state_fallback_passes_remaining_deadline_to_backend(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        state = {
+            "active_offset": usb_recovery.APP1_OFFSET,
+            "image_state": "valid",
+            "pending_verify": False,
+            "accepted": 0,
+            "pending": 0,
+            "pending_address": 0,
+        }
+        process_calls = []
+
+        def fake_process(command, **kwargs):
+            process_calls.append((command, kwargs))
+            return mock.Mock(returncode=0, stdout=json.dumps(state), stderr=b"")
+
+        with mock.patch.object(
+            device.usb_recovery,
+            "run_transaction",
+            side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
+        ), mock.patch.object(device, "_run_process", side_effect=fake_process), \
+                mock.patch.object(device.time, "monotonic", return_value=100.0):
+            result = device._ota_state(ref, deadline=130.0)
+
+        self.assertEqual(result, state)
+        command, kwargs = process_calls[0]
+        self.assertEqual(
+            float(command[command.index("--timeout") + 1]),
+            device.CONTAINER_TIMEOUT,
+        )
+        self.assertEqual(kwargs["timeout"], device.CONTAINER_TIMEOUT)
+
+    def test_ota_migration_fallback_uses_the_same_backend_budget(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        process_calls = []
+
+        def fake_process(command, **kwargs):
+            process_calls.append((command, kwargs))
+            return mock.Mock(returncode=0, stdout='{"ok":true}', stderr=b"")
+
+        with mock.patch.object(device, "_run_process", side_effect=fake_process), \
+                mock.patch.object(device.time, "monotonic", return_value=100.0):
+            result = device._container_recovery(
+                ref, device.STATE_TIMEOUT, caller_timeout=device.CONTAINER_TIMEOUT,
+                deadline=130.0, command=usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        command, kwargs = process_calls[0]
+        self.assertEqual(
+            float(command[command.index("--timeout") + 1]),
+            device.CONTAINER_TIMEOUT,
+        )
+        self.assertEqual(kwargs["timeout"], device.CONTAINER_TIMEOUT)
 
     def test_state_container_fallback_rejects_late_success_after_absolute_deadline(self):
         ref = device.SerialDevice(DEVICE, TARGET)

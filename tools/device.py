@@ -949,9 +949,13 @@ def _container_recovery(
     if deadline is not None:
         process_timeout = min(process_timeout, _remaining(deadline))
         timeout = min(timeout, process_timeout)
+    backend_timeout = process_timeout if query is None and command in {
+        usb_recovery.COMMAND_OTA_STATE,
+        usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+    } else timeout
     arguments = [
         "/workspace/tools/usb_recovery.py", "--device", CONTAINER_DEVICE_PATH,
-        "--timeout", str(timeout), "--internal-container",
+        "--timeout", str(backend_timeout), "--internal-container",
     ]
     if query is None:
         if command == usb_recovery.COMMAND_STATE:
@@ -1906,7 +1910,7 @@ def _ota_migration_recover_command(args: argparse.Namespace) -> int:
 
     device = resolve_serial_device(device_path)
     confirm_basename(device_path, args.confirm)
-    deadline = time.monotonic() + STATE_TIMEOUT
+    deadline = time.monotonic() + CONTAINER_TIMEOUT
     _ota_migration_recover(device, timeout=STATE_TIMEOUT, deadline=deadline)
     plan["status"] = "completed"
     print(json.dumps(plan, sort_keys=True))
