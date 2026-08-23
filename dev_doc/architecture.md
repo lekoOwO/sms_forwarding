@@ -68,9 +68,27 @@ GET 與 ntfy 僅支援 WiFi，漫遊傳送與資料啟用維持 fail closed。
 
 心跳間隔可設定為 1 至 240 小時。時間未完成 NTP 同步時，scheduler 不會開始心跳計時。
 
-## 2026-08-22 實機證據
+## 實機證據
 
-這是單次去識別化硬體紀錄，不是通用的 modem protocol fact：
+### 2026-08-24 ML307A 已註冊紀錄
+
+這是單次去識別化的唯讀硬體紀錄，不是通用的 modem protocol fact：
+
+- 板型與韌體版本：去識別化摘要未記錄。`device.py doctor` 回報 `ready=true` 與 `host_read_write=true`。
+- 模組與輸入：ML307A；唯讀輸入為 `CPIN`、`CEREG`、`COPS`、`CGATT`、`CGACT` 與 `CGPADDR` 查詢。
+- 結果：`CPIN` ready；`CEREG stat=1` 是 home registered、E-UTRAN 且 `roaming=false`。
+  `COPS` 是 automatic，operator present，且 access technology 是 E-UTRAN。
+  `CGATT` 是 attached；`CGACT` 只有一個 active context。
+- `CGPADDR` 結構只有一個有效回覆行與一個 CID。該 CID 同時有 IPv4 與 IPv6。
+- `cc10c2a` 提供 `CGPADDR` sanitizer 結構；`41d3708` 提供 runtime dual-stack parser。
+
+文件不記錄 operator、ICCID、IMSI、IMEI、address、APN 或 credential 值。
+此次操作沒有使用 write AT、manual `COPS`，也沒有執行 `CFUN`、`CGATT`、`CGACT` 或 PDP 狀態變更。
+這份紀錄不證明 Internet、TLS 或 provider delivery 可用。4G push 維持 fail closed。
+
+### 2026-08-22 ML307A 未註冊歷史紀錄
+
+這是較早的單次去識別化硬體紀錄，不是通用的 modem protocol fact：
 
 - 板型：去識別化報告未記錄。
 - 模組：ML307A。
