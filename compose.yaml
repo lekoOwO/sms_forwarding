@@ -1,0 +1,28 @@
+name: sms-forwarding
+
+services:
+  mock-server:
+    build:
+      context: ./mock_server
+    environment:
+      AUTH_REQUIRED: "false"
+      OPENAPI_PATH: /spec/openapi.json
+      PORT: "3000"
+      WEB_ROOT: /web/build
+    init: true
+    ports:
+      - target: 3000
+        published: "4174"
+        protocol: tcp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./web/build
+        target: /web/build
+        read_only: true
+      - type: bind
+        source: ./dev_doc/openapi.json
+        target: /spec/openapi.json
+        read_only: true
