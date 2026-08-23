@@ -102,6 +102,16 @@ GET 與 ntfy 僅支援 WiFi，漫遊傳送與資料啟用維持 fail closed。
 這次結果表示 SIM 與 RF 路徑有回應，但尚未完成標準網路註冊與資料啟用。
 它不證明 4G 可用；韌體因此不會把 4G push、roaming 或 data activation 視為已成功。
 
+### 2026-08-16 Arduino 歷史 TLS 紀錄
+
+這份去識別化紀錄來自 `origin/develop` 的 Arduino 韌體，不是目前原生 ESP-IDF runtime 的實機證據：
+
+- 板型、模組與輸入：ESP32-C3、ML307A，以及 NTP 同步後的嚴格 TLS 1.2 MHTTP private-CA probe。
+- 結果：伺服器端確認正向 server-auth handshake 完成。
+- 證據邊界：wrong-certificate、hostname mismatch 與 expired-certificate rejection 都沒有可信的負向證據。
+
+此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。4G push 維持 fail closed。
+
 ## 設定與備份
 
 `idf_config` 將設定保存在 `appcfg` NVS 的雙槽格式。每次更新會先完成編碼與讀回驗證，再更新有效 marker。

@@ -17,9 +17,33 @@ python3 tools/check_idf_baseline.py
 
 此命令會檢查工具鏈 pin、分區表與第三方授權文件。
 
+### 持續開發 container
+
+`dev` service 使用與 CI 相同的固定 ESP-IDF image。Repository 掛載在 `/workspace`，build output 會保留在 host。
+
+此 service 預設不掛載 USB device，也不使用 privileged mode 或 host network。Container root filesystem 是唯讀的。
+
+使用下列入口管理 service：
+
+```sh
+scripts/dev.sh dev-start
+scripts/dev.sh dev-shell
+scripts/dev.sh firmware-build
+scripts/dev.sh dev-logs
+scripts/dev.sh dev-stop
+```
+
+`dev-shell` 與 `firmware-build` 會在需要時啟動 service。`dev-shell` 會載入固定的 ESP-IDF 5.5.4 環境。
+
 ## 建置韌體
 
-在 POSIX shell 設定 `IDF_PATH`，然後使用單一裝置入口。Production 是預設，release 必須明確指定：
+一般 production build 不需要硬體：
+
+```sh
+scripts/dev.sh firmware-build
+```
+
+如果 host 已安裝 ESP-IDF，請設定 `IDF_PATH` 並使用單一裝置入口。Production 是預設，release 必須明確指定：
 
 ```sh
 IDF_PATH=/path/to/esp-idf-v5.5.4 python3 tools/device.py build
@@ -275,6 +299,14 @@ python3 scripts/generate-firmware-version.py --check
 
 ## Focused checks
 
+開發 stack：
+
+```sh
+python3 tools/test_mock_dev_stack.py
+bash -n scripts/dev.sh
+docker compose -f compose.yaml config --quiet
+```
+
 裝置工具（不連接實機）：
 
 ```sh
@@ -359,6 +391,17 @@ CI compile 不會證明 UART 時序、SIM、PDU、SMTP、推送服務或 OTA rol
 
 這次結果表示 SIM 與 RF 路徑有回應，但尚未完成標準網路註冊與資料啟用。
 它不證明 4G 可用。4G push、roaming 與 data activation 必須維持 fail closed。
+
+### 2026-08-16 Arduino 歷史 TLS 紀錄
+
+這份去識別化紀錄來自 `origin/develop` 的 Arduino 韌體，不是目前原生 ESP-IDF runtime 的實機證據：
+
+- 板型與模組：ESP32-C3 與 ML307A。
+- 輸入：NTP 同步後的嚴格 TLS 1.2 MHTTP private-CA probe。
+- 結果：伺服器端確認正向 server-auth handshake 完成。
+- 證據邊界：wrong-certificate、hostname mismatch 與 expired-certificate rejection 都沒有可信的負向證據。
+
+此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。4G push 維持 fail closed。
 
 ## PR 清理 gate
 
