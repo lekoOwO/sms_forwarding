@@ -1455,41 +1455,6 @@ static std::string parse_cnum_phone(const std::string& resp)
     return normalize_msisdn(phone);
 }
 
-static bool valid_ipv4_address(const std::string& value)
-{
-    int parts = 0;
-    size_t pos = 0;
-    bool non_zero = false;
-    while (pos <= value.size() && parts < 4) {
-        size_t dot = value.find('.', pos);
-        std::string part = value.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
-        if (part.empty() || part.size() > 3) return false;
-        if (part.size() > 1 && part[0] == '0') return false;
-        long octet = -1;
-        if (!parse_long_token(part, octet) || octet < 0 || octet > 255) return false;
-        if (octet != 0) non_zero = true;
-        ++parts;
-        if (dot == std::string::npos) break;
-        if (parts >= 4) return false;
-        pos = dot + 1;
-    }
-    return parts == 4 && non_zero;
-}
-
-static bool parse_cgpaddr_ip(const std::string& resp, std::string& ip)
-{
-    size_t p = resp.find("+CGPADDR:");
-    if (p == std::string::npos) return false;
-    size_t comma = resp.find(',', p);
-    size_t eol = resp.find('\n', p);
-    if (eol == std::string::npos) eol = resp.size();
-    if (comma == std::string::npos || comma >= eol) return false;
-    ip = idf_util_trim_copy(resp.substr(comma + 1, eol - comma - 1));
-    ip.erase(std::remove(ip.begin(), ip.end(), '"'), ip.end());
-    if (!valid_ipv4_address(ip)) return false;
-    return true;
-}
-
 static bool apn_valid_for_at(const std::string& apn)
 {
     return apn.size() <= 96 && apn.find('"') == std::string::npos &&
@@ -1500,9 +1465,9 @@ static bool sample_cell_ip_once(void)
 {
     std::string resp;
     std::string ip;
-    if (send_ok("AT+CGPADDR=1", 3000, &resp) && parse_cgpaddr_ip(resp, ip)) {
+    if (send_ok("AT+CGPADDR=1", 3000, &resp) && idf_modem_parse_cgpaddr_ipv4(resp, ip)) {
         set_status_cell_ip(ip);
-        idf_logf("cellular PDP IP: %s", ip.c_str());
+        idf_log_line("cellular IP acquired");
         return true;
     }
     set_status_cell_ip("");

@@ -221,6 +221,12 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertNotIn("after.iccid.c_str()", identity)
         self.assertNotIn("after.imsi.c_str()", identity)
 
+    def test_cellular_ip_log_does_not_disclose_address(self):
+        source = SOURCE.read_text()
+        sample = function_body(source, "sample_cell_ip_once")
+        self.assertNotIn("ip.c_str()", sample)
+        self.assertIn('idf_log_line("cellular IP acquired")', sample)
+
     def test_registration_state_gates_data_and_rlos_recovery(self):
         source = SOURCE.read_text()
         data_mode = function_body(source, "apply_configured_data_mode_once")

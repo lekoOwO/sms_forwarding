@@ -230,6 +230,61 @@ struct AbsoluteDeadlineFixture {
 
 int main()
 {
+    const std::string ipv4 = std::to_string(192) + "." + std::to_string(0) + "." +
+                             std::to_string(2) + "." + std::to_string(44);
+    const std::string second_ipv4 = std::to_string(198) + "." + std::to_string(51) + "." +
+                                    std::to_string(100) + "." + std::to_string(7);
+    const std::string ipv6 = std::string("2001") + ":" + "db8" + "::" + "44";
+    const std::string full_ipv6 = std::string("2001") + ":" + "db8" + ":0:0:0:0:0:" + "44";
+    const std::string mixed_ipv6 = std::string("::") + "ffff" + ":" + second_ipv4;
+    const auto cgpaddr_response = [](const std::string& fields) {
+        return std::string("\r\n+CGPADDR: ") + fields + "\r\nOK\r\n";
+    };
+    std::string parsed_ip;
+    const auto accept_cgpaddr = [&parsed_ip, &cgpaddr_response](
+                                    const std::string& fields, const std::string& expected) {
+        parsed_ip.clear();
+        assert(idf_modem_parse_cgpaddr_ipv4(cgpaddr_response(fields), parsed_ip));
+        assert(parsed_ip == expected);
+    };
+    const auto reject_cgpaddr = [&parsed_ip](const std::string& response) {
+        parsed_ip = "unchanged";
+        assert(!idf_modem_parse_cgpaddr_ipv4(response, parsed_ip));
+        assert(parsed_ip == "unchanged");
+    };
+    accept_cgpaddr("1," + ipv4, ipv4);
+    accept_cgpaddr("255,\"" + ipv4 + "\"", ipv4);
+    for (bool quoted : {false, true}) {
+        const std::string quote = quoted ? "\"" : "";
+        accept_cgpaddr("1," + quote + ipv4 + quote + "," + quote + ipv6 + quote, ipv4);
+    }
+    accept_cgpaddr("1," + ipv4 + "," + full_ipv6, ipv4);
+    accept_cgpaddr("1," + ipv4 + "," + mixed_ipv6, ipv4);
+    accept_cgpaddr("1,\"" + ipv6 + "\",\"" + second_ipv4 + "\"", second_ipv4);
+
+    reject_cgpaddr(cgpaddr_response("1," + ipv4 + "," + ipv6 + "g"));
+    for (const std::string& malformed_ipv6 : {
+             ipv6 + "::" + "1",
+             std::string("2001") + ":" + "db8" + ":" + "1",
+             std::string("1:2:3:4:5:6:7:8:9"),
+             std::string("12345") + "::" + "1",
+         }) {
+        reject_cgpaddr(cgpaddr_response("1," + ipv4 + "," + malformed_ipv6));
+    }
+    reject_cgpaddr(cgpaddr_response("1"));
+    reject_cgpaddr(cgpaddr_response("1," + ipv6));
+    for (const std::string& cid : {std::string("0"), std::string("256"), std::string("bad")}) {
+        reject_cgpaddr(cgpaddr_response(cid + "," + ipv4));
+    }
+    reject_cgpaddr(cgpaddr_response("1," + ipv4 + "x," + ipv6));
+    reject_cgpaddr(cgpaddr_response("1,\"" + ipv4));
+    reject_cgpaddr(cgpaddr_response("1,\""));
+    reject_cgpaddr(cgpaddr_response("1," + ipv4 + "," + ipv6 + "," + second_ipv4));
+    reject_cgpaddr(cgpaddr_response("1," + ipv4 + "," + ipv6 + "\x1b"));
+    reject_cgpaddr("+CGPADDR: 1," + ipv4 + "\r\n+CGPADDR: 1," + second_ipv4 +
+                   "\r\nOK\r\n");
+    reject_cgpaddr(cgpaddr_response("1," + ipv4) + "NO CARRIER\r\n");
+
     int cereg_stat = -1;
     assert(idf_modem_parse_cereg_status("\r\n+CEREG: 0,11\r\nOK\r\n", cereg_stat));
     assert(cereg_stat == 11); // 3GPP RLOS-only must remain observable.
