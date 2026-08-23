@@ -49,6 +49,7 @@ class MockDevStackTests(unittest.TestCase):
         self.assertEqual(dev["network_mode"], "none")
         self.assertEqual(dev["security_opt"], ["no-new-privileges:true"])
         self.assertEqual(dev["tmpfs"], ["/tmp:rw,nosuid,nodev,noexec,size=64m"])
+        self.assertEqual(dev.get("environment"), {"CCACHE_DIR": "/tmp/ccache"})
         self.assertNotIn("devices", dev)
         self.assertFalse(dev.get("privileged", False))
         self.assertNotIn("secrets", dev)

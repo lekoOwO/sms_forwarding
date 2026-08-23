@@ -9,6 +9,8 @@ services:
     init: true
     network_mode: none
     working_dir: /workspace
+    environment:
+      CCACHE_DIR: /tmp/ccache
     read_only: true
     cap_drop:
       - ALL
