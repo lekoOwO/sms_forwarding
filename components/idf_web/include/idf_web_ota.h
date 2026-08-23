@@ -8,6 +8,13 @@
 #include "esp_err.h"
 #include "idf_web_ota_core.h"
 
+#ifndef FIRMWARE_IS_RELEASE
+#define FIRMWARE_IS_RELEASE 0
+#endif
+#ifndef SMS_USB_RECOVERY
+#define SMS_USB_RECOVERY 0
+#endif
+
 esp_err_t idf_web_ota_init();
 IdfWebOtaCode idf_web_ota_start(const std::string& manifest,
                                 const uint8_t* signature, size_t signature_size,
@@ -34,6 +41,11 @@ struct IdfWebOtaState {
 };
 
 esp_err_t idf_web_ota_get_state(IdfWebOtaState* output);
+
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+// One-time migration escape hatch for a USB recovery build with no metadata floor.
+esp_err_t idf_web_ota_migration_recover();
+#endif
 
 // Called by the boot health task. A rollback decision does not return.
 esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,

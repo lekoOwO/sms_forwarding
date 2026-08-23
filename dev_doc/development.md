@@ -170,6 +170,22 @@ python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app0
 replay 與 signed OTA 證據前，停止於 host build/package 與唯讀 `ota-state`；不要執行
 實機 flash、Web upload 或宣稱 signed OTA READY。
 
+若一次性遷移後裝置停在 `pending-verify`，且舊 metadata 的
+`accepted`、`pending`、`pendingAddr` 都不存在或是正確型別的零值，可在非 release
+USB recovery build 使用下列明確命令：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... ota-migration-recover \
+  --live --confirm <by-id-basename>
+```
+
+命令只接受目前 running image 的 `pending-verify` 狀態，拒絕 active OTA、restart、
+非零或錯誤型別 metadata，以及可辨識為 `VALID` 的另一個 app slot；成功後讀回
+`VALID`。它不寫入 OTA counter，不提供 Web route，也不清除 NVS、`appcfg` 或 app
+slot，亦不擦除 `otadata`；只有 ESP-IDF mark-valid 的 running-image state 會更新 `otadata`。
+預設仍是 dry-run，且 `usb_recovery.py` 的底層命令只供
+`device.py` 的 pinned container 使用。
+
 要建立故意在 pending verification 回復的獨立開發映像，使用同一個 ignored ephemeral
 key，但不同的 build/cache 目錄：
 

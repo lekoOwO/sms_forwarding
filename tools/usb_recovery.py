@@ -31,6 +31,7 @@ COMMAND_WIFI_PROVISION_ASYNC = 0x03
 COMMAND_WIFI_PROVISION_STATUS = 0x04
 COMMAND_MODEM_QUERY = 0x05
 COMMAND_OTA_STATE = 0x06
+COMMAND_OTA_MIGRATION_RECOVER = 0x07
 RESPONSE_MASK = 0x80
 RESPONSE_STATE = COMMAND_STATE | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION = COMMAND_WIFI_PROVISION | RESPONSE_MASK
@@ -38,6 +39,7 @@ RESPONSE_WIFI_PROVISION_ASYNC = COMMAND_WIFI_PROVISION_ASYNC | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION_STATUS = COMMAND_WIFI_PROVISION_STATUS | RESPONSE_MASK
 RESPONSE_MODEM_QUERY = COMMAND_MODEM_QUERY | RESPONSE_MASK
 RESPONSE_OTA_STATE = COMMAND_OTA_STATE | RESPONSE_MASK
+RESPONSE_OTA_MIGRATION_RECOVER = COMMAND_OTA_MIGRATION_RECOVER | RESPONSE_MASK
 QUERY_ATI = 0x01
 QUERY_CPIN = 0x02
 QUERY_CEREG = 0x03
@@ -81,6 +83,7 @@ REQUEST_COMMANDS = frozenset((
     COMMAND_WIFI_PROVISION_STATUS,
     COMMAND_MODEM_QUERY,
     COMMAND_OTA_STATE,
+    COMMAND_OTA_MIGRATION_RECOVER,
 ))
 RESPONSE_COMMANDS = frozenset((
     RESPONSE_STATE,
@@ -89,6 +92,7 @@ RESPONSE_COMMANDS = frozenset((
     RESPONSE_WIFI_PROVISION_STATUS,
     RESPONSE_MODEM_QUERY,
     RESPONSE_OTA_STATE,
+    RESPONSE_OTA_MIGRATION_RECOVER,
 ))
 ALL_COMMANDS = REQUEST_COMMANDS | RESPONSE_COMMANDS
 
@@ -249,7 +253,7 @@ def _max_payload(command: int) -> int:
         return MAX_ASYNC_PROVISION_PAYLOAD
     if command == COMMAND_MODEM_QUERY:
         return MAX_QUERY_PAYLOAD
-    if command == COMMAND_OTA_STATE:
+    if command in (COMMAND_OTA_STATE, COMMAND_OTA_MIGRATION_RECOVER):
         return 0
     return MAX_PAYLOAD
 
@@ -1398,6 +1402,22 @@ def _ota_state_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ota_migration_recover_command(args: argparse.Namespace) -> int:
+    if not getattr(args, "internal_container", False):
+        raise ValueError("OTA migration recovery is available through tools/device.py")
+    timeout = validate_timeout(STATE_TIMEOUT if args.timeout is None else args.timeout)
+    internal = {"internal_container": True} if getattr(args, "internal_container", False) else {}
+    deadline = time.monotonic() + timeout
+    response = run_transaction(
+        args.device, timeout, COMMAND_OTA_MIGRATION_RECOVER, b"",
+        deadline=deadline, **internal,
+    )
+    if response.payload:
+        raise DeviceError("malformed OTA migration response")
+    print('{"ok":true}')
+    return 0
+
+
 def _query_command(args: argparse.Namespace) -> int:
     query_name = args.query_option or args.query_name
     if not query_name:
@@ -1522,6 +1542,7 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("state")
     commands.add_parser("ota-state")
+    commands.add_parser("ota-migration-recover", help=argparse.SUPPRESS)
     wifi = commands.add_parser(
         "wifi-provision",
         help="provision a network; an open network requires a populated Web scan cache",
@@ -1545,6 +1566,8 @@ def main(argv: list[str] | None = None) -> int:
             return _state_command(args)
         if args.command == "ota-state":
             return _ota_state_command(args)
+        if args.command == "ota-migration-recover":
+            return _ota_migration_recover_command(args)
         if args.command == "query":
             return _query_command(args)
         if args.command == "diag-batch":

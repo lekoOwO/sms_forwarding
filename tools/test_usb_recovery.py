@@ -1208,6 +1208,11 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
                 b"x" * (usb_recovery.MAX_PAYLOAD + 1),
                 sequence=0,
             )
+        usb_recovery.build_frame(usb_recovery.COMMAND_OTA_MIGRATION_RECOVER, b"", sequence=0)
+        with self.assertRaises(ValueError):
+            usb_recovery.build_frame(
+                usb_recovery.COMMAND_OTA_MIGRATION_RECOVER, b"x", sequence=0,
+            )
         parser = usb_recovery.FrameParser(usb_recovery.RESPONSE_COMMANDS)
         unknown = usb_recovery._build_unchecked_frame(0x7F, b"", sequence=0)
         self.assertEqual(parser.feed(unknown), [])
@@ -1244,6 +1249,28 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             ]), 0)
         self.assertEqual(calls[0][:4], (
             usb_recovery.INTERNAL_DEVICE_PATH, 2.25, usb_recovery.COMMAND_STATE, b"",
+        ))
+        self.assertTrue(calls[0][4]["internal_container"])
+        self.assertIn("deadline", calls[0][4])
+
+    def test_container_cli_migration_recovery_sends_empty_payload(self):
+        calls = []
+
+        def fake_transaction(path, timeout, command, payload, **kwargs):
+            calls.append((path, timeout, command, payload, kwargs))
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_OTA_MIGRATION_RECOVER, 0, b""
+            )
+
+        with mock.patch.dict(os.environ, {"SMS_DEVICE_IN_CONTAINER": "1"}), \
+                mock.patch.object(usb_recovery, "run_transaction", side_effect=fake_transaction):
+            self.assertEqual(usb_recovery.main([
+                "--device", usb_recovery.INTERNAL_DEVICE_PATH,
+                "--timeout", "2.25", "--internal-container", "ota-migration-recover",
+            ]), 0)
+        self.assertEqual(calls[0][:4], (
+            usb_recovery.INTERNAL_DEVICE_PATH, 2.25,
+            usb_recovery.COMMAND_OTA_MIGRATION_RECOVER, b"",
         ))
         self.assertTrue(calls[0][4]["internal_container"])
         self.assertIn("deadline", calls[0][4])
@@ -1888,6 +1915,7 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
         root_cmake = (ROOT / "CMakeLists.txt").read_text(encoding="utf-8")
         main_cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
         source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
+        ota_source = (ROOT / "components" / "idf_web" / "idf_web_ota.cpp").read_text(encoding="utf-8")
         self.assertIn("SMS_USB_RECOVERY", root_cmake)
         self.assertIn("FIRMWARE_IS_RELEASE", root_cmake)
         self.assertIn("idf_build_set_property(COMPILE_DEFINITIONS", root_cmake)
@@ -1897,6 +1925,8 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
         self.assertIn('target_compile_options(${COMPONENT_LIB} PRIVATE "-fstack-usage")', main_cmake)
         self.assertIn("#if FIRMWARE_IS_RELEASE && SMS_USB_RECOVERY", source)
         self.assertIn("#error", source)
+        self.assertIn("#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE", ota_source)
+        self.assertIn("idf_web_ota_migration_recover", ota_source)
         self.assertIn('#include "lwip/sockets.h"', source)
         self.assertIn("usb_serial_jtag_driver_install", source)
         self.assertIn("usb_serial_jtag_read_bytes", source)
@@ -1956,6 +1986,7 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
                 text=True,
             ).stdout
             self.assertNotRegex(symbols, r"idf_usb_recovery_start|idf_modem_usb_query|usb_query_command")
+            self.assertNotRegex(symbols, r"idf_web_ota_migration_recover")
 
 
 if __name__ == "__main__":

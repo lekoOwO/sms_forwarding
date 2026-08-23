@@ -99,6 +99,10 @@ IdfWebOtaHealthDecision idf_web_ota_health_decide(
     bool deadline_expired, uint32_t accepted, uint32_t pending,
     uint32_t running_address, uint32_t pending_address);
 
+bool idf_web_ota_migration_recovery_allowed(
+    IdfWebOtaImageState state, uint32_t accepted, uint32_t pending,
+    uint32_t pending_address);
+
 struct IdfWebOtaHealthPlatform {
     void* context = nullptr;
     bool (*bind_pending_address)(void*, uint32_t) = nullptr;

@@ -266,6 +266,14 @@ IdfWebOtaHealthDecision idf_web_ota_health_decide(
     return IdfWebOtaHealthDecision::ClearStale;
 }
 
+bool idf_web_ota_migration_recovery_allowed(
+    IdfWebOtaImageState state, uint32_t accepted, uint32_t pending,
+    uint32_t pending_address)
+{
+    return state == IdfWebOtaImageState::PendingVerify &&
+           accepted == 0 && pending == 0 && pending_address == 0;
+}
+
 IdfWebOtaHealthResult idf_web_ota_apply_health(
     IdfWebOtaImageState state, bool http_live, bool management_reachable,
     bool deadline_expired, uint32_t accepted, uint32_t pending,

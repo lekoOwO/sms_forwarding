@@ -32,6 +32,7 @@
 #include "idf_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "nvs.h"
 
 namespace {
 
@@ -44,6 +45,9 @@ constexpr uint8_t kCommandWifiProvisionAsync = 0x03;
 constexpr uint8_t kCommandWifiProvisionStatus = 0x04;
 constexpr uint8_t kCommandModemQuery = 0x05;
 constexpr uint8_t kCommandOtaState = 0x06;
+#if !FIRMWARE_IS_RELEASE
+constexpr uint8_t kCommandOtaMigrationRecover = 0x07;
+#endif
 constexpr uint8_t kResponseMask = 0x80;
 constexpr size_t kHeaderSize = 7;
 constexpr size_t kCrcSize = 2;
@@ -107,7 +111,11 @@ static void secure_zero(void* data, size_t length)
 static size_t command_payload_limit(uint8_t command)
 {
     if (command == kCommandModemQuery) return kMaxQueryRequestPayload;
-    if (command == kCommandOtaState) return 0;
+    if (command == kCommandOtaState
+#if !FIRMWARE_IS_RELEASE
+        || command == kCommandOtaMigrationRecover
+#endif
+    ) return 0;
     return command == kCommandWifiProvisionAsync ? kMaxAsyncPayload : kMaxLegacyPayload;
 }
 
@@ -115,7 +123,11 @@ static bool request_command(uint8_t command)
 {
     return command == kCommandState || command == kCommandWifiProvision ||
            command == kCommandWifiProvisionAsync || command == kCommandWifiProvisionStatus ||
-           command == kCommandModemQuery || command == kCommandOtaState;
+           command == kCommandModemQuery || command == kCommandOtaState
+#if !FIRMWARE_IS_RELEASE
+           || command == kCommandOtaMigrationRecover
+#endif
+        ;
 }
 
 static uint16_t crc16(const uint8_t* bytes, size_t length)
@@ -226,6 +238,7 @@ static Status map_error(esp_err_t err)
     if (err == ESP_OK) return Status::Ok;
     if (err == ESP_ERR_INVALID_ARG) return Status::InvalidArg;
     if (err == ESP_ERR_NOT_FOUND) return Status::NotFound;
+    if (err == ESP_ERR_NVS_NOT_FOUND) return Status::NotFound;
     if (err == ESP_ERR_INVALID_STATE) return Status::InvalidState;
     if (err == ESP_ERR_TIMEOUT) return Status::Timeout;
     if (err == ESP_ERR_NO_MEM) return Status::NoMem;
@@ -465,6 +478,14 @@ static Status ota_state(const Frame& frame, uint8_t* output, size_t* output_leng
     return Status::Ok;
 }
 
+#if !FIRMWARE_IS_RELEASE
+static Status ota_migration_recover(const Frame& frame)
+{
+    if (frame.payload_length != 0) return Status::InvalidArg;
+    return map_error(idf_web_ota_migration_recover());
+}
+#endif
+
 static size_t state_payload(uint8_t* output)
 {
     const IdfWifiStatus wifi = idf_wifi_get_status();
@@ -521,6 +542,10 @@ static void handle_frame(const Frame& frame)
         status = modem_query(frame, payload + 1, &payload_length);
     } else if (frame.command == kCommandOtaState) {
         status = ota_state(frame, payload + 1, &payload_length);
+#if !FIRMWARE_IS_RELEASE
+    } else if (frame.command == kCommandOtaMigrationRecover) {
+        status = ota_migration_recover(frame);
+#endif
     }
     payload[0] = static_cast<uint8_t>(status);
     (void)write_frame(static_cast<uint8_t>(frame.command | kResponseMask), frame.sequence,

@@ -402,6 +402,66 @@ esp_err_t idf_web_ota_get_state(IdfWebOtaState* output)
     return read_ota_state(output);
 }
 
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+esp_err_t idf_web_ota_migration_recover()
+{
+    const esp_err_t init_error = idf_web_ota_init();
+    if (init_error != ESP_OK) return init_error;
+    if (!lock()) return ESP_ERR_TIMEOUT;
+    const auto finish = [](esp_err_t result) {
+        unlock();
+        return result;
+    };
+    if (s_session->active() || s_session->restart_pending()) return finish(ESP_ERR_INVALID_STATE);
+
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!running) return finish(ESP_ERR_INVALID_STATE);
+    esp_ota_img_states_t raw_state;
+    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) {
+        return finish(ESP_ERR_INVALID_STATE);
+    }
+    const IdfWebOtaImageState state = raw_state == ESP_OTA_IMG_PENDING_VERIFY
+        ? IdfWebOtaImageState::PendingVerify
+        : raw_state == ESP_OTA_IMG_VALID ? IdfWebOtaImageState::Valid
+                                         : IdfWebOtaImageState::Other;
+    if (state != IdfWebOtaImageState::PendingVerify) return finish(ESP_ERR_INVALID_STATE);
+
+    const esp_partition_t* other = esp_ota_get_next_update_partition(running);
+    if (other && other != running) {
+        esp_ota_img_states_t other_state;
+        if (esp_ota_get_state_partition(other, &other_state) == ESP_OK &&
+            other_state == ESP_OTA_IMG_VALID) return finish(ESP_ERR_INVALID_STATE);
+    }
+
+    nvs_handle_t handle = 0;
+    const esp_err_t opened = nvs_open(OTA_NAMESPACE, NVS_READONLY, &handle);
+    if (opened != ESP_OK && opened != ESP_ERR_NVS_NOT_FOUND) return finish(opened);
+    uint32_t accepted = 0, pending = 0, pending_address = 0;
+    if (opened == ESP_OK) {
+        const auto read_optional_zero = [handle](const char* key, uint32_t* value) {
+            const esp_err_t err = nvs_get_u32(handle, key, value);
+            if (err == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+            if (err != ESP_OK) return err;
+            return *value == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+        };
+        const esp_err_t accepted_error = read_optional_zero(KEY_ACCEPTED, &accepted);
+        const esp_err_t pending_error = read_optional_zero(KEY_PENDING, &pending);
+        const esp_err_t address_error = read_optional_zero(KEY_PENDING_ADDRESS, &pending_address);
+        nvs_close(handle);
+        if (accepted_error != ESP_OK) return finish(accepted_error);
+        if (pending_error != ESP_OK) return finish(pending_error);
+        if (address_error != ESP_OK) return finish(address_error);
+    }
+    if (!idf_web_ota_migration_recovery_allowed(
+            state, accepted, pending, pending_address)) return finish(ESP_ERR_INVALID_STATE);
+    const esp_err_t mark_error = esp_ota_mark_app_valid_cancel_rollback();
+    if (mark_error != ESP_OK) return finish(mark_error);
+    const esp_err_t readback_error = esp_ota_get_state_partition(running, &raw_state);
+    if (readback_error != ESP_OK) return finish(readback_error);
+    return finish(raw_state == ESP_OTA_IMG_VALID ? ESP_OK : ESP_ERR_INVALID_STATE);
+}
+#endif
+
 esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
                                    bool deadline_expired)
 {

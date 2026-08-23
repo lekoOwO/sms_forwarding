@@ -954,7 +954,14 @@ def _container_recovery(
         "--timeout", str(timeout), "--internal-container",
     ]
     if query is None:
-        arguments.append("ota-state" if command == usb_recovery.COMMAND_OTA_STATE else "state")
+        if command == usb_recovery.COMMAND_STATE:
+            arguments.append("state")
+        elif command == usb_recovery.COMMAND_OTA_STATE:
+            arguments.append("ota-state")
+        elif command == usb_recovery.COMMAND_OTA_MIGRATION_RECOVER:
+            arguments.append("ota-migration-recover")
+        else:
+            raise ValueError("unsupported USB recovery command")
     else:
         arguments.extend(("query", query, "--raw"))
     result = _run_process(
@@ -966,10 +973,9 @@ def _container_recovery(
     if deadline is not None:
         _remaining(deadline)
     if result.returncode:
-        if query is not None:
-            status, reason_payload = usb_recovery.parse_protocol_error(result.stderr)
-            if status is not None:
-                raise usb_recovery.CommandError(status, reason_payload)
+        status, reason_payload = usb_recovery.parse_protocol_error(result.stderr)
+        if status is not None:
+            raise usb_recovery.CommandError(status, reason_payload)
         error_class = _safe_error_class(result.stderr)
         raise usb_recovery.DeviceError(
             f"USB recovery failed (exit {result.returncode}; {error_class})"
@@ -1452,6 +1458,36 @@ def _ota_state(
         return usb_recovery.validate_ota_state(result)
 
 
+def _ota_migration_recover(
+    device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
+    container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
+) -> None:
+    try:
+        transaction_args = {}
+        if deadline is not None:
+            transaction_args["deadline"] = deadline
+        response = usb_recovery.run_transaction(
+            device.by_id, timeout, usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+            b"", **transaction_args,
+        )
+        if response.payload:
+            raise usb_recovery.DeviceError("USB recovery returned invalid migration response")
+        return
+    except usb_recovery.CommandError:
+        raise
+    except (usb_recovery.DeviceError, OSError, ImportError) as error:
+        if not _host_transport_unavailable(error):
+            raise
+        if deadline is not None:
+            container_timeout = min(container_timeout, _remaining(deadline))
+        result = _container_recovery(
+            device, timeout, caller_timeout=container_timeout, deadline=deadline,
+            command=usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+        )
+        if result != {"ok": True}:
+            raise usb_recovery.DeviceError("USB recovery returned invalid migration response")
+
+
 def _try_resolve_exact_device(device_path: str) -> SerialDevice | None:
     try:
         device = resolve_serial_device(device_path)
@@ -1854,6 +1890,29 @@ def _flash_bootloader_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ota_migration_recover_command(args: argparse.Namespace) -> int:
+    device_path = resolve_device(args.device)
+    plan = {
+        "action": "ota-migration-recover",
+        "device": device_path,
+        "live": bool(args.live),
+        "requires": "USB recovery build, pending-verify image, zero-or-absent OTA counters",
+        "preserves": ["nvs", "appcfg", "app0", "app1"],
+        "updates": ["running image state in otadata"],
+    }
+    if not args.live:
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+
+    device = resolve_serial_device(device_path)
+    confirm_basename(device_path, args.confirm)
+    deadline = time.monotonic() + STATE_TIMEOUT
+    _ota_migration_recover(device, timeout=STATE_TIMEOUT, deadline=deadline)
+    plan["status"] = "completed"
+    print(json.dumps(plan, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Safe ESP32-C3 device operations")
     parser.add_argument("--device", default=None, help="explicit /dev/serial/by-id path")
@@ -1937,7 +1996,16 @@ def build_parser() -> argparse.ArgumentParser:
     bootloader.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
     bootloader.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
 
-    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash, flash0, bootloader):
+    migration_recover = commands.add_parser(
+        "ota-migration-recover", help="mark one pending USB-dev image valid during migration"
+    )
+    migration_recover.add_argument("--live", action="store_true", help="perform the one-time recovery")
+    migration_recover.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
+
+    for command in (
+        commands.choices["state"], commands.choices["ota-state"], diag, reset,
+        flash, flash0, bootloader, migration_recover,
+    ):
         command.add_argument(
             "--device",
             default=argparse.SUPPRESS,
@@ -1966,6 +2034,8 @@ def main(argv: list[str] | None = None) -> int:
             return _ota_upload_command(args)
         if args.command == "flash-bootloader":
             return _flash_bootloader_command(args)
+        if args.command == "ota-migration-recover":
+            return _ota_migration_recover_command(args)
         if args.command == "state":
             deadline = time.monotonic() + CONTAINER_TIMEOUT
             state = _state(resolve_serial_device(args.device), deadline=deadline)

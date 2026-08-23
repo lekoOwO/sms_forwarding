@@ -126,6 +126,18 @@ class DeviceCommandTest(unittest.TestCase):
             with self.assertRaisesRegex(usb_recovery.DeviceError, "USB recovery failed"):
                 device._container_recovery(ref, 1.0, "cereg")
 
+    def test_container_migration_failure_preserves_protocol_status(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        result = mock.Mock(
+            returncode=1, stdout="", stderr="device rejected request (invalid-state)\n",
+        )
+        with mock.patch.object(device, "_run_process", return_value=result):
+            with self.assertRaises(usb_recovery.CommandError) as raised:
+                device._container_recovery(
+                    ref, 1.0, command=usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+                )
+        self.assertEqual(raised.exception.status, usb_recovery.STATUS_INVALID_STATE)
+
     def test_external_timeout_is_fixed_error(self):
         timeout = subprocess.TimeoutExpired(["external"], 1.0)
         with mock.patch.object(device.subprocess, "run", side_effect=timeout):
@@ -1027,6 +1039,40 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertNotIn("erase_flash", command)
         self.assertNotIn("partition-table.bin", command)
         self.assertEqual(json.loads(output)["sha256"], digest)
+
+    def test_ota_migration_recovery_dry_run_does_not_touch_usb(self):
+        with mock.patch.object(device, "resolve_serial_device") as resolve, \
+                mock.patch.object(device, "_ota_migration_recover") as recover:
+            result, output = self.run_main([
+                "--device", DEVICE, "ota-migration-recover",
+            ])
+        self.assertEqual(result, 0)
+        resolve.assert_not_called()
+        recover.assert_not_called()
+        plan = json.loads(output)
+        self.assertEqual(plan["action"], "ota-migration-recover")
+        self.assertFalse(plan["live"])
+        self.assertEqual(plan["preserves"], ["nvs", "appcfg", "app0", "app1"])
+        self.assertEqual(plan["updates"], ["running image state in otadata"])
+
+    def test_ota_migration_recovery_live_requires_exact_device_and_empty_command(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        with mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                mock.patch.object(device, "confirm_basename") as confirm, \
+                mock.patch.object(device.usb_recovery, "run_transaction", return_value=usb_recovery.Frame(
+                    usb_recovery.RESPONSE_OTA_MIGRATION_RECOVER, 0, b""
+                )) as transaction, \
+                mock.patch.object(device.time, "monotonic", return_value=100.0):
+            result, output = self.run_main([
+                "--device", DEVICE, "ota-migration-recover", "--live", "--confirm", "usb-test",
+            ])
+        self.assertEqual(result, 0)
+        confirm.assert_called_once_with(DEVICE, "usb-test")
+        transaction.assert_called_once_with(
+            DEVICE, device.STATE_TIMEOUT, device.usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+            b"", deadline=105.0,
+        )
+        self.assertEqual(json.loads(output)["status"], "completed")
 
     def test_flash_app1_dry_run_uses_fixed_slot_and_rejects_arbitrary_offset(self):
         with tempfile.TemporaryDirectory() as temp:
