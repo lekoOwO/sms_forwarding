@@ -9,6 +9,7 @@ import errno
 import fcntl
 import getpass
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -439,6 +440,7 @@ _COPS = re.compile(
 )
 _CGATT = re.compile(r'^\+CGATT:[ ]*([01])$')
 _CGACT = re.compile(r'^\+CGACT:[ ]*([0-9]{1,3})[ ]*,[ ]*([01])$')
+_CGPADDR_ADDRESS = re.compile(r'^[0-9A-Fa-f:.]{1,45}$')
 _CSQ = re.compile(r'^\+CSQ:[ ]*([0-9]{1,2}|99)[ ]*,[ ]*([0-9]{1}|99)$')
 _CESQ = re.compile(
     r'^\+CESQ:[ ]*([0-9]{1,2}|99)[ ]*,[ ]*([0-9]{1,2}|99)[ ]*,[ ]*'
@@ -507,7 +509,6 @@ _GENERIC_QUERY_PATTERNS = {
     QUERY_COPS: re.compile(r'^\+COPS:\s*[0-4](?:\s*,\s*[0-4](?:\s*,\s*"[ -~]{0,32}")?(?:\s*,\s*[0-9]{1,3})?)?$'),
     QUERY_CGATT: re.compile(r'^\+CGATT:\s*[01]$'),
     QUERY_CGACT: re.compile(r'^\+CGACT:\s*[0-9]{1,3}\s*,\s*[01]$'),
-    QUERY_CGPADDR: re.compile(r'^\+CGPADDR:\s*[0-9]{1,3}(?:\s*,\s*[0-9A-Fa-f:.]{1,39})?$'),
     QUERY_ICCID: re.compile(r'^\+ICCID:\s*[0-9]{15,32}$'),
     QUERY_CSQ: re.compile(r'^\+CSQ:\s*(?:[0-9]{1,3}|99)\s*,\s*(?:[0-9]{1,3}|99)$'),
     QUERY_CESQ: re.compile(r'^\+CESQ:\s*(?:[0-9]{1,3}|255)(?:\s*,\s*(?:[0-9]{1,3}|255)){5}$'),
@@ -669,6 +670,54 @@ def _sanitize_cgact(payload: bytes) -> dict[str, object]:
         entries.append({"cid": cid, "active": match.group(2) == "1"})
     return {
         "query_id": QUERY_CGACT,
+        "valid": True,
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _sanitize_cgpaddr(payload: bytes) -> dict[str, object]:
+    data = _query_data_lines(payload)
+    if data is None or len(data) > _MAX_CGACT_ENTRIES:
+        return _invalid_query_response(QUERY_CGPADDR)
+    entries: list[dict[str, object]] = []
+    seen: set[int] = set()
+    for line in data:
+        if not line.startswith("+CGPADDR:"):
+            return _invalid_query_response(QUERY_CGPADDR)
+        fields = line.removeprefix("+CGPADDR:").split(",")
+        cid = _strict_decimal(fields[0].strip(" "), 255)
+        if cid is None or cid == 0 or cid in seen or not 1 <= len(fields) <= 3:
+            return _invalid_query_response(QUERY_CGPADDR)
+        versions: set[int] = set()
+        for field in fields[1:]:
+            address = field.strip(" ")
+            if address.startswith('"') or address.endswith('"'):
+                if (
+                    len(address) < 3
+                    or not address.startswith('"')
+                    or not address.endswith('"')
+                ):
+                    return _invalid_query_response(QUERY_CGPADDR)
+                address = address[1:-1]
+            if _CGPADDR_ADDRESS.fullmatch(address) is None:
+                return _invalid_query_response(QUERY_CGPADDR)
+            try:
+                version = ipaddress.ip_address(address).version
+            except ValueError:
+                return _invalid_query_response(QUERY_CGPADDR)
+            if version in versions:
+                return _invalid_query_response(QUERY_CGPADDR)
+            versions.add(version)
+        seen.add(cid)
+        entries.append({
+            "cid": cid,
+            "address_count": len(versions),
+            "ipv4": 4 in versions,
+            "ipv6": 6 in versions,
+        })
+    return {
+        "query_id": QUERY_CGPADDR,
         "valid": True,
         "entry_count": len(entries),
         "entries": entries,
@@ -1034,7 +1083,7 @@ def sanitize_query_response(query_id: int, payload: bytes) -> dict[str, object]:
     if query_id == QUERY_CGACT:
         return _sanitize_cgact(payload)
     if query_id == QUERY_CGPADDR:
-        return _sanitize_empty_success(payload, query_id)
+        return _sanitize_cgpaddr(payload)
     if query_id == QUERY_CSQ:
         return _sanitize_csq(payload)
     if query_id == QUERY_CESQ:

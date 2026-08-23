@@ -776,6 +776,50 @@ class DeviceCommandTest(unittest.TestCase):
                 self.assertTrue(device._safe_batch_result(name, safe))
                 self.assertNotIn(raw.decode("ascii", "ignore"), json.dumps(safe, sort_keys=True))
 
+    def test_cgpaddr_batch_schema_accepts_structure_and_rejects_extra_address_field(self):
+        result = {
+            "query_id": usb_recovery.QUERY_CGPADDR,
+            "valid": True,
+            "entry_count": 1,
+            "entries": [{
+                "cid": 3,
+                "address_count": 2,
+                "ipv4": True,
+                "ipv6": True,
+            }],
+        }
+        self.assertTrue(device._safe_batch_result("cgpaddr", result))
+
+        for unsafe in (
+            {**result, "address": "198.51.100.9"},
+            {**result, "entries": [{**result["entries"][0], "address": "198.51.100.9"}]},
+        ):
+            self.assertFalse(device._safe_batch_result("cgpaddr", unsafe))
+
+    def test_cgpaddr_batch_schema_accepts_cid_only_and_rejects_inconsistencies(self):
+        result = {
+            "query_id": usb_recovery.QUERY_CGPADDR,
+            "valid": True,
+            "entry_count": 1,
+            "entries": [{
+                "cid": 7,
+                "address_count": 0,
+                "ipv4": False,
+                "ipv6": False,
+            }],
+        }
+        self.assertTrue(device._safe_batch_result("cgpaddr", result))
+
+        entry = result["entries"][0]
+        for mutation in (
+            {"address_count": 3},
+            {"address_count": False},
+            {"ipv4": True},
+            {"ipv4": 0},
+        ):
+            malformed = {**result, "entries": [{**entry, **mutation}]}
+            self.assertFalse(device._safe_batch_result("cgpaddr", malformed))
+
     def test_diag_all_batch_uses_a_tracked_create_command(self):
         ref = device.SerialDevice(DEVICE, TARGET)
         name = "sms-forwarding-device-1-a"

@@ -104,7 +104,7 @@ _BATCH_ALLOWED_KEYS = frozenset((
     "field_count", "mode", "stat", "act", "cause_flags", "home", "roaming",
     "registered", "location", "fields", "error", "state", "format", "operator",
     "attached", "active", "rssi", "ber", "rxlev", "rscp", "ecn0", "rsrq", "rsrp",
-    "unknown", "last_error", "0", "1", "2", "3",
+    "unknown", "last_error", "address_count", "ipv4", "ipv6", "0", "1", "2", "3",
 ))
 
 
@@ -1272,12 +1272,36 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             seen.add(entry["cid"])
         return True
     if name == "cgpaddr":
-        return result == {
-            "query_id": query_id,
-            "valid": True,
-            "entry_count": 0,
-            "entries": [],
-        }
+        if set(result) != common | {"entry_count", "entries"}:
+            return False
+        entries = result["entries"]
+        if (
+            not isinstance(result["entry_count"], int)
+            or isinstance(result["entry_count"], bool)
+            or not 0 <= result["entry_count"] <= 16
+            or not isinstance(entries, list)
+            or result["entry_count"] != len(entries)
+        ):
+            return False
+        seen: set[int] = set()
+        for entry in entries:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"cid", "address_count", "ipv4", "ipv6"}
+                or not isinstance(entry["cid"], int)
+                or isinstance(entry["cid"], bool)
+                or not 1 <= entry["cid"] <= 255
+                or entry["cid"] in seen
+                or not isinstance(entry["address_count"], int)
+                or isinstance(entry["address_count"], bool)
+                or not isinstance(entry["ipv4"], bool)
+                or not isinstance(entry["ipv6"], bool)
+                or entry["address_count"] != entry["ipv4"] + entry["ipv6"]
+                or not 0 <= entry["address_count"] <= 2
+            ):
+                return False
+            seen.add(entry["cid"])
+        return True
     if name == "ceer":
         return set(result) == common | {"last_error"} and result["last_error"] == {
             "present": False,

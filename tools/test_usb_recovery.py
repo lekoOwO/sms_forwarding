@@ -1032,6 +1032,69 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
                     self.assertEqual(safe["entry_count"], 0)
                     self.assertEqual(safe["entries"], [])
 
+    def test_cgpaddr_sanitizes_dual_stack_addresses_to_structure_only(self):
+        ipv4 = "192.0.2.44"
+        ipv6 = "2001:db8::44"
+        raw = f'+CGPADDR: 3,"{ipv4}",{ipv6}\r\nOK\r\n'.encode("ascii")
+
+        safe = usb_recovery.sanitize_query_response(usb_recovery.QUERY_CGPADDR, raw)
+
+        self.assertEqual(safe, {
+            "query_id": usb_recovery.QUERY_CGPADDR,
+            "valid": True,
+            "entry_count": 1,
+            "entries": [{
+                "cid": 3,
+                "address_count": 2,
+                "ipv4": True,
+                "ipv6": True,
+            }],
+        })
+        encoded = json.dumps(safe, sort_keys=True)
+        self.assertNotIn(ipv4, encoded)
+        self.assertNotIn(ipv6, encoded)
+
+    def test_cgpaddr_sanitizes_cid_only_entry(self):
+        self.assertEqual(
+            usb_recovery.sanitize_query_response(
+                usb_recovery.QUERY_CGPADDR,
+                b"+CGPADDR: 7\r\nOK\r\n",
+            ),
+            {
+                "query_id": usb_recovery.QUERY_CGPADDR,
+                "valid": True,
+                "entry_count": 1,
+                "entries": [{
+                    "cid": 7,
+                    "address_count": 0,
+                    "ipv4": False,
+                    "ipv6": False,
+                }],
+            },
+        )
+
+    def test_cgpaddr_rejects_malformed_duplicate_control_and_excess_tokens(self):
+        cases = (
+            b"+CGPADDR: 0,192.0.2.1\r\nOK\r\n",
+            b"+CGPADDR: 256,192.0.2.1\r\nOK\r\n",
+            b"+CGPADDR: 1,999.0.2.1\r\nOK\r\n",
+            b"+CGPADDR: 1,192.0.2.1\r\n+CGPADDR: 1,2001:db8::1\r\nOK\r\n",
+            b"+CGPADDR: 1,192.0.2.1\x1b\r\nOK\r\n",
+            b"+CGPADDR: 1,192.0.2.1,2001:db8::1,192.0.2.2\r\nOK\r\n",
+            b"+CGPADDR: 1,\"\",2001:db8::1\r\nOK\r\n",
+            b"+CGPADDR: 1,192.0.2.1\r\n+CMTI: \"SM\",1\r\nOK\r\n",
+        )
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    usb_recovery.sanitize_query_response(usb_recovery.QUERY_CGPADDR, raw),
+                    {
+                        "query_id": usb_recovery.QUERY_CGPADDR,
+                        "valid": False,
+                        "error": "invalid-response",
+                    },
+                )
+
     def test_new_private_query_fixtures_are_bounded_without_raw_output(self):
         fixtures = (
             ("ati-raw-20260823.bin", 36, "3b92c0b78fdd1dc8afbfd56dc2b876023f6de75411feeff93a4d8550ff65d05c", usb_recovery.QUERY_ATI),
@@ -1069,7 +1132,6 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             (usb_recovery.QUERY_CFUN, b"+CFUN: 9\r\nOK\r\n"),
             (usb_recovery.QUERY_CREG, b"+CREG: 2,1\r\n+CREG: 2,1\r\nOK\r\n"),
             (usb_recovery.QUERY_CEER, b"+CEER: 0\r\nOK\r\n"),
-            (usb_recovery.QUERY_CGPADDR, b"+CGPADDR: 1,10.0.0.1\r\nOK\r\n"),
         )
         for query_id, raw in cases:
             with self.subTest(query_id=query_id):
