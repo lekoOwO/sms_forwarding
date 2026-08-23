@@ -1441,6 +1441,27 @@ class DeviceCommandTest(unittest.TestCase):
             device.CONTAINER_PYTHON,
         )
 
+    def test_state_transaction_timeout_uses_bounded_container_fallback(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        state = {
+            "ap_mode": False,
+            "boot_id": 1,
+            "credential_configured": True,
+            "ip": "",
+            "sta_connected": False,
+        }
+        fallback = mock.Mock(return_value=state)
+        with mock.patch.object(
+            device.usb_recovery,
+            "run_transaction",
+            side_effect=usb_recovery.DeviceError("USB device timed out"),
+        ), mock.patch.object(device, "_container_recovery", fallback):
+            self.assertEqual(
+                device._state(ref, deadline=device.time.monotonic() + device.CONTAINER_TIMEOUT),
+                state,
+            )
+        fallback.assert_called_once()
+
     def test_ota_state_fallback_passes_remaining_deadline_to_backend(self):
         ref = device.SerialDevice(DEVICE, TARGET)
         state = {

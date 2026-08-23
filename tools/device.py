@@ -1430,7 +1430,10 @@ def _state(
     except usb_recovery.CommandError:
         raise
     except (usb_recovery.DeviceError, OSError, ImportError) as error:
-        if not _host_transport_unavailable(error):
+        if not (
+            _host_transport_unavailable(error)
+            or (isinstance(error, usb_recovery.DeviceError) and str(error) == "USB device timed out")
+        ):
             raise
         if deadline is not None:
             container_timeout = min(container_timeout, _remaining(deadline))
