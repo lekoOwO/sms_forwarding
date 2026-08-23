@@ -1414,6 +1414,40 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         )
         self.assertTrue(payload["results"]["csq"]["valid"])
 
+    def test_internal_diag_batch_keeps_unavailable_result_and_continues(self):
+        calls = []
+        args = type("Args", (), {
+            "device": usb_recovery.INTERNAL_DEVICE_PATH,
+            "timeout": 12.0,
+            "query_names": ["iccid", "csq"],
+            "internal_container": True,
+        })()
+
+        def fake_transaction(path, timeout, command, payload, **kwargs):
+            calls.append((path, timeout, command, payload, kwargs))
+            if payload == bytes((usb_recovery.QUERY_ICCID,)):
+                raise usb_recovery.CommandError(usb_recovery.STATUS_NOT_READY)
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_MODEM_QUERY,
+                0,
+                b"+CSQ: 31,99\r\nOK\r\n",
+            )
+
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"SMS_DEVICE_IN_CONTAINER": "1"}), \
+                mock.patch.object(usb_recovery, "run_transaction", side_effect=fake_transaction), \
+                redirect_stdout(output):
+            self.assertEqual(usb_recovery._diag_batch_command(args), 0)
+
+        self.assertEqual(len(calls), 2)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["results"]["iccid"], {
+            "query_id": usb_recovery.QUERY_ICCID,
+            "valid": False,
+            "error": "unavailable",
+        })
+        self.assertEqual(payload["results"]["csq"]["rssi"], 31)
+
     def test_diag_batch_requires_the_internal_container_marker(self):
         args = type("Args", (), {
             "device": usb_recovery.INTERNAL_DEVICE_PATH,

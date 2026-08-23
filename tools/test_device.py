@@ -209,6 +209,42 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertEqual(set(deadlines), {100.0 + device.DIAG_ALL_TIMEOUT})
         self.assertLessEqual(device.DIAG_ALL_TIMEOUT, 90.0)
 
+    def test_diag_all_keeps_unavailable_query_and_continues(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        failed = "iccid"
+
+        def fake_query(_device, name, _deadline):
+            if name == failed:
+                raise usb_recovery.CommandError(usb_recovery.STATUS_NOT_READY)
+            return b"OK\r\n"
+
+        def fake_sanitize(query_id, _payload):
+            return {"query_id": query_id, "valid": True, "line_count": 1,
+                    "sha256": "0" * 64, "redactions": []}
+
+        with mock.patch.object(device, "resolve_serial_device", return_value=ref), \
+                mock.patch.object(device, "_diag_query", side_effect=fake_query), \
+                mock.patch.object(usb_recovery, "sanitize_query_response", side_effect=fake_sanitize):
+            result, output = self.run_main(["--device", DEVICE, "diag", "all"])
+
+        self.assertEqual(result, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload[failed], {
+            "query_id": usb_recovery.QUERY_COMMANDS[failed][0],
+            "valid": False,
+            "error": "unavailable",
+        })
+        self.assertTrue(payload["csq"]["valid"])
+
+    def test_batch_validator_accepts_unavailable_query_result(self):
+        self.assertTrue(device._safe_batch_result(
+            "iccid", {
+                "query_id": usb_recovery.QUERY_ICCID,
+                "valid": False,
+                "error": "unavailable",
+            }
+        ))
+
     def test_diag_all_permission_fallback_starts_one_batch_container(self):
         ref = device.SerialDevice(DEVICE, TARGET)
         process_calls = []

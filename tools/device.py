@@ -1043,7 +1043,7 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
     if result.get("valid") is False:
         return (
             set(result) == common | {"error"}
-            and result.get("error") == "invalid-response"
+            and result.get("error") in {"invalid-response", "unavailable"}
         )
     if result.get("valid") is not True:
         return False
@@ -1644,8 +1644,15 @@ def _diag_command(args: argparse.Namespace) -> int:
         try:
             while completed < len(names):
                 name = names[completed]
-                payload = _diag_query(device, name, deadline)
                 query_id = usb_recovery.QUERY_COMMANDS[name][0]
+                try:
+                    payload = _diag_query(device, name, deadline)
+                except usb_recovery.CommandError:
+                    if args.raw:
+                        raise
+                    results[name] = usb_recovery._unavailable_query_response(query_id)
+                    completed += 1
+                    continue
                 if args.raw:
                     if query_id == usb_recovery.QUERY_CPOL:
                         safe = usb_recovery.sanitize_query_response(query_id, payload)

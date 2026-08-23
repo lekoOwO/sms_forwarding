@@ -466,6 +466,10 @@ def _invalid_query_response(query_id: int) -> dict[str, object]:
     return {"query_id": query_id, "valid": False, "error": "invalid-response"}
 
 
+def _unavailable_query_response(query_id: int) -> dict[str, object]:
+    return {"query_id": query_id, "valid": False, "error": "unavailable"}
+
+
 def _has_forbidden_controls(text: str) -> bool:
     return any(
         (ord(char) < 0x20 and char not in "\r\n") or 0x7F <= ord(char) <= 0x9F
@@ -1493,11 +1497,13 @@ def _diag_batch_command(args: argparse.Namespace) -> int:
                 break
             except CommandError as error:
                 if error.status != STATUS_BUSY or retries >= BATCH_BUSY_RETRIES:
-                    raise
+                    results[name] = _unavailable_query_response(query_id)
+                    break
                 retries += 1
                 remaining = deadline - time.monotonic()
                 if remaining <= BATCH_BUSY_DELAY:
-                    raise DeviceError("USB device timed out") from None
+                    results[name] = _unavailable_query_response(query_id)
+                    break
                 time.sleep(BATCH_BUSY_DELAY)
     print(json.dumps(
         {"version": 1, "results": results},
