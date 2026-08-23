@@ -80,9 +80,8 @@ DIAG_ALL_TIMEOUT = 90.0
 BUSY_RETRIES = 2
 BUSY_DELAY = 5.0
 CONTAINER_TIMEOUT = 30.0
-CONTAINER_STARTUP_TIMEOUT = 5.0
-CONTAINER_CLEANUP_TIMEOUT = 5.0
-CONTAINER_USB_RELEASE_DELAY = 0.1
+CONTAINER_STARTUP_TIMEOUT = 30.0
+CONTAINER_LIFECYCLE_TIMEOUT = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT * 2
 CONTAINER_NAME_PREFIX = "sms-forwarding-device"
 FLASH_RECONCILE_TIMEOUT = 20.0
 EXPECTED_QUERY_NAMES = frozenset((
@@ -166,8 +165,12 @@ def _safe_error_class(stderr: str | bytes | None) -> str:
 
 def _run_process(
     command: list[str], *, timeout: float | None = None, env=None,
-    text: bool = True, stage: str = "external command",
+    text: bool = True, stage: str = "external command", _docker_lifecycle: bool = True,
 ) -> subprocess.CompletedProcess:
+    if _docker_lifecycle and command[:2] == ["docker", "create"]:
+        if timeout is None:
+            raise ValueError("Docker container timeout is required")
+        return _run_docker_container(command, timeout=timeout, text=text, stage=stage)
     try:
         return subprocess.run(
             command,
@@ -215,23 +218,46 @@ def _owned_container_name(name: str) -> bool:
 
 
 def _cleanup_docker_container(name: str) -> None:
-    """只刪除本次工具建立的 container，並等待 serial handle 釋放。"""
-    if not _owned_container_name(name):
+    """只刪除本次工具建立的 container，並由 Docker 確認已消失。"""
+    if not (_owned_container_name(name) or re.fullmatch(r"[0-9a-f]{64}", name)):
         return
-    try:
-        result = subprocess.run(
-            ["docker", "rm", "--force", name],
-            cwd=ROOT,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=CONTAINER_CLEANUP_TIMEOUT,
+
+    def not_found(result: subprocess.CompletedProcess) -> bool:
+        error = result.stderr if isinstance(result.stderr, str) else ""
+        return result.returncode == 1 and any(
+            marker in error
+            for marker in (f"No such object: {name}", f"No such container: {name}")
         )
-    except (OSError, subprocess.SubprocessError):
-        return
-    if result.returncode in (0, 1):
-        # docker rm --force 會等 container process 結束；短暫讓核心完成 USB close。
-        time.sleep(CONTAINER_USB_RELEASE_DELAY)
+
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                ["docker", "rm", "--force", name],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise usb_recovery.DeviceError("USB container cleanup failed") from exc
+        if result.returncode != 0 and not not_found(result):
+            raise usb_recovery.DeviceError("USB container cleanup failed")
+        try:
+            result = subprocess.run(
+                ["docker", "container", "inspect", name],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise usb_recovery.DeviceError(
+                "USB container cleanup could not be confirmed"
+            ) from exc
+        if not_found(result):
+            return
+        if result.returncode != 0 or attempt:
+            raise usb_recovery.DeviceError("USB container cleanup could not be confirmed")
 
 
 def _docker_command(
@@ -254,7 +280,7 @@ def _docker_command(
         else:
             mapped.append(argument)
     command = [
-        "docker", "run", "--rm", "--name", container_name,
+        "docker", "create", "--name", container_name,
         "--pull=never", "--network=none", "--read-only",
         "--env", "SMS_DEVICE_IN_CONTAINER=1",
         "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m",
@@ -272,6 +298,80 @@ def _docker_command(
     return [*command, *mapped]
 
 
+def _settled_docker_create(
+    command: list[str], *, stage: str,
+) -> tuple[subprocess.CompletedProcess, KeyboardInterrupt | None]:
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise usb_recovery.DeviceError(f"{stage} unavailable") from exc
+    except OSError as exc:
+        raise usb_recovery.DeviceError(f"{stage} unavailable") from exc
+
+    interrupted = None
+    while True:
+        try:
+            stdout, stderr = process.communicate()
+            break
+        except KeyboardInterrupt as exc:
+            interrupted = interrupted or exc
+    return (
+        subprocess.CompletedProcess(command, process.returncode, stdout, stderr),
+        interrupted,
+    )
+
+
+def _run_docker_container(
+    command: list[str], *, timeout: float, text: bool, stage: str,
+) -> subprocess.CompletedProcess:
+    try:
+        name_index = command.index("--name")
+        name = command[name_index + 1]
+    except (ValueError, IndexError) as exc:
+        raise usb_recovery.DeviceError(f"{stage} container create is invalid") from exc
+    if command[:2] != ["docker", "create"] or not _owned_container_name(name):
+        raise usb_recovery.DeviceError(f"{stage} container create is invalid")
+    deadline = time.monotonic() + timeout
+    container_id = None
+    try:
+        result, interrupted = _settled_docker_create(
+            command,
+            stage=f"{stage} container create",
+        )
+        if result.returncode:
+            if interrupted is not None:
+                raise interrupted
+            raise usb_recovery.DeviceError(
+                f"{stage} container create failed ({_safe_error_class(result.stderr)})"
+            )
+        raw_id = result.stdout if isinstance(result.stdout, str) else ""
+        if not re.fullmatch(r"[0-9a-f]{64}\n?", raw_id):
+            raise usb_recovery.DeviceError(f"{stage} container create returned invalid id")
+        container_id = raw_id.rstrip("\n")
+        if interrupted is not None:
+            raise interrupted
+        result = _run_process(
+            ["docker", "start", "--attach", container_id],
+            timeout=_remaining(deadline),
+            text=text,
+            stage=stage,
+            _docker_lifecycle=False,
+        )
+        _remaining(deadline)
+        return result
+    finally:
+        _cleanup_docker_container(container_id if container_id is not None else name)
+
+
 def _run_esptool(
     arguments: list[str], device: SerialDevice, timeout: float,
     image: Path | None = None, *, output: Path | None = None,
@@ -281,18 +381,12 @@ def _run_esptool(
         command = [ESPTOOL, *arguments]
         result = _run_process(command, timeout=timeout, stage="esptool")
     else:
-        container_name = _new_container_name()
-        command = _docker_command(
-            arguments, device, image, container_name=container_name,
-            output=output, output_mount=output_mount,
+        result = _run_process(
+            _docker_command(
+                arguments, device, image, output=output, output_mount=output_mount,
+            ),
+            timeout=timeout, text=True, stage="esptool",
         )
-        try:
-            result = _run_process(command, timeout=timeout, stage="esptool")
-        except BaseException:
-            _cleanup_docker_container(container_name)
-            raise
-        if result.returncode:
-            _cleanup_docker_container(container_name)
     if result.returncode:
         raise usb_recovery.DeviceError(
             f"esptool failed (exit {result.returncode}; {_safe_error_class(result.stderr)})"
@@ -1009,7 +1103,7 @@ def _container_recovery(
         usb_recovery.COMMAND_OTA_STATE,
         usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
     }
-    process_budget = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT if ota_command else CONTAINER_TIMEOUT
+    process_budget = CONTAINER_LIFECYCLE_TIMEOUT
     process_timeout = min(process_budget, timeout if caller_timeout is None else caller_timeout)
     if deadline is not None:
         process_timeout = min(process_timeout, _remaining(deadline))
@@ -1032,12 +1126,8 @@ def _container_recovery(
         arguments.extend(("query", query, "--raw"))
     result = _run_process(
         _docker_command(arguments, device, program=None, entrypoint=CONTAINER_PYTHON),
-        timeout=process_timeout,
-        text=query is not None,
-        stage="USB recovery",
+        timeout=process_timeout, text=query is not None, stage="USB recovery",
     )
-    if deadline is not None:
-        _remaining(deadline)
     if result.returncode:
         status, reason_payload = usb_recovery.parse_protocol_error(result.stderr)
         if status is not None:
@@ -1459,11 +1549,8 @@ def _container_recovery_batch(
     ]
     result = _run_process(
         _docker_command(arguments, device, program=None, entrypoint=CONTAINER_PYTHON),
-        timeout=process_timeout,
-        text=True,
-        stage="USB recovery",
+        timeout=process_timeout, text=True, stage="USB recovery",
     )
-    _remaining(deadline)
     if result.returncode:
         status, reason_payload = usb_recovery.parse_protocol_error(result.stderr)
         if status is not None:
@@ -1476,7 +1563,8 @@ def _container_recovery_batch(
 
 def _state(
     device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
-    container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
+    container_timeout: float = CONTAINER_LIFECYCLE_TIMEOUT,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     try:
         transaction_args = {}
@@ -1503,7 +1591,8 @@ def _state(
 
 def _ota_state(
     device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
-    container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
+    container_timeout: float = CONTAINER_LIFECYCLE_TIMEOUT,
+    deadline: float | None = None,
 ) -> dict[str, object]:
     try:
         transaction_args = {}
@@ -1545,7 +1634,8 @@ def _ota_migration_readback(
 
 def _ota_migration_recover(
     device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
-    container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
+    container_timeout: float = CONTAINER_LIFECYCLE_TIMEOUT,
+    deadline: float | None = None,
 ) -> None:
     try:
         transaction_args = {}
@@ -2099,7 +2189,7 @@ def _ota_migration_recover_command(args: argparse.Namespace) -> int:
 
     device = resolve_serial_device(device_path)
     confirm_basename(device_path, args.confirm)
-    deadline = time.monotonic() + CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT + STATE_TIMEOUT
+    deadline = time.monotonic() + CONTAINER_LIFECYCLE_TIMEOUT + STATE_TIMEOUT
     _ota_migration_recover(device, timeout=STATE_TIMEOUT, deadline=deadline)
     plan["status"] = "completed"
     print(json.dumps(plan, sort_keys=True))
@@ -2230,12 +2320,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "ota-migration-recover":
             return _ota_migration_recover_command(args)
         if args.command == "state":
-            deadline = time.monotonic() + CONTAINER_TIMEOUT
+            deadline = (
+                time.monotonic() + CONTAINER_LIFECYCLE_TIMEOUT + STATE_TIMEOUT * 3
+            )
             state = _state(resolve_serial_device(args.device), deadline=deadline)
             print(json.dumps(state, sort_keys=True))
             return 0
         if args.command == "ota-state":
-            deadline = time.monotonic() + CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT
+            deadline = time.monotonic() + CONTAINER_LIFECYCLE_TIMEOUT
             state = _ota_state(resolve_serial_device(args.device), deadline=deadline)
             print(json.dumps(state, sort_keys=True))
             return 0

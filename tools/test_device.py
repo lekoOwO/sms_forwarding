@@ -112,6 +112,229 @@ class DeviceCommandTest(unittest.TestCase):
             with self.assertRaisesRegex(usb_recovery.DeviceError, "invalid state"):
                 device._container_recovery(ref, 1.0)
 
+    def test_docker_create_failure_never_starts_the_container(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        error = usb_recovery.DeviceError("USB recovery container create unavailable")
+
+        with mock.patch.object(device, "_settled_docker_create", side_effect=error) as create, \
+                mock.patch.object(device, "_run_process") as process, \
+                mock.patch.object(device, "_cleanup_docker_container") as cleanup:
+            with self.assertRaisesRegex(usb_recovery.DeviceError, "unavailable"):
+                device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=True, stage="USB recovery",
+                )
+
+        self.assertEqual(create.call_args.args[0][:2], ["docker", "create"])
+        process.assert_not_called()
+        cleanup.assert_called_once_with(name)
+
+    def test_docker_start_failure_always_removes_the_created_id(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        container_id = "a" * 64
+
+        for error in (usb_recovery.DeviceError("USB recovery timed out"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), \
+                    mock.patch.object(
+                        device, "_settled_docker_create",
+                        return_value=(
+                            mock.Mock(returncode=0, stdout=container_id + "\n", stderr=""),
+                            None,
+                        ),
+                    ), \
+                    mock.patch.object(device, "_run_process", side_effect=error) as process, \
+                    mock.patch.object(device, "_cleanup_docker_container") as cleanup:
+                with self.assertRaises(type(error)):
+                    device._run_docker_container(
+                        device._docker_command(["chip_id"], ref, container_name=name),
+                        timeout=10.0, text=True, stage="USB recovery",
+                    )
+            self.assertEqual(
+                process.call_args.args[0],
+                ["docker", "start", "--attach", container_id],
+            )
+            cleanup.assert_called_once_with(container_id)
+
+    def test_docker_container_preserves_child_result_and_removes_it(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        container_id = "b" * 64
+
+        for text, stdout, stderr in (
+            (True, "safe-out", "safe-error"),
+            (False, b"safe-out", b"safe-error"),
+        ):
+            with self.subTest(text=text), \
+                    mock.patch.object(
+                        device, "_settled_docker_create",
+                        return_value=(
+                            mock.Mock(returncode=0, stdout=container_id + "\n", stderr=""),
+                            None,
+                        ),
+                    ), \
+                    mock.patch.object(
+                        device, "_run_process",
+                        return_value=mock.Mock(returncode=7, stdout=stdout, stderr=stderr),
+                    ), \
+                    mock.patch.object(device, "_cleanup_docker_container") as cleanup:
+                result = device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=text, stage="USB recovery",
+                )
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (7, stdout, stderr))
+            cleanup.assert_called_once_with(container_id)
+
+    def test_docker_container_rejects_start_result_after_deadline_and_removes_it(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        container_id = "c" * 64
+        clock = [100.0]
+
+        def fake_process(_command, **_kwargs):
+            clock[0] = 111.0
+            return mock.Mock(returncode=0, stdout="safe-out", stderr="")
+
+        with mock.patch.object(
+                device, "_settled_docker_create",
+                return_value=(
+                    mock.Mock(returncode=0, stdout=container_id + "\n", stderr=""), None,
+                ),
+        ), mock.patch.object(device, "_run_process", side_effect=fake_process), \
+                mock.patch.object(device, "_cleanup_docker_container") as cleanup, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
+                device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=True, stage="USB recovery",
+                )
+
+        cleanup.assert_called_once_with(container_id)
+
+    def test_docker_create_can_settle_past_deadline_without_starting_usb(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        container_id = "d" * 64
+        clock = [100.0]
+
+        def fake_create(_command, **_kwargs):
+            clock[0] = 111.0
+            return mock.Mock(returncode=0, stdout=container_id + "\n", stderr=""), None
+
+        with mock.patch.object(
+                device, "_settled_docker_create", side_effect=fake_create,
+        ) as create, mock.patch.object(device, "_run_process") as process, \
+                mock.patch.object(device, "_cleanup_docker_container") as cleanup, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
+                device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=True, stage="USB recovery",
+                )
+
+        create.assert_called_once()
+        process.assert_not_called()
+        cleanup.assert_called_once_with(container_id)
+
+    def test_interrupted_docker_create_settles_then_removes_id_without_starting(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        container_id = "e" * 64
+
+        class CreateProcess:
+            returncode = 0
+
+            def __init__(self):
+                self.communicate_calls = 0
+
+            def communicate(self):
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise KeyboardInterrupt()
+                return container_id + "\n", ""
+
+        create_process = CreateProcess()
+
+        def fake_run(command, **_kwargs):
+            if command[:2] == ["docker", "create"]:
+                raise KeyboardInterrupt()
+            if command[:3] == ["docker", "rm", "--force"]:
+                return mock.Mock(returncode=0, stdout=command[-1] + "\n", stderr="")
+            if command[:3] == ["docker", "container", "inspect"]:
+                return mock.Mock(
+                    returncode=1,
+                    stdout="",
+                    stderr=f"No such container: {command[-1]}\n",
+                )
+            self.fail("interrupted create must never start a container")
+
+        with mock.patch.object(device.subprocess, "Popen", return_value=create_process) as popen, \
+                mock.patch.object(device.subprocess, "run", side_effect=fake_run) as run:
+            with self.assertRaises(KeyboardInterrupt):
+                device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=True, stage="USB recovery",
+                )
+
+        self.assertEqual(create_process.communicate_calls, 2)
+        popen.assert_called_once()
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(
+            [call.args[0] for call in run.call_args_list],
+            [
+                ["docker", "rm", "--force", container_id],
+                ["docker", "container", "inspect", container_id],
+            ],
+        )
+
+    def test_docker_create_rejects_malformed_id_and_removes_published_name(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        name = "sms-forwarding-device-1-a"
+        create = mock.Mock(return_value=(
+            mock.Mock(returncode=0, stdout="not-an-id\n", stderr=""), None,
+        ))
+
+        with mock.patch.object(device, "_new_container_name", return_value=name), \
+                mock.patch.object(device, "_settled_docker_create", create), \
+                mock.patch.object(device, "_run_process") as process, \
+                mock.patch.object(device, "_cleanup_docker_container") as cleanup:
+            with self.assertRaisesRegex(usb_recovery.DeviceError, "invalid id"):
+                device._run_docker_container(
+                    device._docker_command(["chip_id"], ref, container_name=name),
+                    timeout=10.0, text=True, stage="USB recovery",
+                )
+
+        create.assert_called_once()
+        process.assert_not_called()
+        cleanup.assert_called_once_with(name)
+
+    def test_docker_cleanup_removes_name_published_after_first_rm(self):
+        name = "sms-forwarding-device-1-a"
+        results = (
+            mock.Mock(
+                returncode=1, stdout="", stderr=f"No such container: {name}\n",
+            ),
+            mock.Mock(returncode=0, stdout="[]\n", stderr=""),
+            mock.Mock(returncode=0, stdout=name + "\n", stderr=""),
+            mock.Mock(
+                returncode=1, stdout="", stderr=f"No such container: {name}\n",
+            ),
+        )
+
+        with mock.patch.object(device.subprocess, "run", side_effect=results) as run:
+            device._cleanup_docker_container(name)
+
+        self.assertEqual(
+            [call.args[0][:3] for call in run.call_args_list],
+            [
+                ["docker", "rm", "--force"],
+                ["docker", "container", "inspect"],
+                ["docker", "rm", "--force"],
+                ["docker", "container", "inspect"],
+            ],
+        )
+
     def test_container_query_empty_stdout_is_fixed_error(self):
         ref = device.SerialDevice(DEVICE, TARGET)
         result = mock.Mock(returncode=0, stdout="", stderr="")
@@ -167,21 +390,6 @@ class DeviceCommandTest(unittest.TestCase):
                 device._diag_query(ref, "cereg", deadline), b"+CEREG: 0\r\nOK\r\n"
             )
         self.assertEqual(calls[0][4], {"deadline": deadline})
-
-    def test_diag_container_rejects_process_startup_after_deadline(self):
-        ref = device.SerialDevice(DEVICE, TARGET)
-        clock = [100.0]
-
-        def fake_process(_command, **_kwargs):
-            clock[0] = 191.0
-            return mock.Mock(returncode=0, stdout="OK\r\n", stderr="")
-
-        with mock.patch.object(device, "_run_process", side_effect=fake_process), \
-                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
-                device._container_recovery(
-                    ref, 3.0, "cereg", deadline=190.0
-                )
 
     def test_main_blank_error_has_fixed_stderr(self):
         error = io.StringIO()
@@ -411,39 +619,22 @@ class DeviceCommandTest(unittest.TestCase):
                 self.assertTrue(device._safe_batch_result(name, safe))
                 self.assertNotIn(raw.decode("ascii", "ignore"), json.dumps(safe, sort_keys=True))
 
-    def test_diag_all_batch_rejects_late_container_output(self):
+    def test_diag_all_batch_uses_a_tracked_create_command(self):
         ref = device.SerialDevice(DEVICE, TARGET)
-        clock = [100.0]
+        name = "sms-forwarding-device-1-a"
+        process = mock.Mock(side_effect=usb_recovery.DeviceError("USB recovery timed out"))
 
-        def fake_process(_command, **_kwargs):
-            clock[0] = 190.1
-            return mock.Mock(
-                returncode=0,
-                stdout='{"version":1,"results":{}}',
-                stderr="",
-            )
-
-        with mock.patch.object(device, "_run_process", side_effect=fake_process), \
-                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
+        with mock.patch.object(device, "_new_container_name", return_value=name), \
+                mock.patch.object(device, "_run_process", process):
             with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
                 device._container_recovery_batch(
-                    ref, device.QUERY_NAMES, deadline=190.0,
+                    ref, ("iccid",), deadline=device.time.monotonic() + 10.0,
                 )
 
-    def test_diag_all_batch_late_nonzero_is_a_timeout(self):
-        ref = device.SerialDevice(DEVICE, TARGET)
-        clock = [100.0]
-
-        def fake_process(_command, **_kwargs):
-            clock[0] = 190.1
-            return mock.Mock(returncode=1, stdout="", stderr="private-detail")
-
-        with mock.patch.object(device, "_run_process", side_effect=fake_process), \
-                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
-                device._container_recovery_batch(
-                    ref, ("iccid",), deadline=190.0,
-                )
+        command = process.call_args.args[0]
+        self.assertEqual(command[:2], ["docker", "create"])
+        self.assertEqual(command[command.index("--name") + 1], name)
+        self.assertNotIn("--rm", command)
 
     def test_diag_all_batch_failures_are_fixed_and_do_not_reflect_stderr(self):
         ref = device.SerialDevice(DEVICE, TARGET)
@@ -890,7 +1081,7 @@ class DeviceCommandTest(unittest.TestCase):
 
         with mock.patch.object(device, "resolve_serial_device", side_effect=lambda _path: next(resolve_results)), \
                 mock.patch.object(device, "resolve_esptool", return_value="container"), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(
                     device.usb_recovery,
                     "run_transaction",
@@ -908,7 +1099,8 @@ class DeviceCommandTest(unittest.TestCase):
             ])
         self.assertEqual(result, 0)
         command = calls[0][0]
-        self.assertEqual(command[:2], ["docker", "run"])
+        self.assertEqual(command[:2], ["docker", "create"])
+        self.assertNotIn("--rm", command)
         self.assertIn("--pull=never", command)
         self.assertIn("--network=none", command)
         self.assertIn("SMS_DEVICE_IN_CONTAINER=1", command)
@@ -1106,7 +1298,10 @@ class DeviceCommandTest(unittest.TestCase):
         confirm.assert_called_once_with(DEVICE, "usb-test")
         transaction.assert_called_once_with(
             DEVICE, device.STATE_TIMEOUT, device.usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
-            b"", deadline=140.0,
+            b"", deadline=(
+                100.0 + device.CONTAINER_TIMEOUT
+                + device.CONTAINER_STARTUP_TIMEOUT * 2 + device.STATE_TIMEOUT
+            ),
         )
         self.assertEqual(json.loads(output)["status"], "completed")
 
@@ -1180,8 +1375,10 @@ class DeviceCommandTest(unittest.TestCase):
                 mock.patch.object(device.time, "monotonic", return_value=100.0):
             result = device._container_recovery(
                 ref, device.STATE_TIMEOUT,
-                caller_timeout=device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT,
-                deadline=140.0, command=usb_recovery.COMMAND_OTA_STATE,
+                caller_timeout=(
+                    device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT * 2
+                ),
+                deadline=190.0, command=usb_recovery.COMMAND_OTA_STATE,
             )
 
         self.assertEqual(result, state)
@@ -1192,7 +1389,7 @@ class DeviceCommandTest(unittest.TestCase):
         )
         self.assertEqual(
             kwargs["timeout"],
-            device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT,
+            device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT * 2,
         )
 
     def test_flash_app1_dry_run_uses_fixed_slot_and_rejects_arbitrary_offset(self):
@@ -1345,7 +1542,7 @@ class DeviceCommandTest(unittest.TestCase):
             with mock.patch.object(device, "ROOT", root), \
                     mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
                     mock.patch.object(device, "resolve_esptool", return_value="container"), \
-                    mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(device, "_run_process", side_effect=fake_run), \
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "_read_app_flash_digest", return_value="0" * 64), \
                     mock.patch.object(device, "confirm_basename", return_value=None):
@@ -1366,25 +1563,22 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertNotIn("--privileged", command)
         self.assertNotIn("/dev:/dev", command)
 
-    def test_esptool_container_timeout_cleans_only_its_scoped_container(self):
+    def test_esptool_container_uses_the_shared_create_boundary(self):
         ref = device.SerialDevice(DEVICE, TARGET)
+
         with mock.patch.object(device, "resolve_esptool", return_value="container"), \
                 mock.patch.object(
                     device, "_run_process",
                     side_effect=usb_recovery.DeviceError("esptool timed out"),
-                ) as process, \
-                mock.patch.object(
-                    device.subprocess, "run", return_value=mock.Mock(returncode=0),
-                ) as docker, \
-                mock.patch.object(device.time, "sleep") as sleep:
+                ) as process:
             with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
                 device._run_esptool(["chip_id"], ref, 1.0)
 
         command = process.call_args.args[0]
         name = command[command.index("--name") + 1]
+        self.assertEqual(command[:2], ["docker", "create"])
         self.assertRegex(name, rf"^{device.CONTAINER_NAME_PREFIX}-[a-z0-9-]+$")
-        self.assertEqual(docker.call_args.args[0], ["docker", "rm", "--force", name])
-        sleep.assert_called_once_with(device.CONTAINER_USB_RELEASE_DELAY)
+        self.assertNotIn("--rm", command)
 
     def test_live_flash_timeout_mismatching_readback_fails_without_reset_success(self):
         events = []
@@ -1614,7 +1808,7 @@ class DeviceCommandTest(unittest.TestCase):
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
                 mock.patch.object(device, "resolve_esptool", return_value="container"), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run):
+                mock.patch.object(device, "_run_process", side_effect=fake_run):
             result, output = self.run_main(["--device", DEVICE, "state"])
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output)["sta_connected"], False)
@@ -1647,15 +1841,24 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run):
+                mock.patch.object(device, "_run_process", side_effect=fake_run):
             result, output = self.run_main(["--device", DEVICE, "state"])
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output)["sta_connected"], False)
         self.assertEqual(backend_calls[0][0:2], (device.CONTAINER_DEVICE_PATH, 5.0))
         self.assertTrue(backend_calls[0][4]["internal_container"])
         self.assertIn("deadline", backend_calls[0][4])
-        self.assertLessEqual(process_calls[0][1]["timeout"], device.CONTAINER_TIMEOUT)
-        self.assertGreater(process_calls[0][1]["timeout"], device.CONTAINER_TIMEOUT - 1.0)
+        lifecycle_timeout = (
+            device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT * 2
+        )
+        self.assertLessEqual(
+            process_calls[0][1]["timeout"],
+            lifecycle_timeout,
+        )
+        self.assertGreater(
+            process_calls[0][1]["timeout"],
+            lifecycle_timeout - 1.0,
+        )
         self.assertIn("--internal-container", process_calls[0][0])
         self.assertIn("--timeout", process_calls[0][0])
         self.assertIn("5.0", process_calls[0][0])
@@ -1684,6 +1887,34 @@ class DeviceCommandTest(unittest.TestCase):
                 state,
             )
         fallback.assert_called_once()
+
+    def test_state_command_keeps_full_container_budget_after_host_retries(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        clock = [100.0]
+        state = {
+            "ap_mode": False,
+            "boot_id": 1,
+            "credential_configured": True,
+            "ip": "",
+            "sta_connected": False,
+        }
+
+        def host_timeout(*_args, **_kwargs):
+            clock[0] += device.STATE_TIMEOUT * 3
+            raise usb_recovery.DeviceError("USB device timed out")
+
+        fallback = mock.Mock(return_value=state)
+        with mock.patch.object(device, "resolve_serial_device", return_value=ref), \
+                mock.patch.object(device.usb_recovery, "run_transaction", side_effect=host_timeout), \
+                mock.patch.object(device, "_container_recovery", fallback), \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
+            result, _ = self.run_main(["--device", DEVICE, "state"])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            fallback.call_args.kwargs["caller_timeout"],
+            device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT * 2,
+        )
 
     def test_ota_state_fallback_passes_remaining_deadline_to_backend(self):
         ref = device.SerialDevice(DEVICE, TARGET)
@@ -1740,23 +1971,6 @@ class DeviceCommandTest(unittest.TestCase):
         )
         self.assertEqual(kwargs["timeout"], device.CONTAINER_TIMEOUT)
 
-    def test_state_container_fallback_rejects_late_success_after_absolute_deadline(self):
-        ref = device.SerialDevice(DEVICE, TARGET)
-        clock = [100.0]
-
-        def fake_process(_command, **_kwargs):
-            clock[0] = 111.0
-            return mock.Mock(returncode=0, stdout='{"sta_connected":false}\n', stderr=b"")
-
-        with mock.patch.object(
-            device.usb_recovery,
-            "run_transaction",
-            side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
-        ), mock.patch.object(device, "_run_process", side_effect=fake_process), \
-                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]):
-            with self.assertRaisesRegex(usb_recovery.DeviceError, "timed out"):
-                device._state(ref, deadline=110.0)
-
     def test_diag_fallback_passes_inner_timeout_to_backend_cli(self):
         ref = device.SerialDevice(DEVICE, TARGET)
         backend_calls = []
@@ -1790,7 +2004,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run):
+                mock.patch.object(device, "_run_process", side_effect=fake_run):
             result, output = self.run_main(["--device", DEVICE, "diag", "iccid"])
         self.assertEqual(result, 0)
         self.assertNotIn("8986001234567890123", output)
@@ -1838,7 +2052,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(device.time, "sleep") as sleep:
             result, _ = self.run_main(["--device", DEVICE, "diag", "iccid"])
         self.assertEqual(result, 0)
@@ -1958,7 +2172,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(device.time, "sleep") as sleep:
             result, _ = self.run_main(["--device", DEVICE, "diag", "iccid"])
         self.assertNotEqual(result, 0)
@@ -1996,7 +2210,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(device.time, "monotonic", side_effect=lambda: next(clock)), \
                 mock.patch.object(device.time, "sleep") as sleep:
             result, _ = self.run_main(["--device", DEVICE, "diag", "iccid"])
@@ -2029,7 +2243,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(device.time, "monotonic", side_effect=lambda: next(clock)):
             result, _ = self.run_main([
                 "--device", DEVICE, "reset", "--live", "--confirm", "usb-test",
@@ -2066,7 +2280,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "run_transaction",
                     side_effect=usb_recovery.DeviceError("could not claim USB device (open: EACCES)"),
                 ), \
-                mock.patch.object(device.subprocess, "run", side_effect=fake_run):
+                mock.patch.object(device, "_run_process", side_effect=fake_run):
             result, output = self.run_main(["--device", DEVICE, "diag", "iccid"])
         self.assertEqual(result, 0)
         self.assertNotIn("8986001234567890123", output)
