@@ -7,6 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = (ROOT / "components/idf_web/idf_web.cpp").read_text()
 SPEC = json.loads((ROOT / "dev_doc/openapi.json").read_text())
+CONFIG_SCHEMA = json.loads((ROOT / "dev_doc/config-schema/v6.json").read_text())
 
 
 def main() -> None:
@@ -96,6 +97,19 @@ def main() -> None:
 
     config_update = SPEC["components"]["schemas"]["ConfigUpdate"]
     assert config_update["maxProperties"] == 51
+    config_properties = CONFIG_SCHEMA["properties"]["config"]["properties"]
+    update_properties = config_update["properties"]
+    for field in ("smtpSendTo", "adminPhone"):
+        assert update_properties[field]["x-maxUtf8Bytes"] == config_properties[field]["x-maxUtf8Bytes"]
+    assert update_properties["smtpPort"]["minimum"] == config_properties["smtpPort"]["minimum"]
+    assert update_properties["smtpPort"]["maximum"] == config_properties["smtpPort"]["maximum"]
+
+    field_limits = SOURCE[
+        SOURCE.index("static size_t modern_field_limit"):
+        SOURCE.index("static bool validate_modern_fields")
+    ]
+    assert re.search(r'key == "smtpSendTo"\)\s+return MAX_SMTP_RECIPIENT_BYTES;', field_limits)
+    assert re.search(r'key == "adminPhone"\)\s+return MAX_ADMIN_PHONE_BYTES;', field_limits)
     log_limit = SPEC["paths"]["/log"]["get"]["parameters"][1]["schema"]
     assert log_limit["maximum"] == 50
 

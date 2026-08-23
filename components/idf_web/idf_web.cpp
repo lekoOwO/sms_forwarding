@@ -2484,9 +2484,10 @@ static size_t modern_field_limit(const std::string& key)
     if (key == "smtpPort" || key == "networkMode" || key == "heartbeatEnable" ||
         key == "heartbeatInterval" || key == "kaEnabled" || key == "kaIntervalDays" ||
         key == "kaTrafficKB") return 32;
-    if (key == "smtpUser" || key == "smtpSendTo") return 254;
+    if (key == "smtpUser") return 254;
+    if (key == "smtpSendTo") return MAX_SMTP_RECIPIENT_BYTES;
     if (key == "smtpPass") return 256;
-    if (key == "adminPhone") return 32;
+    if (key == "adminPhone") return MAX_ADMIN_PHONE_BYTES;
     if (key == "numberBlackList") return 1024;
     for (const char* suffix : {"ssid", "pass", "open"}) {
         if (indexed_save_key(key, "wifi", suffix, IDF_MAX_WIFI_NETWORKS) >= 0) {
