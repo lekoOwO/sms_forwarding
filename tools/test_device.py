@@ -961,6 +961,73 @@ class DeviceCommandTest(unittest.TestCase):
             with mock.patch.object(device, "ROOT", root):
                 self.assertEqual(device.validate_app0_image(usb_image), len(b"firmware"))
 
+    def test_flash_bootloader_dry_run_uses_fixed_offset_and_rejects_app_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            bootloader = root / "build" / "idf-ota-test" / "bootloader" / "bootloader.bin"
+            bootloader.parent.mkdir(parents=True)
+            bootloader.write_bytes(b"bootloader")
+            with mock.patch.object(device, "ROOT", root):
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-bootloader", str(bootloader),
+                ])
+            self.assertEqual(result, 0)
+            plan = json.loads(output)
+            self.assertEqual(plan["action"], "flash-bootloader")
+            self.assertEqual(plan["offset"], "0x0")
+            self.assertEqual(plan["size"], len(b"bootloader"))
+            app = root / "build" / "idf-ota-test" / "sms_forwarding_idf.bin"
+            app.write_bytes(b"app")
+            with mock.patch.object(device, "ROOT", root):
+                with self.assertRaises(ValueError):
+                    device.validate_bootloader_image(app)
+            renamed = bootloader.with_name("renamed.bin")
+            renamed.write_bytes(b"bootloader")
+            with mock.patch.object(device, "ROOT", root):
+                with self.assertRaises(ValueError):
+                    device.validate_bootloader_image(renamed)
+            symlink = bootloader.with_name("link.bin")
+            symlink.symlink_to(bootloader)
+            with mock.patch.object(device, "ROOT", root):
+                with self.assertRaises(ValueError):
+                    device.validate_bootloader_image(symlink)
+
+    def test_live_flash_bootloader_writes_only_offset_zero_with_hash_pin(self):
+        events = []
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            profile = root / "build" / "idf-ota-test"
+            image = profile / "bootloader" / "bootloader.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"bootloader")
+            (profile / "CMakeCache.txt").write_text("cache", encoding="ascii")
+            digest = device.sha256_file(image)
+
+            def fake_run(command, **kwargs):
+                events.append((command, kwargs))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "resolve_esptool", return_value="host"), \
+                    mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None):
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-bootloader", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertEqual(result, 0)
+        command = events[-1][0]
+        self.assertIn("write_flash", command)
+        self.assertEqual(command[command.index("--before") + 1], "usb_reset")
+        self.assertEqual(command[command.index("--after") + 1], "hard_reset")
+        self.assertEqual(command[-2:], ["0x0", str(image)])
+        self.assertNotIn("erase_flash", command)
+        self.assertNotIn("partition-table.bin", command)
+        self.assertEqual(json.loads(output)["sha256"], digest)
+
     def test_flash_app1_dry_run_uses_fixed_slot_and_rejects_arbitrary_offset(self):
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)

@@ -258,6 +258,12 @@ int main() {
         0x1f0000, 0x1f0000, health_platform(commit_failure)) == IdfWebOtaHealthResult::Retry);
     assert(commit_failure.persisted && !commit_failure.cleared && !commit_failure.rolled_back);
 
+    HealthFake unknown_bootloader;
+    assert(idf_web_ota_apply_health(S::Other, true, true, false, 0, 31,
+        0x1f0000, 0x1f0000, health_platform(unknown_bootloader)) ==
+        IdfWebOtaHealthResult::Waiting);
+    assert(!unknown_bootloader.cleared && !unknown_bootloader.rolled_back);
+
     HealthFake deadline;
     assert(idf_web_ota_apply_health(S::PendingVerify, false, false, true, 30, 31,
         0x1f0000, 0x1f0000, health_platform(deadline)) == IdfWebOtaHealthResult::RolledBack);

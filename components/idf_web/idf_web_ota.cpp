@@ -408,7 +408,7 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
     const esp_partition_t* running = esp_ota_get_running_partition();
     if (!running) return ESP_ERR_INVALID_STATE;
     esp_ota_img_states_t raw_state;
-    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) return ESP_OK;
+    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) return ESP_FAIL;
     IdfWebOtaImageState state = raw_state == ESP_OTA_IMG_PENDING_VERIFY
         ? IdfWebOtaImageState::PendingVerify
         : raw_state == ESP_OTA_IMG_VALID ? IdfWebOtaImageState::Valid : IdfWebOtaImageState::Other;

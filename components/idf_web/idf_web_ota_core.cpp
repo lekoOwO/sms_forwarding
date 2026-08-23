@@ -257,6 +257,9 @@ IdfWebOtaHealthDecision idf_web_ota_health_decide(
         if (!http_live || !management_reachable) return IdfWebOtaHealthDecision::Wait;
         return IdfWebOtaHealthDecision::Confirm;
     }
+    if (state == IdfWebOtaImageState::Other && pending != 0) {
+        return IdfWebOtaHealthDecision::Wait;
+    }
     if (pending == 0) return IdfWebOtaHealthDecision::None;
     if (state == IdfWebOtaImageState::Valid && running_address == pending_address &&
         pending > accepted) return IdfWebOtaHealthDecision::CommitAccepted;

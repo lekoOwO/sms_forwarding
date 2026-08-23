@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IDF_HELPER = ROOT / "tools" / "idf.sh"
 BASELINE_CHECK = ROOT / "tools" / "check_idf_baseline.py"
 DEFAULT_APP_IMAGE = ROOT / "build" / "idf" / "sms_forwarding_idf.bin"
+DEFAULT_BOOTLOADER_IMAGE = ROOT / "build" / "idf" / "bootloader" / "bootloader.bin"
 OTA_TEST_PROFILE_DIR = ROOT / "build" / "idf-ota-test"
 OTA_TEST_IMAGE = OTA_TEST_PROFILE_DIR / "sms_forwarding_idf.bin"
 OTA_TEST_PRIVATE_KEY = OTA_TEST_PROFILE_DIR / "ota_test_private.pem"
@@ -41,17 +42,24 @@ APP_IMAGE_RELATIVE_PATHS = (
     Path("build/idf-usb-recovery/sms_forwarding_idf.bin"),
     Path("build/idf-ota-test/sms_forwarding_idf.bin"),
 )
+BOOTLOADER_IMAGE_RELATIVE_PATHS = (
+    Path("build/idf/bootloader/bootloader.bin"),
+    Path("build/idf-usb-recovery/bootloader/bootloader.bin"),
+    Path("build/idf-ota-test/bootloader/bootloader.bin"),
+)
 ESPTOOL = os.environ.get("ESPTOOL", "esptool.py")
 IDF_IMAGE = EXPECTED_IDF_IMAGE
 CONTAINER_PYTHON = "/opt/esp/python_env/idf5.5_py3.12_env/bin/python"
 CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
 APP_OFFSET = 0x10000
+BOOTLOADER_OFFSET = 0x0
 APP_SLOT_OFFSETS = {
     "app0": APP_OFFSET,
     "app1": 0x1F0000,
 }
 APP_MAX_SIZE = 0x1E0000
+BOOTLOADER_MAX_SIZE = 0x7000
 CONFIG_MAX_BYTES = 32828
 CONFIG_HEADER_BYTES = 44
 CONFIG_TAG_BYTES = 16
@@ -882,6 +890,29 @@ def validate_app0_image(path: Path) -> int:
     size = resolved.stat().st_size
     if not 0 < size <= APP_MAX_SIZE:
         raise ValueError(f"app image must be 1..{APP_MAX_SIZE} bytes")
+    return size
+
+
+def resolve_bootloader_image(path: Path) -> Path:
+    candidate = path if path.is_absolute() else ROOT / path
+    _reject_symlink_components(candidate)
+    if candidate.is_symlink() or not _is_regular_file(candidate):
+        raise ValueError("bootloader image must be a regular file")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"bootloader image does not exist: {candidate}") from exc
+    allowed = {(ROOT / relative).resolve() for relative in BOOTLOADER_IMAGE_RELATIVE_PATHS}
+    if resolved not in allowed:
+        raise ValueError("bootloader image must be a repository ESP-IDF build artifact")
+    return resolved
+
+
+def validate_bootloader_image(path: Path) -> int:
+    resolved = resolve_bootloader_image(path)
+    size = resolved.stat().st_size
+    if not 0 < size <= BOOTLOADER_MAX_SIZE:
+        raise ValueError(f"bootloader image must be 1..{BOOTLOADER_MAX_SIZE} bytes")
     return size
 
 
@@ -1774,6 +1805,55 @@ def _flash_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _flash_bootloader_command(args: argparse.Namespace) -> int:
+    device_path = resolve_device(args.device)
+    if args.image and args.image_option:
+        raise ValueError("choose one bootloader image")
+    image = Path(args.image_option or args.image or str(DEFAULT_BOOTLOADER_IMAGE))
+    image = resolve_bootloader_image(image)
+    size = validate_bootloader_image(image)
+    plan = {
+        "action": "flash-bootloader",
+        "device": device_path,
+        "image": str(image),
+        "live": bool(args.live),
+        "max_size": BOOTLOADER_MAX_SIZE,
+        "offset": f"0x{BOOTLOADER_OFFSET:X}",
+        "size": size,
+        "preserves": ["otadata", "nvs", "appcfg", "coredump", "app0", "app1"],
+    }
+    if not args.live:
+        print(json.dumps(plan, sort_keys=True))
+        return 0
+
+    device = resolve_serial_device(device_path)
+    _run_baseline(image.parent.parent)
+    digest = sha256_file(image)
+    pin = args.sha256_pin
+    if len(pin) != 64 or any(char not in "0123456789abcdefABCDEF" for char in pin):
+        raise ValueError("--sha256 must be a 64-character SHA-256 pin")
+    if pin.lower() != digest:
+        raise ValueError("--sha256 pin does not match bootloader image")
+    confirm_basename(device_path, args.confirm)
+    arguments = [
+        "--chip",
+        "esp32c3",
+        "--port",
+        device.by_id,
+        "--before",
+        "usb_reset",
+        "--after",
+        "hard_reset",
+        "write_flash",
+        f"0x{BOOTLOADER_OFFSET:X}",
+        str(image),
+    ]
+    _run_esptool(arguments, device, RESET_TIMEOUT, image=image)
+    plan["sha256"] = digest
+    print(json.dumps(plan, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Safe ESP32-C3 device operations")
     parser.add_argument("--device", default=None, help="explicit /dev/serial/by-id path")
@@ -1848,7 +1928,16 @@ def build_parser() -> argparse.ArgumentParser:
     flash0.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
     flash0.set_defaults(slot="app0")
 
-    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash, flash0):
+    bootloader = commands.add_parser(
+        "flash-bootloader", help="flash the fixed ESP-IDF bootloader at offset 0x0"
+    )
+    bootloader.add_argument("image", nargs="?")
+    bootloader.add_argument("--image", dest="image_option")
+    bootloader.add_argument("--live", action="store_true", help="perform the flash")
+    bootloader.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
+    bootloader.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
+
+    for command in (commands.choices["state"], commands.choices["ota-state"], diag, reset, flash, flash0, bootloader):
         command.add_argument(
             "--device",
             default=argparse.SUPPRESS,
@@ -1875,6 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
             return _backup_command(args)
         if args.command == "ota-upload":
             return _ota_upload_command(args)
+        if args.command == "flash-bootloader":
+            return _flash_bootloader_command(args)
         if args.command == "state":
             deadline = time.monotonic() + CONTAINER_TIMEOUT
             state = _state(resolve_serial_device(args.device), deadline=deadline)

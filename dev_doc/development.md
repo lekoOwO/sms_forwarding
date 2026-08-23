@@ -48,7 +48,7 @@ python3 tools/usb_recovery.py --device /dev/serial/by-id/usb-... wifi-provision 
 
 日常裝置操作請使用 `tools/device.py`。它是單一入口：`build` 預設建立 production
 映像，`build --usb-dev` 建立 USB recovery 映像；`state`（可加 `--json`）與 `diag` 只輸出
-去識別化 JSON，`reset` 與 `flash-app`（`flash-app0` 相容命令）預設 dry-run。實際 reset 必須使用
+去識別化 JSON，`reset`、`flash-app`（`flash-app0` 相容命令）與 `flash-bootloader` 預設 dry-run。實際 reset 必須使用
 `--live --confirm <by-id basename>`；reset 與 app slot flash 使用原生 USB Serial/JTAG
 唯一固定的 `--before usb_reset --after hard_reset` sequence；reset 之後再 probe state。
 實際 app slot flash 會先執行 baseline check，`flash-app --slot` 只接受 `app0` 或 `app1`；
@@ -57,6 +57,20 @@ python3 tools/usb_recovery.py --device /dev/serial/by-id/usb-... wifi-provision 
 固定寫入 app0 `0x10000` 或 app1 `0x1f0000`，且不超過 `0x1e0000`；app-only flash 不會修改 `nvs`、`appcfg` 或
 `otadata`。Live flash 另須提供相符的
 `--sha256 <64-hex-digest>` pin，完成後輸出 SHA-256。
+若裝置仍使用舊 bootloader，先使用相符的 ESP-IDF bootloader 進行一次性遷移：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... flash-bootloader \
+  build/idf-ota-test/bootloader/bootloader.bin --live \
+  --sha256 <64-hex-bootloader-sha256> --confirm <by-id-basename>
+```
+
+`flash-bootloader` 只接受 repository 內固定 build profile 的 regular non-symlink
+bootloader，固定寫入 `0x0` 且大小上限為 `0x7000`；不使用 erase、partition-table 或
+merged image，因此會保留 `otadata`、`nvs`、`appcfg`、`coredump` 與兩個 app slot。
+Live flash 同樣要求 baseline check、SHA-256 pin 與 exact by-id basename confirmation。
+若 rollback state 無法讀取，或 pending counter 存在但 running image state 未被確認，
+health task 會 fail closed 並保留 counter，不會清除 OTA floor；完成 bootloader 遷移後才可繼續 OTA。
 `diag --raw` 必須明確指定，資料只寫到 stdout，不會寫入 evidence。
 裝置路徑可由 `SMS_DEVICE` 提供；沒有明確 `/dev/serial/by-id/` 路徑時會 fail closed。
 若 host 沒有 `esptool.py`，`reset` 與 live app slot flash 會使用既有 pinned
