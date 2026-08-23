@@ -76,6 +76,121 @@ class DeviceCommandTest(unittest.TestCase):
             result = device.main(argv)
         return result, output.getvalue()
 
+    def test_doctor_reports_sanitized_read_only_checks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            by_id = root / "by-id"
+            by_id.mkdir()
+            target = root / "ttyACM0"
+            target.write_bytes(b"")
+            target.chmod(0o660)
+            link = by_id / "private-device-serial"
+            link.symlink_to(target)
+            missing = str(by_id / "private-missing-serial")
+
+            cases = (
+                {
+                    "name": "host-access",
+                    "argv": ["--device", str(link), "doctor"],
+                    "environment": {},
+                    "host_access": True,
+                    "image_rc": 1,
+                    "device": (True, True, True, True),
+                    "permission": ("ok", "none"),
+                    "image_present": False,
+                    "ready": True,
+                },
+                {
+                    "name": "group-access-missing",
+                    "argv": ["--device", str(link), "doctor"],
+                    "environment": {},
+                    "host_access": False,
+                    "image_rc": 0,
+                    "device": (True, True, True, False),
+                    "permission": (
+                        "group-access-missing",
+                        "join-device-group-and-start-new-login-session",
+                    ),
+                    "image_present": True,
+                    "ready": True,
+                },
+                {
+                    "name": "unconfigured",
+                    "argv": ["doctor"],
+                    "environment": {},
+                    "host_access": False,
+                    "image_rc": 1,
+                    "device": (False, False, False, False),
+                    "permission": ("device-not-configured", "configure-explicit-by-id"),
+                    "image_present": False,
+                    "ready": False,
+                },
+                {
+                    "name": "missing-environment-device",
+                    "argv": ["doctor"],
+                    "environment": {"SMS_DEVICE": missing},
+                    "host_access": False,
+                    "image_rc": 1,
+                    "device": (True, False, False, False),
+                    "permission": ("device-not-present", "connect-device"),
+                    "image_present": False,
+                    "ready": False,
+                },
+            )
+            for case in cases:
+                docker = mock.Mock(
+                    return_value=mock.Mock(
+                        returncode=case["image_rc"], stdout="", stderr="private-docker-detail",
+                    )
+                )
+                output = io.StringIO()
+                error = io.StringIO()
+                with self.subTest(name=case["name"]), \
+                        mock.patch.dict(os.environ, case["environment"], clear=True), \
+                        mock.patch.object(device, "DEVICE_PREFIX", f"{by_id}/"), \
+                        mock.patch.object(device.stat, "S_ISCHR", return_value=True), \
+                        mock.patch.object(
+                            device.os, "access", return_value=case["host_access"],
+                        ), \
+                        mock.patch.object(device.os, "geteuid", return_value=999_999), \
+                        mock.patch.object(device.os, "getegid", return_value=999_998), \
+                        mock.patch.object(device.os, "getgroups", return_value=[]), \
+                        mock.patch.object(device.subprocess, "run", docker), \
+                        mock.patch.object(device.usb_recovery, "run_transaction") as transaction, \
+                        mock.patch.object(device, "_run_esptool") as esptool, \
+                        mock.patch.object(device.http.client, "HTTPConnection") as connection, \
+                        contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                    result = device.main(case["argv"])
+
+                self.assertEqual(result, 0)
+                self.assertEqual(error.getvalue(), "")
+                configured, present, character_device, host_read_write = case["device"]
+                code, action = case["permission"]
+                self.assertEqual(
+                    json.loads(output.getvalue()),
+                    {
+                        "device": {
+                            "character_device": character_device,
+                            "configured": configured,
+                            "host_read_write": host_read_write,
+                            "present": present,
+                        },
+                        "fallback": {"image_present": case["image_present"]},
+                        "permission": {"code": code, "recommended_action": action},
+                        "ready": case["ready"],
+                    },
+                )
+                self.assertNotIn(link.name, output.getvalue())
+                self.assertNotIn(str(link), output.getvalue())
+                self.assertNotIn("private-missing-serial", output.getvalue())
+                self.assertEqual(
+                    docker.call_args.args[0],
+                    ["docker", "image", "inspect", device.IDF_IMAGE],
+                )
+                transaction.assert_not_called()
+                esptool.assert_not_called()
+                connection.assert_not_called()
+
     def test_build_defaults_to_non_release_production(self):
         calls = []
 

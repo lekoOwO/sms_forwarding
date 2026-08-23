@@ -2196,6 +2196,76 @@ def _ota_migration_recover_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _doctor_command(args: argparse.Namespace) -> int:
+    configured = present = character_device = host_read_write = False
+    permission_code = "device-not-configured"
+    recommended_action = "configure-explicit-by-id"
+
+    try:
+        device_path = resolve_device(args.device)
+    except ValueError:
+        device_path = None
+    if device_path is not None:
+        configured = True
+        present = os.path.lexists(device_path)
+        permission_code = "device-not-present"
+        recommended_action = "connect-device"
+        if present:
+            permission_code = "invalid-device"
+            recommended_action = "check-device-symlink"
+            try:
+                resolved = resolve_serial_device(device_path)
+                device_stat = Path(resolved.target).stat()
+            except (OSError, ValueError):
+                pass
+            else:
+                character_device = True
+                host_read_write = os.access(resolved.target, os.R_OK | os.W_OK)
+                permission_code = "ok" if host_read_write else "access-denied"
+                recommended_action = "none" if host_read_write else "check-device-access"
+                process_groups = {os.getegid(), *os.getgroups()}
+                group_read_write = (
+                    device_stat.st_mode & (stat.S_IRGRP | stat.S_IWGRP)
+                    == stat.S_IRGRP | stat.S_IWGRP
+                )
+                if (
+                    not host_read_write
+                    and os.geteuid() != device_stat.st_uid
+                    and device_stat.st_gid not in process_groups
+                    and group_read_write
+                ):
+                    permission_code = "group-access-missing"
+                    recommended_action = "join-device-group-and-start-new-login-session"
+
+    try:
+        image_present = subprocess.run(
+            ["docker", "image", "inspect", IDF_IMAGE],
+            cwd=ROOT,
+            timeout=CONTAINER_STARTUP_TIMEOUT,
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        image_present = False
+
+    print(json.dumps({
+        "device": {
+            "character_device": character_device,
+            "configured": configured,
+            "host_read_write": host_read_write,
+            "present": present,
+        },
+        "fallback": {"image_present": image_present},
+        "permission": {
+            "code": permission_code,
+            "recommended_action": recommended_action,
+        },
+        "ready": character_device and (host_read_write or image_present),
+    }, sort_keys=True))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Safe ESP32-C3 device operations")
     parser.add_argument("--device", default=None, help="explicit /dev/serial/by-id path")
@@ -2242,6 +2312,8 @@ def build_parser() -> argparse.ArgumentParser:
     state = commands.add_parser("state", help="read sanitized device state")
     state.add_argument("--json", action="store_true", help="write the default JSON state format")
 
+    doctor = commands.add_parser("doctor", help="check read-only host device readiness")
+
     commands.add_parser("ota-state", help="read safe signed OTA state")
 
     diag = commands.add_parser("diag", help="run fixed read-only modem diagnostics")
@@ -2286,7 +2358,7 @@ def build_parser() -> argparse.ArgumentParser:
     migration_recover.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
 
     for command in (
-        commands.choices["state"], commands.choices["ota-state"], diag, reset,
+        commands.choices["state"], doctor, commands.choices["ota-state"], diag, reset,
         flash, flash0, bootloader, migration_recover,
     ):
         command.add_argument(
@@ -2319,6 +2391,8 @@ def main(argv: list[str] | None = None) -> int:
             return _flash_bootloader_command(args)
         if args.command == "ota-migration-recover":
             return _ota_migration_recover_command(args)
+        if args.command == "doctor":
+            return _doctor_command(args)
         if args.command == "state":
             deadline = (
                 time.monotonic() + CONTAINER_LIFECYCLE_TIMEOUT + STATE_TIMEOUT * 3

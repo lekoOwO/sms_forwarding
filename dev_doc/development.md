@@ -46,6 +46,12 @@ python3 tools/device.py --device /dev/serial/by-id/usb-... diag all
 python3 tools/usb_recovery.py --device /dev/serial/by-id/usb-... wifi-provision --ssid 'network-name'
 ```
 
+操作前可用唯讀檢查確認裝置權限與本機 pinned fallback image，不會開啟裝置或連線網路：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... doctor
+```
+
 日常裝置操作請使用 `tools/device.py`。它是單一入口：`build` 預設建立 production
 映像，`build --usb-dev` 建立 USB recovery 映像；`state`（可加 `--json`）與 `diag` 只輸出
 去識別化 JSON，`reset`、`flash-app`（`flash-app0` 相容命令）與 `flash-bootloader` 預設 dry-run。實際 reset 必須使用
