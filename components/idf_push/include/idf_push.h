@@ -17,6 +17,8 @@ int idf_push_forward_queue_depth(void);
 int idf_push_retry_queue_depth(void);
 int idf_push_email_queue_depth(void);
 bool idf_push_busy(void);
+bool idf_push_test_active(void);
+bool idf_push_test_channel_active(uint8_t channel);
 
 bool idf_push_enqueue_test(uint8_t channel, std::string& message);
 std::string idf_push_test_status_json(uint8_t channel);

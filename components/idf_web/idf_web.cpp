@@ -61,6 +61,7 @@ static constexpr uint32_t BACKUP_TTL_MS = 120000;
 static constexpr size_t BACKUP_CHUNK_BYTES = 8192;
 static constexpr uint32_t OTA_TTL_MS = 120000;
 static std::atomic<bool> s_device_restart_pending{false};
+static std::atomic<bool> s_push_test_admission_active{false};
 static std::atomic<bool> s_restore_restart_pending{false};
 static std::atomic<uint32_t> s_restore_restart_completed_ms{0};
 
@@ -1703,7 +1704,7 @@ static bool reject_restart_while_backup_active(httpd_req_t* req)
 {
     if (!backup_transfer_active() && !ota_active() && !device_restart_pending() &&
         !restore_restart_pending() &&
-        !api_jobs_active()) return false;
+        !api_jobs_active() && !idf_push_test_active()) return false;
     send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     return true;
 }
@@ -1743,7 +1744,8 @@ static esp_err_t handle_config_export(httpd_req_t* req)
     if (req->method != HTTP_POST) {
         return send_backup_result(req, "405 Method Not Allowed", false, "ACTION_INPUT_INVALID");
     }
-    if (ota_active() || device_restart_pending() || restore_restart_pending()) {
+    if (ota_active() || device_restart_pending() || restore_restart_pending() ||
+        idf_push_test_active()) {
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
@@ -1782,7 +1784,7 @@ static esp_err_t handle_config_restore_start(httpd_req_t* req)
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
-    if (ota_active() || device_restart_pending() || restore_restart_pending() ||
+    if (ota_active() || device_restart_pending() || restore_restart_pending() || idf_push_test_active() ||
         backup_transfer_active()) {
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
@@ -1962,6 +1964,7 @@ static esp_err_t handle_ota_start(httpd_req_t* req)
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
     if (device_restart_pending() || restore_restart_pending() || ota_active() || backup_transfer_active() ||
+        idf_push_test_active() ||
         api_jobs_active() || cellular_job_active()) {
         return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
@@ -2780,6 +2783,7 @@ static esp_err_t handle_save(httpd_req_t* req)
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
+    if (idf_push_test_active()) return send_action_error(req, "ACTION_BUSY", {}, "409 Conflict");
     std::string body;
     // 16KB: five custom push templates plus URL-encoded forwarding rules can exceed 8KB.
     if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
@@ -3384,38 +3388,70 @@ static esp_err_t handle_resend_message(httpd_req_t* req)
         : "{\"success\":false,\"message\":\"Forwarding queue is busy; try again later\"}");
 }
 
+static esp_err_t send_push_test_failure(httpd_req_t* req, const char* status,
+                                        const std::string& message)
+{
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, status);
+    std::string body = "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,";
+    json_prop(body, "message", message);
+    body += "}";
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
 static esp_err_t handle_test_push(httpd_req_t* req)
 {
+    if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
-    if (!ensure_get_or_post(req)) return ESP_OK;
-    std::string action;
-    get_query_param(req, "action", action);
-    std::string ch_raw;
-    int ch_val = -1;
-    bool valid_channel = get_query_param(req, "ch", ch_raw) && parse_int_strict(ch_raw, ch_val) &&
-                         ch_val >= 0 && ch_val < IDF_MAX_PUSH_CHANNELS;
-    uint8_t ch = valid_channel ? static_cast<uint8_t>(ch_val) : 0;
-    set_json_no_cache(req);
-    if (!valid_channel) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"queued\":false,\"running\":false,\"message\":\"Invalid channel index\"}");
+    if (req->method != HTTP_GET && req->method != HTTP_POST) {
+        httpd_resp_set_hdr(req, "Allow", "GET, POST");
+        return send_push_test_failure(req, "405 Method Not Allowed", "Push tests require GET or POST");
     }
-    if (action == "status") {
-        std::string body = idf_push_test_status_json(ch);
+    if (req->method == HTTP_POST && !check_csrf(req)) return ESP_OK;
+    if (req->method == HTTP_POST && req->content_len != 0) {
+        return send_push_test_failure(req, "400 Bad Request", "Push test request body is not allowed");
+    }
+    std::string channel_raw;
+    int channel_value = -1;
+    if (!get_query_param(req, "channel", channel_raw, 64) ||
+        !parse_int_strict(channel_raw, channel_value) ||
+        channel_value < 0 || channel_value >= IDF_MAX_PUSH_CHANNELS) {
+        return send_push_test_failure(req, "400 Bad Request", "Invalid channel index");
+    }
+    const uint8_t channel = static_cast<uint8_t>(channel_value);
+    if (req->method == HTTP_GET) {
+        set_json_no_cache(req);
+        const std::string body = idf_push_test_status_json(channel);
         return httpd_resp_send(req, body.c_str(), body.size());
     }
-    if (req->method != HTTP_POST) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"queued\":false,\"running\":false,\"message\":\"Push tests require POST\"}");
+    if (idf_push_test_channel_active(channel)) {
+        httpd_resp_set_status(req, "409 Conflict");
+        set_json_no_cache(req);
+        const std::string body = idf_push_test_status_json(channel);
+        return httpd_resp_send(req, body.c_str(), body.size());
+    }
+    if (s_push_test_admission_active.exchange(true, std::memory_order_acq_rel)) {
+        return send_push_test_failure(req, "409 Conflict", "Device is busy; try again later");
     }
 
-    std::string msg;
-    bool ok = idf_push_enqueue_test(ch, msg);
-    std::string body = "{\"success\":";
-    body += ok ? "true" : "false";
-    body += ",\"queued\":";
-    body += ok ? "true" : "false";
-    body += ",";
-    json_prop(body, "message", msg);
-    body += "}";
+    std::string message;
+    const bool blocked = backup_transfer_active() || ota_active() || device_restart_pending() ||
+        restore_restart_pending() || api_jobs_active();
+    const bool queued = !blocked && idf_push_enqueue_test(channel, message);
+    s_push_test_admission_active.store(false, std::memory_order_release);
+    if (blocked) {
+        return send_push_test_failure(req, "409 Conflict", "Device is busy; try again later");
+    }
+    if (!queued) {
+        if (message != "Channel test is already running in the background") {
+            return send_push_test_failure(req, "409 Conflict", message);
+        }
+        httpd_resp_set_status(req, "409 Conflict");
+    } else {
+        httpd_resp_set_status(req, "202 Accepted");
+    }
+    set_json_no_cache(req);
+    const std::string body = idf_push_test_status_json(channel);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -3980,13 +4016,16 @@ static bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days
 }
 
 static bool system_idle_for_maintenance(bool include_done = false,
-                                         bool allow_restore_restart = false)
+                                         bool allow_restore_restart = false,
+                                         bool allow_device_restart = false)
 {
     const bool jobs_busy = include_done && !allow_restore_restart
         ? api_jobs_visible() : api_jobs_active();
-    return !backup_transfer_active() && !ota_active() && !device_restart_pending() &&
+    return !backup_transfer_active() && !ota_active() &&
+           (allow_device_restart || !device_restart_pending()) &&
            (allow_restore_restart || !restore_restart_pending()) && !jobs_busy &&
-           !idf_push_busy() &&
+           !s_push_test_admission_active.load(std::memory_order_acquire) &&
+           !idf_push_busy() && !idf_push_test_active() &&
            idf_push_forward_queue_depth() == 0 &&
            idf_push_retry_queue_depth() == 0 &&
            idf_sms_outgoing_queue_depth() == 0 &&
@@ -4265,9 +4304,15 @@ static void scheduler_task(void*)
         if (heap_caps_get_free_size(MALLOC_CAP_8BIT) < 20000U && system_idle_for_maintenance()) {
             idf_logf("Free heap below threshold (%u<20000); preparing orderly restart",
                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
-            vTaskDelay(pdMS_TO_TICKS(300));
-            idf_modem_power_off_for_restart();
-            esp_restart();
+            bool expected = false;
+            const bool claimed = s_device_restart_pending.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel);
+            if (claimed && system_idle_for_maintenance(false, false, true)) {
+                vTaskDelay(pdMS_TO_TICKS(300));
+                idf_modem_power_off_for_restart();
+                esp_restart();
+            }
+            if (claimed) s_device_restart_pending.store(false, std::memory_order_release);
         }
 
         const uint32_t maintenance_now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
@@ -4361,12 +4406,18 @@ static void scheduler_task(void*)
             uint64_t uptime_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
             if (cfg.rebootEnabled && hour == cfg.rebootHour && day > rb_last_day &&
                 uptime_ms >= 7200000ULL && system_idle_for_maintenance(true)) {
-                rb_last_day = day;
                 idf_log_line("Daily scheduled restart...");
-                vTaskDelay(pdMS_TO_TICKS(300));
-                // Daily restart is the unattended recovery fallback and must cold-start the modem too.
-                idf_modem_power_off_for_restart();
-                esp_restart();
+                bool expected = false;
+                const bool claimed = s_device_restart_pending.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel);
+                if (claimed && system_idle_for_maintenance(true, false, true)) {
+                    rb_last_day = day;
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    // Daily restart is the unattended recovery fallback and must cold-start the modem too.
+                    idf_modem_power_off_for_restart();
+                    esp_restart();
+                }
+                if (claimed) s_device_restart_pending.store(false, std::memory_order_release);
             }
         }
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -4882,6 +4933,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/ota/start", register_handler(s_server, "/api/ota/start", HTTP_POST, handle_ota_start));
     IDF_WEB_TRY_REGISTER("/api/ota/chunk", register_handler(s_server, "/api/ota/chunk", HTTP_POST, handle_ota_chunk));
     IDF_WEB_TRY_REGISTER("/api/ota/finish", register_handler(s_server, "/api/ota/finish", HTTP_POST, handle_ota_finish));
+    IDF_WEB_TRY_REGISTER("/api/push/test", register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push));
     IDF_WEB_TRY_REGISTER("/query", register_handler(s_server, "/query", HTTP_GET, handle_query));
     IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, handle_save));
     IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_GET, handle_wifi));

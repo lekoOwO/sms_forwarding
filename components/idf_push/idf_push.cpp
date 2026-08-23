@@ -68,6 +68,7 @@ static constexpr size_t TLS_MIN_FREE_HEAP = 50000;
 // This prevents a dead endpoint from consuming HTTP timeouts and blocking the only send worker.
 static constexpr uint32_t CHANNEL_COOL_STEP_SEC = 30;
 static constexpr uint32_t CHANNEL_COOL_MAX_SEC = 300;
+static constexpr int64_t PUSH_TEST_PENDING_MAX_US = 60LL * 1000LL * 1000LL;
 
 struct PushJob {
     bool used = false;
@@ -116,6 +117,7 @@ struct TestJob {
     bool done = false;
     bool success = false;
     int64_t nextUs = 0;
+    int64_t deadlineUs = 0;
     std::string message;
 };
 
@@ -1759,14 +1761,36 @@ static bool fail_pending_tests(const char* message)
         job.done = true;
         job.success = false;
         job.nextUs = 0;
+        job.deadlineUs = 0;
         job.message = message;
     }
     xSemaphoreGive(s_mutex);
     return failed;
 }
 
+static bool expire_test_jobs_locked(int64_t now)
+{
+    bool expired = false;
+    for (auto& job : s_test_jobs) {
+        if (!job.pending || job.deadlineUs <= 0 || job.deadlineUs > now) continue;
+        expired = true;
+        job.pending = false;
+        job.done = true;
+        job.success = false;
+        job.nextUs = 0;
+        job.deadlineUs = 0;
+        job.message = "Test push timed out before it could start";
+    }
+    return expired;
+}
+
 static bool process_test_one()
 {
+    const int64_t now = esp_timer_get_time();
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    const bool expired = expire_test_jobs_locked(now);
+    xSemaphoreGive(s_mutex);
+    if (expired) return true;
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
     const IdfWifiStatus wifi = idf_wifi_get_status();
     if (!cfg.pushEnabled) return fail_pending_tests("Push is disabled; test canceled");
@@ -1779,7 +1803,6 @@ static bool process_test_one()
     if (low_heap_defer()) return false;
     int picked = -1;
     IdfPushChannel channel;
-    const int64_t now = esp_timer_get_time();
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (!s_test_jobs[i].pending || s_test_jobs[i].nextUs > now) continue;
@@ -1794,6 +1817,7 @@ static bool process_test_one()
         s_test_jobs[i].done = false;
         s_test_jobs[i].success = false;
         s_test_jobs[i].nextUs = 0;
+        s_test_jobs[i].deadlineUs = 0;
         s_test_jobs[i].message = "Sending test push";
         channel = cfg.pushChannels[i];
         break;
@@ -1814,7 +1838,7 @@ static bool process_test_one()
         result = ok ? "Test push sent" : "Test push failed; see the log";
     }
 
-    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         TestJob& job = s_test_jobs[picked];
         job.running = false;
         job.done = true;
@@ -2009,10 +2033,52 @@ bool idf_push_busy(void)
     return s_busy.load(std::memory_order_relaxed);
 }
 
+bool idf_push_test_active(void)
+{
+    if (!ensure_init()) return true;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return true;
+    expire_test_jobs_locked(esp_timer_get_time());
+    const bool active = std::any_of(s_test_jobs.begin(), s_test_jobs.end(), [](const auto& job) {
+        return job.pending || job.running;
+    });
+    xSemaphoreGive(s_mutex);
+    return active;
+}
+
+bool idf_push_test_channel_active(uint8_t channel)
+{
+    if (channel >= IDF_MAX_PUSH_CHANNELS || !ensure_init()) return true;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return true;
+    expire_test_jobs_locked(esp_timer_get_time());
+    const bool active = s_test_jobs[channel].pending || s_test_jobs[channel].running;
+    xSemaphoreGive(s_mutex);
+    return active;
+}
+
 bool idf_push_enqueue_test(uint8_t channel, std::string& message)
 {
     if (channel >= IDF_MAX_PUSH_CHANNELS) {
         message = "Channel number is invalid";
+        return false;
+    }
+    if (!ensure_init()) {
+        message = "Push queue initialization failed";
+        return false;
+    }
+    if (!s_started) {
+        message = "Push background worker is unavailable";
+        return false;
+    }
+    bool busy = false;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        message = "Push queue is busy";
+        return false;
+    }
+    expire_test_jobs_locked(esp_timer_get_time());
+    busy = s_test_jobs[channel].pending || s_test_jobs[channel].running;
+    xSemaphoreGive(s_mutex);
+    if (busy) {
+        message = "Channel test is already running in the background";
         return false;
     }
     const IdfPushNotifyView cfg = idf_config_get_push_notify_view();
@@ -2030,34 +2096,32 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         message = "WiFi is disconnected; test push is unavailable";
         return false;
     }
-    if (!ensure_init()) {
-        message = "Push queue initialization failed";
-        return false;
-    }
     bool valid = channel_valid(cfg.pushChannels[channel]);
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         message = "Push queue is busy";
         return false;
     }
     TestJob& job = s_test_jobs[channel];
-    bool busy = job.pending || job.running;
+    expire_test_jobs_locked(esp_timer_get_time());
+    busy = job.pending || job.running;
     if (valid && !busy) {
         job.pending = true;
         job.running = false;
         job.done = false;
         job.success = false;
         job.nextUs = 0;
+        job.deadlineUs = esp_timer_get_time() + PUSH_TEST_PENDING_MAX_US;
         job.message = "Test push queued; you can continue to refresh the page";
         message = job.message;
     }
     xSemaphoreGive(s_mutex);
+    if (busy) {
+        message = "Channel test is already running in the background";
+        return false;
+    }
     if (!valid) {
         message = "Channel is disabled or incomplete; save its configuration first";
         return false;
-    }
-    if (busy) {
-        message = "Channel test is already running in the background";
-        return true;
     }
     wake_worker();
     return true;
@@ -2071,11 +2135,16 @@ std::string idf_push_test_status_json(uint8_t channel)
     if (!ensure_init()) {
         return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"Push queue initialization failed\"}";
     }
-    TestJob copy;
-    if (s_mutex && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        copy = s_test_jobs[channel];
-        xSemaphoreGive(s_mutex);
+    if (!s_started) {
+        return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"Push background worker is unavailable\"}";
     }
+    TestJob copy;
+    if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"Push test status is temporarily unavailable\"}";
+    }
+    expire_test_jobs_locked(esp_timer_get_time());
+    copy = s_test_jobs[channel];
+    xSemaphoreGive(s_mutex);
     std::string msg = copy.message.empty() ? "Test not started" : copy.message;
     std::string out = "{";
     out += "\"queued\":"; out += copy.pending ? "true" : "false"; out += ",";

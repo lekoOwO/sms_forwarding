@@ -37,6 +37,15 @@ async function completed(baseUrl, response) {
 	throw new Error("job timeout");
 }
 
+async function completedPushTest(baseUrl, channel) {
+	for (let attempt = 0; attempt < 100; attempt += 1) {
+		const status = await (await request(baseUrl, `/api/push/test?channel=${channel}`)).json();
+		if (status.done) return status;
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	throw new Error("push test timeout");
+}
+
 function decrypt(bytes, passphrase) {
 	const value = Buffer.from(bytes);
 	assert.equal(value.subarray(0, 8).toString(), "SMSCFG01");
@@ -217,6 +226,112 @@ test("global notification switches round-trip independently without clearing cha
 			assert.deepEqual(await (await request(baseUrl, "/api/config")).json(), unchanged);
 		});
 	}
+});
+
+test("push channel tests require CSRF and keep bounded per-channel results independent", async () => {
+	await withServer(async (baseUrl) => {
+		assert.equal((await fetch(`${baseUrl}/api/push/test?channel=0`)).status, 401);
+		assert.equal((await fetch(`${baseUrl}/api/push/test?channel=0`, {
+			method: "POST", headers: { Authorization: auth }
+		})).status, 403);
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push2en: "on", push2type: 9, push2name: "Incomplete",
+			push2url: "https://push3.example/message"
+		}))).success, true);
+		const incomplete = await request(baseUrl, "/api/push/test?channel=2", { method: "POST" });
+		assert.equal(incomplete.status, 409);
+		assert.match((await incomplete.json()).message, /disabled or incomplete/);
+
+		for (const [index, secret] of [[0, "first-secret"], [1, "second-secret"]]) {
+			assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+				[`push${index}en`]: "on", [`push${index}type`]: 9,
+				[`push${index}name`]: `Channel ${index + 1}`,
+				[`push${index}url`]: `https://push${index + 1}.example/message`,
+				[`push${index}key1`]: secret, [`push${index}title`]: "{sender}",
+				[`push${index}template`]: "{message}"
+			}))).code, "ACTION_CONFIG_SAVED");
+		}
+
+		const first = await request(baseUrl, "/api/push/test?channel=0", { method: "POST" });
+		assert.equal(first.status, 202);
+		const firstStatus = await first.json();
+		assert.deepEqual(Object.keys(firstStatus).sort(), ["done", "message", "queued", "running", "success"]);
+		assert.equal(firstStatus.queued, true);
+		const ping = await request(baseUrl, "/ping", { method: "POST" });
+		assert.equal(ping.status, 202);
+		const exportDuringTest = await form(baseUrl, "/api/config/export", { passphrase: "short" });
+		await assertAction(exportDuringTest, 409, "ACTION_BUSY");
+		const duplicate = await request(baseUrl, "/api/push/test?channel=0", { method: "POST" });
+		assert.equal(duplicate.status, 409);
+		assert.equal((await duplicate.json()).queued, true);
+		await assertAction(await form(baseUrl, "/save", { pushEnabled: "0" }), 409, "ACTION_BUSY");
+		assert.equal((await (await request(baseUrl, "/api/push/test?channel=1")).json()).done, false);
+		await completed(baseUrl, ping);
+
+		assert.equal((await request(baseUrl, "/api/push/test?channel=1", { method: "POST" })).status, 202);
+		const [firstDone, secondDone, untouched] = await Promise.all([
+			completedPushTest(baseUrl, 0), completedPushTest(baseUrl, 1),
+			request(baseUrl, "/api/push/test?channel=2").then((response) => response.json())
+		]);
+		assert.deepEqual([firstDone.done, firstDone.success, secondDone.done, secondDone.success],
+			[true, true, true, true]);
+		assert.deepEqual([untouched.done, untouched.success], [false, false]);
+		assert.doesNotMatch(JSON.stringify([firstStatus, firstDone, secondDone, untouched]), /first-secret|second-secret/);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { networkMode: 1 }))).success, true);
+		const unsupportedResponse = await request(baseUrl, "/api/push/test?channel=0", { method: "POST" });
+		assert.equal(unsupportedResponse.status, 409);
+		const unsupported = await unsupportedResponse.json();
+		assert.deepEqual([unsupported.queued, unsupported.running, unsupported.done, unsupported.success],
+			[false, false, true, false]);
+		assert.match(unsupported.message, /Cellular push is not supported/);
+	}, { jobDelayMs: 100 });
+});
+
+test("push test request ordering matches firmware and POST accepts no body", async () => {
+	await withServer(async (baseUrl) => {
+		assert.equal((await fetch(`${baseUrl}/api/push/test?channel=0`, { method: "HEAD" })).status, 401);
+		assert.equal((await fetch(`${baseUrl}/api/push/test?channel=0`, {
+			method: "HEAD", headers: { Authorization: auth }
+		})).status, 405);
+		const unsupported = await fetch(`${baseUrl}/api/push/test?channel=0`, {
+			method: "PUT", headers: { Authorization: auth }
+		});
+		assert.equal(unsupported.status, 405);
+		assert.deepEqual(Object.keys(await unsupported.json()).sort(),
+			["done", "message", "queued", "running", "success"]);
+		assert.equal((await fetch(`${baseUrl}/api/push/test?channel=0`, {
+			method: "POST", headers: { Authorization: auth }, body: "not-allowed"
+		})).status, 403);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push0en: "on", push0type: 1, push0name: "No body",
+			push0url: "https://push.example/message"
+		}))).success, true);
+		const withBody = await request(baseUrl, "/api/push/test?channel=0", {
+			method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: "unexpected=1"
+		});
+		assert.equal(withBody.status, 400);
+		assert.match((await withBody.json()).message, /body is not allowed/i);
+	});
+});
+
+test("pending push tests expire to a terminal result and release configuration saves", async () => {
+	let clock = Date.now();
+	await withServer(async (baseUrl) => {
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push0en: "on", push0type: 1, push0name: "Expiring",
+			push0url: "https://push.example/message"
+		}))).success, true);
+		assert.equal((await request(baseUrl, "/api/push/test?channel=0", { method: "POST" })).status, 202);
+		clock += 60001;
+		const expired = await (await request(baseUrl, "/api/push/test?channel=0")).json();
+		assert.deepEqual([expired.queued, expired.running, expired.done, expired.success],
+			[false, false, true, false]);
+		assert.match(expired.message, /timed out/i);
+		assert.equal((await form(baseUrl, "/save", { pushEnabled: "0" })).status, 202);
+	}, { jobDelayMs: 100, now: () => clock });
 });
 
 test("forwarding rules round-trip exactly and rejected saves leave routing unchanged", async () => {

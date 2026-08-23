@@ -1,5 +1,6 @@
-import type { ActionResult, DeviceSnapshot, Job, LogPage } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, Job, LogPage, PushTestStatus } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
+import { pushSecretRequired } from "$lib/push-template-defaults.js";
 
 let csrfToken = "";
 export const demoMode = import.meta.env.VITE_DEMO_MODE === "1";
@@ -23,6 +24,9 @@ const demoConfig: DeviceSnapshot["config"] = {
 	}))
 };
 const demoLogs = ["Demo device started", "WiFi connected: DemoNetwork", "Cellular modem ready"];
+const demoPushTests: PushTestStatus[] = Array.from({ length: 5 }, () => ({
+	queued: false, running: false, done: false, success: false, message: "Test not started"
+}));
 
 function demoSnapshot(): DeviceSnapshot {
 	return {
@@ -48,8 +52,35 @@ function forwardRulesValid(rules: string) {
 	return true;
 }
 
+function isPushTestStatus(value: unknown): value is PushTestStatus {
+	if (!value || typeof value !== "object") return false;
+	const status = value as Record<string, unknown>;
+	return ["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") &&
+		typeof status.message === "string";
+}
+
 function demoResponse<T>(path: string, init?: RequestInit): T {
 	if (path === "/api/config") return demoSnapshot() as T;
+	if (path.startsWith("/api/push/test?")) {
+		const channel = Number(new URL(path, "http://device").searchParams.get("channel"));
+		if (!Number.isInteger(channel) || channel < 0 || channel >= demoPushTests.length) return {
+			queued: false, running: false, done: true, success: false, message: "Invalid channel index"
+		} as T;
+		if (init?.method === "POST") {
+			const configured = demoConfig.pushChannels[channel];
+			const complete = (["url", "key1", "key2", "customBody"] as const)
+				.every((field) => !pushSecretRequired(configured, field));
+			const message = !demoConfig.pushEnabled ? "Push is disabled; test push is unavailable"
+				: demoConfig.networkMode === 1 ? "Cellular push is not supported; test was not queued"
+				: !configured.enabled || !complete ? "Channel is disabled or incomplete; save its configuration first"
+				: "Test push sent";
+			demoPushTests[channel] = {
+				queued: false, running: false, done: true,
+				success: message === "Test push sent", message
+			};
+		}
+		return structuredClone(demoPushTests[channel]) as T;
+	}
 	if (path.startsWith("/log?")) return {
 		entries: demoLogs.map((message, index) => ({ id: index + 1, message })), nextCursor: 1, hasMore: false
 	} as T;
@@ -146,7 +177,7 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 		}
 	});
 	const data = await response.json().catch(() => undefined);
-	if (!response.ok && !(data && typeof data === "object" && "code" in data)) {
+	if (!response.ok && !(data && typeof data === "object" && ("code" in data || isPushTestStatus(data)))) {
 		throw new Error(`HTTP ${response.status}`);
 	}
 	return data as T;
@@ -255,6 +286,49 @@ export async function waitForAccepted(result: ActionResult): Promise<ActionResul
 	const jobId = Number(result.data.jobId);
 	if (!Number.isInteger(jobId)) throw new Error("Accepted job did not return a job id.");
 	return waitForJob(jobId);
+}
+
+export async function runPushTest(
+	channel: number,
+	onStatus?: (status: PushTestStatus) => void,
+	timeoutMs = 90000
+) {
+	if (!Number.isInteger(channel) || channel < 0 || channel > 4) throw new Error("Invalid push channel.");
+	const path = `/api/push/test?${new URLSearchParams({ channel: String(channel) })}`;
+	const controller = new AbortController();
+	const deadline = Date.now() + Math.max(1, timeoutMs);
+	const timeout = globalThis.setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+	const read = async (init?: RequestInit) => {
+		const status = await requestJson<unknown>(path, { ...init, signal: controller.signal });
+		if (!isPushTestStatus(status)) throw new Error("Invalid push test response.");
+		onStatus?.(status);
+		return status;
+	};
+	try {
+		let status = await read({ method: "POST" });
+		while (status.queued || status.running) {
+			if (Date.now() >= deadline) controller.abort();
+			await new Promise<void>((resolve, reject) => {
+				if (controller.signal.aborted) return reject(controller.signal.reason);
+				const onAbort = () => {
+					globalThis.clearTimeout(timer);
+					reject(controller.signal.reason);
+				};
+				const timer = globalThis.setTimeout(() => {
+					controller.signal.removeEventListener("abort", onAbort);
+					resolve();
+				}, Math.min(750, deadline - Date.now()));
+				controller.signal.addEventListener("abort", onAbort, { once: true });
+			});
+			status = await read();
+		}
+		return status;
+	} catch (error) {
+		if (controller.signal.aborted) throw new Error("Push test timed out.", { cause: error });
+		throw error;
+	} finally {
+		globalThis.clearTimeout(timeout);
+	}
 }
 
 export function postForm(path: string, values: Record<string, string | number | boolean>) {

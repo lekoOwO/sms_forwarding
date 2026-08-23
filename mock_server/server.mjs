@@ -587,6 +587,10 @@ export function createApp({
 	const state = initialState(now());
 	const csrfToken = "mock-csrf-token";
 	const jobs = new Map();
+	const pushTests = Array.from({ length: 5 }, () => ({
+		queued: false, running: false, done: false, success: false, message: "Test not started"
+	}));
+	const pushTestDeadlines = Array(5).fill(0);
 	const exportsById = new Map();
 	let upload;
 	let nextId = 1;
@@ -595,6 +599,27 @@ export function createApp({
 		for (const [id, job] of jobs) {
 			if (["succeeded", "failed"].includes(job.state) && now() - job.completedAt >= 60000) jobs.delete(id);
 		}
+	};
+	const pushTestFailure = (message) => ({
+		queued: false, running: false, done: true, success: false, message
+	});
+	const expirePushTests = () => pushTests.forEach((status, channel) => {
+		if (!status.queued || !pushTestDeadlines[channel] || now() < pushTestDeadlines[channel]) return;
+		pushTests[channel] = pushTestFailure("Test push timed out before it could start");
+		pushTestDeadlines[channel] = 0;
+	});
+	const pushTestActive = () => {
+		expirePushTests();
+		return pushTests.some((test) => test.queued || test.running);
+	};
+	const pushChannelConfigured = (channel) => {
+		if (!channel.enabled || (channel.type === 7
+			? !channel.customBody || channel.titleTemplate || channel.bodyTemplate
+			: channel.customBody)) return false;
+		if ([1, 2, 3, 4, 7, 8, 11, 12].includes(channel.type)) return Boolean(channel.url);
+		if ([5, 6].includes(channel.type)) return Boolean(channel.key1);
+		if (channel.type === 9) return Boolean(channel.url && channel.key1);
+		return channel.type === 10 && Boolean(channel.key1 && channel.key2);
 	};
 	const acceptJob = (type, finalResult, response, { allowOta = false } = {}) => {
 		expireJobs();
@@ -634,10 +659,10 @@ export function createApp({
 		"POST /save", "POST /sendsms", "POST /ping", "GET /flight", "GET /at", "GET /modem",
 		"GET /wifi", "GET /api/config/export", "POST /api/config/export", "POST /api/config/restore/start",
 		"POST /api/config/restore/chunk", "POST /api/config/restore/finish", "POST /api/ota/start",
-		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /wificonfig"
+		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /wificonfig"
 	]);
 	app.use(rejectEnvelope);
-	app.use((request, response, next) => request.method === "HEAD"
+	app.use((request, response, next) => request.method === "HEAD" && request.path !== "/api/push/test"
 		? response.set("Allow", "GET, POST").status(405).json(result(false, "ACTION_INPUT_INVALID"))
 		: next());
 
@@ -742,7 +767,63 @@ export function createApp({
 		});
 	});
 
+	app.all("/api/push/test", (request, response, next) => {
+		if (request.method === "GET" || request.method === "POST") return next();
+		return response.set("Allow", "GET, POST").status(405)
+			.json(pushTestFailure("Push tests require GET or POST"));
+	});
+	app.get("/api/push/test", (request, response) => {
+		expirePushTests();
+		const channel = boundedUnsigned(request.query.channel, 0, 4);
+		return channel === undefined
+			? response.status(400).json(pushTestFailure("Invalid channel index"))
+			: response.json(pushTests[channel]);
+	});
+	app.post("/api/push/test", (request, response) => {
+		expirePushTests();
+		if (Number(request.headers["content-length"] ?? 0) > 0 || request.headers["transfer-encoding"]) {
+			return response.status(400).json(pushTestFailure("Push test request body is not allowed"));
+		}
+		const channel = boundedUnsigned(request.query.channel, 0, 4);
+		if (channel === undefined) return response.status(400).json(pushTestFailure("Invalid channel index"));
+		const current = pushTests[channel];
+		if (current.queued || current.running) return response.status(409).json(current);
+		expireJobs();
+		if (upload || [...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) {
+			return response.status(409).json(pushTestFailure("Device is busy; try again later"));
+		}
+		if (!state.config.pushEnabled) {
+			return response.status(409).json(pushTestFailure("Push is disabled; test push is unavailable"));
+		}
+		if (state.config.networkMode === 1) {
+			return response.status(409).json(pushTestFailure("Cellular push is not supported; test was not queued"));
+		}
+		if (!pushChannelConfigured(state.config.pushChannels[channel])) {
+			return response.status(409).json(pushTestFailure("Channel is disabled or incomplete; save its configuration first"));
+		}
+		const status = {
+			queued: true, running: false, done: false, success: false,
+			message: "Test push queued; you can continue to refresh the page"
+		};
+		pushTests[channel] = status;
+		pushTestDeadlines[channel] = now() + 60000;
+		const finish = () => {
+			if (pushTests[channel] !== status || (!status.queued && !status.running)) return;
+			status.queued = false;
+			status.running = false;
+			status.done = true;
+			status.success = true;
+			status.message = "Test push sent";
+			pushTestDeadlines[channel] = 0;
+			state.logs.push(`Channel ${channel + 1} test push sent`);
+		};
+		if (jobDelayMs > 0) setTimeout(finish, jobDelayMs);
+		else finish();
+		return response.status(202).json(status);
+	});
+
 	app.post("/save", (request, response) => {
+		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
 		const body = request.body;
 		const fields = Object.keys(body);
 		if (!fields.length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "form"));
@@ -988,6 +1069,7 @@ export function createApp({
 	});
 
 	app.post("/api/config/export", (request, response) => {
+		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
 		if (typeof request.body.passphrase !== "string" || byteLength(request.body.passphrase) < 12 ||
 			byteLength(request.body.passphrase) > 128) return response.status(400).json(result(false, "ACTION_CONFIG_PASSPHRASE_INVALID"));
 		const exportId = nextId++;
@@ -1008,6 +1090,7 @@ export function createApp({
 	});
 
 	function startUpload(kind, metadata, response) {
+		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
 		if (upload && now() - upload.lastActivity > 120000) upload = undefined;
 		if (upload) return response.status(409).json(result(false, kind === "ota" ? "ACTION_OTA_BUSY" : "ACTION_BUSY"));
 		const uploadId = nextId++;
@@ -1031,7 +1114,7 @@ export function createApp({
 	});
 	app.post("/api/ota/start", (request, response) => {
 		expireJobs();
-		if (upload || [...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) {
+		if (pushTestActive() || upload || [...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) {
 			return response.status(409).json(result(false, "ACTION_BUSY"));
 		}
 		if (!request.body || Object.keys(request.body).length !== 2 ||

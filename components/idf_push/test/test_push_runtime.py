@@ -71,6 +71,7 @@ int main() {
         subprocess.run([str(binary_path)], check=True)
 
     source = (PUSH / "idf_push.cpp").read_text()
+    header = (PUSH / "include/idf_push.h").read_text()
     assert "idf_modem_cellular_http_get" not in source
     assert "enum : uint8_t" not in source
     discord = source.split("case PUSH_TYPE_DISCORD:", 2)[2].split("case PUSH_TYPE_NTFY:", 1)[0]
@@ -114,6 +115,42 @@ int main() {
     assert 'fail_pending_tests("Cellular push is not supported; test stopped")' in tests
     assert "channel_waits_for_time(cfg.pushChannels[i])" in tests
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
+
+    assert "bool idf_push_test_active(void)" in source
+    assert "bool idf_push_test_channel_active(uint8_t channel)" in header
+    test_active = source.split("bool idf_push_test_active(void)", 1)[1].split(
+        "bool idf_push_test_channel_active", 1
+    )[0]
+    assert "if (!ensure_init()) return true" in test_active
+    assert "xSemaphoreTake(s_mutex" in test_active
+    assert "job.pending || job.running" in test_active
+    assert "return true" in test_active
+    assert "expire_test_jobs_locked" in test_active
+    channel_active = source.split("bool idf_push_test_channel_active", 1)[1].split(
+        "bool idf_push_enqueue_test", 1
+    )[0]
+    assert "expire_test_jobs_locked" in channel_active
+    enqueue_test = source.split("bool idf_push_enqueue_test", 1)[1].split(
+        "std::string idf_push_test_status_json", 1
+    )[0]
+    duplicate = enqueue_test.split("if (busy)", 1)[1]
+    assert "return false" in duplicate
+    assert enqueue_test.index("if (busy)") < enqueue_test.index("idf_push_select_network")
+    assert "PUSH_TEST_PENDING_MAX_US" in source
+    assert "int64_t deadlineUs = 0" in source
+    assert "job.deadlineUs = esp_timer_get_time() + PUSH_TEST_PENDING_MAX_US" in enqueue_test
+    assert enqueue_test.index("if (!s_started)") < enqueue_test.index("job.pending = true")
+    assert "expire_test_jobs_locked" in enqueue_test
+    process_test = source.split("static bool process_test_one()", 1)[1].split(
+        "static bool process_startup_notification", 1
+    )[0]
+    assert "expire_test_jobs_locked" in process_test
+    assert process_test.index("expire_test_jobs_locked") < process_test.index("IdfPushNetworkDecision::Defer")
+    completion = process_test.split("result = ok ?", 1)[1]
+    assert "xSemaphoreTake(s_mutex, portMAX_DELAY)" in completion
+    status = source.split("std::string idf_push_test_status_json", 1)[1]
+    assert "expire_test_jobs_locked" in status
+    assert "Push test status is temporarily unavailable" in status
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1

@@ -54,7 +54,7 @@ test("all locales show the runtime provisioning SSID", () => {
 	}
 });
 
-test("demo save rejects invalid forwarding regex before any mutation", async () => {
+test("demo API rejects invalid forwarding regex and tests only configured push channels", async () => {
 	const previousMode = process.env.VITE_DEMO_MODE;
 	const previousCwd = process.cwd();
 	let server;
@@ -76,7 +76,69 @@ test("demo save rejects invalid forwarding regex before any mutation", async () 
 		assert.deepEqual([rejected.success, rejected.code, rejected.detail],
 			[false, "ACTION_CONFIG_INVALID", "forwardRules"]);
 		assert.deepEqual((await api.loadSnapshot()).config, before.config);
+		assert.equal(typeof api.runPushTest, "function");
+		const sent = await api.runPushTest?.(0);
+		await api.postForm("/save", {
+			push1en: true, push1type: 9, push1name: "Incomplete",
+			push1url: "https://push.example/message"
+		});
+		const incomplete = await api.runPushTest?.(1);
+		assert.deepEqual([sent.done, sent.success, incomplete.done, incomplete.success],
+			[true, true, true, false]);
 	} finally {
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
+	}
+});
+
+test("real push test helper accepts 409 status bodies, polls, and aborts stalled requests", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	const previousFetch = globalThis.fetch;
+	let server;
+	try {
+		delete process.env.VITE_DEMO_MODE;
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({
+			server: { middlewareMode: true }, appType: "custom", logLevel: "silent"
+		});
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const calls = [];
+		globalThis.fetch = async (path, init = {}) => {
+			calls.push([path, init]);
+			if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "real-csrf" }), {
+				status: 200, headers: { "Content-Type": "application/json" }
+			});
+			const status = calls.filter(([value]) => String(value).startsWith("/api/push/test")).length === 1
+				? { queued: true, running: false, done: false, success: false, message: "Already queued" }
+				: { queued: false, running: false, done: true, success: true, message: "Sent" };
+			return new Response(JSON.stringify(status), {
+				status: status.queued ? 409 : 200, headers: { "Content-Type": "application/json" }
+			});
+		};
+		await api.loadSnapshot();
+		const completed = await api.runPushTest(0, undefined, 2000);
+		assert.deepEqual([completed.done, completed.success], [true, true]);
+		const pushCalls = calls.filter(([path]) => String(path).startsWith("/api/push/test"));
+		assert.deepEqual(pushCalls.map(([, init]) => init.method ?? "GET"), ["POST", "GET"]);
+		assert.equal(pushCalls[0][1].body, undefined);
+		assert.equal(pushCalls[0][1].headers["X-CSRF-Token"], "real-csrf");
+
+		globalThis.fetch = (_path, init = {}) => new Promise((_resolve, reject) => {
+			init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+		});
+		const outcome = await Promise.race([
+			api.runPushTest(0, undefined, 20).then(() => "resolved", (error) => error.message),
+			new Promise((resolve) => setTimeout(() => resolve("hung"), 150))
+		]);
+		assert.match(outcome, /timed out/i);
+	} finally {
+		globalThis.fetch = previousFetch;
 		try { await server?.close(); }
 		finally {
 			process.chdir(previousCwd);

@@ -54,7 +54,7 @@ def main() -> None:
     assert {
         "GET /api/config/export", "POST /api/config/export",
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
-        "POST /api/config/restore/finish",
+        "POST /api/config/restore/finish", "GET /api/push/test", "POST /api/push/test",
     } <= registered
     assert {"GET /tools", "GET /sms"} <= registered
     csrf_methods = {
@@ -70,8 +70,25 @@ def main() -> None:
         "GET /modem", "GET /wifi", "GET /api/config/export", "POST /api/config/export",
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
         "POST /api/config/restore/finish", "POST /api/ota/start", "POST /api/ota/chunk",
-        "POST /api/ota/finish",
+        "POST /api/ota/finish", "POST /api/push/test",
     }
+
+    push_test = SPEC["paths"]["/api/push/test"]
+    assert set(push_test) == {"get", "post"}
+    assert push_test["get"]["parameters"][0]["schema"] == {
+        "type": "integer", "minimum": 0, "maximum": 4
+    }
+    assert push_test["post"]["parameters"][1]["$ref"].endswith("/CsrfToken")
+    assert "requestBody" not in push_test["post"]
+    assert "body must be empty" in push_test["post"]["description"]
+    push_status = SPEC["components"]["schemas"]["PushTestStatus"]
+    assert set(push_status["required"]) == {"queued", "running", "done", "success", "message"}
+    assert push_status["additionalProperties"] is False
+    assert {name: schema["type"] for name, schema in push_status["properties"].items()} == {
+        "queued": "boolean", "running": "boolean", "done": "boolean",
+        "success": "boolean", "message": "string",
+    }
+    assert len(push_status["oneOf"]) == 5
 
     # Provisioning endpoints are firmware-private AP routes. Legacy plaintext
     # Import and raw OTA entry points remain absent; signed OTA uses /api/ota/*.

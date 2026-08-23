@@ -320,9 +320,38 @@ int main() {
         "/wifiscan", "/wificonfig", "/apstatus", "/log", "/at", "/ping", "/flight",
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
-        "/api/ota/chunk", "/api/ota/finish", "/*",
+        "/api/ota/chunk", "/api/ota/finish", "/api/push/test", "/*",
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
+    assert 'register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push)' in source
+    assert 'register_handler(s_server, "/testpush"' not in source
+    push_test = function_body(source, "handle_test_push")
+    assert push_test.index("reject_oversized_body(req)") < push_test.index("check_auth(req)")
+    assert push_test.index("check_auth(req)") < push_test.index("req->method != HTTP_GET")
+    assert push_test.index("req->method != HTTP_GET") < push_test.index("check_csrf(req)")
+    assert push_test.index("check_csrf(req)") < push_test.index("req->content_len != 0")
+    assert push_test.index("idf_push_test_channel_active") < push_test.index("api_jobs_active()")
+    for guard in (
+        "backup_transfer_active()", "ota_active()", "device_restart_pending()",
+        "restore_restart_pending()", "api_jobs_active()",
+    ):
+        assert guard in push_test
+    for handler in ("handle_save", "handle_config_restore_start", "handle_ota_start"):
+        assert "idf_push_test_active()" in function_body(source, handler)
+    assert "idf_push_test_active()" in function_body(source, "reject_restart_while_backup_active")
+    assert "!idf_push_test_active()" in function_body(source, "system_idle_for_maintenance")
+    scheduler = function_body(source, "scheduler_task")
+    for marker, end in (
+        ("Free heap below threshold", "const uint32_t maintenance_now_ms"),
+        ("Daily scheduled restart", "vTaskDelay(pdMS_TO_TICKS(5000))"),
+    ):
+        guarded_restart = scheduler.split(marker, 1)[1].split(end, 1)[0]
+        assert "s_device_restart_pending.compare_exchange_strong" in guarded_restart
+        assert "system_idle_for_maintenance" in guarded_restart
+        assert "s_device_restart_pending.store(false" in guarded_restart
+    export = function_body(source, "handle_config_export")
+    export_post = export.split("if (req->method != HTTP_POST)", 1)[1]
+    assert export_post.index("idf_push_test_active()") < export_post.index("read_body(req, body")
     for route in (
         'register_handler(s_server, "/api/config/export", HTTP_ANY, handle_config_export)',
         'register_handler(s_server, "/api/config/restore/start", HTTP_POST, handle_config_restore_start)',

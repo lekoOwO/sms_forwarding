@@ -342,6 +342,35 @@
         }
       }
     },
+    "/api/push/test": {
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Get one push channel test status",
+        "parameters": [{ "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } }],
+        "responses": {
+          "200": { "description": "The bounded per-channel test status. Provider credentials are never returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "400": { "description": "The channel index is invalid.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Test one saved push channel",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "responses": {
+          "202": { "description": "The bounded channel test was queued.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "400": { "description": "The channel index is invalid.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is missing or invalid." },
+          "409": { "description": "The selected channel is already active or the test was not admitted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/api/config/export": {
       "post": {
         "tags": ["Configuration"],
@@ -633,6 +662,26 @@
           "state": { "type": "string", "enum": ["queued", "running", "succeeded", "failed"] },
           "result": { "$ref": "#/components/schemas/ActionResult" }
         }
+      },
+      "PushTestStatus": {
+        "type": "object",
+        "required": ["queued", "running", "done", "success", "message"],
+        "additionalProperties": false,
+        "description": "Exactly one lifecycle shape applies: idle, queued, running, succeeded, or failed. Success is true only for a completed successful test.",
+        "properties": {
+          "queued": { "type": "boolean" },
+          "running": { "type": "boolean" },
+          "done": { "type": "boolean" },
+          "success": { "type": "boolean" },
+          "message": { "type": "string" }
+        },
+        "oneOf": [
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": true }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": true }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": true } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": false } } }
+        ]
       },
       "WebAccount": {
         "type": "object",

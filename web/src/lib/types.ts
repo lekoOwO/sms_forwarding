@@ -16,6 +16,14 @@ export type PushChannel = {
 	bodyTemplate: string;
 };
 
+export type PushTestStatus = {
+	queued: boolean;
+	running: boolean;
+	done: boolean;
+	success: boolean;
+	message: string;
+};
+
 export type WebAccount = {
 	username: string;
 	password: string;
