@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import tempfile
@@ -81,6 +82,9 @@ HOST_TEST_CPP = r"""#include <algorithm>
 #define static_assert(...)
 #include "idf_config.cpp"
 #undef static_assert
+
+static const uint8_t kV5PortableFixture[] = {V5_PORTABLE_FIXTURE};
+static const uint8_t kV6PortableFixture[] = {V6_PORTABLE_FIXTURE};
 
 static int check_number = 0;
 static bool reject_allocations = false;
@@ -434,6 +438,22 @@ int main() {
     require(portable_decoded.simCredentials[0].iccid == portable_target.simCredentials[0].iccid);
     require(portable_decoded.schedTasks[0].profile == portable_target.schedTasks[0].profile);
     require(portable_decoded.schedTasks[0].lastRun == portable_target.schedTasks[0].lastRun);
+
+    IdfConfig v5_fixture_target = defaults();
+    v5_fixture_target.kaTrafficKB = 4321;
+    IdfConfig v5_fixture_migrated;
+    require(idf_config_storage_decode_portable(
+                kV5PortableFixture, sizeof(kV5PortableFixture), v5_fixture_target,
+                v5_fixture_migrated) == IdfPortableConfigStatus::Ok);
+    uint8_t v5_fixture_current[MAX_CONFIG_BLOB_SIZE] = {};
+    size_t v5_fixture_current_size = 0;
+    require(idf_config_storage_encode_portable(
+                v5_fixture_migrated, v5_fixture_current, sizeof(v5_fixture_current),
+                &v5_fixture_current_size) == ESP_OK);
+    require(v5_fixture_current_size == sizeof(kV6PortableFixture));
+    require(std::equal(v5_fixture_current,
+                       v5_fixture_current + v5_fixture_current_size,
+                       kV6PortableFixture));
 
     IdfConfig decode_output = defaults();
     decode_output.smtpServer = "unchanged";
@@ -927,7 +947,25 @@ class IdfConfigCodecTest(unittest.TestCase):
                 encoding="utf-8",
             )
             source = temp / "idf_config_codec_host.cpp"
-            source.write_text(HOST_TEST_CPP, encoding="utf-8")
+            legacy = json.loads(
+                (ROOT / "mock_server/test/fixtures/config-envelope-v1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            current = json.loads(
+                (ROOT / "mock_server/test/fixtures/config-envelope-v6.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            def byte_list(value: str) -> str:
+                return ", ".join(f"0x{byte:02x}" for byte in bytes.fromhex(value))
+
+            source.write_text(
+                HOST_TEST_CPP.replace(
+                    "V5_PORTABLE_FIXTURE", byte_list(legacy["schemaV5PlaintextHex"])
+                ).replace("V6_PORTABLE_FIXTURE", byte_list(current["plaintextHex"])),
+                encoding="utf-8",
+            )
             binary = temp / "idf_config_codec_host"
             compile = [
                 compiler,

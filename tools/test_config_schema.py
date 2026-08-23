@@ -15,12 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = ROOT / "dev_doc/config-schema"
 
-# The v1-v4 files are immutable wire-format compatibility fixtures.
+# The v1-v5 files are immutable wire-format compatibility fixtures.
 IMMUTABLE_SCHEMA_SHA256 = {
     1: "80b341a31713f61f14f8373bf7ecfdfc06b755efd7d701688f9967d25d08f448",
     2: "acfbfae7c5e6691e8c445d4d5d13125ee70b0eb1b6775e00e146ca3f7f3d6a18",
     3: "f83c9413623b8d0a99665a078993ed98aff6b0c1d40cc97e2597b751a8f96aa6",
     4: "51ebce31de035cc853d5b9e55a7c46233724121369c543839bed258c8a1d4984",
+    5: "01318a093657a2e166b65dd6cd31650a5dcb79a70860fb068a6b9cc392b9de58",
 }
 
 
