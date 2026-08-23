@@ -2237,17 +2237,28 @@ def _doctor_command(args: argparse.Namespace) -> int:
                     permission_code = "group-access-missing"
                     recommended_action = "join-device-group-and-start-new-login-session"
 
-    try:
-        image_present = subprocess.run(
-            ["docker", "image", "inspect", IDF_IMAGE],
-            cwd=ROOT,
-            timeout=CONTAINER_STARTUP_TIMEOUT,
-            check=False,
-            capture_output=True,
-            text=True,
-        ).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        image_present = False
+    docker_host = os.environ.get("DOCKER_HOST", "")
+    docker_context = os.environ.get("DOCKER_CONTEXT", "")
+    local_docker = (
+        (not docker_host or docker_host.startswith("unix://"))
+        and docker_context in {"", "default"}
+    )
+    image_present = False
+    if local_docker:
+        try:
+            image_present = subprocess.run(
+                [
+                    "docker", "--host", "unix:///var/run/docker.sock",
+                    "image", "inspect", IDF_IMAGE,
+                ],
+                cwd=ROOT,
+                timeout=CONTAINER_STARTUP_TIMEOUT,
+                check=False,
+                capture_output=True,
+                text=True,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     print(json.dumps({
         "device": {

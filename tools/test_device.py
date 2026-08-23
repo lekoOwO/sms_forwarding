@@ -99,6 +99,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "permission": ("ok", "none"),
                     "image_present": False,
                     "ready": True,
+                    "docker_called": True,
                 },
                 {
                     "name": "group-access-missing",
@@ -113,6 +114,7 @@ class DeviceCommandTest(unittest.TestCase):
                     ),
                     "image_present": True,
                     "ready": True,
+                    "docker_called": True,
                 },
                 {
                     "name": "unconfigured",
@@ -124,6 +126,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "permission": ("device-not-configured", "configure-explicit-by-id"),
                     "image_present": False,
                     "ready": False,
+                    "docker_called": True,
                 },
                 {
                     "name": "missing-environment-device",
@@ -135,6 +138,37 @@ class DeviceCommandTest(unittest.TestCase):
                     "permission": ("device-not-present", "connect-device"),
                     "image_present": False,
                     "ready": False,
+                    "docker_called": True,
+                },
+                {
+                    "name": "remote-docker-host",
+                    "argv": ["--device", str(link), "doctor"],
+                    "environment": {"DOCKER_HOST": "tcp://remote.example:2376"},
+                    "host_access": False,
+                    "image_rc": 0,
+                    "device": (True, True, True, False),
+                    "permission": (
+                        "group-access-missing",
+                        "join-device-group-and-start-new-login-session",
+                    ),
+                    "image_present": False,
+                    "ready": False,
+                    "docker_called": False,
+                },
+                {
+                    "name": "remote-docker-context",
+                    "argv": ["--device", str(link), "doctor"],
+                    "environment": {"DOCKER_CONTEXT": "remote-production"},
+                    "host_access": False,
+                    "image_rc": 0,
+                    "device": (True, True, True, False),
+                    "permission": (
+                        "group-access-missing",
+                        "join-device-group-and-start-new-login-session",
+                    ),
+                    "image_present": False,
+                    "ready": False,
+                    "docker_called": False,
                 },
             )
             for case in cases:
@@ -183,10 +217,18 @@ class DeviceCommandTest(unittest.TestCase):
                 self.assertNotIn(link.name, output.getvalue())
                 self.assertNotIn(str(link), output.getvalue())
                 self.assertNotIn("private-missing-serial", output.getvalue())
-                self.assertEqual(
-                    docker.call_args.args[0],
-                    ["docker", "image", "inspect", device.IDF_IMAGE],
-                )
+                self.assertNotIn("remote.example", output.getvalue())
+                if case["docker_called"]:
+                    self.assertEqual(docker.call_count, 1)
+                    self.assertEqual(
+                        docker.call_args.args[0],
+                        [
+                            "docker", "--host", "unix:///var/run/docker.sock",
+                            "image", "inspect", device.IDF_IMAGE,
+                        ],
+                    )
+                else:
+                    docker.assert_not_called()
                 transaction.assert_not_called()
                 esptool.assert_not_called()
                 connection.assert_not_called()
