@@ -81,6 +81,10 @@ BUSY_RETRIES = 2
 BUSY_DELAY = 5.0
 CONTAINER_TIMEOUT = 30.0
 CONTAINER_STARTUP_TIMEOUT = 5.0
+CONTAINER_CLEANUP_TIMEOUT = 5.0
+CONTAINER_USB_RELEASE_DELAY = 0.1
+CONTAINER_NAME_PREFIX = "sms-forwarding-device"
+FLASH_RECONCILE_TIMEOUT = 20.0
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
@@ -200,26 +204,66 @@ def _container_path(path: Path) -> str:
     return str(Path("/workspace") / relative)
 
 
+def _new_container_name() -> str:
+    return f"{CONTAINER_NAME_PREFIX}-{os.getpid()}-{time.monotonic_ns():x}"
+
+
+def _owned_container_name(name: str) -> bool:
+    return bool(re.fullmatch(
+        rf"{re.escape(CONTAINER_NAME_PREFIX)}-[0-9]+-[0-9a-f]+", name,
+    ))
+
+
+def _cleanup_docker_container(name: str) -> None:
+    """只刪除本次工具建立的 container，並等待 serial handle 釋放。"""
+    if not _owned_container_name(name):
+        return
+    try:
+        result = subprocess.run(
+            ["docker", "rm", "--force", name],
+            cwd=ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=CONTAINER_CLEANUP_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode in (0, 1):
+        # docker rm --force 會等 container process 結束；短暫讓核心完成 USB close。
+        time.sleep(CONTAINER_USB_RELEASE_DELAY)
+
+
 def _docker_command(
     arguments: list[str], device: SerialDevice, image: Path | None = None,
     program: str | None = "esptool.py", entrypoint: str | None = None,
+    *, container_name: str | None = None, output: Path | None = None,
+    output_mount: Path | None = None,
 ) -> list[str]:
+    container_name = container_name or _new_container_name()
+    if output is not None and output_mount is None:
+        raise ValueError("container readback output requires a writable mount")
     mapped = []
     for argument in arguments:
         if argument == device.by_id:
             mapped.append(CONTAINER_DEVICE_PATH)
+        elif output and argument == str(output):
+            mapped.append(str(Path("/flash-readback") / output.name))
         elif image and argument == str(image):
             mapped.append(_container_path(image))
         else:
             mapped.append(argument)
     command = [
-        "docker", "run", "--rm", "--pull=never", "--network=none", "--read-only",
+        "docker", "run", "--rm", "--name", container_name,
+        "--pull=never", "--network=none", "--read-only",
         "--env", "SMS_DEVICE_IN_CONTAINER=1",
         "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=16m",
         "--volume", f"{ROOT.resolve()}:/workspace:ro",
         "--device", f"{device.target}:{CONTAINER_DEVICE_PATH}",
         "--workdir", "/workspace",
     ]
+    if output_mount:
+        command.extend(("--volume", f"{output_mount.resolve()}:/flash-readback:rw"))
     if entrypoint:
         command.extend(("--entrypoint", entrypoint))
     command.append(IDF_IMAGE)
@@ -228,12 +272,27 @@ def _docker_command(
     return [*command, *mapped]
 
 
-def _run_esptool(arguments: list[str], device: SerialDevice, timeout: float, image: Path | None = None) -> None:
+def _run_esptool(
+    arguments: list[str], device: SerialDevice, timeout: float,
+    image: Path | None = None, *, output: Path | None = None,
+    output_mount: Path | None = None,
+) -> None:
     if resolve_esptool() == "host":
         command = [ESPTOOL, *arguments]
+        result = _run_process(command, timeout=timeout, stage="esptool")
     else:
-        command = _docker_command(arguments, device, image)
-    result = _run_process(command, timeout=timeout, stage="esptool")
+        container_name = _new_container_name()
+        command = _docker_command(
+            arguments, device, image, container_name=container_name,
+            output=output, output_mount=output_mount,
+        )
+        try:
+            result = _run_process(command, timeout=timeout, stage="esptool")
+        except BaseException:
+            _cleanup_docker_container(container_name)
+            raise
+        if result.returncode:
+            _cleanup_docker_container(container_name)
     if result.returncode:
         raise usb_recovery.DeviceError(
             f"esptool failed (exit {result.returncode}; {_safe_error_class(result.stderr)})"
@@ -1830,6 +1889,54 @@ def _run_baseline(build_dir: Path) -> None:
         raise usb_recovery.DeviceError("ESP-IDF baseline check failed")
 
 
+def _is_esptool_timeout(error: BaseException) -> bool:
+    text = str(error).lower()
+    return isinstance(error, usb_recovery.DeviceError) and (
+        "timed out" in text or "timeout" in text
+    )
+
+
+def _flash_esptool(
+    device_path: str, expected_target: str, arguments: list[str], timeout: float,
+    *, image: Path | None = None, output: Path | None = None,
+    output_mount: Path | None = None,
+) -> None:
+    device = resolve_serial_device(device_path)
+    if device.by_id != device_path or device.target != expected_target:
+        raise usb_recovery.DeviceError("device target changed")
+    _run_esptool(
+        arguments, device, timeout, image=image, output=output,
+        output_mount=output_mount,
+    )
+
+
+def _read_app_flash_digest(
+    device_path: str, expected_target: str, offset: int, size: int, timeout: float,
+) -> str:
+    with tempfile.TemporaryDirectory(prefix="sms-forwarding-flash-") as directory:
+        output = Path(directory) / "readback.bin"
+        _flash_esptool(
+            device_path, expected_target, [
+                "--chip", "esp32c3", "--port", device_path,
+                "--before", "usb_reset", "--after", "no_reset",
+                "read_flash", f"0x{offset:X}", str(size), str(output),
+            ], timeout, output=output, output_mount=Path(directory),
+        )
+        if output.stat().st_size != size:
+            raise usb_recovery.DeviceError("app flash readback length mismatch")
+        return sha256_file(output)
+
+
+def _verify_app_flash(
+    device_path: str, expected_target: str, image: Path, offset: int, timeout: float,
+) -> None:
+    _flash_esptool(device_path, expected_target, [
+        "--chip", "esp32c3", "--port", device_path,
+        "--before", "usb_reset", "--after", "no_reset",
+        "verify_flash", f"0x{offset:X}", str(image),
+    ], timeout, image=image)
+
+
 def _flash_command(args: argparse.Namespace) -> int:
     device_path = resolve_device(args.device)
     if args.image and args.image_option:
@@ -1850,37 +1957,81 @@ def _flash_command(args: argparse.Namespace) -> int:
         "offset": f"0x{offset:X}",
         "slot": args.slot,
         "size": size,
+        "activation": "none",
     }
     if not args.live:
         print(json.dumps(plan, sort_keys=True))
         return 0
 
     device = resolve_serial_device(device_path)
+    expected_target = device.target
     _run_baseline(image.parent)
-    digest = sha256_file(image)
-    pin = args.sha256_pin
-    if len(pin) != 64 or any(char not in "0123456789abcdefABCDEF" for char in pin):
-        raise ValueError("--sha256 must be a 64-character SHA-256 pin")
-    if pin.lower() != digest:
-        raise ValueError("SHA-256 pin does not match app image")
-    confirm_basename(device_path, args.confirm)
-    arguments = [
-        "--chip",
-        "esp32c3",
-        "--port",
-        device.by_id,
-        "--before",
-        "usb_reset",
-        "--after",
-        "hard_reset",
-        "write_flash",
-        f"0x{offset:X}",
-        str(image),
-    ]
-    _run_esptool(arguments, device, RESET_TIMEOUT, image=image)
-    plan["sha256"] = digest
-    print(json.dumps(plan, sort_keys=True))
-    return 0
+    with tempfile.TemporaryDirectory(prefix="sms-forwarding-image-", dir=ROOT) as directory:
+        snapshot = Path(directory) / "image.bin"
+        with image.open("rb") as source:
+            descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as target:
+                shutil.copyfileobj(source, target)
+        if snapshot.stat().st_size != size:
+            raise usb_recovery.DeviceError("app image changed while snapshotting")
+        digest = sha256_file(snapshot)
+        pin = args.sha256_pin
+        if len(pin) != 64 or any(char not in "0123456789abcdefABCDEF" for char in pin):
+            raise ValueError("--sha256 must be a 64-character SHA-256 pin")
+        if pin.lower() != digest:
+            raise ValueError("SHA-256 pin does not match app image")
+        confirm_basename(device_path, args.confirm)
+        ota_state = _ota_state(device)
+        active_offset = ota_state.get("active_offset")
+        if active_offset not in APP_SLOT_OFFSETS.values():
+            raise usb_recovery.DeviceError("OTA state active slot is unknown")
+        if active_offset == offset:
+            raise usb_recovery.DeviceError("cannot flash the active app slot")
+
+        before_digest = _read_app_flash_digest(
+            device_path, expected_target, offset, size, FLASH_RECONCILE_TIMEOUT,
+        )
+        if before_digest == digest:
+            plan.update({
+                "status": "already-matching",
+                "verification": "pre_readback_sha256",
+                "sha256": digest,
+                "written": False,
+            })
+            print(json.dumps(plan, sort_keys=True))
+            return 0
+
+        arguments = [
+            "--chip", "esp32c3", "--port", device_path,
+            "--before", "usb_reset", "--after", "no_reset",
+            "write_flash", f"0x{offset:X}", str(snapshot),
+        ]
+        reconciled = False
+        try:
+            _flash_esptool(
+                device_path, expected_target, arguments, RESET_TIMEOUT, image=snapshot,
+            )
+        except usb_recovery.DeviceError as error:
+            if not _is_esptool_timeout(error):
+                raise
+            after_digest = _read_app_flash_digest(
+                device_path, expected_target, offset, size, FLASH_RECONCILE_TIMEOUT,
+            )
+            if after_digest != digest:
+                raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch")
+            reconciled = True
+        else:
+            _verify_app_flash(
+                device_path, expected_target, snapshot, offset, RESET_TIMEOUT,
+            )
+        plan.update({
+            "status": "reconciled" if reconciled else "flashed",
+            "verification": "readback_sha256" if reconciled else "verify_flash",
+            "sha256": digest,
+            "written": True,
+        })
+        print(json.dumps(plan, sort_keys=True))
+        return 0
 
 
 def _flash_bootloader_command(args: argparse.Namespace) -> int:
