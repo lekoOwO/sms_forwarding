@@ -58,7 +58,8 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 
 ## 通知與網路邊界
 
-`idf_push` 支援 SMTP 與 12 種推送 provider。Provider enum 的唯一來源是 `config-schema/manifest.json`。
+`idf_push` 支援 SMTP 與 12 種推送 provider。Provider enum 由 `dev_doc/config-schema/v6.json` 的
+`x-enumMapping` 定義，並由 `tools/generate-config-schema.py` 產生。
 
 目前通知傳送只使用 WiFi。4G-only 模式會回傳 unsupported，混合模式在 WiFi 中斷時會 defer。
 

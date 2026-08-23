@@ -262,16 +262,16 @@ partition table、`appcfg` 或 `coredump`，但會更新 `otadata` 與 NVS 的 O
 python3 scripts/generate-firmware-version.py --check
 ```
 
-`develop` 的成功 push 會建立只含 USB `.bin` 的 Dev Pre-release。
+`develop` 的成功 push 會建立只含 USB 完整 `.bin` 的 Dev Pre-release。此 job 不受 OTA readiness gate 影響。
 
-`master` 上相符的 `vMAJOR.MINOR.PATCH` tag 會建立正式 Release。USB `.bin` 可由 release workflow 建立；已簽章 `.smsota` 只有在 readiness gate 通過時才會建立。
+`master` 上相符的 `vMAJOR.MINOR.PATCH` tag 只有在 `components/idf_web/OTA_RUNTIME_READY` 存在時才會執行正式 `release` job。
+目前此檔案缺席，因此 workflow 會跳過整個正式 `release` job，不會發佈 USB `.bin` 或 `.smsota`。
 
 只有 `release` environment 可以讀取 OTA private key。Build 與 Pre-release job 不可取得此 key。
 
 裝置只保存 public key。不要將 private key、測試憑證或未遮蔽 secret 寫入 repository。
 
-目前 checkout 沒有 `components/idf_web/OTA_RUNTIME_READY`，也沒有 matching private key。
-硬體 rollback/replay evidence 仍未完成，因此目前不能把 signed OTA 標記為 READY。
+目前 checkout 沒有 matching private key。硬體 rollback/replay evidence 仍未完成，因此目前不能把 signed OTA 標記為 READY。
 
 ## Focused checks
 
