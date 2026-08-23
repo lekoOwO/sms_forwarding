@@ -353,6 +353,7 @@ int main() {
         assert flag in snapshot
     for flag in ("cfg.emailEnabled", "cfg.pushEnabled"):
         assert flag in snapshot
+    assert 'json_prop(body, "forwardRules", cfg.forwardRules)' in snapshot
 
     scheduler = function_body(source, "scheduler_task")
     assert "idf_push_heartbeat_tick();" in scheduler
@@ -418,6 +419,10 @@ int main() {
     assert "idf_config_save_accounts(accounts, true)" in modern_save
     assert 'key == "emailEnabled"' in save_family
     assert 'key == "pushEnabled"' in save_family
+    assert 'key == "forwardRules"' in save_family
+    save_limits = function_body(source, "modern_field_limit")
+    assert re.search(r'key == "forwardRules"\)\s+return MAX_FORWARD_RULES_BYTES;', save_limits)
+    assert "idf_config_save_forward_rules" in modern_save
     for field in ("emailEnabled", "pushEnabled"):
         assert f'const std::string {field} = field_text(fields, "{field}")' in modern_save
         assert f'{field} != "0" && {field} != "1"' in modern_save

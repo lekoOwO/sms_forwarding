@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import { gunzipSync } from "node:zlib";
 
@@ -51,6 +51,38 @@ test("all locales show the runtime provisioning SSID", () => {
 		const messages = JSON.parse(readFileSync(new URL(`../src/lib/locales/${locale}.json`, import.meta.url), "utf8"));
 		assert.match(messages.apModeDescription, /SMS-Forwarder-XXXXXX/);
 		assert.doesNotMatch(messages.apModeDescription, /sms-forwarder-<MAC6>/);
+	}
+});
+
+test("demo save rejects invalid forwarding regex before any mutation", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	let server;
+	try {
+		process.env.VITE_DEMO_MODE = "1";
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({
+			server: { middlewareMode: true },
+			appType: "custom",
+			logLevel: "silent"
+		});
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const before = await api.loadSnapshot();
+		const rejected = await api.postForm("/save", {
+			deviceName: "must-not-save",
+			forwardRules: "re\t(?=a)\temail"
+		});
+		assert.deepEqual([rejected.success, rejected.code, rejected.detail],
+			[false, "ACTION_CONFIG_INVALID", "forwardRules"]);
+		assert.deepEqual((await api.loadSnapshot()).config, before.config);
+	} finally {
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
 	}
 });
 

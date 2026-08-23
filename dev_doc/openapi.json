@@ -93,7 +93,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get the device state and configuration",
-        "description": "SMTP, management account, and WiFi password values are empty strings in this response.",
+        "description": "SMTP, management account, and WiFi password values are empty strings in this response. Forwarding rules are returned exactly so they can be edited without changing multiline, tab, or UTF-8 content.",
         "responses": {
           "200": {
             "description": "The current state and configuration.",
@@ -113,7 +113,7 @@
         "tags": ["Configuration"],
         "summary": "Update the configuration",
 		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-		"description": "The request can contain one configuration section. emailEnabled and pushEnabled use explicit 0 or 1 values, and each can be updated alone without changing credentials or per-channel settings. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
+		"description": "The request can contain one configuration section. forwardRules is saved as exact multiline, tab, and UTF-8 text after the existing 2048-byte and enabled regular-expression validation. emailEnabled and pushEnabled use explicit 0 or 1 values, and each can be updated alone without changing credentials or per-channel settings. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
           "content": {
@@ -697,7 +697,7 @@
           },
           "config": {
             "type": "object",
-		"required": ["deviceName", "hostname", "notificationLocale", "emailEnabled", "pushEnabled", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
+		"required": ["deviceName", "hostname", "notificationLocale", "emailEnabled", "pushEnabled", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "forwardRules", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
             "additionalProperties": false,
             "properties": {
 			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
@@ -718,6 +718,7 @@
               "smtpSendTo": { "type": "string" },
               "adminPhone": { "type": "string" },
               "numberBlackList": { "type": "string" },
+			  "forwardRules": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Exact saved rule text. This editor field is not masked; credential fields remain redacted separately." },
 			  "wifiProfiles": {
 				"type": "array",
 				"minItems": 5,
@@ -758,6 +759,7 @@
           "smtpSendTo": { "type": "string", "x-maxUtf8Bytes": 256 },
           "adminPhone": { "type": "string", "x-maxUtf8Bytes": 64 },
 		  "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 },
+		  "forwardRules": { "type": "string", "x-maxUtf8Bytes": 2048 },
 		  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "x-maxUtf8Bytes": 32 },
 		  "heartbeatEnable": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
 		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 },

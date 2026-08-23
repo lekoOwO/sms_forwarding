@@ -749,6 +749,7 @@ static esp_err_t handle_api_config(httpd_req_t* req)
     json_prop(body, "smtpSendTo", cfg.smtpSendTo); body += ",";
     json_prop(body, "adminPhone", cfg.adminPhone); body += ",";
     json_prop(body, "numberBlackList", cfg.numberBlackList); body += ",";
+    json_prop(body, "forwardRules", cfg.forwardRules); body += ",";
     body += "\"wifiProfiles\":[";
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
         if (i) body += ",";
@@ -2461,7 +2462,9 @@ static ModernSaveFamily modern_save_field_family(const std::string& key)
     if (key == "emailEnabled" || key == "smtpServer" || key == "smtpPort" || key == "smtpUser" ||
         key == "smtpPass" || key == "smtpSendTo") return ModernSaveFamily::Email;
     if (key == "pushEnabled") return ModernSaveFamily::Push;
-    if (key == "adminPhone" || key == "numberBlackList") return ModernSaveFamily::Routing;
+    if (key == "adminPhone" || key == "numberBlackList" || key == "forwardRules") {
+        return ModernSaveFamily::Routing;
+    }
     if (key == "networkMode") return ModernSaveFamily::Network;
     if (key == "heartbeatEnable" || key == "heartbeatInterval") return ModernSaveFamily::Heartbeat;
     if (key == "kaEnabled" || key == "kaIntervalDays" || key == "kaTrafficKB") {
@@ -2494,6 +2497,7 @@ static size_t modern_field_limit(const std::string& key)
     if (key == "smtpPass") return 256;
     if (key == "adminPhone") return MAX_ADMIN_PHONE_BYTES;
     if (key == "numberBlackList") return 1024;
+    if (key == "forwardRules") return MAX_FORWARD_RULES_BYTES;
     for (const char* suffix : {"ssid", "pass", "open"}) {
         if (indexed_save_key(key, "wifi", suffix, IDF_MAX_WIFI_NETWORKS) >= 0) {
             return strcmp(suffix, "ssid") == 0 ? 31 : strcmp(suffix, "pass") == 0 ? 63 : 32;
@@ -2642,6 +2646,11 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     }
 
     if (family == ModernSaveFamily::Routing) {
+        if (has_field(fields, "forwardRules")) {
+            if (fields.size() != 1) return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "forwardRules");
+            return send_modern_save_result(req,
+                idf_config_save_forward_rules(field_text(fields, "forwardRules")), "forwardRules");
+        }
         const IdfConfigWebView current = idf_config_get_web_view();
         return send_modern_save_result(req,
             idf_config_save_filter(has_field(fields, "adminPhone") ? field_text(fields, "adminPhone") : current.adminPhone,

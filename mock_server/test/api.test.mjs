@@ -219,6 +219,44 @@ test("global notification switches round-trip independently without clearing cha
 	}
 });
 
+test("forwarding rules round-trip exactly and rejected saves leave routing unchanged", async () => {
+	await withServer(async (baseUrl) => {
+		const rules = "from\t^\\+886\\d+$\temail,push1\nkw\t驗證碼\tpush2\t1";
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { forwardRules: rules }))).code,
+			"ACTION_CONFIG_SAVED");
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, rules);
+		const mixed = await completed(baseUrl, await form(baseUrl, "/save", {
+			forwardRules: rules, adminPhone: "must-not-save"
+		}));
+		assert.deepEqual([mixed.code, mixed.detail], ["ACTION_CONFIG_INVALID", "forwardRules"]);
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.adminPhone, "");
+
+		const tooLong = await form(baseUrl, "/save", { forwardRules: "界".repeat(683) });
+		assert.equal(tooLong.status, 400);
+		assert.deepEqual(await tooLong.json(), {
+			success: false, code: "ACTION_INPUT_TOO_LONG", data: {}, detail: "forwardRules"
+		});
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, rules);
+
+		const invalid = await completed(baseUrl, await form(baseUrl, "/save", { forwardRules: "re\t[\temail" }));
+		assert.deepEqual([invalid.success, invalid.code, invalid.detail], [false, "ACTION_CONFIG_INVALID", "forwardRules"]);
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, rules);
+
+		const posixInvalid = await completed(baseUrl, await form(baseUrl, "/save", {
+			forwardRules: "re\t(?=a)\temail"
+		}));
+		assert.deepEqual([posixInvalid.success, posixInvalid.code, posixInvalid.detail],
+			[false, "ACTION_CONFIG_INVALID", "forwardRules"]);
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, rules);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { adminPhone: "+886900000000" }))).code,
+			"ACTION_CONFIG_SAVED");
+		const snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.adminPhone, "+886900000000");
+		assert.equal(snapshot.config.forwardRules, rules);
+	});
+});
+
 test("one save family and current limits reject without mutation", async () => {
 	await withServer(async (baseUrl) => {
 		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { adminPhone: "1".repeat(64) }))).success, true);

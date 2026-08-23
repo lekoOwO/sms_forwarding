@@ -54,6 +54,7 @@ export type DeviceSnapshot = {
 		smtpSendTo: string;
 		adminPhone: string;
 		numberBlackList: string;
+		forwardRules: string;
 		wifiProfiles: WifiProfile[];
 		networkMode: number;
 		heartbeatEnable: boolean;

@@ -31,7 +31,7 @@
 	const idle = (): UiResult => ({ state: "idle", code: "", data: {}, detail: "" });
 	const encoder = new TextEncoder();
 	const byteLimits: Record<string, number> = {
-		...CONFIG_FIELD_LIMITS, smtpPort: 32, phone: 32, content: 2048, cmd: 256
+		...CONFIG_FIELD_LIMITS, forwardRules: 2048, smtpPort: 32, phone: 32, content: 2048, cmd: 256
 	};
 	const providers = [
 		"POST JSON",
@@ -70,6 +70,7 @@
 	let wifiResult = $state(idle());
 	let networkModeResult = $state(idle());
 	let routingResult = $state(idle());
+	let forwardRulesResult = $state(idle());
 	let securityResult = $state(idle());
 	let smsResult = $state(idle());
 	let overviewResult = $state(idle());
@@ -556,6 +557,7 @@
 					<Accordion.Root type="single" value="sms">
 						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="forward-rules"><Accordion.Trigger>{t("forwardRulesTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("forwardRulesDescription")}</p><form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><Field.Group><Field.Field><Field.Label for="forward-rules">{t("forwardRulesTitle")}</Field.Label><Textarea id="forward-rules" rows={10} spellcheck={false} aria-describedby="forward-rules-hint" bind:value={snapshot.config.forwardRules} /><Field.Description id="forward-rules-hint">{t("forwardRulesHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
 					</Accordion.Root>
 				</section>
 			{:else if mainTab === "device"}

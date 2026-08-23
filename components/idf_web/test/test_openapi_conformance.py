@@ -104,6 +104,9 @@ def main() -> None:
         assert config_update["properties"][field]["enum"] == ["0", "1"]
     config_properties = CONFIG_SCHEMA["properties"]["config"]["properties"]
     update_properties = config_update["properties"]
+    assert "forwardRules" in snapshot_config["required"]
+    assert snapshot_config["properties"]["forwardRules"]["x-maxUtf8Bytes"] == 2048
+    assert update_properties["forwardRules"]["x-maxUtf8Bytes"] == 2048
     for field in ("smtpSendTo", "adminPhone"):
         assert update_properties[field]["x-maxUtf8Bytes"] == config_properties[field]["x-maxUtf8Bytes"]
     assert update_properties["smtpPort"]["minimum"] == config_properties["smtpPort"]["minimum"]

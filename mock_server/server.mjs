@@ -369,11 +369,23 @@ function decodePortableConfig(bytes, target) {
 const fieldLimits = {
 	smtpServer: 253, smtpPort: 32, smtpUser: 254, smtpPass: 256, smtpSendTo: 256,
 	adminPhone: 64, numberBlackList: 1024, phone: 32, content: 2048,
+	forwardRules: 2048,
 	cmd: 256, action: 32, type: 32, deviceName: 64, hostname: 32, notificationLocale: 16,
 	networkMode: 32, heartbeatEnable: 32, heartbeatInterval: 32,
 	emailEnabled: 32, pushEnabled: 32,
 	kaEnabled: 32, kaIntervalDays: 32, kaTrafficKB: 32
 };
+
+function forwardRulesValid(rules) {
+	for (const rawLine of rules.split("\n")) {
+		const [type, pattern, , enabled = "1"] = rawLine.trim().split("\t");
+		if (enabled.trim() === "0" || !pattern || !["from", "re"].includes(type)) continue;
+		if (/(^|[^\\])(?:\\\\)*\(\?/.test(pattern)) return false;
+		try { new RegExp(pattern, "i"); }
+		catch { return false; }
+	}
+	return true;
+}
 
 function configSemanticallyValid(config) {
 	const bounded = (value, limit) => typeof value === "string" && byteLength(value) <= limit;
@@ -394,6 +406,7 @@ function configSemanticallyValid(config) {
 		!integer(config.networkMode, 0, 2) || !boolean(config.heartbeatEnable) ||
 		!integer(config.heartbeatInterval, 1, 240) || ![8, 20, 28, 34, 44, 52, 56, 60, 66, 72, 80].includes(config.wifiTxPowerQuarterDbm) ||
 		!boolean(config.emailEnabled) || !boolean(config.pushEnabled) || !bounded(config.forwardRules, 2048) ||
+		!forwardRulesValid(config.forwardRules) ||
 		!boolean(config.kaEnabled) || !integer(config.kaIntervalDays, 1, 3650) ||
 		!integer(config.kaAction, 0, 3) || !bounded(config.kaTarget, 64) || !bounded(config.kaUrl, 256) ||
 		!bounded(config.kaProfile, 64) || !integer(config.kaLastTime, 0, 0xffffffff) ||
@@ -521,7 +534,7 @@ function saveFieldFamily(field) {
 		deviceName: "identity", hostname: "identity", notificationLocale: "locale",
 		emailEnabled: "email", smtpServer: "email", smtpPort: "email", smtpUser: "email", smtpPass: "email", smtpSendTo: "email",
 		pushEnabled: "push",
-		adminPhone: "routing", numberBlackList: "routing", networkMode: "network",
+		adminPhone: "routing", numberBlackList: "routing", forwardRules: "routing", networkMode: "network",
 		heartbeatEnable: "heartbeat", heartbeatInterval: "heartbeat",
 		kaEnabled: "keepalive", kaIntervalDays: "keepalive", kaTrafficKB: "keepalive"
 	};
@@ -711,6 +724,7 @@ export function createApp({
 				emailEnabled: config.emailEnabled, pushEnabled: config.pushEnabled,
 				smtpServer: config.smtpServer, smtpPort: config.smtpPort, smtpUser: config.smtpUser,
 				smtpSendTo: config.smtpSendTo, adminPhone: config.adminPhone, numberBlackList: config.numberBlackList,
+				forwardRules: config.forwardRules,
 				networkMode: config.networkMode, heartbeatEnable: config.heartbeatEnable,
 				heartbeatInterval: config.heartbeatInterval, kaEnabled: config.kaEnabled,
 				kaIntervalDays: config.kaIntervalDays, kaTrafficKB: config.kaTrafficKB,
@@ -746,6 +760,9 @@ export function createApp({
 			saveIndex = saveIndex ?? current.index;
 		}
 		if (mixedFamily) return acceptJob("save", result(false, "ACTION_CONFIG_INVALID"), response);
+		if (Object.hasOwn(body, "forwardRules") && fields.length !== 1) {
+			return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, "forwardRules"), response);
+		}
 		for (const [field, limit] of Object.entries(fieldLimits)) {
 			if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
 		}
@@ -797,6 +814,10 @@ export function createApp({
 		if (Object.hasOwn(body, "smtpSendTo")) config.smtpSendTo = body.smtpSendTo;
 		if (Object.hasOwn(body, "adminPhone")) config.adminPhone = body.adminPhone;
 		if (Object.hasOwn(body, "numberBlackList")) config.numberBlackList = body.numberBlackList;
+		if (Object.hasOwn(body, "forwardRules")) config.forwardRules = body.forwardRules;
+		if (Object.hasOwn(body, "forwardRules") && !forwardRulesValid(config.forwardRules)) {
+			return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, "forwardRules"), response);
+		}
 		if (Object.hasOwn(body, "deviceName")) config.deviceName = body.deviceName;
 		if (Object.hasOwn(body, "hostname")) config.hostname = body.hostname;
 		if (Object.hasOwn(body, "notificationLocale")) config.notificationLocale = body.notificationLocale;
