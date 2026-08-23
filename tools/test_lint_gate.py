@@ -205,8 +205,20 @@ class LintGateTests(unittest.TestCase):
                     "with": {
                         "node-version": "24.14.0",
                         "cache": "npm",
-                        "cache-dependency-path": "mock_server/package-lock.json",
+                        "cache-dependency-path": (
+                            "mock_server/package-lock.json\n"
+                            "web/package-lock.json\n"
+                        ),
                     },
+                },
+                {
+                    "name": "Install Web UI dependencies",
+                    "run": "npm ci --prefix web",
+                },
+                {
+                    "name": "Build Web UI for mock tests",
+                    "working-directory": "web",
+                    "run": "npm exec -- vite build",
                 },
                 {
                     "name": "Install mock server dependencies",
