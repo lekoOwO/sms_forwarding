@@ -1070,9 +1070,94 @@ class DeviceCommandTest(unittest.TestCase):
         confirm.assert_called_once_with(DEVICE, "usb-test")
         transaction.assert_called_once_with(
             DEVICE, device.STATE_TIMEOUT, device.usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
-            b"", deadline=130.0,
+            b"", deadline=140.0,
         )
         self.assertEqual(json.loads(output)["status"], "completed")
+
+    def test_ota_migration_timeout_reads_back_valid_state_without_resending(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        state_payload = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET,
+            usb_recovery.OTA_IMAGE_STATE_VALID,
+            0, 0, 0, 0,
+        )
+        calls = []
+
+        def transaction(_path, _timeout, command, payload, **_kwargs):
+            calls.append((command, payload))
+            if command == usb_recovery.COMMAND_OTA_MIGRATION_RECOVER:
+                raise usb_recovery.DeviceError("USB device timed out")
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_OTA_STATE, 0, state_payload,
+            )
+
+        with mock.patch.object(
+            device.usb_recovery, "run_transaction", side_effect=transaction,
+        ):
+            device._ota_migration_recover(reference, timeout=1.0)
+
+        self.assertEqual(calls, [
+            (usb_recovery.COMMAND_OTA_MIGRATION_RECOVER, b""),
+            (usb_recovery.COMMAND_OTA_STATE, b""),
+        ])
+
+    def test_ota_migration_timeout_preserves_error_when_readback_is_not_valid(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        state_payload = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET,
+            usb_recovery.OTA_IMAGE_STATE_PENDING_VERIFY,
+            1, 0, 1, usb_recovery.APP0_OFFSET,
+        )
+        original = usb_recovery.DeviceError("USB device timed out")
+
+        def transaction(_path, _timeout, command, _payload, **_kwargs):
+            if command == usb_recovery.COMMAND_OTA_MIGRATION_RECOVER:
+                raise original
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_OTA_STATE, 0, state_payload,
+            )
+
+        with mock.patch.object(
+            device.usb_recovery, "run_transaction", side_effect=transaction,
+        ):
+            with self.assertRaisesRegex(usb_recovery.DeviceError, "USB device timed out") as raised:
+                device._ota_migration_recover(reference, timeout=1.0)
+        self.assertIs(raised.exception, original)
+
+    def test_ota_container_fallback_adds_cold_start_budget(self):
+        ref = device.SerialDevice(DEVICE, TARGET)
+        state = {
+            "active_offset": usb_recovery.APP0_OFFSET,
+            "image_state": "valid",
+            "pending_verify": False,
+            "accepted": 0,
+            "pending": 0,
+            "pending_address": 0,
+        }
+        process_calls = []
+
+        def fake_process(command, **kwargs):
+            process_calls.append((command, kwargs))
+            return mock.Mock(returncode=0, stdout=json.dumps(state), stderr=b"")
+
+        with mock.patch.object(device, "_run_process", side_effect=fake_process), \
+                mock.patch.object(device.time, "monotonic", return_value=100.0):
+            result = device._container_recovery(
+                ref, device.STATE_TIMEOUT,
+                caller_timeout=device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT,
+                deadline=140.0, command=usb_recovery.COMMAND_OTA_STATE,
+            )
+
+        self.assertEqual(result, state)
+        command, kwargs = process_calls[0]
+        self.assertEqual(
+            float(command[command.index("--timeout") + 1]),
+            device.CONTAINER_TIMEOUT,
+        )
+        self.assertEqual(
+            kwargs["timeout"],
+            device.CONTAINER_TIMEOUT + device.CONTAINER_STARTUP_TIMEOUT,
+        )
 
     def test_flash_app1_dry_run_uses_fixed_slot_and_rejects_arbitrary_offset(self):
         with tempfile.TemporaryDirectory() as temp:

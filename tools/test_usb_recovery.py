@@ -112,6 +112,68 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
                 )
         self.assertEqual(attempts, [5.0, 1.0])
 
+    def test_ota_state_retries_after_a_lost_read_response(self):
+        attempts = []
+        response = usb_recovery.Frame(
+            usb_recovery.RESPONSE_OTA_STATE, 0,
+            usb_recovery.OTA_STATE_STRUCT.pack(
+                usb_recovery.APP0_OFFSET,
+                usb_recovery.OTA_IMAGE_STATE_VALID,
+                0, 0, 0, 0,
+            ),
+        )
+
+        class LostReadDevice:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def transact(self, command, _payload):
+                attempts.append(command)
+                if len(attempts) == 1:
+                    raise usb_recovery.DeviceError("USB device timed out")
+                return response
+
+        with mock.patch.object(usb_recovery, "Device", LostReadDevice):
+            self.assertEqual(
+                usb_recovery.run_transaction(
+                    "/dev/serial/by-id/test", 1.0,
+                    usb_recovery.COMMAND_OTA_STATE, b"",
+                ),
+                response,
+            )
+        self.assertEqual(attempts, [usb_recovery.COMMAND_OTA_STATE] * 2)
+
+    def test_ota_migration_recovery_is_at_most_once(self):
+        attempts = []
+
+        class LostMutationDevice:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def transact(self, command, _payload):
+                attempts.append(command)
+                raise usb_recovery.DeviceError("USB device timed out")
+
+        with mock.patch.object(usb_recovery, "Device", LostMutationDevice):
+            with self.assertRaises(usb_recovery.DeviceError):
+                usb_recovery.run_transaction(
+                    "/dev/serial/by-id/test", 1.0,
+                    usb_recovery.COMMAND_OTA_MIGRATION_RECOVER, b"",
+                )
+        self.assertEqual(attempts, [usb_recovery.COMMAND_OTA_MIGRATION_RECOVER])
+
     def test_transaction_rejects_setup_overrun_after_absolute_deadline(self):
         clock = [100.0]
 

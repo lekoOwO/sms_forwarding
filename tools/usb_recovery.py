@@ -32,6 +32,7 @@ COMMAND_WIFI_PROVISION_STATUS = 0x04
 COMMAND_MODEM_QUERY = 0x05
 COMMAND_OTA_STATE = 0x06
 COMMAND_OTA_MIGRATION_RECOVER = 0x07
+RETRYABLE_READ_COMMANDS = frozenset((COMMAND_STATE, COMMAND_OTA_STATE))
 RESPONSE_MASK = 0x80
 RESPONSE_STATE = COMMAND_STATE | RESPONSE_MASK
 RESPONSE_WIFI_PROVISION = COMMAND_WIFI_PROVISION | RESPONSE_MASK
@@ -1349,7 +1350,7 @@ def run_transaction(
 ) -> Frame:
     timeout = validate_timeout(timeout)
     last_error: DeviceError | None = None
-    attempts = 3 if command == COMMAND_STATE else 1
+    attempts = 3 if command in RETRYABLE_READ_COMMANDS else 1
     for attempt in range(attempts):
         attempt_timeout = timeout
         if deadline is not None:
@@ -1395,8 +1396,9 @@ def _state_command(args: argparse.Namespace) -> int:
 def _ota_state_command(args: argparse.Namespace) -> int:
     timeout = validate_timeout(STATE_TIMEOUT if args.timeout is None else args.timeout)
     internal = {"internal_container": True} if getattr(args, "internal_container", False) else {}
+    deadline = time.monotonic() + timeout
     response = run_transaction(
-        args.device, timeout, COMMAND_OTA_STATE, b"", **internal,
+        args.device, timeout, COMMAND_OTA_STATE, b"", deadline=deadline, **internal,
     )
     print(json.dumps(decode_ota_state_payload(response.payload), sort_keys=True))
     return 0

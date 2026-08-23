@@ -80,6 +80,7 @@ DIAG_ALL_TIMEOUT = 90.0
 BUSY_RETRIES = 2
 BUSY_DELAY = 5.0
 CONTAINER_TIMEOUT = 30.0
+CONTAINER_STARTUP_TIMEOUT = 5.0
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
@@ -945,14 +946,16 @@ def _container_recovery(
         caller_timeout = _remaining(deadline)
     if caller_timeout is not None:
         timeout = min(timeout, caller_timeout)
-    process_timeout = min(CONTAINER_TIMEOUT, timeout if caller_timeout is None else caller_timeout)
+    ota_command = query is None and command in {
+        usb_recovery.COMMAND_OTA_STATE,
+        usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+    }
+    process_budget = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT if ota_command else CONTAINER_TIMEOUT
+    process_timeout = min(process_budget, timeout if caller_timeout is None else caller_timeout)
     if deadline is not None:
         process_timeout = min(process_timeout, _remaining(deadline))
         timeout = min(timeout, process_timeout)
-    backend_timeout = process_timeout if query is None and command in {
-        usb_recovery.COMMAND_OTA_STATE,
-        usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
-    } else timeout
+    backend_timeout = min(CONTAINER_TIMEOUT, process_timeout) if ota_command else timeout
     arguments = [
         "/workspace/tools/usb_recovery.py", "--device", CONTAINER_DEVICE_PATH,
         "--timeout", str(backend_timeout), "--internal-container",
@@ -1462,6 +1465,22 @@ def _ota_state(
         return usb_recovery.validate_ota_state(result)
 
 
+def _ota_migration_readback(
+    device: SerialDevice, timeout: float, container_timeout: float,
+    deadline: float | None, original_error: BaseException,
+) -> None:
+    try:
+        state = _ota_state(
+            device, timeout=min(STATE_TIMEOUT, timeout),
+            container_timeout=container_timeout, deadline=deadline,
+        )
+    except (usb_recovery.DeviceError, OSError, ImportError):
+        raise original_error
+    if state.get("image_state") == "valid" and state.get("pending") == 0:
+        return
+    raise original_error
+
+
 def _ota_migration_recover(
     device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
     container_timeout: float = CONTAINER_TIMEOUT, deadline: float | None = None,
@@ -1480,16 +1499,25 @@ def _ota_migration_recover(
     except usb_recovery.CommandError:
         raise
     except (usb_recovery.DeviceError, OSError, ImportError) as error:
-        if not _host_transport_unavailable(error):
-            raise
-        if deadline is not None:
-            container_timeout = min(container_timeout, _remaining(deadline))
-        result = _container_recovery(
-            device, timeout, caller_timeout=container_timeout, deadline=deadline,
-            command=usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
-        )
-        if result != {"ok": True}:
-            raise usb_recovery.DeviceError("USB recovery returned invalid migration response")
+        if _host_transport_unavailable(error):
+            if deadline is not None:
+                container_timeout = min(container_timeout, _remaining(deadline))
+            try:
+                result = _container_recovery(
+                    device, timeout, caller_timeout=container_timeout, deadline=deadline,
+                    command=usb_recovery.COMMAND_OTA_MIGRATION_RECOVER,
+                )
+            except usb_recovery.CommandError:
+                raise
+            except (usb_recovery.DeviceError, OSError, ImportError) as recovery_error:
+                error = recovery_error
+            else:
+                if result == {"ok": True}:
+                    return
+                error = usb_recovery.DeviceError(
+                    "USB recovery returned invalid migration response"
+                )
+        _ota_migration_readback(device, timeout, container_timeout, deadline, error)
 
 
 def _try_resolve_exact_device(device_path: str) -> SerialDevice | None:
@@ -1910,7 +1938,7 @@ def _ota_migration_recover_command(args: argparse.Namespace) -> int:
 
     device = resolve_serial_device(device_path)
     confirm_basename(device_path, args.confirm)
-    deadline = time.monotonic() + CONTAINER_TIMEOUT
+    deadline = time.monotonic() + CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT + STATE_TIMEOUT
     _ota_migration_recover(device, timeout=STATE_TIMEOUT, deadline=deadline)
     plan["status"] = "completed"
     print(json.dumps(plan, sort_keys=True))
@@ -2046,7 +2074,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(state, sort_keys=True))
             return 0
         if args.command == "ota-state":
-            deadline = time.monotonic() + CONTAINER_TIMEOUT
+            deadline = time.monotonic() + CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT
             state = _ota_state(resolve_serial_device(args.device), deadline=deadline)
             print(json.dumps(state, sort_keys=True))
             return 0
