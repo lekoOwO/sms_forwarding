@@ -22,6 +22,16 @@ def main() -> None:
     config_failure = app_main.index("if (cfg_err != ESP_OK)")
     config_failure_return = app_main.index("return;", config_failure)
     assert app_main.index("idf_web_ota_health_check(false, false, true)", config_failure) < config_failure_return
+    assert "idf_web_ota_init();" in app_main
+    ota_init = app_main.index("idf_web_ota_init();")
+    usb_start = app_main.index("idf_usb_recovery_start())")
+    assert ota_init < usb_start
+    ota_runtime = (WEB / "idf_web_ota.cpp").read_text(encoding="utf-8")
+    health = ota_runtime[ota_runtime.index("esp_err_t idf_web_ota_health_check") :]
+    assert "if (!lock()) return ESP_ERR_TIMEOUT;" in health
+    assert "if (!other || other == running)" in ota_runtime
+    assert "if (other_error != ESP_OK)" in ota_runtime
+    assert "ESP_OTA_IMG_INVALID" in ota_runtime
 
     harness = r'''
 #include <cassert>

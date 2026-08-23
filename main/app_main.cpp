@@ -66,6 +66,8 @@ extern "C" void app_main(void)
     idf_inbox_init();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    const esp_err_t ota_init_err = idf_web_ota_init();
+    log_start_result("OTA", ota_init_err);
     // Configuration storage is fail-closed: an invalid committed slot must
     // not be replaced with administrator defaults.
     esp_err_t cfg_err = idf_config_load();

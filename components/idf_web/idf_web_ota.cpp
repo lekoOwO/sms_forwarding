@@ -399,7 +399,10 @@ bool idf_web_ota_restart_pending()
 
 esp_err_t idf_web_ota_get_state(IdfWebOtaState* output)
 {
-    return read_ota_state(output);
+    if (!lock()) return ESP_ERR_TIMEOUT;
+    const esp_err_t result = read_ota_state(output);
+    unlock();
+    return result;
 }
 
 #if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
@@ -427,10 +430,19 @@ esp_err_t idf_web_ota_migration_recover()
     if (state != IdfWebOtaImageState::PendingVerify) return finish(ESP_ERR_INVALID_STATE);
 
     const esp_partition_t* other = esp_ota_get_next_update_partition(running);
-    if (other && other != running) {
-        esp_ota_img_states_t other_state;
-        if (esp_ota_get_state_partition(other, &other_state) == ESP_OK &&
-            other_state == ESP_OTA_IMG_VALID) return finish(ESP_ERR_INVALID_STATE);
+    if (!other || other == running) return finish(ESP_ERR_INVALID_STATE);
+    esp_ota_img_states_t other_state;
+    const esp_err_t other_error = esp_ota_get_state_partition(other, &other_state);
+    if (other_error != ESP_OK) return finish(other_error);
+    // Accept only the ESP-IDF documented non-VALID states for the alternate slot.
+    switch (other_state) {
+    case ESP_OTA_IMG_NEW:
+    case ESP_OTA_IMG_INVALID:
+    case ESP_OTA_IMG_ABORTED:
+    case ESP_OTA_IMG_UNDEFINED:
+        break;
+    default:
+        return finish(ESP_ERR_INVALID_STATE);
     }
 
     nvs_handle_t handle = 0;
@@ -465,10 +477,15 @@ esp_err_t idf_web_ota_migration_recover()
 esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
                                    bool deadline_expired)
 {
+    if (!lock()) return ESP_ERR_TIMEOUT;
+    const auto finish = [](esp_err_t result) {
+        unlock();
+        return result;
+    };
     const esp_partition_t* running = esp_ota_get_running_partition();
-    if (!running) return ESP_ERR_INVALID_STATE;
+    if (!running) return finish(ESP_ERR_INVALID_STATE);
     esp_ota_img_states_t raw_state;
-    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) return ESP_FAIL;
+    if (esp_ota_get_state_partition(running, &raw_state) != ESP_OK) return finish(ESP_FAIL);
     IdfWebOtaImageState state = raw_state == ESP_OTA_IMG_PENDING_VERIFY
         ? IdfWebOtaImageState::PendingVerify
         : raw_state == ESP_OTA_IMG_VALID ? IdfWebOtaImageState::Valid : IdfWebOtaImageState::Other;
@@ -478,14 +495,14 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
         // The development test intentionally rolls back in the bootloader;
         // it does not read or write OTA metadata.
         esp_ota_mark_app_invalid_rollback_and_reboot();
-        return ESP_FAIL;
+        return finish(ESP_FAIL);
     }
 #endif
 
     nvs_handle_t handle = 0;
     if (nvs_open(OTA_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
         if (state == IdfWebOtaImageState::PendingVerify) esp_ota_mark_app_invalid_rollback_and_reboot();
-        return ESP_FAIL;
+        return finish(ESP_FAIL);
     }
     uint32_t accepted = 0, pending = 0, pending_address = 0;
     const bool metadata_ok = read_counter(handle, KEY_ACCEPTED, accepted) &&
@@ -494,7 +511,7 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
     if (!metadata_ok) {
         nvs_close(handle);
         if (state == IdfWebOtaImageState::PendingVerify) esp_ota_mark_app_invalid_rollback_and_reboot();
-        return ESP_FAIL;
+        return finish(ESP_FAIL);
     }
     HealthContext context{handle};
     const IdfWebOtaHealthPlatform platform = {
@@ -505,7 +522,7 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
         state, http_live, management_reachable, deadline_expired,
         accepted, pending, running->address, pending_address, platform);
     nvs_close(handle);
-    if (result == IdfWebOtaHealthResult::Waiting) return ESP_ERR_NOT_FINISHED;
-    if (result == IdfWebOtaHealthResult::Done) return ESP_OK;
-    return ESP_FAIL;
+    if (result == IdfWebOtaHealthResult::Waiting) return finish(ESP_ERR_NOT_FINISHED);
+    if (result == IdfWebOtaHealthResult::Done) return finish(ESP_OK);
+    return finish(ESP_FAIL);
 }
