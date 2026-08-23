@@ -199,6 +199,7 @@ jobs:
           git diff --exit-code -- code/web_assets.h code/web_assets.cpp
 
       - name: Run host contract tests
+        shell: bash
         run: |
           python3 tools/test_config_schema.py
           python3 tools/test_idf_config_codec.py
@@ -211,6 +212,7 @@ jobs:
           python3 tools/test_idf_baseline.py
           python3 tools/test_device.py
           python3 tools/test_ota_test_profile.py
+          python3 tools/test_ota_observability.py
           python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
           python3 components/idf_web/test/test_openapi_conformance.py

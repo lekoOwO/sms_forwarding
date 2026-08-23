@@ -63,6 +63,41 @@ def parse_workflow_job(workflow: str, name: str) -> dict[str, object]:
 
 
 class LintGateTests(unittest.TestCase):
+    def assert_host_contracts(self, workflow):
+        build = parse_workflow_job(workflow, "build")
+        host_index = next(
+            index for index, step in enumerate(build["steps"])
+            if step.get("name") == "Run host contract tests"
+        )
+        build_index = next(
+            index for index, step in enumerate(build["steps"])
+            if step.get("name") == "Build firmware"
+        )
+        host_contracts = build["steps"][host_index]
+        self.assertLess(host_index, build_index)
+        self.assertEqual("bash", host_contracts.get("shell"))
+        self.assertNotIn("if", host_contracts)
+        self.assertNotIn("continue-on-error", host_contracts)
+        self.assertEqual([
+            "python3 tools/test_config_schema.py",
+            "python3 tools/test_idf_config_codec.py",
+            "python3 tools/test_idf_config_persistence.py",
+            "python3 tools/test_idf_config_updates.py",
+            "python3 components/idf_modem/test/test_uart_owner.py",
+            "python3 components/idf_push/test/test_push_runtime.py",
+            "python3 components/idf_sms/test/test_sms_retention_policy.py",
+            "python3 components/idf_wifi/test/test_wifi_security.py",
+            "python3 tools/test_idf_baseline.py",
+            "python3 tools/test_device.py",
+            "python3 tools/test_ota_test_profile.py",
+            "python3 tools/test_ota_observability.py",
+            "python3 tools/test_usb_recovery.py",
+            "python3 components/idf_web/test/test_web_security.py",
+            "python3 components/idf_web/test/test_openapi_conformance.py",
+            "python3 components/idf_web/test/test_ota_runtime.py",
+        ], host_contracts["run"].splitlines())
+        return build
+
     def test_discovery_reads_only_tracked_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -171,22 +206,34 @@ class LintGateTests(unittest.TestCase):
     def test_ci_enforces_lint_before_build_and_runs_current_host_contracts(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("\n  lint:\n", workflow)
-        self.assertEqual(parse_workflow_job(workflow, "build")["needs"], "[lint, mock]")
+        build = self.assert_host_contracts(workflow)
+        self.assertEqual(build["needs"], "[lint, mock]")
         self.assertIn("python3 tests/lint_gate_smoke.py", workflow)
         self.assertIn("python3 tools/run_lint.py", workflow)
-        for command in (
-            "python3 components/idf_web/test/test_ota_runtime.py",
-            "python3 components/idf_web/test/test_web_security.py",
-            "python3 components/idf_web/test/test_openapi_conformance.py",
-            "python3 tools/test_idf_config_codec.py",
-            "python3 tools/test_idf_config_persistence.py",
-            "python3 tools/test_idf_config_updates.py",
-            "python3 components/idf_modem/test/test_uart_owner.py",
-            "python3 components/idf_push/test/test_push_runtime.py",
-            "python3 components/idf_sms/test/test_sms_retention_policy.py",
-            "python3 components/idf_wifi/test/test_wifi_security.py",
-        ):
-            self.assertIn(command, workflow)
+
+    def test_ci_host_contracts_reject_bypass_mutations(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        command = "python3 tools/test_ota_observability.py"
+        step = "      - name: Run host contract tests\n        shell: bash\n        run: |"
+        before_host = "      - name: Build and verify Web UI assets"
+        build_firmware = "      - name: Build firmware"
+        wrong_order = (
+            workflow.replace(before_host, "      - name: ORDER_PLACEHOLDER", 1)
+            .replace(build_firmware, before_host, 1)
+            .replace("      - name: ORDER_PLACEHOLDER", build_firmware, 1)
+        )
+        mutations = {
+            "ignored failure": workflow.replace(command, f"{command} || true", 1),
+            "duplicate": workflow.replace(command, f"{command}\n          {command}", 1),
+            "commented": workflow.replace(command, f"# {command}", 1),
+            "conditional": workflow.replace(step, step.replace("run:", "if: always()\n        run:"), 1),
+            "continue on error": workflow.replace(step, step.replace("run:", "continue-on-error: true\n        run:"), 1),
+            "unsafe shell": workflow.replace(step, step.replace("shell: bash", "shell: bash {0}"), 1),
+            "wrong order": wrong_order,
+        }
+        for name, mutated in mutations.items():
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                self.assert_host_contracts(mutated)
 
     def test_ci_runs_mock_gate_on_pinned_ubuntu(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")

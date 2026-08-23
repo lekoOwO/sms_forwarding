@@ -282,6 +282,7 @@ Release、Web security 與 OTA：
 ```sh
 python3 -m unittest \
   tools/test_firmware_release.py \
+  tools/test_ota_observability.py \
   components/idf_web/test/test_openapi_conformance.py \
   components/idf_web/test/test_ota_runtime.py \
   components/idf_web/test/test_web_security.py
