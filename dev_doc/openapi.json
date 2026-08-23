@@ -113,7 +113,7 @@
         "tags": ["Configuration"],
         "summary": "Update the configuration",
 		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "description": "The request can contain one configuration section. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
+		"description": "The request can contain one configuration section. emailEnabled and pushEnabled use explicit 0 or 1 values, and each can be updated alone without changing credentials or per-channel settings. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
           "content": {
@@ -697,12 +697,14 @@
           },
           "config": {
             "type": "object",
-		"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
+		"required": ["deviceName", "hostname", "notificationLocale", "emailEnabled", "pushEnabled", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
             "additionalProperties": false,
             "properties": {
 			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
 			  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
 			  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"] },
+			  "emailEnabled": { "type": "boolean", "description": "Global email delivery switch. SMTP credentials remain configured while this is false." },
+			  "pushEnabled": { "type": "boolean", "description": "Global push delivery switch. Per-channel enabled values and credentials remain configured while this is false." },
               "webAccounts": {
                 "type": "array",
                 "minItems": 10,
@@ -747,6 +749,8 @@
 		  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
 		  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
 		  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"], "x-maxUtf8Bytes": 16 },
+		  "emailEnabled": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
+		  "pushEnabled": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
           "smtpServer": { "type": "string", "x-maxUtf8Bytes": 253 },
           "smtpPort": { "type": "integer", "minimum": 1, "maximum": 65535, "x-maxUtf8Bytes": 32 },
           "smtpUser": { "type": "string", "x-maxUtf8Bytes": 254 },

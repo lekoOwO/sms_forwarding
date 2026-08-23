@@ -162,6 +162,63 @@ test("masked secrets retain blank same-type values and clear them on provider ch
 	});
 });
 
+test("global notification switches round-trip independently without clearing channel state or secrets", async () => {
+	await withServer(async (baseUrl) => {
+		for (const values of [
+			{ emailEnabled: "0", smtpServer: "smtp.example.com", smtpPort: 465, smtpUser: "sender@example.com", smtpPass: "smtp-secret", smtpSendTo: "ops@example.com" },
+			{ pushEnabled: "0", push0en: "on", push0type: 9, push0name: "Gotify", push0url: "https://gotify.example/message", push0key1: "push-secret", push0title: "{sender}", push0template: "{message}" }
+		]) assert.equal((await completed(baseUrl, await form(baseUrl, "/save", values))).code, "ACTION_CONFIG_SAVED");
+
+		let snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([snapshot.config.emailEnabled, snapshot.config.pushEnabled], [false, false]);
+		assert.equal(snapshot.config.smtpPass, "");
+		assert.deepEqual([
+			snapshot.config.pushChannels[0].url,
+			snapshot.config.pushChannels[0].key1,
+			snapshot.config.pushChannels[0].urlSet,
+			snapshot.config.pushChannels[0].key1Set
+		], ["", "", true, true]);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { emailEnabled: "1" }))).code,
+			"ACTION_CONFIG_SAVED");
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.emailEnabled, true);
+		assert.equal(snapshot.config.pushEnabled, false);
+		assert.equal(snapshot.status.emailConfigured, true);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { pushEnabled: "1" }))).code,
+			"ACTION_CONFIG_SAVED");
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.emailEnabled, true);
+		assert.equal(snapshot.config.pushEnabled, true);
+		assert.deepEqual([
+			snapshot.config.pushChannels[0].enabled,
+			snapshot.config.pushChannels[0].type,
+			snapshot.config.pushChannels[0].name,
+			snapshot.config.pushChannels[0].urlSet,
+			snapshot.config.pushChannels[0].key1Set,
+			snapshot.config.pushChannels[0].titleTemplate,
+			snapshot.config.pushChannels[0].bodyTemplate
+		], [true, 9, "Gotify", true, true, "{sender}", "{message}"]);
+
+	});
+
+	for (const [field, invalid] of [
+			["emailEnabled", "+1"], ["emailEnabled", "01"], ["emailEnabled", " 1"],
+			["pushEnabled", "+1"], ["pushEnabled", "01"], ["pushEnabled", "1 "]
+	]) {
+		await withServer(async (baseUrl) => {
+			const unchanged = await (await request(baseUrl, "/api/config")).json();
+			const sibling = field === "emailEnabled"
+				? { smtpServer: "must-not-save.example" }
+				: { push0en: "on", push0type: 9, push0name: "must-not-save" };
+			const rejected = await completed(baseUrl, await form(baseUrl, "/save", { [field]: invalid, ...sibling }));
+			assert.deepEqual([rejected.code, rejected.detail], ["ACTION_CONFIG_INVALID", field]);
+			assert.deepEqual(await (await request(baseUrl, "/api/config")).json(), unchanged);
+		});
+	}
+});
+
 test("one save family and current limits reject without mutation", async () => {
 	await withServer(async (baseUrl) => {
 		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { adminPhone: "1".repeat(64) }))).success, true);

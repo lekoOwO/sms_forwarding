@@ -730,6 +730,9 @@ static esp_err_t handle_api_config(httpd_req_t* req)
     json_prop(body, "deviceName", cfg.deviceName); body += ",";
     json_prop(body, "hostname", cfg.hostname); body += ",";
     json_prop(body, "notificationLocale", cfg.notificationLocale); body += ",";
+    snprintf(buf, sizeof(buf), "\"emailEnabled\":%s,\"pushEnabled\":%s,",
+             cfg.emailEnabled ? "true" : "false", cfg.pushEnabled ? "true" : "false");
+    body += buf;
     body += "\"webAccounts\":[";
     for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
         if (i) body += ",";
@@ -2455,8 +2458,9 @@ static ModernSaveFamily modern_save_field_family(const std::string& key)
 {
     if (key == "deviceName" || key == "hostname") return ModernSaveFamily::Identity;
     if (key == "notificationLocale") return ModernSaveFamily::Locale;
-    if (key == "smtpServer" || key == "smtpPort" || key == "smtpUser" ||
+    if (key == "emailEnabled" || key == "smtpServer" || key == "smtpPort" || key == "smtpUser" ||
         key == "smtpPass" || key == "smtpSendTo") return ModernSaveFamily::Email;
+    if (key == "pushEnabled") return ModernSaveFamily::Push;
     if (key == "adminPhone" || key == "numberBlackList") return ModernSaveFamily::Routing;
     if (key == "networkMode") return ModernSaveFamily::Network;
     if (key == "heartbeatEnable" || key == "heartbeatInterval") return ModernSaveFamily::Heartbeat;
@@ -2481,7 +2485,8 @@ static size_t modern_field_limit(const std::string& key)
     if (key == "hostname") return 32;
     if (key == "notificationLocale") return 16;
     if (key == "smtpServer") return 253;
-    if (key == "smtpPort" || key == "networkMode" || key == "heartbeatEnable" ||
+    if (key == "emailEnabled" || key == "pushEnabled" || key == "smtpPort" ||
+        key == "networkMode" || key == "heartbeatEnable" ||
         key == "heartbeatInterval" || key == "kaEnabled" || key == "kaIntervalDays" ||
         key == "kaTrafficKB") return 32;
     if (key == "smtpUser") return 254;
@@ -2613,13 +2618,21 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
 
     if (family == ModernSaveFamily::Email) {
         const IdfConfigWebView current = idf_config_get_web_view();
+        bool enabled = current.emailEnabled;
         int port = current.smtpPort;
+        if (has_field(fields, "emailEnabled")) {
+            const std::string emailEnabled = field_text(fields, "emailEnabled");
+            if (emailEnabled != "0" && emailEnabled != "1") {
+                return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "emailEnabled");
+            }
+            enabled = emailEnabled == "1";
+        }
         if ((has_field(fields, "smtpPort") && !parse_int_strict(field_text(fields, "smtpPort"), port)) ||
             port < 1 || port > 65535) {
             return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "smtpPort");
         }
         const bool has_pass = has_field(fields, "smtpPass");
-        esp_err_t err = idf_config_save_email(current.emailEnabled,
+        esp_err_t err = idf_config_save_email(enabled,
             has_field(fields, "smtpServer") ? field_text(fields, "smtpServer") : current.smtpServer, port,
             has_field(fields, "smtpUser") ? field_text(fields, "smtpUser") : current.smtpUser,
             field_text(fields, "smtpPass"),
@@ -2639,6 +2652,7 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     if (family == ModernSaveFamily::Push) {
         int index = -1;
         for (const auto& field : fields) {
+            if (field.first == "pushEnabled") continue;
             int parsed = -1;
             for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template"}) {
                 parsed = indexed_save_key(field.first, "push", suffix, IDF_MAX_PUSH_CHANNELS);
@@ -2647,15 +2661,26 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
             if (index >= 0 && parsed != index) return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "push");
             index = parsed;
         }
+        const IdfConfigWebView current = idf_config_get_web_view();
+        bool enabled = current.pushEnabled;
+        if (has_field(fields, "pushEnabled")) {
+            const std::string pushEnabled = field_text(fields, "pushEnabled");
+            if (pushEnabled != "0" && pushEnabled != "1") {
+                return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "pushEnabled");
+            }
+            enabled = pushEnabled == "1";
+        }
+        IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS];
+        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) channels[i] = current.pushChannels[i];
+        if (index < 0) {
+            return send_modern_save_result(req, idf_config_save_push(enabled, channels), "push");
+        }
         char key[24];
         snprintf(key, sizeof(key), "push%dtype", index);
-        const IdfConfigWebView current = idf_config_get_web_view();
         int type = current.pushChannels[index].type;
         if ((has_field(fields, key) && !parse_int_strict(field_text(fields, key), type)) || type < 1 || type > 12) {
             return send_modern_save_result(req, ESP_ERR_INVALID_ARG, key);
         }
-        IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS];
-        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) channels[i] = current.pushChannels[i];
         IdfPushChannel next = type == current.pushChannels[index].type
             ? current.pushChannels[index] : IdfPushChannel();
         next.type = static_cast<uint8_t>(type);
@@ -2668,7 +2693,7 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         snprintf(key, sizeof(key), "push%dtitle", index); if (has_field(fields, key)) next.titleTemplate = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dtemplate", index); if (has_field(fields, key)) next.bodyTemplate = field_text(fields, key);
         channels[index] = std::move(next);
-        return send_modern_save_result(req, idf_config_save_push(current.pushEnabled, channels), "push");
+        return send_modern_save_result(req, idf_config_save_push(enabled, channels), "push");
     }
 
     if (family == ModernSaveFamily::Wifi) {

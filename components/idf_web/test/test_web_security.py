@@ -351,6 +351,8 @@ int main() {
         assert secret not in snapshot
     for flag in ("pushUrlSet", "pushKey1Set", "pushKey2Set", "pushCustomBodySet"):
         assert flag in snapshot
+    for flag in ("cfg.emailEnabled", "cfg.pushEnabled"):
+        assert flag in snapshot
 
     scheduler = function_body(source, "scheduler_task")
     assert "idf_push_heartbeat_tick();" in scheduler
@@ -405,6 +407,7 @@ int main() {
         assert "enqueue_api_job" in function_body(source, handler)
     assert "check_csrf(req)" not in function_body(source, "handle_query")
     modern_save = function_body(source, "handle_modern_save")
+    save_family = function_body(source, "modern_save_field_family")
     save = function_body(source, "handle_save")
     run_save = function_body(source, "run_save_job")
     assert save.index("reject_oversized_body(req)") < save.index("check_auth(req)")
@@ -413,6 +416,13 @@ int main() {
     assert re.search(r"idf_web_decode_form\(body,\s*51\)", save)
     assert "idf_config_get()" not in source
     assert "idf_config_save_accounts(accounts, true)" in modern_save
+    assert 'key == "emailEnabled"' in save_family
+    assert 'key == "pushEnabled"' in save_family
+    for field in ("emailEnabled", "pushEnabled"):
+        assert f'const std::string {field} = field_text(fields, "{field}")' in modern_save
+        assert f'{field} != "0" && {field} != "1"' in modern_save
+    assert "idf_config_save_email(enabled," in modern_save
+    assert "idf_config_save_push(enabled," in modern_save
     for api in (
         "idf_config_save_identity", "idf_config_save_notification_locale",
         "idf_config_save_network_mode", "idf_config_save_heartbeat",

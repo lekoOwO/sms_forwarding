@@ -8,6 +8,8 @@ const demoConfig: DeviceSnapshot["config"] = {
 	deviceName: "Lobby SMS Gateway",
 	hostname: "sms-forwarder-demo",
 	notificationLocale: "zh-TW",
+	emailEnabled: true,
+	pushEnabled: true,
 	webAccounts: Array.from({ length: 10 }, (_, index) => ({ username: index === 0 ? "admin" : "", password: "" })),
 	smtpServer: "smtp.example.com", smtpPort: 465, smtpUser: "gateway@example.com", smtpPass: "", smtpSendTo: "ops@example.com",
 	adminPhone: "+886900000000", numberBlackList: "",
@@ -42,9 +44,18 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 	} as T;
 	if (path === "/save" && init?.body instanceof URLSearchParams) {
 		const form = init.body;
-		for (const [key, value] of init.body) {
-			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+		for (const field of ["emailEnabled", "pushEnabled"] as const) {
+			if (!form.has(field)) continue;
+			const value = form.get(field);
+			if (value !== "0" && value !== "1") return {
+				success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: field
+			} as T;
 		}
+		for (const [key, value] of init.body) {
+			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "emailEnabled", "pushEnabled", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+		}
+		if (form.has("emailEnabled")) demoConfig.emailEnabled = form.get("emailEnabled") === "1";
+		if (form.has("pushEnabled")) demoConfig.pushEnabled = form.get("pushEnabled") === "1";
 		if (init.body.has("networkMode")) demoConfig.networkMode = Number(init.body.get("networkMode"));
 		if (init.body.has("heartbeatInterval")) {
 			demoConfig.heartbeatEnable = init.body.has("heartbeatEnable");

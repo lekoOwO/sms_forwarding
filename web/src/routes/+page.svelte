@@ -7,6 +7,7 @@
 	import * as Alert from "$lib/components/ui/alert";
 	import { Badge } from "$lib/components/ui/badge";
 	import { Button } from "$lib/components/ui/button";
+	import * as Card from "$lib/components/ui/card";
 	import * as Empty from "$lib/components/ui/empty";
 	import * as Field from "$lib/components/ui/field";
 	import { Input } from "$lib/components/ui/input";
@@ -79,6 +80,11 @@
 	let logsResult = $state(idle());
 	let identityResult = $state(idle());
 	let notificationLocaleResult = $state(idle());
+	let emailSwitchResult = $state(idle());
+	let pushSwitchResult = $state(idle());
+	let emailEnabledDraft = $state(false);
+	let pushEnabledDraft = $state(false);
+	let notificationSwitchSaving = $derived(emailSwitchResult.state === "loading" || pushSwitchResult.state === "loading");
 	let configFileResult = $state(idle());
 	let otaResult = $state(idle());
 	let phone = $state("");
@@ -127,6 +133,8 @@
 		loadError = "";
 		try {
 			snapshot = await loadSnapshot();
+			emailEnabledDraft = snapshot.config.emailEnabled;
+			pushEnabledDraft = snapshot.config.pushEnabled;
 			originalWifiSsids = snapshot.config.wifiProfiles.map((profile) => profile.ssid);
 			originalWifiOpen = snapshot.config.wifiProfiles.map((profile) => profile.open);
 			openWifiProfiles = snapshot.config.wifiProfiles.map((profile) => profile.open);
@@ -494,6 +502,18 @@
 			{:else if mainTab === "notifications"}
 				<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("notificationTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("notificationDescription")}</p></div>
+					<div class="grid gap-4 md:grid-cols-2">
+						<Card.Root>
+							<Card.Header><Card.Title>{t("emailTitle")}</Card.Title><Card.Description>{t("emailDescription")}</Card.Description></Card.Header>
+							<Card.Content class="flex flex-col gap-4"><form id="email-global-form" onsubmit={(event) => { event.preventDefault(); if (notificationSwitchSaving) return; void save((value) => emailSwitchResult = value, { emailEnabled: emailEnabledDraft ? "1" : "0" }); }}><Field.Field orientation="horizontal"><Field.Label for="email-global-enabled">{t("emailGlobalEnabled")}</Field.Label><Switch id="email-global-enabled" bind:checked={emailEnabledDraft} /></Field.Field></form><ActionResult result={emailSwitchResult} title={t("resultTitle")} {locale} /></Card.Content>
+							<Card.Footer class="justify-end"><Button type="submit" form="email-global-form" disabled={notificationSwitchSaving}>{emailSwitchResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></Card.Footer>
+						</Card.Root>
+						<Card.Root>
+							<Card.Header><Card.Title>{t("pushTitle")}</Card.Title><Card.Description>{t("pushDescription")}</Card.Description></Card.Header>
+							<Card.Content class="flex flex-col gap-4"><form id="push-global-form" onsubmit={(event) => { event.preventDefault(); if (notificationSwitchSaving) return; void save((value) => pushSwitchResult = value, { pushEnabled: pushEnabledDraft ? "1" : "0" }); }}><Field.Field orientation="horizontal"><Field.Label for="push-global-enabled">{t("pushGlobalEnabled")}</Field.Label><Switch id="push-global-enabled" bind:checked={pushEnabledDraft} /></Field.Field></form><ActionResult result={pushSwitchResult} title={t("resultTitle")} {locale} /></Card.Content>
+							<Card.Footer class="justify-end"><Button type="submit" form="push-global-form" disabled={notificationSwitchSaving}>{pushSwitchResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></Card.Footer>
+						</Card.Root>
+					</div>
 					<Accordion.Root type="single" value="notification-locale">
 						<Accordion.Item value="notification-locale">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("notificationLocale")}</span><Badge variant="outline">{snapshot.config.notificationLocale}</Badge></span></Accordion.Trigger>

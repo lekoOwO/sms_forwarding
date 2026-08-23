@@ -44,6 +44,8 @@ export type DeviceSnapshot = {
 		deviceName: string;
 		hostname: string;
 		notificationLocale: Locale;
+		emailEnabled: boolean;
+		pushEnabled: boolean;
 		webAccounts: WebAccount[];
 		smtpServer: string;
 		smtpPort: number;

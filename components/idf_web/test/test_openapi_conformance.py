@@ -97,6 +97,11 @@ def main() -> None:
 
     config_update = SPEC["components"]["schemas"]["ConfigUpdate"]
     assert config_update["maxProperties"] == 51
+    snapshot_config = SPEC["components"]["schemas"]["DeviceSnapshot"]["properties"]["config"]
+    for field in ("emailEnabled", "pushEnabled"):
+        assert field in snapshot_config["required"]
+        assert snapshot_config["properties"][field]["type"] == "boolean"
+        assert config_update["properties"][field]["enum"] == ["0", "1"]
     config_properties = CONFIG_SCHEMA["properties"]["config"]["properties"]
     update_properties = config_update["properties"]
     for field in ("smtpSendTo", "adminPhone"):

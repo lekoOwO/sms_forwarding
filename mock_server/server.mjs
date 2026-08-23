@@ -371,6 +371,7 @@ const fieldLimits = {
 	adminPhone: 64, numberBlackList: 1024, phone: 32, content: 2048,
 	cmd: 256, action: 32, type: 32, deviceName: 64, hostname: 32, notificationLocale: 16,
 	networkMode: 32, heartbeatEnable: 32, heartbeatInterval: 32,
+	emailEnabled: 32, pushEnabled: 32,
 	kaEnabled: 32, kaIntervalDays: 32, kaTrafficKB: 32
 };
 
@@ -518,7 +519,8 @@ function boundedUnsigned(value, minimum, maximum) {
 function saveFieldFamily(field) {
 	const direct = {
 		deviceName: "identity", hostname: "identity", notificationLocale: "locale",
-		smtpServer: "email", smtpPort: "email", smtpUser: "email", smtpPass: "email", smtpSendTo: "email",
+		emailEnabled: "email", smtpServer: "email", smtpPort: "email", smtpUser: "email", smtpPass: "email", smtpSendTo: "email",
+		pushEnabled: "push",
 		adminPhone: "routing", numberBlackList: "routing", networkMode: "network",
 		heartbeatEnable: "heartbeat", heartbeatInterval: "heartbeat",
 		kaEnabled: "keepalive", kaIntervalDays: "keepalive", kaTrafficKB: "keepalive"
@@ -706,6 +708,7 @@ export function createApp({
 			},
 			config: {
 				deviceName: config.deviceName, hostname: config.hostname, notificationLocale: config.notificationLocale,
+				emailEnabled: config.emailEnabled, pushEnabled: config.pushEnabled,
 				smtpServer: config.smtpServer, smtpPort: config.smtpPort, smtpUser: config.smtpUser,
 				smtpSendTo: config.smtpSendTo, adminPhone: config.adminPhone, numberBlackList: config.numberBlackList,
 				networkMode: config.networkMode, heartbeatEnable: config.heartbeatEnable,
@@ -797,6 +800,11 @@ export function createApp({
 		if (Object.hasOwn(body, "deviceName")) config.deviceName = body.deviceName;
 		if (Object.hasOwn(body, "hostname")) config.hostname = body.hostname;
 		if (Object.hasOwn(body, "notificationLocale")) config.notificationLocale = body.notificationLocale;
+		for (const field of ["emailEnabled", "pushEnabled"]) {
+			if (!Object.hasOwn(body, field)) continue;
+			if (!["0", "1"].includes(body[field])) return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, field), response);
+			config[field] = body[field] === "1";
+		}
 		if (Object.hasOwn(body, "networkMode")) {
 			const value = boundedUnsigned(body.networkMode, 0, 2);
 			if (value === undefined) return response.status(400).json(result(false, "ACTION_CONFIG_INVALID", {}, "networkMode"));
