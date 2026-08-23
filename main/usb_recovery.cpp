@@ -504,34 +504,57 @@ static size_t state_payload(uint8_t* output)
 static esp_err_t write_frame(uint8_t command, uint8_t sequence,
                              const uint8_t* payload, size_t payload_length)
 {
-    if (payload_length > kMaxPayload) return ESP_ERR_INVALID_ARG;
-    uint8_t frame[kMaxFrame] = {};
-    frame[0] = kMagic0;
-    frame[1] = kMagic1;
-    frame[2] = kVersion;
-    frame[3] = command;
-    frame[4] = static_cast<uint8_t>(payload_length);
-    frame[5] = static_cast<uint8_t>(payload_length >> 8);
-    frame[6] = sequence;
-    memcpy(frame + kHeaderSize, payload, payload_length);
-    const uint16_t crc = crc16(frame, kHeaderSize + payload_length);
-    frame[kHeaderSize + payload_length] = static_cast<uint8_t>(crc);
-    frame[kHeaderSize + payload_length + 1] = static_cast<uint8_t>(crc >> 8);
-    const size_t frame_length = kHeaderSize + payload_length + kCrcSize;
-    const int written = usb_serial_jtag_write_bytes(frame, frame_length, kIoTimeout);
-    if (written != static_cast<int>(frame_length)) return ESP_ERR_TIMEOUT;
-    return usb_serial_jtag_wait_tx_done(kIoTimeout);
+    int written = 0;
+    esp_err_t result = ESP_ERR_INVALID_ARG;
+    if (payload_length <= kMaxPayload) {
+        uint8_t frame[kMaxFrame] = {};
+        frame[0] = kMagic0;
+        frame[1] = kMagic1;
+        frame[2] = kVersion;
+        frame[3] = command;
+        frame[4] = static_cast<uint8_t>(payload_length);
+        frame[5] = static_cast<uint8_t>(payload_length >> 8);
+        frame[6] = sequence;
+        memcpy(frame + kHeaderSize, payload, payload_length);
+        const uint16_t crc = crc16(frame, kHeaderSize + payload_length);
+        frame[kHeaderSize + payload_length] = static_cast<uint8_t>(crc);
+        frame[kHeaderSize + payload_length + 1] = static_cast<uint8_t>(crc >> 8);
+        const size_t frame_length = kHeaderSize + payload_length + kCrcSize;
+        written = usb_serial_jtag_write_bytes(frame, frame_length, kIoTimeout);
+        result = written != static_cast<int>(frame_length)
+            ? ESP_ERR_TIMEOUT
+            : usb_serial_jtag_wait_tx_done(kIoTimeout);
+    }
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+    idf_logf_try("usb_recovery stage=write_frame seq=%u len=%u result=%s written=%u",
+                 static_cast<unsigned>(sequence), static_cast<unsigned>(payload_length),
+                 esp_err_to_name(result), written > 0 ? static_cast<unsigned>(written) : 0U);
+#endif
+    return result;
 }
 
 static void handle_frame(const Frame& frame)
 {
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+    idf_logf_try("usb_recovery stage=frame_received seq=%u len=%u",
+                 static_cast<unsigned>(frame.sequence), static_cast<unsigned>(frame.payload_length));
+#endif
     uint8_t payload[1 + kMaxPayload] = {};
     TaskHandle_t deferred_task = nullptr;
     Status status = Status::InvalidArg;
     size_t payload_length = 1;
     if (frame.command == kCommandState && frame.payload_length == 0) {
         status = Status::Ok;
-        payload_length += state_payload(payload + 1);
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+        idf_logf_try("usb_recovery stage=state_payload_begin seq=%u len=%u",
+                     static_cast<unsigned>(frame.sequence), static_cast<unsigned>(frame.payload_length));
+#endif
+        const size_t state_length = state_payload(payload + 1);
+        payload_length += state_length;
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
+        idf_logf_try("usb_recovery stage=state_payload_end seq=%u len=%u",
+                     static_cast<unsigned>(frame.sequence), static_cast<unsigned>(state_length));
+#endif
     } else if (frame.command == kCommandWifiProvision) {
         status = provision_wifi_legacy(frame);
     } else if (frame.command == kCommandWifiProvisionAsync) {

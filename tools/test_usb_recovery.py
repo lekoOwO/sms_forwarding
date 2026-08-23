@@ -1791,6 +1791,39 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
 
 
 class UsbRecoveryBuildGuardTest(unittest.TestCase):
+    def test_dev_frame_stage_instrumentation_is_bounded(self):
+        source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
+        self.assertIn("#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE", source)
+        for stage in (
+            "frame_received",
+            "state_payload_begin",
+            "state_payload_end",
+            "write_frame",
+        ):
+            self.assertEqual(source.count(f"stage={stage}"), 1)
+
+        fixture = "\n".join((
+            "usb_recovery stage=frame_received seq=9 len=0",
+            "usb_recovery stage=state_payload_begin seq=9 len=0",
+            "usb_recovery stage=state_payload_end seq=9 len=9",
+            "usb_recovery stage=write_frame seq=9 len=10 result=ESP_OK written=19",
+        ))
+        marker = re.compile(
+            r"^usb_recovery stage=(frame_received|state_payload_begin|"
+            r"state_payload_end|write_frame) seq=(\d+) len=(\d+)"
+            r"(?: result=([A-Z0-9_]+) written=(\d+))?$"
+        )
+        records = [marker.fullmatch(line) for line in fixture.splitlines()]
+        self.assertTrue(all(records))
+        self.assertEqual([record.group(1) for record in records], [
+            "frame_received",
+            "state_payload_begin",
+            "state_payload_end",
+            "write_frame",
+        ])
+        instrumented_lines = [line for line in source.splitlines() if "usb_recovery stage=" in line]
+        self.assertNotRegex("\n".join(instrumented_lines), r"\b(payload|ip|ssid|password|credential|device)\b")
+
     def test_query_path_is_dev_only_and_never_accepts_at_text(self):
         source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
         modem = (ROOT / "components" / "idf_modem" / "idf_modem.cpp").read_text(encoding="utf-8")

@@ -278,6 +278,10 @@ static void ensure_init()
     if (!s_log_mutex) s_log_mutex = xSemaphoreCreateMutex();
 }
 
+static std::string prepare_log_line(const char* line);
+static void append_log_line_locked(std::string item);
+static bool format_log_line(char* output, const char* fmt, va_list ap);
+
 void idf_log_init(void)
 {
     ensure_init();
@@ -288,11 +292,8 @@ void idf_log_init(void)
     }
 }
 
-void idf_log_line(const char* line)
+static std::string prepare_log_line(const char* line)
 {
-    ensure_init();
-    if (!s_log_mutex || !line) return;
-
     std::string item(line);
     if (item.size() > LOG_LINE_MAX) {
         size_t end = LOG_LINE_MAX - 3;
@@ -301,8 +302,11 @@ void idf_log_line(const char* line)
         item.resize(end);
         item += "...";
     }
+    return item;
+}
 
-    if (xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+static void append_log_line_locked(std::string item)
+{
     prev_ring_append(item.data(), item.size());
     prev_ring_append("\n", 1);
     s_lines[s_next] = std::move(item);
@@ -310,6 +314,37 @@ void idf_log_line(const char* line)
     if (s_count < LOG_RING_SIZE) ++s_count;
     ++s_seq;
     s_seq_mirror.store(s_seq, std::memory_order_relaxed);
+}
+
+static bool format_log_line(char* output, const char* fmt, va_list ap)
+{
+    if (!fmt) return false;
+    int ret = vsnprintf(output, LOG_LINE_MAX + 1, fmt, ap);
+    if (ret < 0) return false;
+    if (ret > static_cast<int>(LOG_LINE_MAX)) {
+        // vsnprintf can truncate inside a multibyte character. Move back to a UTF-8 boundary.
+        size_t end = LOG_LINE_MAX;
+        size_t p = end;
+        while (p > 0 && (static_cast<unsigned char>(output[p - 1]) & 0xC0) == 0x80) --p;
+        if (p > 0) {
+            unsigned char lead = static_cast<unsigned char>(output[p - 1]);
+            size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
+            if (need > 1 && p - 1 + need > end) end = p - 1;
+        }
+        output[end] = '\0';
+    }
+    return true;
+}
+
+void idf_log_line(const char* line)
+{
+    ensure_init();
+    if (!s_log_mutex || !line) return;
+
+    std::string item = prepare_log_line(line);
+
+    if (xSemaphoreTake(s_log_mutex, pdMS_TO_TICKS(500)) != pdTRUE) return;
+    append_log_line_locked(std::move(item));
     xSemaphoreGive(s_log_mutex);
 }
 
@@ -318,21 +353,24 @@ void idf_logf(const char* fmt, ...)
     char buf[LOG_LINE_MAX + 1];
     va_list ap;
     va_start(ap, fmt);
-    int ret = vsnprintf(buf, sizeof(buf), fmt, ap);
+    const bool ok = format_log_line(buf, fmt, ap);
     va_end(ap);
-    if (ret > static_cast<int>(LOG_LINE_MAX)) {
-        // vsnprintf can truncate inside a multibyte character. Move back to a UTF-8 boundary.
-        size_t end = LOG_LINE_MAX;
-        size_t p = end;
-        while (p > 0 && (static_cast<unsigned char>(buf[p - 1]) & 0xC0) == 0x80) --p;
-        if (p > 0) {
-            unsigned char lead = static_cast<unsigned char>(buf[p - 1]);
-            size_t need = (lead >= 0xF0) ? 4 : (lead >= 0xE0) ? 3 : (lead >= 0xC0) ? 2 : 1;
-            if (need > 1 && p - 1 + need > end) end = p - 1;  // Remove an incomplete final character
-        }
-        buf[end] = '\0';
-    }
-    idf_log_line(buf);
+    if (ok) idf_log_line(buf);
+}
+
+bool idf_logf_try(const char* fmt, ...)
+{
+    ensure_init();
+    if (!s_log_mutex || !fmt || xSemaphoreTake(s_log_mutex, 0) != pdTRUE) return false;
+
+    char buf[LOG_LINE_MAX + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    const bool ok = format_log_line(buf, fmt, ap);
+    va_end(ap);
+    if (ok) append_log_line_locked(prepare_log_line(buf));
+    xSemaphoreGive(s_log_mutex);
+    return ok;
 }
 
 std::string idf_log_json_since(uint32_t since)
