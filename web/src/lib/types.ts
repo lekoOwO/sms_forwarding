@@ -56,6 +56,9 @@ export type DeviceSnapshot = {
 		networkMode: number;
 		heartbeatEnable: boolean;
 		heartbeatInterval: number;
+		kaEnabled: boolean;
+		kaIntervalDays: number;
+		kaTrafficKB: number;
 		pushChannels: PushChannel[];
 	};
 };

@@ -188,6 +188,28 @@ test("one save family and current limits reject without mutation", async () => {
 	});
 });
 
+test("save jobs disable stale unsupported keepalive without changing compatibility values", async () => {
+	await withServer(async (baseUrl) => {
+		const enabled = await form(baseUrl, "/save", {
+			kaEnabled: "on", kaIntervalDays: 200, kaTrafficKB: 4321
+		});
+		assert.equal(enabled.status, 202);
+		assert.equal((await completed(baseUrl, enabled)).code, "ACTION_CONFIG_SAVED");
+		let snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([
+			snapshot.config.kaEnabled, snapshot.config.kaIntervalDays, snapshot.config.kaTrafficKB
+		], [true, 200, 4321]);
+
+		const disabled = await form(baseUrl, "/save", { kaIntervalDays: 200, kaTrafficKB: 4321 });
+		assert.equal(disabled.status, 202);
+		assert.equal((await completed(baseUrl, disabled)).code, "ACTION_CONFIG_SAVED");
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([
+			snapshot.config.kaEnabled, snapshot.config.kaIntervalDays, snapshot.config.kaTrafficKB
+		], [false, 200, 4321]);
+	});
+});
+
 test("jobs expose six slots, at most three active, and a 60-second terminal TTL", async () => {
 	let clock = 1000;
 	await withServer(async (baseUrl) => {

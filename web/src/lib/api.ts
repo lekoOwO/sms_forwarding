@@ -13,6 +13,7 @@ const demoConfig: DeviceSnapshot["config"] = {
 	adminPhone: "+886900000000", numberBlackList: "",
 	wifiProfiles: Array.from({ length: 5 }, (_, index) => ({ ssid: index === 0 ? "DemoNetwork" : "", password: "", open: false })),
 	networkMode: 0, heartbeatEnable: true, heartbeatInterval: 6,
+	kaEnabled: false, kaIntervalDays: 175, kaTrafficKB: 1,
 	pushChannels: Array.from({ length: 5 }, (_, index) => ({
 		enabled: index === 0, type: 1, name: `Channel ${index + 1}`, url: "", urlSet: index === 0,
 		key1: "", key1Set: false, key2: "", key2Set: false, customBody: "", customBodySet: false,
@@ -42,12 +43,17 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 	if (path === "/save" && init?.body instanceof URLSearchParams) {
 		const form = init.body;
 		for (const [key, value] of init.body) {
-			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
 		}
 		if (init.body.has("networkMode")) demoConfig.networkMode = Number(init.body.get("networkMode"));
 		if (init.body.has("heartbeatInterval")) {
 			demoConfig.heartbeatEnable = init.body.has("heartbeatEnable");
 			demoConfig.heartbeatInterval = Number(init.body.get("heartbeatInterval"));
+		}
+		if (["kaEnabled", "kaIntervalDays", "kaTrafficKB"].some((field) => form.has(field))) {
+			demoConfig.kaEnabled = form.has("kaEnabled");
+			if (form.has("kaIntervalDays")) demoConfig.kaIntervalDays = Number(form.get("kaIntervalDays"));
+			if (form.has("kaTrafficKB")) demoConfig.kaTrafficKB = Number(form.get("kaTrafficKB"));
 		}
 		for (let index = 0; index < demoConfig.wifiProfiles.length; index += 1) {
 			const ssidKey = `wifi${index}ssid`;

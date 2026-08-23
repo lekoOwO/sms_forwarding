@@ -64,6 +64,7 @@
 	let loadError = $state("");
 	let emailResult = $state(idle());
 	let heartbeatResult = $state(idle());
+	let keepaliveResult = $state(idle());
 	let pushResult = $state(idle());
 	let wifiResult = $state(idle());
 	let networkModeResult = $state(idle());
@@ -577,6 +578,21 @@
 									</form>
 									<div class="flex justify-end"><Button type="submit" form="network-mode-form" disabled={networkModeResult.state === "loading"}>{networkModeResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 									<ActionResult result={networkModeResult} title={t("resultTitle")} {locale} />
+								</Accordion.Content>
+							</Accordion.Item>
+							<Accordion.Item value="keepalive-compatibility">
+								<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("keepaliveTitle")}</span><Badge variant={snapshot.config.kaEnabled ? "destructive" : "outline"}>{snapshot.config.kaEnabled ? t("keepaliveLegacyEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger>
+								<Accordion.Content class="flex flex-col gap-5">
+									<Alert.Root><Alert.Title>{t("keepaliveUnsupportedTitle")}</Alert.Title><Alert.Description>{t("keepaliveUnsupportedDescription")}</Alert.Description></Alert.Root>
+									<p class="text-muted-foreground">{snapshot.config.kaEnabled ? t("keepaliveEnabledDescription") : t("keepaliveDisabledDescription")}</p>
+									<dl class="grid gap-4 sm:grid-cols-2">
+										<div><dt class="text-sm text-muted-foreground">{t("keepaliveIntervalDays")}</dt><dd class="mt-1 font-medium tabular-nums">{snapshot.config.kaIntervalDays}</dd></div>
+										<div><dt class="text-sm text-muted-foreground">{t("keepaliveTrafficKB")}</dt><dd class="mt-1 font-medium tabular-nums">{snapshot.config.kaTrafficKB}</dd></div>
+									</dl>
+									{#if snapshot.config.kaEnabled}
+										<div class="flex justify-end"><Button variant="destructive" disabled={keepaliveResult.state === "loading"} onclick={() => { const c = snapshot!.config; void save((value) => keepaliveResult = value, { kaIntervalDays: c.kaIntervalDays, kaTrafficKB: c.kaTrafficKB }); }}>{keepaliveResult.state === "loading" ? t("commonSaving") : t("keepaliveDisable")}</Button></div>
+									{/if}
+									<ActionResult result={keepaliveResult} title={t("resultTitle")} {locale} />
 								</Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
