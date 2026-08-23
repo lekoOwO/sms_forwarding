@@ -9,14 +9,13 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-import sys
-
 sys.path.insert(0, str(ROOT / "tools"))
 import device  # noqa: E402
 import usb_recovery  # noqa: E402

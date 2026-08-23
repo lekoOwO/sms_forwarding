@@ -1733,8 +1733,8 @@ def _ota_migration_readback(
             device, timeout=min(STATE_TIMEOUT, timeout),
             container_timeout=container_timeout, deadline=deadline,
         )
-    except (usb_recovery.DeviceError, OSError, ImportError):
-        raise original_error
+    except (usb_recovery.DeviceError, OSError, ImportError) as readback_error:
+        raise original_error from readback_error
     if state.get("image_state") == "valid" and state.get("pending") == 0:
         return
     raise original_error
@@ -2216,7 +2216,7 @@ def _flash_command(args: argparse.Namespace) -> int:
                 device_path, expected_target, offset, size, FLASH_RECONCILE_TIMEOUT,
             )
             if after_digest != digest:
-                raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch")
+                raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch") from error
             reconciled = True
         else:
             _verify_app_flash(
