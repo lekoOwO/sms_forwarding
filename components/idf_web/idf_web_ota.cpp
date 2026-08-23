@@ -83,9 +83,10 @@ bool verify_signature(void*, const uint8_t* manifest, size_t manifest_size,
     size_t key_size = 0;
     // The linker exposes these as independent extern arrays; cppcheck cannot
     // prove that both symbols belong to the same embedded object.
-    const size_t encoded_size = static_cast<size_t>(
+    size_t encoded_size = static_cast<size_t>(
         reinterpret_cast<uintptr_t>(ota_public_key_b64_end) -
         reinterpret_cast<uintptr_t>(ota_public_key_b64_start));
+    if (encoded_size > 0 && ota_public_key_b64_start[encoded_size - 1] == '\0') --encoded_size;
     if (mbedtls_base64_decode(key_der, sizeof(key_der), &key_size,
             ota_public_key_b64_start, encoded_size) != 0 || key_size == 0) return false;
     uint8_t digest[32] = {};
