@@ -47,7 +47,7 @@ def discover_sources(root: Path) -> dict[str, list[str]]:
             continue
         name = relative.as_posix()
         suffix = path.suffix.lower()
-        if parts[0] == "web" and suffix in WEB_SUFFIXES and ".generated." not in path.name:
+        if parts[0] in {"mock_server", "web"} and suffix in WEB_SUFFIXES and ".generated." not in path.name:
             sources["web"].append(name)
         if suffix == ".py":
             sources["python"].append(name)

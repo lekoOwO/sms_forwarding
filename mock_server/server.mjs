@@ -378,7 +378,7 @@ function configSemanticallyValid(config) {
 	const bounded = (value, limit) => typeof value === "string" && byteLength(value) <= limit;
 	const integer = (value, minimum, maximum) => Number.isInteger(value) && value >= minimum && value <= maximum;
 	const boolean = (value) => typeof value === "boolean";
-	if (!bounded(config.deviceName, 64) || !config.deviceName || /[\x00-\x1f\x7f]/.test(config.deviceName) ||
+	if (!bounded(config.deviceName, 64) || !config.deviceName || [...config.deviceName].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127) ||
 		!bounded(config.hostname, 32) || !/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(config.hostname) ||
 		!["zh-TW", "zh-CN", "en"].includes(config.notificationLocale) || !integer(config.smtpPort, 1, 65535) ||
 		!bounded(config.smtpServer, 253) ||
