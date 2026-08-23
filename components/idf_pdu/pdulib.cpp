@@ -318,7 +318,7 @@ int PDU::encodePDU(const char *recipient, const char *message, unsigned short cs
   if (!setAddress(scabuffout, OCTETS, tempbuf)) { // set SCSA address
     return ADDRESS_FORMAT; // bail out now
   }
-  else 
+  else
     beginning = smsOffset;
   int pdutype = PDU_SMS_SUBMIT;                                                                // SMS-SUBMIT
   if (csms != 0)
@@ -577,7 +577,7 @@ int PDU::pduGsm7_to_unicode(const char *pdu, int numSeptets, char *unicode, int 
 
   w = 0;
   int index = 0; // index into the string
-  int ovflow = 0;  
+  int ovflow = 0;
 // firstchar >= 0 表示它取自 UDH 尾随字节，插入缓冲头部(Issues #28,30)。
 // 0('@')也是合法首字符，判断依据是 >=0 而非 !=0
   if (firstchar >= 0)
@@ -1111,7 +1111,7 @@ int PDU::decodeAddress(const char *pdu, char *output, eLengthType et)
     }
     if (addressLength == 0) {
       *output = 0;
-      return 0;    
+      return 0;
     }
   }
   pdu += 2; // gethex reads 2 bytes

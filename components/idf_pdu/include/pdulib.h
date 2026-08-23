@@ -1,12 +1,12 @@
 /**
  * @file pdulib.h
  * @author David Henry (mgadriver@gmail.com)
- * @brief Encode/Decode PDU data 
+ * @brief Encode/Decode PDU data
  * @version 0.5.5
  * @date 2022-07-11
- * 
+ *
  * @copyright Copyright (c) 2021
- * 
+ *
  * Release History
  * 0.1.1 Original release
  * 0.5.1 Fixed bug where Greek characters in a GSM7 message were ignored
@@ -80,7 +80,7 @@ enum eLengthType {OCTETS,NIBBLES};  // SCA is in octets, sender/recipient nibble
 /**
  * @brief PDU class, provides methods to decode a PDU message or encode a new one
  * @param Optional Size of encode / decode work area
- * 
+ *
  */
 class PDU
 {
@@ -89,7 +89,7 @@ public:
   ~PDU();
 /**
  * @brief Encode a PDU block for sending to an GSM modem
- * 
+ *
  * @param recipient Phone number, must be numeric, no whitespace. International numbers prefixed by '+'
  * @param message The message in UTF-8 format
  * @return int The length of the message, need for the GSM command <b>AT+CSMG=nn</b>
@@ -98,7 +98,7 @@ public:
 
 /**
    * @brief Get the address of the PDU message created by <b>encodePDU</b>
-   * 
+   *
    * @return const char* The pointer to the message. It already contained the CTRL/Z delimiter byte.
    */
   const char *getSMS();
@@ -106,23 +106,23 @@ public:
 /**
  * @brief Before encoding a PDU, you must supply the SCA phone number.
  * Typically this can be retrieved from a GSM modem with the AT+CSCA? command.
- * 
+ *
  * @param number The number as retrieved from the AT+CSCA? command
- * 
+ *
  */
   void setSCAnumber(const char *number);
 
 /**
  * @brief Instruct the carrier to use the default SCA number
- * 
+ *
  * @param None
- * 
+ *
  */
   void setSCAnumber();
   /**
    * @brief Decode a PDU, typically received from a GSM modem when in PDU mode.
    * After a successful decoding you can retrieve the components parts, described below.
-   * 
+   *
    * @param pdu A pointer to the PDU
    * @return true If the decoding succeeded.
    * @return false If the decoding did not succeed.
@@ -131,28 +131,28 @@ public:
 
   /**
    * @brief Get the senders phone number from a decoded PDU
-   * 
+   *
    * @return const char* Pointer to the number
    */
   const char *getSender();
 
   /**
    * @brief Get the Timestamp from a decoded PDU
-   * 
+   *
    * @return const char* The tomestamp formatted as YYYMMDDHHMMSS
    */
   const char *getTimeStamp();
 
   /**
    * @brief Get the text from a decoded PDU.
-   * 
+   *
    * @return const unsigned char* The message in UTF-8 format.
    */
   const char *getText();
 
   /**
    * @brief Create a UTF string from a codepoint. Handles practically anything
-   * 
+   *
    * @param codepoint Examples https://en.wikipedia.org/wiki/List_of_Unicode_characters
    * @param target Where to place the string
    */
@@ -160,16 +160,16 @@ public:
 
   /**
    * @brief Convert a UTF8 string into an array of UCS2 octets
-   * 
+   *
    * @param utf8 The UTF8 string
    * @param ucs2 Pointer to UCS2 array
    * @return int Return the number of octets, -1 if the message is greater than the maximum allowed
    */
-  int utf8_to_ucs2(const char *utf8, char *ucs2);  // translate an utf8 zero terminated string 
+  int utf8_to_ucs2(const char *utf8, char *ucs2);  // translate an utf8 zero terminated string
 
   /**
    * @brief Examine an array of UCS2 to determine if this is a default GSM7 character
-   * 
+   *
    * @param pucs A UCS2 array e.g. as created by the utf8_to_ucs2_single method
    * @return true or false
    */
@@ -177,14 +177,14 @@ public:
 
   /**
    * @brief Examine a UTF8 encoded Unicode character
-   * 
+   *
    * @return The number of bytes (octets) occupied by the character
    */
   int utf8Length(const char *);
 
   /**
-   * @brief Encode a single UTF8 encoded Unicode character into UCS2 format. 
-   * 
+   * @brief Encode a single UTF8 encoded Unicode character into UCS2 format.
+   *
    * @param utf8 Pointer to an UTF8 stream
    * @param pucs2 An array of unsigned short to receive the UCS2 data. Surrogate pair characters need an array size of 2.
    * @return int The length (in bytes) of the converted character. This will be 4 for a Surrogate Pair (e.g an Emoji) else 2.
@@ -193,12 +193,12 @@ public:
   /**
    * @brief Return info on concatenated message
    * @return Pointer to an array of 3 int. 1st int, CMCS number, 2nd byte part number, 3rd number of parts, zero means this is not a concatenated message
-   *  
+   *
    */
   int * getConcatInfo();
   /**
    * @brief Error codes from Encode
-   * 
+   *
    */
   enum eEncodeError {OBSOLETE_ERROR = -1,UCS2_TOO_LONG = -2, GSM7_TOO_LONG = -3, MULTIPART_NUMBERS = -4,ADDRESS_FORMAT=-5,WORK_BUFFER_TOO_SMALL=-6,ALPHABET_8BIT_NOT_SUPPORTED = -7};
 private:
