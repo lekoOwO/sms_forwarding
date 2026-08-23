@@ -4,6 +4,10 @@
 
 使用 ESP32-C3 与 ML307 系列 4G 模组接收短信，并通过 WiFi 转发到电子邮件或推送服务。
 
+[管理页 Demo](https://lekoowo.github.io/sms_forwarding/)
+
+> Demo 不连接真实设备，并停用备份、恢复和 OTA 操作。
+
 <p>
   <a href="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
@@ -33,7 +37,7 @@
 3. 设备找不到已保存的 WiFi 时，连接到 `SMS-Forwarder-XXXXXX`。
 4. 输入密码 `sms-forwarder-setup`，然后打开 `http://192.168.1.1`。
 5. 设备连接到路由器后，使用管理页显示的局域网地址登录。
-6. 使用管理账号登录，然后立即修改默认密码。
+6. 使用管理账号 `admin` 和密码 `admin123` 登录。首次登录后立即修改密码。
 7. 配置电子邮件或推送通道，并使用通道测试确认发送结果。
 
 ### 后续 OTA 更新

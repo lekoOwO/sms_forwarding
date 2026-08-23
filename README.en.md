@@ -4,6 +4,10 @@
 
 This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received SMS messages through WiFi to email or push services.
 
+[Management UI demo](https://lekoowo.github.io/sms_forwarding/)
+
+> The demo does not connect to a device. It disables backup, restore, and OTA operations.
+
 <p>
   <a href="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
@@ -33,7 +37,7 @@ This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received
 3. If the device cannot find saved WiFi, connect to `SMS-Forwarder-XXXXXX`.
 4. Enter password `sms-forwarder-setup`. Then open `http://192.168.1.1`.
 5. After the device joins the router, sign in at the LAN address that the management page shows.
-6. Sign in with the management account. Change the default password immediately.
+6. Sign in with username `admin` and password `admin123`. Change the password after the first login.
 7. Configure email or push channels. Use the channel test to confirm delivery.
 
 ### Later OTA updates
