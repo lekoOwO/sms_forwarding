@@ -10,6 +10,68 @@
 #include <string>
 #include <thread>
 
+struct HealthResetRetryFixture {
+    uint8_t attempts = 0;
+    uint32_t delays[3] = {};
+    size_t accepted = 0;
+
+    bool request(void)
+    {
+        if (!idf_modem_health_reset_retry_allowed(attempts)) return false;
+        delays[accepted++] = idf_modem_health_reset_backoff_ms(attempts++);
+        return true;
+    }
+};
+
+struct SimPresenceFixture {
+    int baseline = -1;
+    int last_confirmed = -1;
+    int removal_events = 0;
+    int insertion_events = 0;
+
+    void reset(void)
+    {
+        baseline = -1;
+    }
+
+    void observe(std::string_view state)
+    {
+        int observed = idf_modem_sim_presence(state);
+        if (observed < 0) {
+            baseline = -1;
+            return;
+        }
+        IdfModemSimPresenceEvent event =
+            idf_modem_sim_presence_event(last_confirmed, observed);
+        last_confirmed = observed;
+        baseline = observed;
+        if (event == IdfModemSimPresenceEvent::removed) ++removal_events;
+        if (event == IdfModemSimPresenceEvent::inserted) ++insertion_events;
+    }
+};
+
+struct RawOwnerUrcFixture {
+    std::string urcs;
+
+    void observe(std::string_view line)
+    {
+        if (idf_modem_is_standalone_urc_line(line)) {
+            urcs += std::string(line) + "\r\n";
+        }
+    }
+};
+
+struct SmsHealthCompletionFixture {
+    bool backoff_cleared = false;
+
+    void finish(bool registered, bool phase2, bool pdu, bool cnmi, bool storage)
+    {
+        if (idf_modem_sms_health_complete(registered, phase2, pdu, cnmi, storage)) {
+            backoff_cleared = true;
+        }
+    }
+};
+
 struct ResetBarrierFixture {
     std::mutex command_mutex;
     std::mutex barrier_mutex;
@@ -216,6 +278,60 @@ int main()
     assert(idf_modem_sms_health_reset_required(true, true, false, true, true));
     assert(idf_modem_sms_health_reset_required(true, true, true, false, true));
     assert(idf_modem_sms_health_reset_required(true, true, true, true, false));
+    assert(!idf_modem_health_reset_required(true, false, true, false, -1, false, false));
+    assert(!idf_modem_health_reset_required(true, true, true, true, 11, false, false));
+    assert(idf_modem_health_reset_required(true, true, true, false, -1, true, true));
+    assert(idf_modem_health_reset_required(true, true, true, true, 0, false, true));
+    assert(idf_modem_unregistered_reset_allowed(false, 0) == false);
+    assert(idf_modem_unregistered_reset_allowed(true, 11) == false);
+    assert(idf_modem_unregistered_reset_allowed(true, 0));
+    assert(!idf_modem_unregistered_reset_allowed(true, 1));
+    assert(idf_modem_sim_presence("absent") == 0);
+    assert(idf_modem_sim_presence("unknown") == -1);
+    assert(idf_modem_sim_presence("ready") == 1);
+    assert(idf_modem_sim_presence("pin") == 1);
+    assert(idf_modem_health_reset_backoff_ms(0) == 60000UL);
+    assert(idf_modem_health_reset_backoff_ms(1) == 120000UL);
+    assert(idf_modem_health_reset_backoff_ms(2) == 240000UL);
+    assert(idf_modem_health_reset_backoff_ms(3) == 300000UL);
+    assert(idf_modem_health_reset_backoff_ms(10) == 300000UL);
+    assert(idf_modem_health_reset_retry_allowed(0));
+    assert(idf_modem_health_reset_retry_allowed(2));
+    assert(!idf_modem_health_reset_retry_allowed(3));
+    assert(!idf_modem_health_reset_retry_allowed(255));
+    SmsHealthCompletionFixture health_fixture;
+    health_fixture.finish(true, false, true, true, true);
+    assert(!health_fixture.backoff_cleared);
+    health_fixture.finish(true, true, true, true, true);
+    assert(health_fixture.backoff_cleared);
+    HealthResetRetryFixture retry_fixture;
+    for (int i = 0; i < 10; ++i) retry_fixture.request();
+    assert(retry_fixture.accepted == 3);
+    assert(retry_fixture.delays[0] == 60000UL);
+    assert(retry_fixture.delays[1] == 120000UL);
+    assert(retry_fixture.delays[2] == 240000UL);
+    SimPresenceFixture sim_fixture;
+    sim_fixture.observe("ready");
+    assert(sim_fixture.baseline == 1);
+    sim_fixture.observe("unknown");
+    assert(sim_fixture.baseline == -1);
+    sim_fixture.observe("absent");
+    assert(sim_fixture.baseline == 0);
+    assert(sim_fixture.removal_events == 1);
+    assert(sim_fixture.insertion_events == 0);
+    SimPresenceFixture reset_fixture;
+    reset_fixture.observe("ready");
+    reset_fixture.reset();
+    reset_fixture.observe("unknown");
+    assert(reset_fixture.removal_events == 0);
+    reset_fixture.observe("absent");
+    assert(reset_fixture.removal_events == 1);
+
+    RawOwnerUrcFixture raw_owner;
+    raw_owner.observe("+CEREG: 2");
+    raw_owner.observe("+CSQ: 31,99");
+    assert(raw_owner.urcs.find("+CEREG: 2") != std::string::npos);
+    assert(raw_owner.urcs.find("+CSQ: 31,99") == std::string::npos);
     assert(idf_modem_identity_sampling_allowed(1));
     assert(!idf_modem_identity_sampling_allowed(5));
     assert(!idf_modem_identity_sampling_allowed(11));
@@ -391,7 +507,6 @@ int main()
     };
     const FixedQueryCase fixed_queries[] = {
         {"AT+CPIN?", "+CPIN:", "+CPIN: READY", "+CPIN: TEST"},
-        {"AT+CEREG?", "+CEREG:", "+CEREG: 1", "+CEREG: 5"},
         {"AT+COPS?", "+COPS:", "+COPS: 0", "+COPS: 2"},
         {"AT+CGATT?", "+CGATT:", "+CGATT: 1", "+CGATT: 0"},
         {"AT+CGACT?", "+CGACT:", "+CGACT: 1,1", "+CGACT: 1,0"},
@@ -414,13 +529,8 @@ int main()
         shaped.feed(input.data(), input.size());
         assert(shaped.response().find(query.command) == std::string::npos);
         assert(shaped.response().find(query.expected) != std::string::npos);
-        if (std::string(query.command) == "AT+CEREG?") {
-            assert(shaped.response().find(query.duplicate) != std::string::npos);
-            assert(shaped.urcs().find(query.duplicate) == std::string::npos);
-        } else {
-            assert(shaped.response().find(query.duplicate) == std::string::npos);
-            assert(shaped.urcs().find(query.duplicate) != std::string::npos);
-        }
+        assert(shaped.response().find(query.duplicate) == std::string::npos);
+        assert(shaped.urcs().find(query.duplicate) != std::string::npos);
         assert(shaped.response().find("+CMT:") == std::string::npos);
         assert(shaped.response().find("00112233445566778899AABBCCDDEEFF") == std::string::npos);
         assert(shaped.response().find("+OTHER:") == std::string::npos);
@@ -431,13 +541,27 @@ int main()
 
     IdfModemQueryResponseFilter cereg_filter("AT+CEREG?", "+CEREG:", "", false);
     const std::string cereg_interleaved =
-        "AT+CEREG?\r\n+CEREG: 0,1\r\n"
-        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\r\nOK\r\n";
+        "AT+CEREG?\r\n+CEREG: 5\r\n"
+        "+CMT: \"sender\",145\r\n"
+        "00112233445566778899AABBCCDDEEFF\r\n"
+        "+OTHER: unsolicited\r\n"
+        "+CEREG: 2,1,\"ABCD\",\"12345678\",7\r\n"
+        "+CEREG: 1\r\nOK\r\n";
     cereg_filter.feed(cereg_interleaved.data(), cereg_interleaved.size());
     cereg_filter.flush_pending();
-    assert(cereg_filter.response().find("+CEREG: 0,1") != std::string::npos);
     assert(cereg_filter.response().find("+CEREG: 2,1") != std::string::npos);
-    assert(!idf_modem_parse_cereg_status(cereg_filter.response(), cereg_stat));
+    assert(cereg_filter.response().find("+CEREG: 5") == std::string::npos);
+    assert(cereg_filter.response().find("+CEREG: 1") == std::string::npos);
+    assert(cereg_filter.response().find("+OTHER:") == std::string::npos);
+    assert(cereg_filter.response().find("+CMT:") == std::string::npos);
+    assert(cereg_filter.response().find("00112233445566778899AABBCCDDEEFF") == std::string::npos);
+    assert(cereg_filter.urcs().find("+CEREG: 5") != std::string::npos);
+    assert(cereg_filter.urcs().find("+CEREG: 1") != std::string::npos);
+    assert(cereg_filter.urcs().find("+OTHER: unsolicited") != std::string::npos);
+    assert(cereg_filter.urcs().find("+CMT:") != std::string::npos);
+    assert(cereg_filter.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
+    assert(idf_modem_parse_cereg_status(cereg_filter.response(), cereg_stat));
+    assert(cereg_stat == 1);
 
     for (const std::string malformed : {
              "AT+CEREG?\r\n\t+CEREG: 0,1\r\nOK\r\n",

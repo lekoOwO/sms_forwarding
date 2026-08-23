@@ -242,7 +242,8 @@ class UartOwnerContractTest(unittest.TestCase):
     def test_sms_health_keeps_rlos_restricted_without_reset(self):
         source = SOURCE.read_text()
         health = function_body(source, "idf_modem_sms_health_check")
-        self.assertIn("idf_modem_sms_health_reset_required", health)
+        self.assertIn("idf_modem_health_reset_required", health)
+        self.assertIn("request_health_reset_with_backoff", health)
         self.assertIn('stat == 11 ? "restricted-rlos"', health)
         self.assertIn("Registration unavailable; modem reset not requested", health)
         self.assertIn("cereg_query_ok", health)
@@ -350,6 +351,8 @@ class UartOwnerContractTest(unittest.TestCase):
 
         public_send_at = function_body(source, "idf_modem_send_at")
         self.assertIn('cmd.rfind("AT+CNMA", 0)', public_send_at)
+        self.assertIn('request.filter_urcs = cmd == "AT+CEREG?"', public_send_at)
+        self.assertIn('request.response_prefix = "+CEREG:"', public_send_at)
         self.assertIn("if (!priority) owner_drain_priority_commands();", public_send_at)
         submit = function_body(source, "submit_owner_command")
         self.assertIn("!priority && !s_runtime_queue_ready.load", submit)

@@ -115,6 +115,9 @@ static std::atomic<uint32_t> s_status_sample_requests{0};
 static std::atomic<uint32_t> s_esim_operation_depth{0};
 static std::atomic<int> s_sim_unlock_request{0};  // 1=recheck or automatic PIN, 2=confirmed PUK attempt
 static std::string s_last_pin_attempt_key;
+static std::atomic<uint8_t> s_health_reset_retry_count{0};
+static std::atomic<TickType_t> s_next_health_reset_tick{0};
+static std::atomic<bool> s_health_reset_claimed{false};
 
 void idf_modem_signal_event(void);
 
@@ -599,7 +602,7 @@ static void preserve_uart_urc_line(const std::string& raw)
     }
 
     bool cmt = line.rfind("+CMT:", 0) == 0;
-    bool standalone = line.rfind("+CMTI:", 0) == 0 || line.rfind("+CLIP:", 0) == 0 || line == "RING";
+    bool standalone = idf_modem_is_standalone_urc_line(line);
     if (cmt || standalone || (s_uart_wait_cmt_pdu && looks_like_pdu_line(line))) {
         append_urc_text(line + "\r\n");
     }
@@ -877,9 +880,13 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
     request.kind = OwnerCommandKind::at;
     request.command = cmd;
     request.timeout_ms = timeout_ms;
+    request.filter_urcs = cmd == "AT+CEREG?";
+    if (request.filter_urcs) request.response_prefix = "+CEREG:";
     bool priority = cmd.rfind("AT+CNMA", 0) == 0;
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
-        esp_err_t result = owner_send_at(cmd, timeout_ms, response);
+        esp_err_t result = owner_send_at(
+            cmd, timeout_ms, response, request.filter_urcs,
+            request.response_prefix.empty() ? nullptr : request.response_prefix.c_str());
         // Acknowledge direct SMS at safe AT boundaries during startup and sampling.
         // CNMA does not recurse into drain, which avoids nested acknowledgment calls.
         if (!priority) owner_drain_priority_commands();
@@ -1147,6 +1154,40 @@ static bool send_ok(const char* cmd, uint32_t timeout_ms = 1000, std::string* ou
     esp_err_t err = idf_modem_send_at(cmd, timeout_ms, resp);
     if (out) *out = resp;
     return err == ESP_OK;
+}
+
+static void clear_health_reset_backoff(void)
+{
+    s_health_reset_retry_count.store(0, std::memory_order_relaxed);
+    s_next_health_reset_tick.store(0, std::memory_order_relaxed);
+}
+
+static bool request_health_reset_with_backoff(void)
+{
+    bool expected = false;
+    if (!s_health_reset_claimed.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed)) {
+        return false;
+    }
+
+    bool requested = false;
+    do {
+        if (s_reset_request.load(std::memory_order_acquire) != 0) break;
+        const TickType_t now = xTaskGetTickCount();
+        const TickType_t next = s_next_health_reset_tick.load(std::memory_order_relaxed);
+        if (static_cast<int32_t>(now - next) < 0) break;
+        const uint8_t retry_count = s_health_reset_retry_count.load(std::memory_order_relaxed);
+        if (!idf_modem_health_reset_retry_allowed(retry_count)) break;
+        if (idf_modem_request_reset(true) != ESP_OK) break;
+        s_health_reset_retry_count.store(retry_count + 1, std::memory_order_relaxed);
+        s_next_health_reset_tick.store(
+            now + pdMS_TO_TICKS(idf_modem_health_reset_backoff_ms(retry_count)),
+            std::memory_order_relaxed);
+        requested = true;
+    } while (false);
+
+    s_health_reset_claimed.store(false, std::memory_order_release);
+    return requested;
 }
 
 static std::string parse_iccid_response(const std::string& raw)
@@ -2091,9 +2132,17 @@ static void query_sms_receive_config(bool& phase2, bool& pdu, bool& cnmi)
 bool idf_modem_sms_health_check(std::string& summary)
 {
     summary.clear();
-    if (!idf_modem_get_status().atReady) {
-        idf_modem_request_reset(true);
-        summary = "Modem AT is not ready. Hard reset requested";
+    IdfModemStatus initial_status = idf_modem_get_status();
+    const bool sim_present = initial_status.simState != "absent" &&
+                             initial_status.simState != "unknown";
+    if (!initial_status.atReady) {
+        if (idf_modem_health_reset_required(false, sim_present, initial_status.simState == "ready",
+                                            false, -1, false, false) &&
+            request_health_reset_with_backoff()) {
+            summary = "Modem AT is not ready. Hard reset requested";
+        } else {
+            summary = "Modem AT is not ready. Reset deferred";
+        }
         idf_logf("daily SMS health check failed: %s", summary.c_str());
         return false;
     }
@@ -2119,7 +2168,8 @@ bool idf_modem_sms_health_check(std::string& summary)
         storage = select_sms_storage();
     }
 
-    bool final_ok = registered && phase2 && pdu && cnmi && storage;
+    bool final_ok = idf_modem_sms_health_complete(registered, phase2, pdu, cnmi, storage);
+    if (final_ok) clear_health_reset_backoff();
     char state[192];
     const char* registration = registered ? "ok" :
                                (cereg_query_ok && stat == 11 ? "restricted-rlos" : "unavailable");
@@ -2135,23 +2185,23 @@ bool idf_modem_sms_health_check(std::string& summary)
     }
     if (final_ok) {
         summary = std::string("Error found and repaired: ") + state;
-    } else if (!idf_modem_sms_health_reset_required(
-                   idf_modem_get_status().atReady, sim_ready, cereg_query_ok,
+    } else if (!idf_modem_health_reset_required(
+                   true, sim_present, sim_ready, cereg_query_ok, cereg_query_ok ? stat : -1,
                    phase2 && pdu && cnmi, storage)) {
         summary = std::string("Registration unavailable; modem reset not requested: ") + state;
-    } else {
-        idf_modem_request_reset(true);
+    } else if (request_health_reset_with_backoff()) {
         summary = std::string("Error remains. Hard modem reset requested: ") + state;
+    } else {
+        summary = std::string("Error remains. Hard modem reset deferred: ") + state;
     }
     idf_logf("daily SMS health check failed: %s", summary.c_str());
     return false;
 }
 
-// A PIN- or PUK-locked SIM is present. Hot-swap detection must not restart it as absent.
-static bool query_sim_present(void)
+static int query_sim_present(void)
 {
     std::string state = query_sim_state();
-    return state != "absent" && state != "unknown";
+    return idf_modem_sim_presence(state);
 }
 
 // After a reset handshake fails, run full initialization when any later probe
@@ -2349,6 +2399,7 @@ static void modem_task(void*)
     TickType_t last_sim_check = 0;
     int64_t sim_check_not_before_us = 0;  // Allow SIM and CPIN startup time after modem reset.
     int sim_present = -1;  // -1=unknown baseline, 0=absent, 1=present
+    int sim_confirmed_present = -1;
     bool sms_reconfigure_pending = false;  // Reassert SMS after SIM or network recovery.
     while (true) {
         // Process direct SMS acknowledgments before caller commands. Run at most
@@ -2429,16 +2480,24 @@ static void modem_task(void*)
                 post_register_done = true;
             }
         }
+        const int64_t sim_check_now_us = esp_timer_get_time();
+        const bool sim_check_due =
+            sim_check_now_us >= sim_check_not_before_us &&
+            (last_sim_check == 0 || now - last_sim_check >= pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
+            at_channel_idle_now();
         // Probe every 60 seconds when healthy and every 5 seconds while unregistered
         // unless the SIM is confirmed absent.
         uint32_t health_interval_ms = 60000UL;
         if (!registered && sim_present != 0) health_interval_ms = 5000UL;
         else if (sms_reconfigure_pending && sim_present != 0) health_interval_ms = 15000UL;
-        if (sim_ready && (reset_handled || now - last_health > pdMS_TO_TICKS(health_interval_ms)) &&
+        if (!sim_check_due && sim_ready &&
+            (reset_handled || now - last_health > pdMS_TO_TICKS(health_interval_ms)) &&
             at_channel_idle_now()) {
             last_health = now;
             std::string resp;
-            if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, stat)) {
+            int probed_stat = -1;
+            if (send_ok("AT+CEREG?", 1200, &resp) && parse_cereg(resp, probed_stat)) {
+                stat = probed_stat;
                 health_fail_count = 0;
                 bool now_ready = (stat == 1 || stat == 5);
                 IdfModemStatus reg_patch;
@@ -2454,7 +2513,9 @@ static void modem_task(void*)
                         // The modem can rebuild its SMS stack after CPIN READY.
                         // Reassert PDU, CNMI, and CPMS after stable registration.
                         idf_log_line("network registration restored. Reasserting SMS setup");
-                        sms_reconfigure_pending = !configure_sms_and_registration();
+                        const bool sms_ready_now = configure_sms_and_registration();
+                        sms_reconfigure_pending = !sms_ready_now;
+                        if (sms_ready_now) clear_health_reset_backoff();
                         sms_reconfigured_now = true;
                     }
                     if (!post_register_done) {
@@ -2483,36 +2544,36 @@ static void modem_task(void*)
                         }
                     } else {
                         rlos_only_seen = false;
-                        // Wait about five minutes before reset so cell reselection or roaming
-                        // registration can finish. Do not reset repeatedly when SIM is absent.
-                        if (sim_present == 0) {
+                        if (!idf_modem_unregistered_reset_allowed(sim_present == 1, stat)) {
                             dereg_count = 0;
-                        } else if (++dereg_count >= 60) {
+                        } else if (++dereg_count >= 60 && request_health_reset_with_backoff()) {
                             dereg_count = 0;
                             idf_log_line("modem remained unregistered. Requesting hard reset");
-                            idf_modem_request_reset(true);
                         }
                     }
                 }
-            } else if (++health_fail_count >= 3) {
+            } else if (!idf_modem_health_reset_required(
+                           idf_modem_get_status().atReady, sim_present == 1, sim_ready,
+                           false, -1, true, true)) {
+                health_fail_count = 0;
+            } else if (++health_fail_count >= 3 && request_health_reset_with_backoff()) {
                 health_fail_count = 0;
                 idf_log_line("modem health probes failed repeatedly. Requesting hard reset");
-                idf_modem_request_reset(true);
             }
         }
         // Poll AT+CPIN? for SIM hot swaps. On insertion, reset the modem and clear
         // old identity. On removal, mark unavailable and clear old identity.
-        int64_t sim_check_now_us = esp_timer_get_time();
-        if (sim_check_now_us >= sim_check_not_before_us &&
-            (last_sim_check == 0 || now - last_sim_check > pdMS_TO_TICKS(SIM_CHECK_INTERVAL_MS)) &&
-            at_channel_idle_now()) {
+        if (sim_check_due) {
             last_sim_check = now;
-            int present_now = query_sim_present() ? 1 : 0;
-            if (sim_present == -1) {
-                sim_present = present_now;  // Record the initial baseline without a hot-swap event.
-            } else if (present_now != sim_present) {
+            int present_now = query_sim_present();
+            if (present_now < 0) {
+                sim_present = -1;
+            } else {
+                const IdfModemSimPresenceEvent presence_event =
+                    idf_modem_sim_presence_event(sim_confirmed_present, present_now);
+                sim_confirmed_present = present_now;
                 sim_present = present_now;
-                if (present_now == 1) {
+                if (presence_event == IdfModemSimPresenceEvent::inserted) {
                     // ML307 firmware can restore SMS defaults after CPIN READY while
                     // rebuilding the stack. Hard reset once to initialize the new SIM.
                     idf_log_line("SIM inserted. Hard-resetting modem to initialize the SMS stack");
@@ -2522,7 +2583,7 @@ static void modem_task(void*)
                     dereg_count = 0;
                     sms_reconfigure_pending = true;
                     idf_modem_request_reset(true);
-                } else {
+                } else if (presence_event == IdfModemSimPresenceEvent::removed) {
                     idf_log_line("SIM removed");
                     invalidate_registration_state("registering", true);
                     registered = false;

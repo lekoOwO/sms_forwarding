@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 
 inline void idf_modem_trim_cereg_ascii(std::string_view& text)
@@ -148,6 +149,66 @@ inline bool idf_modem_sms_health_reset_required(bool at_ready, bool sim_ready,
                                                 bool storage_ok)
 {
     return !at_ready || !sim_ready || !cereg_query_ok || !sms_ok || !storage_ok;
+}
+
+inline bool idf_modem_sms_health_complete(bool registered, bool phase2, bool pdu, bool cnmi,
+                                          bool storage)
+{
+    return registered && phase2 && pdu && cnmi && storage;
+}
+
+inline bool idf_modem_health_reset_required(bool at_ready, bool sim_present, bool sim_ready,
+                                            bool cereg_query_ok, int cereg_stat, bool sms_ok,
+                                            bool storage_ok)
+{
+    if (!sim_present || cereg_stat == 11) return false;
+    return idf_modem_sms_health_reset_required(at_ready, sim_ready, cereg_query_ok, sms_ok,
+                                               storage_ok);
+}
+
+inline bool idf_modem_unregistered_reset_allowed(bool sim_present, int cereg_stat)
+{
+    return sim_present && cereg_stat != 1 && cereg_stat != 5 && cereg_stat != 11;
+}
+
+inline int idf_modem_sim_presence(std::string_view state)
+{
+    if (state == "absent") return 0;
+    if (state == "unknown") return -1;
+    return 1;
+}
+
+enum class IdfModemSimPresenceEvent : uint8_t {
+    none,
+    inserted,
+    removed,
+};
+
+inline IdfModemSimPresenceEvent idf_modem_sim_presence_event(int last_confirmed,
+                                                             int observed)
+{
+    if (last_confirmed < 0 || observed < 0 || last_confirmed == observed) {
+        return IdfModemSimPresenceEvent::none;
+    }
+    return observed == 1 ? IdfModemSimPresenceEvent::inserted
+                         : IdfModemSimPresenceEvent::removed;
+}
+
+inline bool idf_modem_health_reset_retry_allowed(uint8_t retry_count)
+{
+    constexpr uint8_t maximum_attempts = 3;
+    return retry_count < maximum_attempts;
+}
+
+inline uint32_t idf_modem_health_reset_backoff_ms(uint8_t retry_count)
+{
+    constexpr uint32_t initial_ms = 60000UL;
+    constexpr uint32_t maximum_ms = 300000UL;
+    uint32_t delay_ms = initial_ms;
+    while (retry_count-- > 0 && delay_ms < maximum_ms) {
+        delay_ms = std::min(maximum_ms, delay_ms * 2U);
+    }
+    return delay_ms;
 }
 
 inline bool idf_modem_identity_sampling_allowed(int cereg_stat)

@@ -6,6 +6,8 @@
 #include <string>
 #include <string_view>
 
+#include "idf_modem_registration.h"
+
 enum class IdfModemUsbQueryAdmission {
     busy,
     not_ready,
@@ -36,6 +38,12 @@ inline bool idf_modem_owner_command_allowed(bool priority, bool reset_requested,
                                             bool runtime_queue_ready)
 {
     return priority || (runtime_queue_ready && !reset_requested);
+}
+
+inline bool idf_modem_is_standalone_urc_line(std::string_view line)
+{
+    return line == "RING" || line.rfind("+CMTI:", 0) == 0 ||
+           line.rfind("+CLIP:", 0) == 0 || line.rfind("+CEREG:", 0) == 0;
 }
 
 class IdfModemQueryResponseFilter {
@@ -137,10 +145,13 @@ private:
         bool unsolicited_text = is_unsolicited_text(line);
         bool solicited = is_final(line);
         if (!solicited && !response_prefix_.empty() && starts_with(line, response_prefix_)) {
-            // Keep every CEREG line so its strict parser can reject duplicates.
-            solicited = allow_multiple_response_lines_ || !expected_line_seen_ ||
-                        response_prefix_ == "+CEREG:";
-            expected_line_seen_ = true;
+            if (response_prefix_ == "+CEREG:") {
+                int ignored_stat = -1;
+                solicited = !expected_line_seen_ && idf_modem_parse_cereg_line(line, ignored_stat);
+            } else {
+                solicited = allow_multiple_response_lines_ || !expected_line_seen_;
+            }
+            if (solicited) expected_line_seen_ = true;
         }
         // ATI returns bounded free-form model/firmware lines. Other fixed
         // queries must match their expected +PREFIX; all remaining + lines are
