@@ -317,6 +317,117 @@ test("push test request ordering matches firmware and POST accepts no body", asy
 	});
 });
 
+test("device restart is authenticated, POST-only, CSRF-protected, empty-body, and single-admission", async () => {
+	await withServer(async (baseUrl) => {
+		assert.equal((await fetch(`${baseUrl}/api/device/restart`)).status, 401);
+		const get = await request(baseUrl, "/api/device/restart");
+		assert.equal(get.status, 405);
+		assert.equal(get.headers.get("allow"), "POST");
+		assert.equal((await fetch(`${baseUrl}/api/device/restart`, { method: "HEAD" })).status, 401);
+		const head = await request(baseUrl, "/api/device/restart", { method: "HEAD" });
+		assert.equal(head.status, 405);
+		assert.equal(head.headers.get("allow"), "POST");
+		const put = await request(baseUrl, "/api/device/restart", { method: "PUT" });
+		assert.equal(put.status, 405);
+		assert.equal(put.headers.get("allow"), "POST");
+
+		const noCsrf = await fetch(`${baseUrl}/api/device/restart`, {
+			method: "POST", headers: { Authorization: auth }
+		});
+		assert.equal(noCsrf.status, 403);
+		assert.equal((await noCsrf.json()).code, "ACTION_CSRF_INVALID");
+		const noCsrfWithBody = await fetch(`${baseUrl}/api/device/restart`, {
+			method: "POST", headers: { Authorization: auth, "Content-Type": "text/plain" }, body: "unexpected"
+		});
+		assert.equal(noCsrfWithBody.status, 403);
+		assert.equal((await noCsrfWithBody.json()).code, "ACTION_CSRF_INVALID");
+
+		const withBody = await request(baseUrl, "/api/device/restart", {
+			method: "POST", body: "unexpected=1"
+		});
+		assert.equal(withBody.status, 400);
+		assert.deepEqual(await withBody.json(), {
+			success: false, code: "ACTION_INPUT_INVALID", data: {}, detail: "body"
+		});
+
+		const accepted = await request(baseUrl, "/api/device/restart", { method: "POST" });
+		assert.equal(accepted.status, 200);
+		assert.deepEqual(await accepted.json(), {
+			success: true, code: "ACTION_DEVICE_RESTARTING", data: {}, detail: ""
+		});
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+	});
+
+	await withServer(async (baseUrl) => {
+		const start = await form(baseUrl, "/api/config/restore/start", { size: 60 });
+		assert.equal(start.status, 201);
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+	});
+
+	let clock = Date.now();
+	const fixture = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v6.json", import.meta.url), "utf8"));
+	await withServer(async (baseUrl) => {
+		const exportRequest = await form(baseUrl, "/api/config/export", {
+			passphrase: fixture.passphrase
+		});
+		assert.equal(exportRequest.status, 202);
+		// Advance past the request-time TTL while the encryption job is still pending.
+		// The firmware starts the download TTL when encryption completes.
+		clock += 120001;
+		const ready = await completed(baseUrl, exportRequest);
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+		clock += 120001;
+		const accepted = await request(baseUrl, "/api/device/restart", { method: "POST" });
+		assert.equal(accepted.status, 200);
+		assert.equal((await accepted.json()).code, "ACTION_DEVICE_RESTARTING");
+		assert.ok(ready.data.exportId);
+	}, { now: () => clock, jobDelayMs: 100 });
+
+	await withServer(async (baseUrl) => {
+		const pending = await request(baseUrl, "/ping", { method: "POST" });
+		assert.equal(pending.status, 202);
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+	}, { jobDelayMs: 100 });
+
+	await withServer(async (baseUrl) => {
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push0en: "on", push0type: 1, push0name: "Restart interlock",
+			push0url: "https://push.example/message"
+		}))).success, true);
+		assert.equal((await request(baseUrl, "/api/push/test?channel=0", { method: "POST" })).status, 202);
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+	}, { jobDelayMs: 100 });
+
+	await withServer(async (baseUrl) => {
+		assert.equal((await restore(baseUrl, Buffer.from(fixture.smscfgHex, "hex"), fixture.passphrase)).code,
+			"ACTION_CONFIG_RESTORED");
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }),
+			409, "ACTION_BUSY");
+	});
+});
+
+test("queue-full export admission leaves no pending download transfer", async () => {
+	const fixture = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v6.json", import.meta.url), "utf8"));
+	await withServer(async (baseUrl) => {
+		const active = await Promise.all(Array.from({ length: 3 }, () =>
+			request(baseUrl, "/ping", { method: "POST" })));
+		assert.deepEqual(active.map(({ status }) => status), [202, 202, 202]);
+		await assertAction(await form(baseUrl, "/api/config/export", {
+			passphrase: fixture.passphrase
+		}), 429, "ACTION_JOB_QUEUE_FULL");
+		await Promise.all(active.map((response) => completed(baseUrl, response)));
+		// A rejected export must not leave a download transfer that blocks restart.
+		const accepted = await request(baseUrl, "/api/device/restart", { method: "POST" });
+		assert.equal(accepted.status, 200);
+		assert.equal((await accepted.json()).code, "ACTION_DEVICE_RESTARTING");
+	}, { jobDelayMs: 100 });
+});
+
 test("pending push tests expire to a terminal result and release configuration saves", async () => {
 	let clock = Date.now();
 	await withServer(async (baseUrl) => {
@@ -589,11 +700,10 @@ test("OTA session errors, mutual exclusion, and invalid actions are immediate fo
 		sha256: createHash("sha256").update(firmware).digest("hex"), size: firmware.length,
 		target: "esp32c3", version: "1.2.1" });
 	await withServer(async (baseUrl) => {
-		const active = request(baseUrl, "/ping", { method: "POST" });
-		await new Promise((resolve) => setTimeout(resolve, 5));
+		const active = await request(baseUrl, "/ping", { method: "POST" });
+		assert.equal(active.status, 202);
 		await assertAction(await form(baseUrl, "/api/ota/start", { manifest: text,
 			signature: sign("sha256", Buffer.from(text), privateKey).toString("hex") }), 409, "ACTION_BUSY");
-		await active;
 	}, { otaPublicKey: publicKey, jobDelayMs: 100 });
 	await withServer(async (baseUrl) => {
 		const start = await form(baseUrl, "/api/ota/start", { manifest: text,
@@ -667,8 +777,11 @@ test("OTA incomplete, finishing, and queue-full sessions retain firmware lifecyc
 		await request(baseUrl, `/api/ota/chunk?id=${id}&offset=0`, {
 			method: "POST", headers: { "Content-Type": "text/plain" }, body: firmware.toString("base64")
 		});
-		assert.equal((await request(baseUrl, `/api/ota/finish?id=${id}`, { method: "POST" })).status, 202);
+		const finish = await request(baseUrl, `/api/ota/finish?id=${id}`, { method: "POST" });
+		assert.equal(finish.status, 202);
 		await assertAction(await request(baseUrl, "/ping", { method: "POST" }), 409, "ACTION_BUSY");
+		await completed(baseUrl, finish);
+		await assertAction(await request(baseUrl, "/api/device/restart", { method: "POST" }), 409, "ACTION_BUSY");
 	}, { otaPublicKey: publicKey, jobDelayMs: 100 });
 	let clock = 1000;
 	await withServer(async (baseUrl) => {

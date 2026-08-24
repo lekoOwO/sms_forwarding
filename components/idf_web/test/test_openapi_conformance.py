@@ -36,6 +36,15 @@ def main() -> None:
     assert set(SPEC["paths"]["/api/ota/finish"]["post"]["responses"]) == {
         "202", "401", "403", "409", "413", "429"
     }
+    restart = SPEC["paths"]["/api/device/restart"]
+    assert set(restart) == {"post"}
+    assert restart["post"]["parameters"] == [{"$ref": "#/components/parameters/CsrfToken"}]
+    assert "requestBody" not in restart["post"]
+    assert "body must be empty" in restart["post"]["description"]
+    assert set(restart["post"]["responses"]) == {"200", "400", "401", "403", "405", "409", "413"}
+    assert restart["post"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/ActionResult"
+    }
 
     documented = {
         f"{method.upper()} {path}"
@@ -70,7 +79,7 @@ def main() -> None:
         "GET /modem", "GET /wifi", "GET /api/config/export", "POST /api/config/export",
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
         "POST /api/config/restore/finish", "POST /api/ota/start", "POST /api/ota/chunk",
-        "POST /api/ota/finish", "POST /api/push/test",
+        "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
     }
 
     push_test = SPEC["paths"]["/api/push/test"]
@@ -104,7 +113,7 @@ def main() -> None:
         "ACTION_SMS_PHONE_REQUIRED", "ACTION_SMS_CONTENT_REQUIRED", "ACTION_SMS_SENT", "ACTION_SMS_FAILED",
         "ACTION_PING_OK", "ACTION_PING_MODEM_ERROR", "ACTION_PING_UNREACHABLE", "ACTION_PING_TIMEOUT",
         "ACTION_PING_UNSUPPORTED",
-        "ACTION_WIFI_RESTARTING", "ACTION_AT_REJECTED", "ACTION_FLIGHT_FAILED",
+        "ACTION_WIFI_RESTARTING", "ACTION_DEVICE_RESTARTING", "ACTION_AT_REJECTED", "ACTION_FLIGHT_FAILED",
     }
     assert required_codes <= action_codes
     ping = SPEC["paths"]["/ping"]["post"]

@@ -486,6 +486,7 @@ const actionCodes = new Set([
 	"ACTION_MODEM_OK",
 	"ACTION_MODEM_FAILED",
 	"ACTION_WIFI_RESTARTING",
+	"ACTION_DEVICE_RESTARTING",
 	"ACTION_JOB_ACCEPTED", "ACTION_CONFIG_EXPORT_READY", "ACTION_CONFIG_RESTORED",
 	"ACTION_OTA_UPLOAD_STARTED", "ACTION_OTA_CHUNK_OK", "ACTION_OTA_READY",
 	"ACTION_JOB_NOT_FOUND", "ACTION_CSRF_INVALID", "ACTION_AUTH_THROTTLED", "ACTION_BUSY",
@@ -593,8 +594,17 @@ export function createApp({
 	const pushTestDeadlines = Array(5).fill(0);
 	const exportsById = new Map();
 	let upload;
+	let deviceRestartPending = false;
+	let otaRestartPending = false;
+	let restoreRestartPending = false;
 	let nextId = 1;
 	let acceptedOtaCounter = otaAcceptedCounter;
+	const expireUpload = () => {
+		if (upload && now() - upload.lastActivity >= 120000) upload = undefined;
+	};
+	const expireExports = () => {
+		for (const [id, item] of exportsById) if (now() >= item.expiresAt) exportsById.delete(id);
+	};
 	const expireJobs = () => {
 		for (const [id, job] of jobs) {
 			if (["succeeded", "failed"].includes(job.state) && now() - job.completedAt >= 60000) jobs.delete(id);
@@ -659,10 +669,11 @@ export function createApp({
 		"POST /save", "POST /sendsms", "POST /ping", "GET /flight", "GET /at", "GET /modem",
 		"GET /wifi", "GET /api/config/export", "POST /api/config/export", "POST /api/config/restore/start",
 		"POST /api/config/restore/chunk", "POST /api/config/restore/finish", "POST /api/ota/start",
-		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /wificonfig"
+		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart", "POST /wificonfig"
 	]);
 	app.use(rejectEnvelope);
-	app.use((request, response, next) => request.method === "HEAD" && request.path !== "/api/push/test"
+	app.use((request, response, next) => request.method === "HEAD" &&
+		!["/api/push/test", "/api/device/restart"].includes(request.path)
 		? response.set("Allow", "GET, POST").status(405).json(result(false, "ACTION_INPUT_INVALID"))
 		: next());
 
@@ -765,6 +776,28 @@ export function createApp({
 				}))
 			}
 		});
+	});
+
+	app.all("/api/device/restart", (request, response, next) => {
+		if (request.method === "POST") return next();
+		return response.set("Allow", "POST").status(405)
+			.json(result(false, "ACTION_INPUT_INVALID", {}, "method"));
+	});
+	app.post("/api/device/restart", (request, response) => {
+		if (Number(request.headers["content-length"] ?? 0) > 0 || request.headers["transfer-encoding"] ||
+			Object.keys(request.body).length) {
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
+		}
+		expireJobs();
+		expireUpload();
+		expireExports();
+		if (deviceRestartPending || otaRestartPending || restoreRestartPending || upload || exportsById.size || pushTestActive() ||
+			[...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) {
+			return response.status(409).json(result(false, "ACTION_BUSY"));
+		}
+		deviceRestartPending = true;
+		state.logs.push("Web UI requested device restart");
+		return response.status(200).json(result(true, "ACTION_DEVICE_RESTARTING"));
 	});
 
 	app.all("/api/push/test", (request, response, next) => {
@@ -1075,13 +1108,21 @@ export function createApp({
 		const exportId = nextId++;
 		exportsById.clear();
 		exportsById.set(exportId, { bytes: encryptConfig(portableConfig(state.config), request.body.passphrase), expiresAt: now() + 120000 });
-		return acceptJob("config-export", result(true, "ACTION_CONFIG_EXPORT_READY", { exportId }), response);
+		const accepted = acceptJob("config-export", () => {
+			const completed = result(true, "ACTION_CONFIG_EXPORT_READY", { exportId });
+			const item = exportsById.get(exportId);
+			if (completed.success && item) item.expiresAt = now() + 120000;
+			return completed;
+		}, response);
+		if (response.statusCode !== 202) exportsById.delete(exportId);
+		return accepted;
 	});
 	app.get("/api/config/export", (request, response) => {
+		expireExports();
 		const id = parseUint32(request.query.id);
 		const item = exportsById.get(id);
 		exportsById.delete(id);
-		if (!item || item.expiresAt < now()) return response.status(404).json(result(false, "ACTION_CONFIG_EXPORT_NOT_FOUND"));
+		if (!item) return response.status(404).json(result(false, "ACTION_CONFIG_EXPORT_NOT_FOUND"));
 		return response.set({
 			"Content-Type": "application/vnd.sms-forwarding.config",
 			"X-Config-Schema-Version": "6",
@@ -1091,7 +1132,7 @@ export function createApp({
 
 	function startUpload(kind, metadata, response) {
 		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
-		if (upload && now() - upload.lastActivity > 120000) upload = undefined;
+		expireUpload();
 		if (upload) return response.status(409).json(result(false, kind === "ota" ? "ACTION_OTA_BUSY" : "ACTION_BUSY"));
 		const uploadId = nextId++;
 		upload = { kind, uploadId, bytes: Buffer.alloc(0), lastActivity: now(), ...metadata };
@@ -1139,7 +1180,7 @@ export function createApp({
 			const id = parseUint32(request.query.id);
 			const offset = parseUint32(request.query.offset, true);
 			const chunk = decodeBase64Chunk(request.body);
-			if (upload && now() - upload.lastActivity > 120000) upload = undefined;
+			expireUpload();
 			if (id === undefined || offset === undefined || !upload || upload.kind !== kind || upload.uploadId !== id) {
 				return response.status(409).json(result(false, kind === "ota" ? "ACTION_OTA_SESSION_INVALID" : "ACTION_CONFIG_RESTORE_CHUNK_INVALID"));
 			}
@@ -1159,7 +1200,7 @@ export function createApp({
 		});
 		app.post(`${prefix}/finish`, (request, response) => {
 			const id = parseUint32(request.query.id);
-			if (upload && now() - upload.lastActivity > 120000) upload = undefined;
+			expireUpload();
 			if (id === undefined || !upload || upload.kind !== kind || upload.uploadId !== id) {
 				return response.status(409).json(result(false,
 					kind === "ota" ? "ACTION_OTA_SESSION_INVALID" : "ACTION_CONFIG_RESTORE_FINISH_INVALID"));
@@ -1188,11 +1229,13 @@ export function createApp({
 						return result(false, "ACTION_OTA_HASH_INVALID");
 					}
 					acceptedOtaCounter = session.manifest.releaseCounter;
+					otaRestartPending = true;
 					return result(true, "ACTION_OTA_READY");
 				}
 				try {
 					const restored = decodePortableConfig(decryptConfig(session.bytes, request.body.passphrase), state.config);
 					state.config = restored;
+					restoreRestartPending = true;
 					return result(true, "ACTION_CONFIG_RESTORED");
 				} catch {
 					return result(false, "ACTION_CONFIG_RESTORE_INVALID");

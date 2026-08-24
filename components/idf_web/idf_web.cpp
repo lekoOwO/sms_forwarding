@@ -144,8 +144,8 @@ static bool s_web_modem_action_running = false;
 
 static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
 static void cell_job_unlock(void);
-static bool cellular_job_active_locked(void);
-static bool cellular_job_active(void);
+static bool cellular_job_active_locked(bool allow_device_restart = false);
+static bool cellular_job_active(bool allow_device_restart = false);
 static void set_json_no_cache(httpd_req_t* req);
 static bool get_query_param(httpd_req_t* req, const char* key, std::string& out, size_t max_query);
 static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::string& arg,
@@ -3071,12 +3071,27 @@ static void restart_task(void*)
     esp_restart();
 }
 
-static void schedule_restart_or_now(const char* task_name)
+static bool claim_restart_owner()
 {
-    s_device_restart_pending.store(true, std::memory_order_relaxed);
-    if (xTaskCreate(restart_task, task_name, 3072, nullptr, 1, nullptr) == pdPASS) return;
+    bool expected = false;
+    if (s_device_restart_pending.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel)) return true;
+    idf_log_line("Restart already pending; keeping the existing restart owner");
+    return false;
+}
+
+static void release_restart_owner()
+{
+    s_device_restart_pending.store(false, std::memory_order_release);
+}
+
+static bool schedule_restart_or_now(const char* task_name, bool already_claimed)
+{
+    if (!already_claimed && !claim_restart_owner()) return false;
+    if (xTaskCreate(restart_task, task_name, 3072, nullptr, 1, nullptr) == pdPASS) return true;
     idf_log_line("Restart task creation failed; restarting from the current task");
     restart_task(nullptr);
+    return true;
 }
 
 static esp_err_t handle_factory_reset(httpd_req_t* req)
@@ -3084,17 +3099,22 @@ static esp_err_t handle_factory_reset(httpd_req_t* req)
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
     if (reject_restart_while_backup_active(req)) return ESP_OK;
+    if (!claim_restart_owner()) return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     esp_err_t err = idf_config_factory_reset();
     if (err == ESP_OK) idf_log_line("Web UI requested factory reset; all configuration cleared, restarting");
     set_json_no_cache(req);
     if (err != ESP_OK) {
+        release_restart_owner();
         std::string body = "{\"success\":false,";
         json_prop(body, "message", std::string("Factory reset failed: ") + esp_err_to_name(err));
         body += "}";
         return httpd_resp_send(req, body.c_str(), body.size());
     }
+    if (!schedule_restart_or_now("factory_restart", true)) {
+        release_restart_owner();
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Configuration cleared; device will restart with default settings\"}");
-    schedule_restart_or_now("factory_restart");
     return send_err;
 }
 
@@ -3122,9 +3142,13 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         std::string msg = "{\"success\":false,\"message\":\"Invalid WiFi configuration\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
+    if (!ap_mode && !claim_restart_owner()) {
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     // Persist the exact provisioning slot before touching the runtime driver.
     esp_err_t err = idf_config_save_wifi_profile(0, ssid_s, pass_s, pass_s.empty(), false);
     if (err != ESP_OK) {
+        if (!ap_mode) release_restart_owner();
         httpd_resp_set_status(req, "500 Internal Server Error");
         std::string msg = "{\"success\":false,\"message\":\"WiFi configuration could not be saved; retry\"}";
         return httpd_resp_send(req, msg.c_str(), msg.size());
@@ -3143,8 +3167,11 @@ static esp_err_t handle_wifi_config(httpd_req_t* req)
         return httpd_resp_send(req, msg.c_str(), msg.size());
     }
     std::string msg = "{\"success\":true,\"message\":\"WiFi saved; device will restart\"}";
+    if (!schedule_restart_or_now("wifi_restart", true)) {
+        release_restart_owner();
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     esp_err_t send_err = httpd_resp_send(req, msg.c_str(), msg.size());
-    schedule_restart_or_now("wifi_restart");
     return send_err;
 }
 
@@ -3465,9 +3492,12 @@ static void cell_job_unlock(void)
     xSemaphoreGive(s_cell_job_mutex);
 }
 
-static bool cellular_job_active_locked(void)
+static bool cellular_job_active_locked(bool allow_device_restart)
 {
-    return device_restart_pending() || ota_active() ||
+    const bool restart_busy =
+        (!allow_device_restart && s_device_restart_pending.load(std::memory_order_relaxed)) ||
+        idf_web_ota_restart_pending();
+    return restart_busy || ota_active() ||
            s_keepalive_job.running || s_keepalive_job.queued ||
            s_esim_job.running || s_esim_job.queued ||
            s_sched_job.running || s_sched_job.queued ||
@@ -4019,10 +4049,13 @@ static bool system_idle_for_maintenance(bool include_done = false,
                                          bool allow_restore_restart = false,
                                          bool allow_device_restart = false)
 {
+    const bool restart_busy =
+        (!allow_device_restart && s_device_restart_pending.load(std::memory_order_relaxed)) ||
+        idf_web_ota_restart_pending();
     const bool jobs_busy = include_done && !allow_restore_restart
         ? api_jobs_visible() : api_jobs_active();
     return !backup_transfer_active() && !ota_active() &&
-           (allow_device_restart || !device_restart_pending()) &&
+           !restart_busy &&
            (allow_restore_restart || !restore_restart_pending()) && !jobs_busy &&
            !s_push_test_admission_active.load(std::memory_order_acquire) &&
            !idf_push_busy() && !idf_push_test_active() &&
@@ -4030,16 +4063,16 @@ static bool system_idle_for_maintenance(bool include_done = false,
            idf_push_retry_queue_depth() == 0 &&
            idf_sms_outgoing_queue_depth() == 0 &&
            idf_push_email_queue_depth() == 0 &&
-           !cellular_job_active();
+           !cellular_job_active(allow_device_restart);
 }
 
-static bool cellular_job_active()
+static bool cellular_job_active(bool allow_device_restart)
 {
     // Treat lock failure as busy (fail-safe) before maintenance restart. A false idle result could restart
     // during eSIM switch or keepalive work and leave the device on the wrong card.
     bool active = true;
     if (cell_job_lock()) {
-        active = cellular_job_active_locked();
+        active = cellular_job_active_locked(allow_device_restart);
         cell_job_unlock();
     }
     return active;
@@ -4316,10 +4349,17 @@ static void scheduler_task(void*)
         }
 
         const uint32_t maintenance_now_ms = static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
-        if (restore_restart_due(maintenance_now_ms) && system_idle_for_maintenance(false, true)) {
-            idf_log_line("Configuration restore completed; restarting after API job TTL");
-            schedule_restart_or_now("restore_restart");
-            s_restore_restart_pending.store(false, std::memory_order_release);
+        if (restore_restart_due(maintenance_now_ms) && claim_restart_owner()) {
+            if (system_idle_for_maintenance(false, true, true)) {
+                idf_log_line("Configuration restore completed; restarting after API job TTL");
+                if (schedule_restart_or_now("restore_restart", true)) {
+                    s_restore_restart_pending.store(false, std::memory_order_release);
+                } else {
+                    release_restart_owner();
+                }
+            } else {
+                release_restart_owner();
+            }
         }
 
         uint32_t now = static_cast<uint32_t>(time(nullptr));
@@ -4815,13 +4855,34 @@ static esp_err_t handle_ntp(httpd_req_t* req)
 
 static esp_err_t handle_reboot(httpd_req_t* req)
 {
+    if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
+    if (req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        httpd_resp_set_status(req, "405 Method Not Allowed");
+        httpd_resp_set_hdr(req, "Allow", "POST");
+        const std::string body = action_result(false, "ACTION_INPUT_INVALID", {}, "method");
+        return httpd_resp_send(req, body.c_str(), body.size());
+    }
     if (!check_csrf(req)) return ESP_OK;
-    if (reject_restart_while_backup_active(req)) return ESP_OK;
+    if (req->content_len != 0) return send_action_error(req, "ACTION_INPUT_INVALID", "body");
+
+    if (!claim_restart_owner()) {
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
+    if (backup_transfer_active() || ota_active() || idf_web_ota_restart_pending() ||
+        restore_restart_pending() || api_jobs_active() ||
+        s_push_test_admission_active.load(std::memory_order_acquire) || idf_push_test_active()) {
+        release_restart_owner();
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
+
     idf_log_line("Web UI requested device restart");
     set_json_no_cache(req);
-    esp_err_t send_err = httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Device will restart\"}");
-    schedule_restart_or_now("web_restart");
+    httpd_resp_set_status(req, "200 OK");
+    const std::string body = action_result(true, "ACTION_DEVICE_RESTARTING");
+    esp_err_t send_err = httpd_resp_send(req, body.c_str(), body.size());
+    schedule_restart_or_now("web_restart", true);
     return send_err;
 }
 
@@ -4933,6 +4994,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/ota/start", register_handler(s_server, "/api/ota/start", HTTP_POST, handle_ota_start));
     IDF_WEB_TRY_REGISTER("/api/ota/chunk", register_handler(s_server, "/api/ota/chunk", HTTP_POST, handle_ota_chunk));
     IDF_WEB_TRY_REGISTER("/api/ota/finish", register_handler(s_server, "/api/ota/finish", HTTP_POST, handle_ota_finish));
+    IDF_WEB_TRY_REGISTER("/api/device/restart", register_handler(s_server, "/api/device/restart", HTTP_ANY, handle_reboot));
     IDF_WEB_TRY_REGISTER("/api/push/test", register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push));
     IDF_WEB_TRY_REGISTER("/query", register_handler(s_server, "/query", HTTP_GET, handle_query));
     IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, handle_save));

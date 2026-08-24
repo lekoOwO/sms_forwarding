@@ -330,6 +330,23 @@
         }
       }
     },
+    "/api/device/restart": {
+      "post": {
+        "tags": ["Device"],
+        "summary": "Restart the whole device",
+        "description": "Requests one planned whole-device restart. The request body must be empty. The device authenticates and checks the POST CSRF token before body validation, then returns 409 when a backup transfer, OTA, device or restore restart, API job, or push test is active. This direct action uses 200 OK because it has no queued API job or job ID; the delayed restart task powers off the modem before esp_restart.",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "responses": {
+          "200": { "description": "The restart was admitted and will occur after a short delay.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "description": "The request body is not empty.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The POST CSRF token is missing or invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "Another transfer, job, push test, or planned restart is active.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/api/jobs": {
       "get": {
         "tags": ["Device"],
@@ -563,7 +580,8 @@
               "ACTION_MODEM_OK",
               "ACTION_MODEM_FAILED",
               "ACTION_WIFI_RESTARTING",
-			  "ACTION_WIFI_PASSWORD_REQUIRED",
+              "ACTION_DEVICE_RESTARTING",
+              "ACTION_WIFI_PASSWORD_REQUIRED",
               "ACTION_CSRF_INVALID",
               "ACTION_JOB_ACCEPTED",
               "ACTION_JOB_NOT_FOUND",

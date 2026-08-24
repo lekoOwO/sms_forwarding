@@ -17,6 +17,14 @@ def scheduler_keepalive_baseline_model(ka_enabled, ka_action, ka_last_valid):
     return writes
 
 
+def restore_restart_idle_model(local_owner, ota_restart_pending, other_cellular_job,
+                               allow_local_owner):
+    """The restore restart may ignore only its own local restart claim."""
+    cellular_busy = ((local_owner and not allow_local_owner) or
+                     ota_restart_pending or other_cellular_job)
+    return not cellular_busy
+
+
 def function_body(source: str, name: str) -> str:
     search = 0
     while True:
@@ -36,6 +44,169 @@ def function_body(source: str, name: str) -> str:
             if depth == 0:
                 return source[start:index]
     raise AssertionError(f"unterminated function: {name}")
+
+
+def definition_body(source: str, declaration: str) -> str:
+    declaration_start = source.index(declaration)
+    brace = source.index("{", declaration_start)
+    depth = 1
+    for index in range(brace + 1, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[brace + 1:index]
+    raise AssertionError(f"unterminated definition: {declaration}")
+
+
+def run_guard_seam(source: str, mutate_idle=None):
+    cellular_locked = definition_body(source, "static bool cellular_job_active_locked(bool allow_device_restart)")
+    cellular_active = definition_body(source, "static bool cellular_job_active(bool allow_device_restart)")
+    idle = definition_body(source, "static bool system_idle_for_maintenance(bool include_done = false,")
+    if mutate_idle:
+        idle = mutate_idle(idle)
+    harness = f'''
+#include <atomic>
+#include <cassert>
+
+using TickType_t = unsigned;
+struct WebAsyncJob {{ bool running = false; bool queued = false; }};
+
+static std::atomic<bool> s_device_restart_pending{{false}};
+static std::atomic<bool> s_push_test_admission_active{{false}};
+static WebAsyncJob s_keepalive_job;
+static WebAsyncJob s_esim_job;
+static WebAsyncJob s_sched_job;
+static bool s_modem_apply_running = false;
+static bool s_web_modem_action_running = false;
+
+static bool g_lock_available = true;
+static bool g_backup_transfer = false;
+static bool g_ota_active = false;
+static bool g_ota_restart_pending = false;
+static bool g_restore_restart_pending = false;
+static bool g_api_jobs_active = false;
+static bool g_api_jobs_visible = false;
+static bool g_push_busy = false;
+static bool g_push_test_active = false;
+static unsigned g_forward_queue = 0;
+static unsigned g_retry_queue = 0;
+static unsigned g_sms_queue = 0;
+static unsigned g_email_queue = 0;
+
+static bool cell_job_lock(TickType_t = 0) {{ return g_lock_available; }}
+static void cell_job_unlock() {{}}
+static bool backup_transfer_active() {{ return g_backup_transfer; }}
+static bool ota_active() {{ return g_ota_active; }}
+static bool idf_web_ota_restart_pending() {{ return g_ota_restart_pending; }}
+static bool restore_restart_pending() {{ return g_restore_restart_pending; }}
+static bool api_jobs_active() {{ return g_api_jobs_active; }}
+static bool api_jobs_visible() {{ return g_api_jobs_visible; }}
+static bool idf_push_busy() {{ return g_push_busy; }}
+static bool idf_push_test_active() {{ return g_push_test_active; }}
+static unsigned idf_push_forward_queue_depth() {{ return g_forward_queue; }}
+static unsigned idf_push_retry_queue_depth() {{ return g_retry_queue; }}
+static unsigned idf_sms_outgoing_queue_depth() {{ return g_sms_queue; }}
+static unsigned idf_push_email_queue_depth() {{ return g_email_queue; }}
+
+static bool cellular_job_active_locked(bool allow_device_restart)
+{{{cellular_locked}}}
+
+static bool cellular_job_active(bool allow_device_restart)
+{{{cellular_active}}}
+
+static bool system_idle_for_maintenance(bool include_done = false,
+                                         bool allow_restore_restart = false,
+                                         bool allow_device_restart = false)
+{{{idle}}}
+
+static void reset_state()
+{{
+    g_lock_available = true;
+    g_backup_transfer = false;
+    g_ota_active = false;
+    g_ota_restart_pending = false;
+    g_restore_restart_pending = false;
+    g_api_jobs_active = false;
+    g_api_jobs_visible = false;
+    g_push_busy = false;
+    g_push_test_active = false;
+    g_forward_queue = 0;
+    g_retry_queue = 0;
+    g_sms_queue = 0;
+    g_email_queue = 0;
+    s_device_restart_pending.store(false);
+    s_push_test_admission_active.store(false);
+    s_keepalive_job = WebAsyncJob{{}};
+    s_esim_job = WebAsyncJob{{}};
+    s_sched_job = WebAsyncJob{{}};
+    s_modem_apply_running = false;
+    s_web_modem_action_running = false;
+}}
+
+static void expect_idle(bool expected, bool allow_device_restart = true,
+                        bool allow_restore_restart = true, bool include_done = false)
+{{
+    assert(system_idle_for_maintenance(include_done, allow_restore_restart, allow_device_restart) == expected);
+}}
+
+int main()
+{{
+    reset_state();
+    expect_idle(true);
+
+    s_device_restart_pending.store(true);
+    expect_idle(true);  // The scheduler owns this local claim.
+    expect_idle(false, false);
+    g_ota_restart_pending = true;
+    expect_idle(false);  // An OTA restart is an external owner.
+    reset_state();
+
+    g_restore_restart_pending = true;
+    expect_idle(true);  // The restore scheduler explicitly allows its own pending state.
+    expect_idle(false, true, false);
+    reset_state();
+
+    g_backup_transfer = true; expect_idle(false); reset_state();
+    g_ota_active = true; expect_idle(false); reset_state();
+    g_api_jobs_active = true; expect_idle(false); reset_state();
+    g_api_jobs_visible = true; expect_idle(false, true, false, true); reset_state();
+    s_push_test_admission_active.store(true); expect_idle(false); reset_state();
+    g_push_busy = true; expect_idle(false); reset_state();
+    g_push_test_active = true; expect_idle(false); reset_state();
+    g_forward_queue = 1; expect_idle(false); reset_state();
+    g_retry_queue = 1; expect_idle(false); reset_state();
+    g_sms_queue = 1; expect_idle(false); reset_state();
+    g_email_queue = 1; expect_idle(false); reset_state();
+
+    s_keepalive_job.running = true; expect_idle(false); reset_state();
+    s_keepalive_job.queued = true; expect_idle(false); reset_state();
+    s_esim_job.running = true; expect_idle(false); reset_state();
+    s_esim_job.queued = true; expect_idle(false); reset_state();
+    s_sched_job.running = true; expect_idle(false); reset_state();
+    s_sched_job.queued = true; expect_idle(false); reset_state();
+    s_modem_apply_running = true; expect_idle(false); reset_state();
+    s_web_modem_action_running = true; expect_idle(false); reset_state();
+    g_lock_available = false; expect_idle(false);
+
+    reset_state();
+    s_device_restart_pending.store(true);
+    s_esim_job.running = true;
+    expect_idle(false);  // Ignoring the owner must not skip other cellular work.
+    return 0;
+}}
+'''
+    with tempfile.TemporaryDirectory() as temp_dir:
+        harness_path = Path(temp_dir) / "guard_seam_test.cpp"
+        binary_path = Path(temp_dir) / "guard_seam_test"
+        harness_path.write_text(harness)
+        subprocess.run(
+            ["g++", "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
+             str(harness_path), "-o", str(binary_path)],
+            check=True,
+        )
+        return subprocess.run([str(binary_path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def main() -> None:
@@ -296,6 +467,10 @@ int main() {
         subprocess.run([str(binary_path)], check=True)
 
     source = (WEB / "idf_web.cpp").read_text()
+    assert run_guard_seam(source).returncode == 0
+    mutated_guard = run_guard_seam(source, lambda body: body.replace(
+        "!s_push_test_admission_active.load(std::memory_order_acquire) &&", "true &&", 1))
+    assert mutated_guard.returncode != 0
     sdkconfig_defaults = (ROOT / "sdkconfig.defaults").read_text()
     assert "CONFIG_HTTPD_MAX_URI_LEN=2048" in sdkconfig_defaults
     assert "CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192" in sdkconfig_defaults
@@ -312,6 +487,8 @@ int main() {
     assert 'register_handler(s_server, "/import"' not in source
     assert 'register_handler(s_server, "/update"' not in source
     assert 'register_handler(s_server, "/api/jobs", HTTP_GET, handle_api_job)' in source
+    assert 'register_handler(s_server, "/api/device/restart", HTTP_ANY, handle_reboot)' in source
+    assert 'register_handler(s_server, "/reboot"' not in source
     assert "handle_import_config" not in source
     assert "handle_ota_update" not in source
     registered = set(re.findall(r'register_handler\(s_server, "([^"]+)"', source))
@@ -320,10 +497,26 @@ int main() {
         "/wifiscan", "/wificonfig", "/apstatus", "/log", "/at", "/ping", "/flight",
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
-        "/api/ota/chunk", "/api/ota/finish", "/api/push/test", "/*",
+        "/api/ota/chunk", "/api/ota/finish", "/api/push/test", "/api/device/restart", "/*",
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
     assert 'register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push)' in source
+    restart = function_body(source, "handle_reboot")
+    assert restart.index("reject_oversized_body(req)") < restart.index("check_auth(req)")
+    assert restart.index("check_auth(req)") < restart.index("req->method != HTTP_POST")
+    assert restart.index("req->method != HTTP_POST") < restart.index("check_csrf(req)")
+    assert restart.index("check_csrf(req)") < restart.index("req->content_len != 0")
+    assert 'httpd_resp_set_hdr(req, "Allow", "POST")' in restart
+    assert "ACTION_DEVICE_RESTARTING" in restart
+    assert 'httpd_resp_set_status(req, "200 OK")' in restart
+    assert "claim_restart_owner()" in restart
+    assert "idf_web_ota_restart_pending()" in restart
+    assert 'schedule_restart_or_now("web_restart", true)' in restart
+    for guard in (
+        "backup_transfer_active()", "ota_active()", "restore_restart_pending()",
+        "api_jobs_active()", "s_push_test_admission_active.load", "idf_push_test_active()",
+    ):
+        assert guard in restart
     assert 'register_handler(s_server, "/testpush"' not in source
     push_test = function_body(source, "handle_test_push")
     assert push_test.index("reject_oversized_body(req)") < push_test.index("check_auth(req)")
@@ -340,6 +533,20 @@ int main() {
         assert "idf_push_test_active()" in function_body(source, handler)
     assert "idf_push_test_active()" in function_body(source, "reject_restart_while_backup_active")
     assert "!idf_push_test_active()" in function_body(source, "system_idle_for_maintenance")
+    claim = function_body(source, "claim_restart_owner")
+    assert "compare_exchange_strong" in claim
+    schedule = function_body(source, "schedule_restart_or_now")
+    assert "static bool schedule_restart_or_now" in source
+    assert "return false;" in schedule
+    assert "return true;" in schedule
+    assert "if (!already_claimed && !claim_restart_owner()) return false;" in schedule
+    assert "xTaskCreate(restart_task, task_name" in schedule
+    factory = function_body(source, "handle_factory_reset")
+    assert factory.index("claim_restart_owner()") < factory.index("idf_config_factory_reset()")
+    assert 'schedule_restart_or_now("factory_restart", true)' in factory
+    wifi = function_body(source, "handle_wifi_config")
+    assert wifi.index("claim_restart_owner()") < wifi.index("idf_config_save_wifi_profile")
+    assert 'schedule_restart_or_now("wifi_restart", true)' in wifi
     scheduler = function_body(source, "scheduler_task")
     for marker, end in (
         ("Free heap below threshold", "const uint32_t maintenance_now_ms"),
@@ -369,7 +576,7 @@ int main() {
     assert "crypto_job ? 8192 : 6144" in source
     assert "uxTaskGetStackHighWaterMark(nullptr)" in source
     assert "uint8_t chunk[8192]" not in source
-    assert source.count("reject_restart_while_backup_active(req)") == 3
+    assert source.count("reject_restart_while_backup_active(req)") == 2
     snapshot = function_body(source, "handle_api_config")
     for redacted in ("smtpPass", "password", "url", "key1", "key2", "customBody"):
         assert f'json_prop(body, "{redacted}", "")' in snapshot
@@ -391,10 +598,27 @@ int main() {
     assert "system_idle_for_maintenance())" in scheduler
     assert "system_idle_for_maintenance(true)" in scheduler
     assert "restore_restart_due(maintenance_now_ms)" in scheduler
-    assert 'system_idle_for_maintenance(false, true)' in scheduler
-    assert 'schedule_restart_or_now("restore_restart")' in scheduler
+    assert 'system_idle_for_maintenance(false, true, true)' in scheduler
+    assert 'restore_restart_due(maintenance_now_ms) && claim_restart_owner()' in scheduler
+    assert 'if (schedule_restart_or_now("restore_restart", true))' in scheduler
     assert "s_restore_restart_pending.store(false" in scheduler
+    restore_restart = scheduler.split("if (restore_restart_due(maintenance_now_ms)", 1)[1].split(
+        "uint32_t now", 1)[0]
+    assert restore_restart.index("claim_restart_owner()") < restore_restart.index(
+        "system_idle_for_maintenance(false, true, true)")
+    assert restore_restart.index("system_idle_for_maintenance(false, true, true)") < restore_restart.index(
+        'schedule_restart_or_now("restore_restart", true)')
+    assert restore_restart.count("release_restart_owner()") == 2
     maintenance = function_body(source, "system_idle_for_maintenance")
+    cellular = function_body(source, "cellular_job_active_locked")
+    assert "static bool cellular_job_active_locked(bool allow_device_restart)" in source
+    assert "(!allow_device_restart && s_device_restart_pending.load" in cellular
+    assert "idf_web_ota_restart_pending()" in cellular
+    assert "s_keepalive_job.running" in cellular
+    assert "s_esim_job.running" in cellular
+    assert "cellular_job_active(allow_device_restart)" in maintenance
+    assert "(!allow_device_restart && s_device_restart_pending.load" in maintenance
+    assert "idf_web_ota_restart_pending()" in maintenance
     assert "api_jobs_active()" in maintenance
     assert "api_jobs_visible()" in maintenance
     assert "include_done" in maintenance
@@ -580,6 +804,10 @@ int main() {
         (False, 1, False, []),
     ):
         assert scheduler_keepalive_baseline_model(ka_enabled, ka_action, ka_last_valid) == expected_writes
+    assert restore_restart_idle_model(True, False, False, True)
+    assert not restore_restart_idle_model(True, True, False, True)
+    assert not restore_restart_idle_model(True, False, True, True)
+    assert not restore_restart_idle_model(True, False, False, False)
     sched_worker = function_body(source, "sched_task_worker")
     assert "epoch_valid(now) && t.action != 1" in sched_worker
     assert sched_worker.index("if (t.action == 1)") < sched_worker.index("esim_prepare_profile")
