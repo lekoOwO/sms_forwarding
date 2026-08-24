@@ -152,6 +152,8 @@ OTA_IMAGE_STATE_NAMES = {
 }
 OTA_STATE_STRUCT = struct.Struct("<IBBIII")
 OTA_STATE_PAYLOAD_SIZE = OTA_STATE_STRUCT.size
+OTA_STATE_PUBLIC_KEY_SIZE = 32
+OTA_STATE_EXTENDED_PAYLOAD_SIZE = OTA_STATE_PAYLOAD_SIZE + OTA_STATE_PUBLIC_KEY_SIZE
 HEADER = struct.Struct("<2sBBHB")
 HEADER_SIZE = HEADER.size
 CRC_SIZE = 2
@@ -255,7 +257,9 @@ def _max_payload(command: int) -> int:
         return MAX_ASYNC_PROVISION_PAYLOAD
     if command == COMMAND_MODEM_QUERY:
         return MAX_QUERY_PAYLOAD
-    if command in (COMMAND_OTA_STATE, COMMAND_OTA_MIGRATION_RECOVER):
+    if command == COMMAND_OTA_STATE:
+        return 1
+    if command == COMMAND_OTA_MIGRATION_RECOVER:
         return 0
     return MAX_PAYLOAD
 
@@ -266,6 +270,8 @@ def build_frame(command: int, payload: bytes, sequence: int) -> bytes:
     max_payload = _max_payload(command)
     if len(payload) > max_payload:
         raise ValueError("payload is too large")
+    if command == COMMAND_OTA_STATE and payload not in {b"", b"\x01"}:
+        raise ValueError("unsupported OTA state selector")
     if not 0 <= sequence <= 0xFF:
         raise ValueError("sequence is out of range")
     return _build_unchecked_frame(command, payload, sequence)
@@ -1150,10 +1156,10 @@ def decode_state_payload(payload: bytes) -> dict[str, object]:
 
 
 def decode_ota_state_payload(payload: bytes) -> dict[str, object]:
-    if len(payload) != OTA_STATE_PAYLOAD_SIZE:
+    if len(payload) not in {OTA_STATE_PAYLOAD_SIZE, OTA_STATE_EXTENDED_PAYLOAD_SIZE}:
         raise DeviceError("malformed OTA state response")
     active_offset, image_state, pending_verify, accepted, pending, pending_address = (
-        OTA_STATE_STRUCT.unpack(payload)
+        OTA_STATE_STRUCT.unpack(payload[:OTA_STATE_PAYLOAD_SIZE])
     )
     if active_offset not in {APP0_OFFSET, APP1_OFFSET}:
         raise DeviceError("malformed OTA state response")
@@ -1164,7 +1170,7 @@ def decode_ota_state_payload(payload: bytes) -> dict[str, object]:
         raise DeviceError("malformed OTA state response")
     if bool(pending_verify) != (image_state == OTA_IMAGE_STATE_PENDING_VERIFY):
         raise DeviceError("malformed OTA state response")
-    return {
+    result: dict[str, object] = {
         "active_offset": active_offset,
         "image_state": state_name,
         "pending_verify": bool(pending_verify),
@@ -1172,12 +1178,55 @@ def decode_ota_state_payload(payload: bytes) -> dict[str, object]:
         "pending": pending,
         "pending_address": pending_address,
     }
+    if len(payload) == OTA_STATE_EXTENDED_PAYLOAD_SIZE:
+        result["public_key_sha256"] = payload[OTA_STATE_PAYLOAD_SIZE:].hex()
+    return result
+
+
+def read_ota_state(
+    path: str, timeout: float, *, internal_container: bool = False,
+    deadline: float | None = None, legacy: bool = False,
+) -> dict[str, object]:
+    transaction_args = {"deadline": deadline} if deadline is not None else {}
+    if internal_container:
+        transaction_args["internal_container"] = True
+    if legacy:
+        response = run_transaction(
+            path, timeout, COMMAND_OTA_STATE, b"", **transaction_args,
+        )
+        state = decode_ota_state_payload(response.payload)
+        if "public_key_sha256" in state:
+            raise DeviceError("malformed OTA state response")
+        return state
+    try:
+        response = run_transaction(
+            path, timeout, COMMAND_OTA_STATE, b"\x01", **transaction_args,
+        )
+    except CommandError as error:
+        if error.status != STATUS_INVALID_ARG:
+            raise
+    except DeviceError as error:
+        if str(error) != "USB device timed out":
+            raise
+    else:
+        state = decode_ota_state_payload(response.payload)
+        if "public_key_sha256" not in state:
+            raise DeviceError("malformed OTA state response")
+        return state
+    response = run_transaction(
+        path, timeout, COMMAND_OTA_STATE, b"", **transaction_args,
+    )
+    state = decode_ota_state_payload(response.payload)
+    if "public_key_sha256" in state:
+        raise DeviceError("malformed OTA state response")
+    state["public_key_sha256"] = None
+    return state
 
 
 def validate_ota_state(value: object) -> dict[str, object]:
     if not isinstance(value, dict) or set(value) != {
         "active_offset", "image_state", "pending_verify",
-        "accepted", "pending", "pending_address",
+        "accepted", "pending", "pending_address", "public_key_sha256",
     }:
         raise DeviceError("malformed OTA state response")
     active_offset = value["active_offset"]
@@ -1186,6 +1235,7 @@ def validate_ota_state(value: object) -> dict[str, object]:
     accepted = value["accepted"]
     pending = value["pending"]
     pending_address = value["pending_address"]
+    public_key_sha256 = value["public_key_sha256"]
     if (
         not isinstance(active_offset, int) or isinstance(active_offset, bool)
         or active_offset not in {APP0_OFFSET, APP1_OFFSET}
@@ -1201,6 +1251,14 @@ def validate_ota_state(value: object) -> dict[str, object]:
         or not isinstance(pending_address, int)
         or isinstance(pending_address, bool)
         or pending_address not in {0, APP0_OFFSET, APP1_OFFSET}
+        or (
+            public_key_sha256 is not None
+            and (
+                not isinstance(public_key_sha256, str)
+                or len(public_key_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in public_key_sha256)
+            )
+        )
     ):
         raise DeviceError("malformed OTA state response")
     return {
@@ -1210,7 +1268,18 @@ def validate_ota_state(value: object) -> dict[str, object]:
         "accepted": accepted,
         "pending": pending,
         "pending_address": pending_address,
+        "public_key_sha256": public_key_sha256,
     }
+
+
+def validate_legacy_ota_state(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise DeviceError("malformed OTA state response")
+    validated = validate_ota_state({**value, "public_key_sha256": None})
+    validated.pop("public_key_sha256")
+    if validated != value:
+        raise DeviceError("malformed OTA state response")
+    return validated
 
 
 def decode_provision_status_payload(payload: bytes) -> dict[str, int]:
@@ -1403,7 +1472,7 @@ def run_transaction(
 ) -> Frame:
     timeout = validate_timeout(timeout)
     last_error: DeviceError | None = None
-    attempts = 3 if command in RETRYABLE_READ_COMMANDS else 1
+    attempts = 3 if command in RETRYABLE_READ_COMMANDS and not payload else 1
     for attempt in range(attempts):
         attempt_timeout = timeout
         if deadline is not None:
@@ -1449,11 +1518,14 @@ def _state_command(args: argparse.Namespace) -> int:
 def _ota_state_command(args: argparse.Namespace) -> int:
     timeout = validate_timeout(STATE_TIMEOUT if args.timeout is None else args.timeout)
     internal = {"internal_container": True} if getattr(args, "internal_container", False) else {}
-    deadline = time.monotonic() + timeout
-    response = run_transaction(
-        args.device, timeout, COMMAND_OTA_STATE, b"", deadline=deadline, **internal,
+    legacy = getattr(args, "legacy", False)
+    if legacy and not getattr(args, "internal_container", False):
+        raise ValueError("legacy OTA state is internal-only")
+    deadline = time.monotonic() + timeout * (1 if legacy else 2)
+    state = read_ota_state(
+        args.device, timeout, deadline=deadline, legacy=legacy, **internal,
     )
-    print(json.dumps(decode_ota_state_payload(response.payload), sort_keys=True))
+    print(json.dumps(state, sort_keys=True))
     return 0
 
 
@@ -1598,7 +1670,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--internal-container", action="store_true", help=argparse.SUPPRESS)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("state")
-    commands.add_parser("ota-state")
+    ota_state = commands.add_parser("ota-state")
+    ota_state.add_argument("--legacy", action="store_true", help=argparse.SUPPRESS)
     commands.add_parser("ota-migration-recover", help=argparse.SUPPRESS)
     wifi = commands.add_parser(
         "wifi-provision",

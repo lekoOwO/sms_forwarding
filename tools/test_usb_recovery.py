@@ -149,6 +149,117 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             )
         self.assertEqual(attempts, [usb_recovery.COMMAND_OTA_STATE] * 2)
 
+    def test_ota_state_extended_probe_is_once_and_returns_key_identity(self):
+        legacy = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_VALID,
+            0, 0, 0, 0,
+        )
+        fingerprint = "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b"
+        transaction = mock.Mock(return_value=usb_recovery.Frame(
+            usb_recovery.RESPONSE_OTA_STATE, 0,
+            legacy + bytes.fromhex(fingerprint),
+        ))
+        with mock.patch.object(usb_recovery, "run_transaction", transaction):
+            state = usb_recovery.read_ota_state(
+                "/dev/serial/by-id/test", 1.0, deadline=5.0,
+            )
+        self.assertEqual(state["public_key_sha256"], fingerprint)
+        transaction.assert_called_once_with(
+            "/dev/serial/by-id/test", 1.0, usb_recovery.COMMAND_OTA_STATE,
+            b"\x01", deadline=5.0,
+        )
+
+    def test_ota_state_falls_back_only_for_old_firmware_timeout_or_invalid_argument(self):
+        legacy = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_VALID,
+            0, 0, 0, 0,
+        )
+        for unsupported in (
+            usb_recovery.DeviceError("USB device timed out"),
+            usb_recovery.CommandError(usb_recovery.STATUS_INVALID_ARG),
+        ):
+            with self.subTest(error=unsupported), mock.patch.object(
+                usb_recovery, "run_transaction", side_effect=(
+                    unsupported,
+                    usb_recovery.Frame(usb_recovery.RESPONSE_OTA_STATE, 0, legacy),
+                ),
+            ) as transaction:
+                state = usb_recovery.read_ota_state("/dev/serial/by-id/test", 1.0)
+            self.assertIsNone(state["public_key_sha256"])
+            self.assertEqual(
+                [call.args[3] for call in transaction.call_args_list],
+                [b"\x01", b""],
+            )
+
+    def test_ota_state_never_downgrades_internal_error_or_malformed_extended_data(self):
+        legacy = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_VALID,
+            0, 0, 0, 0,
+        )
+        cases = (
+            usb_recovery.CommandError(usb_recovery.STATUS_INTERNAL),
+            usb_recovery.DeviceError("USB device disconnected"),
+            usb_recovery.Frame(
+                usb_recovery.RESPONSE_OTA_STATE, 0, legacy + b"\x00" * 31,
+            ),
+        )
+        for result in cases:
+            with self.subTest(result=result), mock.patch.object(
+                usb_recovery, "run_transaction",
+                side_effect=result if isinstance(result, Exception) else None,
+                return_value=None if isinstance(result, Exception) else result,
+            ) as transaction:
+                with self.assertRaises(usb_recovery.DeviceError):
+                    usb_recovery.read_ota_state("/dev/serial/by-id/test", 1.0)
+            transaction.assert_called_once()
+
+    def test_ota_state_legacy_read_requires_exact_18_byte_response(self):
+        extended = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_VALID,
+            0, 0, 0, 0,
+        ) + b"\x00" * 32
+        with mock.patch.object(
+            usb_recovery, "run_transaction", return_value=usb_recovery.Frame(
+                usb_recovery.RESPONSE_OTA_STATE, 0, extended,
+            ),
+        ):
+            with self.assertRaises(usb_recovery.DeviceError):
+                usb_recovery.read_ota_state(
+                    "/dev/serial/by-id/test", 1.0, legacy=True,
+                )
+
+    def test_ota_state_selector_accepts_only_empty_or_identity_request(self):
+        usb_recovery.build_frame(usb_recovery.COMMAND_OTA_STATE, b"", 1)
+        usb_recovery.build_frame(usb_recovery.COMMAND_OTA_STATE, b"\x01", 1)
+        for payload in (b"\x00", b"\x02", b"\x01\x00"):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                usb_recovery.build_frame(usb_recovery.COMMAND_OTA_STATE, payload, 1)
+
+    def test_ota_state_identity_request_is_not_retried(self):
+        attempts = []
+
+        class TimeoutDevice:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def transact(self, command, payload):
+                attempts.append((command, payload))
+                raise usb_recovery.DeviceError("USB device timed out")
+
+        with mock.patch.object(usb_recovery, "Device", TimeoutDevice):
+            with self.assertRaises(usb_recovery.DeviceError):
+                usb_recovery.run_transaction(
+                    "/dev/serial/by-id/test", 1.0,
+                    usb_recovery.COMMAND_OTA_STATE, b"\x01",
+                )
+        self.assertEqual(attempts, [(usb_recovery.COMMAND_OTA_STATE, b"\x01")])
+
     def test_ota_migration_recovery_is_at_most_once(self):
         attempts = []
 
@@ -1853,6 +1964,17 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
 
 
 class UsbRecoveryBuildGuardTest(unittest.TestCase):
+    def test_ota_state_firmware_keeps_legacy_wire_and_opt_in_identity(self):
+        source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
+        limit = function_body(source, "command_payload_limit")
+        state = function_body(source, "ota_state")
+        self.assertIn("if (command == kCommandOtaState) return 1;", limit)
+        self.assertIn("frame.payload_length == 1 && frame.payload[0] == 0x01", state)
+        self.assertIn("idf_web_ota_get_public_key_sha256", state)
+        self.assertIn("kOtaStatePublicKeySize", state)
+        self.assertIn("size_t state_length = kOtaStatePayload", state)
+        self.assertIn("*output_length = 1 + state_length", state)
+
     def test_dev_frame_stage_instrumentation_is_bounded(self):
         source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
         self.assertIn("#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE", source)

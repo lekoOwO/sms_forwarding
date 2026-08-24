@@ -62,6 +62,7 @@ constexpr TickType_t kIoTimeout = pdMS_TO_TICKS(2000);
 constexpr TickType_t kParserIdleTimeout = pdMS_TO_TICKS(1000);
 constexpr size_t kProvisionStatusPayload = 11;
 constexpr size_t kOtaStatePayload = 18;
+constexpr size_t kOtaStatePublicKeySize = 32;
 
 enum class Status : uint8_t {
     Ok = 0,
@@ -111,11 +112,10 @@ static void secure_zero(void* data, size_t length)
 static size_t command_payload_limit(uint8_t command)
 {
     if (command == kCommandModemQuery) return kMaxQueryRequestPayload;
-    if (command == kCommandOtaState
+    if (command == kCommandOtaState) return 1;
 #if !FIRMWARE_IS_RELEASE
-        || command == kCommandOtaMigrationRecover
+    if (command == kCommandOtaMigrationRecover) return 0;
 #endif
-    ) return 0;
     return command == kCommandWifiProvisionAsync ? kMaxAsyncPayload : kMaxLegacyPayload;
 }
 
@@ -464,7 +464,9 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
 
 static Status ota_state(const Frame& frame, uint8_t* output, size_t* output_length)
 {
-    if (frame.payload_length != 0) return Status::InvalidArg;
+    const bool include_public_key =
+        frame.payload_length == 1 && frame.payload[0] == 0x01;
+    if (frame.payload_length != 0 && !include_public_key) return Status::InvalidArg;
     IdfWebOtaState state;
     const esp_err_t err = idf_web_ota_get_state(&state);
     if (err != ESP_OK) return map_error(err);
@@ -474,7 +476,14 @@ static Status ota_state(const Frame& frame, uint8_t* output, size_t* output_leng
     write_u32(output + 6, state.accepted);
     write_u32(output + 10, state.pending);
     write_u32(output + 14, state.pending_address);
-    *output_length = 1 + kOtaStatePayload;
+    size_t state_length = kOtaStatePayload;
+    if (include_public_key) {
+        const esp_err_t key_error = idf_web_ota_get_public_key_sha256(
+            output + kOtaStatePayload);
+        if (key_error != ESP_OK) return map_error(key_error);
+        state_length += kOtaStatePublicKeySize;
+    }
+    *output_length = 1 + state_length;
     return Status::Ok;
 }
 

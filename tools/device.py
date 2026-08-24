@@ -1178,6 +1178,7 @@ def _container_recovery(
     device: SerialDevice, timeout: float, query: str | None = None,
     *, caller_timeout: float | None = None, deadline: float | None = None,
     command: int = usb_recovery.COMMAND_STATE,
+    legacy_ota_state: bool = False,
 ) -> bytes | dict[str, object]:
     if deadline is not None and caller_timeout is None:
         caller_timeout = _remaining(deadline)
@@ -1202,6 +1203,8 @@ def _container_recovery(
             arguments.append("state")
         elif command == usb_recovery.COMMAND_OTA_STATE:
             arguments.append("ota-state")
+            if legacy_ota_state:
+                arguments.append("--legacy")
         elif command == usb_recovery.COMMAND_OTA_MIGRATION_RECOVER:
             arguments.append("ota-migration-recover")
         else:
@@ -1701,15 +1704,15 @@ def _ota_state(
     device: SerialDevice, timeout: float = STATE_TIMEOUT, *,
     container_timeout: float = CONTAINER_LIFECYCLE_TIMEOUT,
     deadline: float | None = None,
+    legacy: bool = False,
 ) -> dict[str, object]:
     try:
         transaction_args = {}
         if deadline is not None:
             transaction_args["deadline"] = deadline
-        response = usb_recovery.run_transaction(
-            device.by_id, timeout, usb_recovery.COMMAND_OTA_STATE, b"", **transaction_args
+        return usb_recovery.read_ota_state(
+            device.by_id, timeout, legacy=legacy, **transaction_args
         )
-        return usb_recovery.decode_ota_state_payload(response.payload)
     except usb_recovery.CommandError:
         raise
     except (usb_recovery.DeviceError, OSError, ImportError) as error:
@@ -1719,9 +1722,12 @@ def _ota_state(
             container_timeout = min(container_timeout, _remaining(deadline))
         result = _container_recovery(
             device, timeout, caller_timeout=container_timeout, deadline=deadline,
-            command=usb_recovery.COMMAND_OTA_STATE,
+            command=usb_recovery.COMMAND_OTA_STATE, legacy_ota_state=legacy,
         )
-        return usb_recovery.validate_ota_state(result)
+        return (
+            usb_recovery.validate_legacy_ota_state(result)
+            if legacy else usb_recovery.validate_ota_state(result)
+        )
 
 
 def _ota_migration_readback(
@@ -1731,7 +1737,7 @@ def _ota_migration_readback(
     try:
         state = _ota_state(
             device, timeout=min(STATE_TIMEOUT, timeout),
-            container_timeout=container_timeout, deadline=deadline,
+            container_timeout=container_timeout, deadline=deadline, legacy=True,
         )
     except (usb_recovery.DeviceError, OSError, ImportError) as readback_error:
         raise original_error from readback_error
@@ -2028,6 +2034,7 @@ def _ota_test_package_command(args: argparse.Namespace) -> int:
         "output": str(output),
         "package_sha256": sha256_file(output),
         "profile": "usb-dev-test-key",
+        "public_key_sha256": public_fingerprint,
         "fail_health": bool(args.fail_health),
         "version": args.version,
     }, sort_keys=True))
@@ -2179,7 +2186,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         if pin.lower() != digest:
             raise ValueError("SHA-256 pin does not match app image")
         confirm_basename(device_path, args.confirm)
-        ota_state = _ota_state(device)
+        ota_state = _ota_state(device, legacy=True)
         active_offset = ota_state.get("active_offset")
         if active_offset not in APP_SLOT_OFFSETS.values():
             raise usb_recovery.DeviceError("OTA state active slot is unknown")

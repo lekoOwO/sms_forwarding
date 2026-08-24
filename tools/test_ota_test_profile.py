@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import shutil
 import struct
@@ -410,9 +411,22 @@ class OtaTestProfileTests(unittest.TestCase):
             args = device.build_parser().parse_args([
                 "ota-test-package", "--output", str(output), "--sha256", image_sha,
             ])
-            with mock.patch.object(device.subprocess, "run", side_effect=run):
+            with mock.patch.object(device.subprocess, "run", side_effect=run), \
+                    mock.patch("builtins.print") as printed:
                 self.assertEqual(device._ota_test_package_command(args), 0)
             self.assertTrue(output.is_file())
+            metadata = json.loads(printed.call_args.args[0])
+            public_der = base64.b64decode(
+                device.OTA_TEST_PUBLIC_KEY.read_text().strip(), validate=True,
+            )
+            self.assertEqual(
+                metadata["public_key_sha256"], hashlib.sha256(public_der).hexdigest(),
+            )
+            self.assertNotEqual(metadata["public_key_sha256"], PRODUCTION_KEY_FINGERPRINT)
+            manifest, _, _ = parse_package(output.read_bytes())
+            self.assertEqual(set(json.loads(manifest)), {
+                "format", "releaseCounter", "sha256", "size", "target", "version",
+            })
         finally:
             output.unlink(missing_ok=True)
             if previous is None:

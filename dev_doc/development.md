@@ -197,6 +197,9 @@ ephemeral P-256 private key，並把對應 public key 路徑傳給 CMake。priva
 其 counter 使用獨立的 `ota_test_meta` NVS namespace，不會改變 production
 `ota_meta` floor。production public-key fingerprint
 `a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735` 不會變更。
+命令的 JSON 另含 `public_key_sha256`，它是簽署者綁定的 generated public DER
+SHA-256，可與裝置 `ota-state` 的同名欄位直接比較；`.smsota` manifest 維持既有
+六個欄位，不加入 key identity。
 
 若要測試 app0 直接燒錄，先確認 `build/idf-ota-test/CMakeCache.txt` 同時顯示
 `FIRMWARE_IS_RELEASE=0`、`SMS_USB_RECOVERY=1` 與 `SMS_OTA_TEST_KEY=1`，再使用
@@ -211,10 +214,14 @@ python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app0
 
 需要寫入 app1 時，只將 `--slot app0` 改為 `--slot app1`；其餘安全檢查相同。
 
-`ota-state` 只回報 app0/app1 offset、映像狀態與目前 OTA metadata；回報格式錯誤、
+`ota-state` 回報 app0/app1 offset、映像狀態、目前 OTA metadata 與
+`public_key_sha256`；回報格式錯誤、
 未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。尚未完成實機 rollback、
 replay 與 signed OTA 證據前，停止於 host build/package 與唯讀 `ota-state`；不要執行
 實機 flash、Web upload 或宣稱 signed OTA READY。
+此 fingerprint 只是執行中韌體所回報的 observable trust key，不是 attestation。
+`null` 只會在有效回退至較舊韌體的 legacy response 後出現，表示 key identity
+無法觀察；它不代表 production key，也不能用於宣稱裝置未遭修改。
 
 若一次性遷移後裝置停在 `pending-verify`，且舊 metadata 的
 `accepted`、`pending`、`pendingAddr` 都不存在或是正確型別的零值，可在非 release

@@ -63,13 +63,16 @@ class OtaFlashProfileTest(unittest.TestCase):
 
 
 class OtaStateProtocolTest(unittest.TestCase):
-    def test_ota_state_payload_decodes_only_known_slots_and_exact_types(self):
-        payload = usb_recovery.OTA_STATE_STRUCT.pack(
+    def test_ota_state_payload_preserves_legacy_and_decodes_exact_extended_identity(self):
+        legacy = usb_recovery.OTA_STATE_STRUCT.pack(
             usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_PENDING_VERIFY,
             1, 7, 9, 0,
         )
         self.assertEqual(
-            usb_recovery.decode_ota_state_payload(payload),
+            len(legacy), 18,
+        )
+        self.assertEqual(
+            usb_recovery.decode_ota_state_payload(legacy),
             {
                 "active_offset": usb_recovery.APP0_OFFSET,
                 "image_state": "pending-verify",
@@ -79,19 +82,68 @@ class OtaStateProtocolTest(unittest.TestCase):
                 "pending_address": 0,
             },
         )
+        fingerprint = "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b"
+        extended = legacy + bytes.fromhex(fingerprint)
+        self.assertEqual(len(extended), 50)
+        self.assertEqual(
+            usb_recovery.decode_ota_state_payload(extended),
+            {
+                "active_offset": usb_recovery.APP0_OFFSET,
+                "image_state": "pending-verify",
+                "pending_verify": True,
+                "accepted": 7,
+                "pending": 9,
+                "pending_address": 0,
+                "public_key_sha256": fingerprint,
+            },
+        )
+
+    def test_ota_state_payload_rejects_invalid_fields_and_lengths(self):
+        legacy = usb_recovery.OTA_STATE_STRUCT.pack(
+            usb_recovery.APP0_OFFSET, usb_recovery.OTA_IMAGE_STATE_PENDING_VERIFY,
+            1, 7, 9, 0,
+        )
         for bad in (
             usb_recovery.OTA_STATE_STRUCT.pack(0, 1, 1, 7, 9, 0),
             usb_recovery.OTA_STATE_STRUCT.pack(
                 usb_recovery.APP0_OFFSET, 99, 0, 7, 9, 0,
             ),
-            payload + b"\x00",
+            legacy + b"\x00",
+            legacy + b"\x00" * 31,
+            legacy + b"\x00" * 33,
         ):
             with self.subTest(payload=bad):
                 with self.assertRaises(usb_recovery.DeviceError):
                     usb_recovery.decode_ota_state_payload(bad)
 
+    def test_container_ota_state_requires_exact_seven_key_shape(self):
+        fingerprint = "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b"
+        state = {
+            "active_offset": usb_recovery.APP0_OFFSET,
+            "image_state": "valid",
+            "pending_verify": False,
+            "accepted": 7,
+            "pending": 0,
+            "pending_address": 0,
+            "public_key_sha256": fingerprint,
+        }
+        self.assertEqual(usb_recovery.validate_ota_state(state), state)
+        legacy_fallback = dict(state, public_key_sha256=None)
+        self.assertEqual(usb_recovery.validate_ota_state(legacy_fallback), legacy_fallback)
+        for bad in (
+            {key: value for key, value in state.items() if key != "public_key_sha256"},
+            dict(state, public_key_sha256=fingerprint.upper()),
+            dict(state, public_key_sha256=fingerprint[:-1]),
+            dict(state, public_key_sha256=""),
+            dict(state, extra=None),
+        ):
+            with self.subTest(state=bad):
+                with self.assertRaises(usb_recovery.DeviceError):
+                    usb_recovery.validate_ota_state(bad)
+
     def test_device_ota_state_command_emits_strict_json(self):
         active_offset = usb_recovery.APP1_OFFSET
+        fingerprint = "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b"
         wire_payload = (
             bytes((usb_recovery.STATUS_OK,))
             + active_offset.to_bytes(4, "little")
@@ -99,12 +151,13 @@ class OtaStateProtocolTest(unittest.TestCase):
             + (11).to_bytes(4, "little")
             + (0).to_bytes(4, "little")
             + (0).to_bytes(4, "little")
+            + bytes.fromhex(fingerprint)
         )
         wire = usb_recovery.build_frame(
             usb_recovery.RESPONSE_OTA_STATE, wire_payload, 0x2A,
         )
         self.assertEqual(
-            len(wire), usb_recovery.HEADER_SIZE + 19 + usb_recovery.CRC_SIZE,
+            len(wire), usb_recovery.HEADER_SIZE + 51 + usb_recovery.CRC_SIZE,
         )
         frames = usb_recovery.FrameParser(usb_recovery.RESPONSE_COMMANDS).feed(wire)
         self.assertEqual(len(frames), 1)
@@ -114,9 +167,10 @@ class OtaStateProtocolTest(unittest.TestCase):
         output = io.StringIO()
         with mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(
                 "/dev/serial/by-id/test", "/dev/ttyACM0")), \
-                mock.patch.object(device.usb_recovery, "run_transaction", return_value=response), \
+                mock.patch.object(device.usb_recovery, "run_transaction", return_value=response) as transaction, \
                 contextlib.redirect_stdout(output):
             self.assertEqual(device.main(["--device", "/dev/serial/by-id/test", "ota-state"]), 0)
+        self.assertEqual(transaction.call_args.args[3], b"\x01")
         result = json.loads(output.getvalue())
         self.assertEqual(result, {
             "accepted": 11,
@@ -125,6 +179,7 @@ class OtaStateProtocolTest(unittest.TestCase):
             "pending": 0,
             "pending_address": 0,
             "pending_verify": False,
+            "public_key_sha256": fingerprint,
         })
         self.assertFalse(result["pending_verify"])
 

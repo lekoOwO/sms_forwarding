@@ -41,6 +41,7 @@ struct IdfWebOtaState {
 };
 
 esp_err_t idf_web_ota_get_state(IdfWebOtaState* output);
+esp_err_t idf_web_ota_get_public_key_sha256(uint8_t output[32]);
 
 #if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE
 // One-time migration escape hatch for a USB recovery build with no metadata floor.

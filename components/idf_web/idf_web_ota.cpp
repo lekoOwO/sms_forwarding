@@ -76,19 +76,29 @@ bool load_counters(void*, uint32_t* accepted, uint32_t* pending)
     return ok;
 }
 
-bool verify_signature(void*, const uint8_t* manifest, size_t manifest_size,
-                      const uint8_t* signature, size_t signature_size)
+bool decode_embedded_public_key(uint8_t* output, size_t capacity, size_t* output_size)
 {
-    uint8_t key_der[96] = {};
-    size_t key_size = 0;
+    if (!output || !output_size) return false;
+    *output_size = 0;
     // The linker exposes these as independent extern arrays; cppcheck cannot
     // prove that both symbols belong to the same embedded object.
     size_t encoded_size = static_cast<size_t>(
         reinterpret_cast<uintptr_t>(ota_public_key_b64_end) -
         reinterpret_cast<uintptr_t>(ota_public_key_b64_start));
     if (encoded_size > 0 && ota_public_key_b64_start[encoded_size - 1] == '\0') --encoded_size;
-    if (mbedtls_base64_decode(key_der, sizeof(key_der), &key_size,
-            ota_public_key_b64_start, encoded_size) != 0 || key_size == 0) return false;
+    if (mbedtls_base64_decode(output, capacity, output_size,
+            ota_public_key_b64_start, encoded_size) == 0 && *output_size != 0) return true;
+    std::memset(output, 0, capacity);
+    *output_size = 0;
+    return false;
+}
+
+bool verify_signature(void*, const uint8_t* manifest, size_t manifest_size,
+                      const uint8_t* signature, size_t signature_size)
+{
+    uint8_t key_der[96] = {};
+    size_t key_size = 0;
+    if (!decode_embedded_public_key(key_der, sizeof(key_der), &key_size)) return false;
     uint8_t digest[32] = {};
     if (mbedtls_sha256(manifest, manifest_size, digest, 0) != 0) {
         std::memset(key_der, 0, sizeof(key_der));
@@ -403,6 +413,24 @@ esp_err_t idf_web_ota_get_state(IdfWebOtaState* output)
     const esp_err_t result = read_ota_state(output);
     unlock();
     return result;
+}
+
+esp_err_t idf_web_ota_get_public_key_sha256(uint8_t output[32])
+{
+    if (!output) return ESP_ERR_INVALID_ARG;
+    uint8_t key_der[96] = {};
+    size_t key_size = 0;
+    if (!decode_embedded_public_key(key_der, sizeof(key_der), &key_size)) {
+        std::memset(output, 0, 32);
+        return ESP_FAIL;
+    }
+    const int hash_error = mbedtls_sha256(key_der, key_size, output, 0);
+    std::memset(key_der, 0, sizeof(key_der));
+    if (hash_error != 0) {
+        std::memset(output, 0, 32);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 #if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE

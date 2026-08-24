@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import hashlib
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -10,11 +11,161 @@ ROOT = Path(__file__).resolve().parents[3]
 WEB = ROOT / "components/idf_web"
 
 
+def function_definition(source: str, name: str) -> str:
+    match = re.search(rf"\b(?:bool|esp_err_t)\s+{re.escape(name)}\s*\(", source)
+    assert match is not None
+    brace = source.index("{", match.end())
+    depth = 1
+    for index in range(brace + 1, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[match.start():index + 1]
+    raise AssertionError(f"unterminated function: {name}")
+
+
+def check_public_key_hash_function(source: str) -> None:
+    decode = function_definition(source, "decode_embedded_public_key")
+    fingerprint = function_definition(source, "idf_web_ota_get_public_key_sha256")
+    fixtures = (
+        (
+            b"test-public-key-der",
+            "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b",
+        ),
+        (
+            b"test-public-key-der-mutated",
+            hashlib.sha256(b"test-public-key-der-mutated").hexdigest(),
+        ),
+    )
+    assert fixtures[0][1] != fixtures[1][1]
+    for der, expected in fixtures:
+        encoded = base64.b64encode(der)
+        byte_list = lambda value: ",".join(str(byte) for byte in value)
+        harness = f'''
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+using esp_err_t = int;
+static constexpr esp_err_t ESP_OK = 0;
+static constexpr esp_err_t ESP_FAIL = -1;
+static constexpr esp_err_t ESP_ERR_INVALID_ARG = -2;
+static const uint8_t kEncoded[] = {{{byte_list(encoded)}}};
+static const uint8_t kDer[] = {{{byte_list(der)}}};
+static const uint8_t kDigest[] = {{{byte_list(bytes.fromhex(expected))}}};
+static const uint8_t kWrongDigest[] = {{{byte_list(bytes.fromhex("a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735"))}}};
+static bool decode_fails = false;
+static bool hash_fails = false;
+
+extern const uint8_t ota_public_key_b64_start[] asm("ota_public_key_b64_start");
+extern const uint8_t ota_public_key_b64_end[] asm("ota_public_key_b64_end");
+asm(".pushsection .rodata\\n"
+    ".global ota_public_key_b64_start\\n"
+    "ota_public_key_b64_start:\\n"
+    ".byte {byte_list(encoded)}\\n"
+    ".global ota_public_key_b64_end\\n"
+    "ota_public_key_b64_end:\\n"
+    ".popsection\\n");
+
+int mbedtls_base64_decode(uint8_t* output, size_t capacity, size_t* output_size,
+                          const uint8_t* input, size_t input_size) {{
+    if (decode_fails) {{
+        std::memset(output, 0xA5, capacity);
+        *output_size = capacity;
+        return -1;
+    }}
+    if (input_size != sizeof(kEncoded) || capacity < sizeof(kDer) ||
+        std::memcmp(input, kEncoded, sizeof(kEncoded)) != 0) return -1;
+    std::memcpy(output, kDer, sizeof(kDer));
+    *output_size = sizeof(kDer);
+    return 0;
+}}
+
+int mbedtls_sha256(const uint8_t* input, size_t input_size,
+                   uint8_t output[32], int is224) {{
+    if (hash_fails) {{
+        std::memset(output, 0xA5, 32);
+        return -1;
+    }}
+    if (is224 != 0 || input_size != sizeof(kDer) ||
+        std::memcmp(input, kDer, sizeof(kDer)) != 0) return -1;
+    std::memcpy(output, kDigest, sizeof(kDigest));
+    return 0;
+}}
+
+{decode}
+{fingerprint}
+
+int main() {{
+    uint8_t actual[32] = {{}};
+    assert(idf_web_ota_get_public_key_sha256(actual) == ESP_OK);
+    assert(std::memcmp(actual, kDigest, sizeof(actual)) == 0);
+    std::memset(actual, 0x5A, sizeof(actual));
+    decode_fails = true;
+    assert(idf_web_ota_get_public_key_sha256(actual) == ESP_FAIL);
+    for (uint8_t byte : actual) assert(byte == 0);
+    decode_fails = false;
+    std::memset(actual, 0x5A, sizeof(actual));
+    hash_fails = true;
+    assert(idf_web_ota_get_public_key_sha256(actual) == ESP_FAIL);
+    for (uint8_t byte : actual) assert(byte == 0);
+}}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            test_source = Path(directory) / "public_key_hash_test.cpp"
+            binary = Path(directory) / "public_key_hash_test"
+            test_source.write_text(harness, encoding="utf-8")
+            subprocess.run([
+                "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                str(test_source), "-o", str(binary),
+            ], check=True)
+            subprocess.run([str(binary)], check=True)
+            if der == fixtures[0][0]:
+                mutation = harness.replace(
+                    "const int hash_error = mbedtls_sha256(key_der, key_size, output, 0);",
+                    "std::memcpy(output, kWrongDigest, 32); const int hash_error = 0;",
+                    1,
+                )
+                assert mutation != harness
+                test_source.write_text(mutation, encoding="utf-8")
+                subprocess.run([
+                    "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    str(test_source), "-o", str(binary),
+                ], check=True)
+                rejected = subprocess.run([str(binary)], capture_output=True, check=False)
+                assert rejected.returncode != 0
+                for old, new in (
+                    ("std::memset(output, 0, 32);", ""),
+                    ("return ESP_FAIL;", "return ESP_OK;"),
+                ):
+                    mutation = harness.replace(old, new, 1)
+                    assert mutation != harness
+                    test_source.write_text(mutation, encoding="utf-8")
+                    subprocess.run([
+                        "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                        str(test_source), "-o", str(binary),
+                    ], check=True)
+                    rejected = subprocess.run(
+                        [str(binary)], capture_output=True, check=False,
+                    )
+                    assert rejected.returncode != 0
+
+
 def main() -> None:
     key_bytes = base64.b64decode((WEB / "ota_public_key.der.b64").read_text().strip(), validate=True)
-    assert hashlib.sha256(key_bytes).hexdigest() == (
+    key_fingerprint = hashlib.sha256(key_bytes).hexdigest()
+    assert key_fingerprint == (
         "a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735"
     )
+    workflow = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+    workflow_pin = re.search(r"--expected-public-sha256 ([0-9a-f]{64})", workflow)
+    assert workflow_pin is not None and workflow_pin.group(1) == key_fingerprint
+    mutated = workflow.replace(workflow_pin.group(1), "0" * 64, 1)
+    mutated_pin = re.search(r"--expected-public-sha256 ([0-9a-f]{64})", mutated)
+    assert mutated_pin is not None and mutated_pin.group(1) != key_fingerprint
     sdkconfig = (ROOT / "sdkconfig.defaults").read_text(encoding="utf-8")
     assert "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" in sdkconfig
     assert "CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK" not in sdkconfig
@@ -27,6 +178,11 @@ def main() -> None:
     usb_start = app_main.index("idf_usb_recovery_start())")
     assert ota_init < usb_start
     ota_runtime = (WEB / "idf_web_ota.cpp").read_text(encoding="utf-8")
+    assert "decode_embedded_public_key" in ota_runtime
+    assert "idf_web_ota_get_public_key_sha256" in ota_runtime
+    verify_signature = function_definition(ota_runtime, "verify_signature")
+    assert "decode_embedded_public_key(key_der, sizeof(key_der), &key_size)" in verify_signature
+    check_public_key_hash_function(ota_runtime)
     health = ota_runtime[ota_runtime.index("esp_err_t idf_web_ota_health_check") :]
     assert "if (!lock()) return ESP_ERR_TIMEOUT;" in health
     assert "if (!other || other == running)" in ota_runtime

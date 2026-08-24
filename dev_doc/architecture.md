@@ -151,6 +151,10 @@ OTA metadata 會寫入 `otadata` 與 NVS。
 ignored build profile 產生的 NON-PRODUCTION public key，並使用獨立的
 `ota_test_meta` NVS namespace；正式版與一般開發版仍嵌入 production key，
 並使用 `ota_meta`。
+USB recovery 的使用者 `ota-state` 會顯示執行中韌體用於簽章驗證的
+SubjectPublicKeyInfo DER SHA-256。這只是可觀察的 trust key identity，不是
+attestation；被修改的韌體仍可回報任意值。`public_key_sha256: null` 只表示較舊韌體
+無法觀察此欄位，不表示 production key。
 `components/idf_web/OTA_RUNTIME_READY` 仍不存在；matching private key 與硬體 rollback/replay evidence 也未具備。
 因此目前不能宣稱 signed OTA 已達到 READY。
 

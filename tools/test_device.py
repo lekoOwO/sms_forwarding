@@ -1628,6 +1628,7 @@ class DeviceCommandTest(unittest.TestCase):
 
     def test_live_flash_app1_writes_fixed_slot(self):
         events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
 
         with tempfile.TemporaryDirectory() as temp:
             root = pathlib.Path(temp)
@@ -1643,10 +1644,10 @@ class DeviceCommandTest(unittest.TestCase):
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
             with mock.patch.object(device, "ROOT", root), \
-                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
                     mock.patch.object(device, "resolve_esptool", return_value="host"), \
                     mock.patch.object(device.subprocess, "run", side_effect=fake_run), \
-                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app0"]}), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app0"]}) as ota_state, \
                     mock.patch.object(device, "confirm_basename", return_value=None):
                 result, output = self.run_main([
                     "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
@@ -1657,6 +1658,7 @@ class DeviceCommandTest(unittest.TestCase):
         esptool = events[-1][0]
         self.assertIn("0x1F0000", esptool)
         self.assertEqual(json.loads(output)["slot"], "app1")
+        ota_state.assert_called_once_with(reference, legacy=True)
 
     def test_live_flash_runs_baseline_before_hash_and_fixed_write(self):
         events = []
@@ -2130,6 +2132,7 @@ class DeviceCommandTest(unittest.TestCase):
             "accepted": 0,
             "pending": 0,
             "pending_address": 0,
+            "public_key_sha256": "d7699fd512f82cfa86924a2ed90f3f165b1b21795455641f4327b24dc04fbe0b",
         }
         process_calls = []
 
