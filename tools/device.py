@@ -86,7 +86,8 @@ CONTAINER_TIMEOUT = 30.0
 CONTAINER_STARTUP_TIMEOUT = 30.0
 CONTAINER_LIFECYCLE_TIMEOUT = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT * 2
 CONTAINER_NAME_PREFIX = "sms-forwarding-device"
-FLASH_RECONCILE_TIMEOUT = RESET_TIMEOUT
+FLASH_READBACK_MIN_BYTES_PER_SECOND = 8 * 1024
+FLASH_READBACK_OVERHEAD = 30.0
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
@@ -2101,6 +2102,13 @@ def _is_esptool_timeout(error: BaseException) -> bool:
     )
 
 
+def _flash_readback_timeout(size: int) -> float:
+    return max(
+        RESET_TIMEOUT,
+        FLASH_READBACK_OVERHEAD + size / FLASH_READBACK_MIN_BYTES_PER_SECOND,
+    )
+
+
 def _recover_app_flash(device: SerialDevice) -> None:
     try:
         run_esptool(device, RESET_TIMEOUT)
@@ -2204,8 +2212,9 @@ def _flash_command(args: argparse.Namespace) -> int:
         if active_offset == offset:
             raise usb_recovery.DeviceError("cannot flash the active app slot")
 
+        readback_timeout = _flash_readback_timeout(size)
         before_digest = _read_app_flash_digest(
-            device_path, expected_target, offset, size, FLASH_RECONCILE_TIMEOUT,
+            device_path, expected_target, offset, size, readback_timeout,
         )
         if before_digest == digest:
             plan.update({
@@ -2231,7 +2240,7 @@ def _flash_command(args: argparse.Namespace) -> int:
             if not _is_esptool_timeout(error):
                 raise
             after_digest = _read_app_flash_digest(
-                device_path, expected_target, offset, size, FLASH_RECONCILE_TIMEOUT,
+                device_path, expected_target, offset, size, readback_timeout,
             )
             if after_digest != digest:
                 raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch") from error

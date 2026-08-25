@@ -1707,7 +1707,8 @@ class DeviceCommandTest(unittest.TestCase):
             image.parent.mkdir(parents=True)
             image.write_bytes(b"f" * 1_300_000)
             digest = device.sha256_file(image)
-            readback = mock.Mock(return_value="0" * 64)
+            readback = mock.Mock(side_effect=["0" * 64, digest])
+            write = mock.Mock(side_effect=usb_recovery.DeviceError("esptool timed out"))
 
             with mock.patch.object(device, "ROOT", root), \
                     mock.patch.object(device, "resolve_serial_device", return_value=reference), \
@@ -1715,15 +1716,27 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "confirm_basename", return_value=None), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
                     mock.patch.object(device, "_read_app_flash_digest", readback), \
-                    mock.patch.object(device, "_flash_esptool"):
+                    mock.patch.object(device, "_flash_esptool", write):
                 result, _ = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
                     "--confirm", "usb-test", "--sha256", digest,
                 ])
 
         self.assertEqual(result, 0)
-        self.assertEqual(readback.call_args.args[3], 1_300_000)
-        self.assertEqual(readback.call_args.args[4], device.RESET_TIMEOUT)
+        expected_timeout = 30.0 + 1_300_000 / (8 * 1024)
+        self.assertEqual(readback.call_count, 2)
+        self.assertTrue(all(call.args[3] == 1_300_000 for call in readback.call_args_list))
+        self.assertTrue(all(
+            call.args[4] == expected_timeout for call in readback.call_args_list
+        ))
+
+    def test_flash_readback_timeout_uses_floor_rate_and_overhead(self):
+        self.assertEqual(
+            device._flash_readback_timeout(64 * 1024), device.RESET_TIMEOUT,
+        )
+        expected = 30.0 + 1_376_000 / (8 * 1024)
+        self.assertEqual(device._flash_readback_timeout(1_376_000), expected)
+        self.assertGreaterEqual(device._flash_readback_timeout(1_376_000), 150.0)
 
     def test_live_flash_checks_baseline_for_selected_usb_recovery_profile(self):
         events = []
