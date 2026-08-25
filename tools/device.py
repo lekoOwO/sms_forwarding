@@ -86,7 +86,7 @@ CONTAINER_TIMEOUT = 30.0
 CONTAINER_STARTUP_TIMEOUT = 30.0
 CONTAINER_LIFECYCLE_TIMEOUT = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT * 2
 CONTAINER_NAME_PREFIX = "sms-forwarding-device"
-FLASH_RECONCILE_TIMEOUT = 20.0
+FLASH_RECONCILE_TIMEOUT = RESET_TIMEOUT
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
@@ -2101,6 +2101,13 @@ def _is_esptool_timeout(error: BaseException) -> bool:
     )
 
 
+def _recover_app_flash(device: SerialDevice) -> None:
+    try:
+        run_esptool(device, RESET_TIMEOUT)
+    except BaseException:
+        pass
+
+
 def _flash_esptool(
     device_path: str, expected_target: str, arguments: list[str], timeout: float,
     *, image: Path | None = None, output: Path | None = None,
@@ -2109,10 +2116,14 @@ def _flash_esptool(
     device = resolve_serial_device(device_path)
     if device.by_id != device_path or device.target != expected_target:
         raise usb_recovery.DeviceError("device target changed")
-    _run_esptool(
-        arguments, device, timeout, image=image, output=output,
-        output_mount=output_mount,
-    )
+    try:
+        _run_esptool(
+            arguments, device, timeout, image=image, output=output,
+            output_mount=output_mount,
+        )
+    except BaseException:
+        _recover_app_flash(device)
+        raise
 
 
 def _read_app_flash_digest(
@@ -2123,7 +2134,7 @@ def _read_app_flash_digest(
         _flash_esptool(
             device_path, expected_target, [
                 "--chip", "esp32c3", "--port", device_path,
-                "--before", "usb_reset", "--after", "no_reset",
+                "--before", "usb_reset", "--after", "hard_reset",
                 "read_flash", f"0x{offset:X}", str(size), str(output),
             ], timeout, output=output, output_mount=Path(directory),
         )
@@ -2137,7 +2148,7 @@ def _verify_app_flash(
 ) -> None:
     _flash_esptool(device_path, expected_target, [
         "--chip", "esp32c3", "--port", device_path,
-        "--before", "usb_reset", "--after", "no_reset",
+        "--before", "usb_reset", "--after", "hard_reset",
         "verify_flash", f"0x{offset:X}", str(image),
     ], timeout, image=image)
 
@@ -2208,7 +2219,7 @@ def _flash_command(args: argparse.Namespace) -> int:
 
         arguments = [
             "--chip", "esp32c3", "--port", device_path,
-            "--before", "usb_reset", "--after", "no_reset",
+            "--before", "usb_reset", "--after", "hard_reset",
             "write_flash", f"0x{offset:X}", str(snapshot),
         ]
         reconciled = False

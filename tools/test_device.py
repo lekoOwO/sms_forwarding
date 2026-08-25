@@ -1691,12 +1691,39 @@ class DeviceCommandTest(unittest.TestCase):
         esptool = next(command for kind, command, _kwargs in events if "write_flash" in command)
         self.assertIn("write_flash", esptool)
         self.assertEqual(esptool[esptool.index("--before") + 1], "usb_reset")
-        self.assertEqual(esptool[esptool.index("--after") + 1], "no_reset")
+        self.assertEqual(esptool[esptool.index("--after") + 1], "hard_reset")
         self.assertIn("0x10000", esptool)
         self.assertNotIn("--offset", esptool)
         verify = next(command for kind, command, _kwargs in events if "verify_flash" in command)
         self.assertEqual(verify[verify.index("verify_flash") + 1], "0x10000")
+        self.assertEqual(verify[verify.index("--after") + 1], "hard_reset")
         self.assertEqual(json.loads(output)["sha256"], expected_sha256)
+
+    def test_live_flash_large_app_readback_uses_conservative_timeout(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"f" * 1_300_000)
+            digest = device.sha256_file(image)
+            readback = mock.Mock(return_value="0" * 64)
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "_read_app_flash_digest", readback), \
+                    mock.patch.object(device, "_flash_esptool"):
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertEqual(result, 0)
+        self.assertEqual(readback.call_args.args[3], 1_300_000)
+        self.assertEqual(readback.call_args.args[4], device.RESET_TIMEOUT)
 
     def test_live_flash_checks_baseline_for_selected_usb_recovery_profile(self):
         events = []
@@ -1787,6 +1814,106 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertRegex(name, rf"^{device.CONTAINER_NAME_PREFIX}-[a-z0-9-]+$")
         self.assertNotIn("--rm", command)
 
+    def test_app_flash_pre_read_timeout_attempts_hard_reset_recovery(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        original = usb_recovery.DeviceError("esptool timed out")
+        recovery = mock.Mock()
+        with mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                mock.patch.object(device, "_run_esptool", side_effect=original), \
+                mock.patch.object(device, "run_esptool", recovery):
+            with self.assertRaises(usb_recovery.DeviceError) as raised:
+                device._read_app_flash_digest(
+                    DEVICE, TARGET, device.APP_OFFSET, 1_300_000, device.RESET_TIMEOUT,
+                )
+        self.assertIs(raised.exception, original)
+        recovery.assert_called_once_with(reference, device.RESET_TIMEOUT)
+
+    def test_app_flash_verify_timeout_attempts_hard_reset_recovery(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        original = usb_recovery.DeviceError("esptool timed out")
+        recovery = mock.Mock()
+        with mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                mock.patch.object(device, "_run_esptool", side_effect=original), \
+                mock.patch.object(device, "run_esptool", recovery):
+            with self.assertRaises(usb_recovery.DeviceError) as raised:
+                device._verify_app_flash(
+                    DEVICE, TARGET, pathlib.Path("image.bin"), device.APP_OFFSET,
+                    device.RESET_TIMEOUT,
+                )
+        self.assertIs(raised.exception, original)
+        recovery.assert_called_once_with(reference, device.RESET_TIMEOUT)
+
+    def test_app_flash_keyboard_interrupt_attempts_hard_reset_recovery(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        original = KeyboardInterrupt()
+        recovery = mock.Mock()
+        with mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                mock.patch.object(device, "_run_esptool", side_effect=original), \
+                mock.patch.object(device, "run_esptool", recovery):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                device._flash_esptool(
+                    DEVICE, TARGET, ["--before", "usb_reset", "chip_id"],
+                    device.RESET_TIMEOUT,
+                )
+        self.assertIs(raised.exception, original)
+        recovery.assert_called_once_with(reference, device.RESET_TIMEOUT)
+
+    def test_app_flash_recovery_failure_does_not_mask_original_error(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        original = usb_recovery.DeviceError("esptool timed out")
+        recovery = mock.Mock(side_effect=RuntimeError("reset failed"))
+        with mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                mock.patch.object(device, "_run_esptool", side_effect=original), \
+                mock.patch.object(device, "run_esptool", recovery):
+            with self.assertRaises(usb_recovery.DeviceError) as raised:
+                device._flash_esptool(
+                    DEVICE, TARGET, ["--before", "usb_reset", "chip_id"],
+                    device.RESET_TIMEOUT,
+                )
+        self.assertIs(raised.exception, original)
+        recovery.assert_called_once_with(reference, device.RESET_TIMEOUT)
+
+    def test_live_flash_reconcile_failure_attempts_hard_reset_recovery(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+        write_error = usb_recovery.DeviceError("esptool timed out")
+        reconcile_error = usb_recovery.DeviceError("esptool timed out while reconciling")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = device.sha256_file(image)
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                if "read_flash" in arguments:
+                    if sum("read_flash" in command for command in events) == 1:
+                        pathlib.Path(arguments[-1]).write_bytes(b"old-data")
+                        return
+                    raise reconcile_error
+                raise write_error
+
+            recovery = mock.Mock()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool), \
+                    mock.patch.object(device, "run_esptool", recovery):
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(recovery.call_args_list, [
+            mock.call(reference, device.RESET_TIMEOUT),
+            mock.call(reference, device.RESET_TIMEOUT),
+        ])
+
     def test_live_flash_timeout_mismatching_readback_fails_without_reset_success(self):
         events = []
         image_bytes = b"firmware"
@@ -1815,6 +1942,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "confirm_basename", return_value=None), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool"), \
                     mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
                 result, _ = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1824,6 +1952,10 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertNotEqual(result, 0)
         self.assertEqual(len(events), 3)
         self.assertNotIn("chip_id", events[-1])
+        self.assertTrue(all(
+            command[command.index("--after") + 1] == "hard_reset"
+            for command in events if "read_flash" in command
+        ))
 
     def test_live_flash_pre_read_matching_is_explicit_noop(self):
         events = []
@@ -1846,6 +1978,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "confirm_basename", return_value=None), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool"), \
                     mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
                 result, output = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1854,6 +1987,7 @@ class DeviceCommandTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertIn("read_flash", events[0])
+        self.assertEqual(events[0][events[0].index("--after") + 1], "hard_reset")
         self.assertFalse(any("write_flash" in command for command in events))
         plan = json.loads(output)
         self.assertEqual(plan["status"], "already-matching")
@@ -1872,6 +2006,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app0"]}), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool") as recovery, \
                     mock.patch.object(device, "_run_esptool") as esptool:
                 result, _ = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1880,6 +2015,7 @@ class DeviceCommandTest(unittest.TestCase):
 
         self.assertNotEqual(result, 0)
         esptool.assert_not_called()
+        recovery.assert_not_called()
 
     def test_live_flash_rejects_by_id_target_change_before_esptool(self):
         image_bytes = b"firmware"
@@ -1895,6 +2031,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "resolve_serial_device", side_effect=(initial, changed)), \
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool") as recovery, \
                     mock.patch.object(device, "_run_esptool") as esptool:
                 result, _ = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1903,6 +2040,7 @@ class DeviceCommandTest(unittest.TestCase):
 
         self.assertNotEqual(result, 0)
         esptool.assert_not_called()
+        recovery.assert_not_called()
 
     def test_live_flash_uses_private_snapshot_after_source_mutation(self):
         events = []
@@ -1965,6 +2103,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "confirm_basename", return_value=None), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool"), \
                     mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
                 result, output = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1973,7 +2112,10 @@ class DeviceCommandTest(unittest.TestCase):
 
         self.assertEqual(result, 0)
         self.assertEqual(json.loads(output)["verification"], "readback_sha256")
-        self.assertFalse(any("hard_reset" in command for command in events))
+        self.assertTrue(all(
+            command[command.index("--after") + 1] == "hard_reset"
+            for command in events
+        ))
         self.assertFalse(any("chip_id" in command for command in events))
 
     def test_live_flash_rejects_missing_or_wrong_sha256_pin(self):
