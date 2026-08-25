@@ -2103,6 +2103,23 @@ def _is_esptool_timeout(error: BaseException) -> bool:
     )
 
 
+def _is_recoverable_app_flash_readback_error(error: BaseException) -> bool:
+    if not isinstance(error, usb_recovery.DeviceError):
+        return False
+    return bool(re.fullmatch(
+        r"esptool timed out|esptool failed \(exit -?\d+; (?:external-error|timeout)\)",
+        str(error).strip(),
+    ))
+
+
+def _ensure_inactive_app_slot(device: SerialDevice, offset: int) -> None:
+    active_offset = _ota_state(device, legacy=True).get("active_offset")
+    if active_offset not in APP_SLOT_OFFSETS.values():
+        raise usb_recovery.DeviceError("OTA state active slot is unknown")
+    if active_offset == offset:
+        raise usb_recovery.DeviceError("cannot flash the active app slot")
+
+
 def _flash_operation_timeout(size: int) -> float:
     return min(
         FLASH_OPERATION_MAX_TIMEOUT,
@@ -2209,26 +2226,28 @@ def _flash_command(args: argparse.Namespace) -> int:
         if pin.lower() != digest:
             raise ValueError("SHA-256 pin does not match app image")
         confirm_basename(device_path, args.confirm)
-        ota_state = _ota_state(device, legacy=True)
-        active_offset = ota_state.get("active_offset")
-        if active_offset not in APP_SLOT_OFFSETS.values():
-            raise usb_recovery.DeviceError("OTA state active slot is unknown")
-        if active_offset == offset:
-            raise usb_recovery.DeviceError("cannot flash the active app slot")
+        _ensure_inactive_app_slot(device, offset)
 
         operation_timeout = _flash_operation_timeout(size)
-        before_digest = _read_app_flash_digest(
-            device_path, expected_target, offset, size, operation_timeout,
-        )
-        if before_digest == digest:
-            plan.update({
-                "status": "already-matching",
-                "verification": "pre_readback_sha256",
-                "sha256": digest,
-                "written": False,
-            })
-            print(json.dumps(plan, sort_keys=True))
-            return 0
+        try:
+            before_digest = _read_app_flash_digest(
+                device_path, expected_target, offset, size, operation_timeout,
+            )
+        except usb_recovery.DeviceError as error:
+            if not _is_recoverable_app_flash_readback_error(error):
+                raise
+        else:
+            if before_digest == digest:
+                plan.update({
+                    "status": "already-matching",
+                    "verification": "pre_readback_sha256",
+                    "sha256": digest,
+                    "written": False,
+                })
+                print(json.dumps(plan, sort_keys=True))
+                return 0
+
+        _ensure_inactive_app_slot(device, offset)
 
         arguments = [
             "--chip", "esp32c3", "--port", device_path,

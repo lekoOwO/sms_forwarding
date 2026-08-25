@@ -1658,7 +1658,10 @@ class DeviceCommandTest(unittest.TestCase):
         esptool = events[-1][0]
         self.assertIn("0x1F0000", esptool)
         self.assertEqual(json.loads(output)["slot"], "app1")
-        ota_state.assert_called_once_with(reference, legacy=True)
+        self.assertEqual(ota_state.call_args_list, [
+            mock.call(reference, legacy=True),
+            mock.call(reference, legacy=True),
+        ])
 
     def test_live_flash_runs_baseline_before_hash_and_fixed_write(self):
         events = []
@@ -2076,6 +2079,203 @@ class DeviceCommandTest(unittest.TestCase):
             command[command.index("--after") + 1] == "hard_reset"
             for command in events
         ))
+
+    def test_live_flash_pre_read_transport_errors_fall_back_to_one_write_and_verify(self):
+        for pre_read_error in (
+            usb_recovery.DeviceError("esptool timed out"),
+            usb_recovery.DeviceError("esptool failed (exit 1; external-error)"),
+        ):
+            with self.subTest(error=str(pre_read_error)):
+                events = []
+                reference = device.SerialDevice(DEVICE, TARGET)
+                with tempfile.TemporaryDirectory() as temp:
+                    root = pathlib.Path(temp)
+                    image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+                    image.parent.mkdir(parents=True)
+                    image.write_bytes(b"firmware")
+                    digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+                    def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                        events.append(arguments)
+                        if "read_flash" in arguments:
+                            raise pre_read_error
+
+                    recovery = mock.Mock()
+                    with mock.patch.object(device, "ROOT", root), \
+                            mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                            mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                            mock.patch.object(device, "confirm_basename", return_value=None), \
+                            mock.patch.object(device, "_run_baseline", return_value=None), \
+                            mock.patch.object(device, "run_esptool", recovery), \
+                            mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
+                        result, output = self.run_main([
+                            "--device", DEVICE, "flash-app0", str(image), "--live",
+                            "--confirm", "usb-test", "--sha256", digest,
+                        ])
+
+                self.assertEqual(result, 0)
+                self.assertEqual(json.loads(output)["status"], "flashed")
+                self.assertEqual(recovery.call_count, 1)
+                self.assertEqual(sum("read_flash" in command for command in events), 1)
+                self.assertEqual(sum("write_flash" in command for command in events), 1)
+                self.assertEqual(sum("verify_flash" in command for command in events), 1)
+
+    def test_live_flash_pre_read_permission_error_does_not_fall_back(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+        error = usb_recovery.DeviceError("esptool failed (exit 1; permission-denied)")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                raise error
+
+            recovery = mock.Mock()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool", recovery), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(recovery.call_count, 1)
+        self.assertFalse(any("write_flash" in command for command in events))
+
+    def test_live_flash_pre_read_fallback_rechecks_inactive_slot_before_write(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+        slot_state = mock.Mock(side_effect=[
+            {"active_offset": device.APP_SLOT_OFFSETS["app1"]},
+            {"active_offset": device.APP_SLOT_OFFSETS["app0"]},
+        ])
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                raise usb_recovery.DeviceError("esptool failed (exit 1; external-error)")
+
+            recovery = mock.Mock()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", slot_state), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool", recovery), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertNotEqual(result, 0)
+        self.assertEqual(slot_state.call_count, 2)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(any("write_flash" in command for command in events))
+
+    def test_pre_read_fallback_classifier_rejects_unsafe_errors(self):
+        for error in (
+            KeyboardInterrupt(),
+            SystemExit(1),
+            ValueError("invalid readback"),
+            usb_recovery.DeviceError("esptool failed (exit 1; permission-denied)"),
+            usb_recovery.DeviceError("device target changed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.assertFalse(device._is_recoverable_app_flash_readback_error(error))
+
+    def test_live_flash_pre_read_keyboard_interrupt_does_not_fall_back(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                raise KeyboardInterrupt()
+
+            recovery = mock.Mock()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool", recovery), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_main([
+                        "--device", DEVICE, "flash-app0", str(image), "--live",
+                        "--confirm", "usb-test", "--sha256", digest,
+                    ])
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(recovery.call_count, 1)
+        self.assertFalse(any("write_flash" in command for command in events))
+
+    def test_live_flash_verify_failure_does_not_reconcile_or_retry(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+        verify_error = usb_recovery.DeviceError("esptool failed (exit 7; external-error)")
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"firmware")
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                if "read_flash" in arguments:
+                    pathlib.Path(arguments[-1]).write_bytes(b"old-data")
+                    return
+                if "verify_flash" in arguments:
+                    raise verify_error
+
+            recovery = mock.Mock()
+            error = io.StringIO()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool", recovery), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool), \
+                    mock.patch("sys.stderr", error):
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("external-error", error.getvalue())
+        self.assertEqual(recovery.call_count, 1)
+        self.assertEqual(sum("read_flash" in command for command in events), 1)
+        self.assertEqual(sum("write_flash" in command for command in events), 1)
+        self.assertEqual(sum("verify_flash" in command for command in events), 1)
 
     def test_live_flash_pre_read_matching_is_explicit_noop(self):
         events = []
