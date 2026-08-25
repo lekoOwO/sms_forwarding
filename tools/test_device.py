@@ -1723,7 +1723,7 @@ class DeviceCommandTest(unittest.TestCase):
                 ])
 
         self.assertEqual(result, 0)
-        expected_timeout = 30.0 + 1_300_000 / (8 * 1024)
+        expected_timeout = 60.0 + 1_300_000 / (8 * 1024)
         self.assertEqual(readback.call_count, 2)
         self.assertTrue(all(call.args[3] == 1_300_000 for call in readback.call_args_list))
         self.assertTrue(all(
@@ -1732,11 +1732,49 @@ class DeviceCommandTest(unittest.TestCase):
 
     def test_flash_readback_timeout_uses_floor_rate_and_overhead(self):
         self.assertEqual(
-            device._flash_readback_timeout(64 * 1024), device.RESET_TIMEOUT,
+            device._flash_operation_timeout(64 * 1024), device.RESET_TIMEOUT,
         )
-        expected = 30.0 + 1_376_000 / (8 * 1024)
-        self.assertEqual(device._flash_readback_timeout(1_376_000), expected)
-        self.assertGreaterEqual(device._flash_readback_timeout(1_376_000), 150.0)
+        expected = 60.0 + 1_376_000 / (8 * 1024)
+        self.assertEqual(device._flash_operation_timeout(1_376_000), expected)
+        self.assertGreaterEqual(device._flash_operation_timeout(1_376_000), 227.0)
+        self.assertEqual(device._flash_operation_timeout(device.APP_MAX_SIZE), 300.0)
+        self.assertEqual(
+            device._flash_operation_timeout(device.APP_MAX_SIZE + 1_000_000), 300.0,
+        )
+
+    def test_live_flash_operation_timeout_covers_write_and_verify(self):
+        reference = device.SerialDevice(DEVICE, TARGET)
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"f" * 1_300_000)
+            digest = device.sha256_file(image)
+            readback = mock.Mock(return_value="0" * 64)
+            esptool = mock.Mock()
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "_read_app_flash_digest", readback), \
+                    mock.patch.object(device, "_flash_esptool", esptool):
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        expected_timeout = 60.0 + 1_300_000 / (8 * 1024)
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output)["status"], "flashed")
+        self.assertEqual(readback.call_args.args[4], expected_timeout)
+        self.assertEqual(len(esptool.call_args_list), 2)
+        self.assertTrue(all(
+            call.args[3] == expected_timeout for call in esptool.call_args_list
+        ))
+        self.assertIn("write_flash", esptool.call_args_list[0].args[2])
+        self.assertIn("verify_flash", esptool.call_args_list[1].args[2])
 
     def test_live_flash_checks_baseline_for_selected_usb_recovery_profile(self):
         events = []
@@ -1955,7 +1993,7 @@ class DeviceCommandTest(unittest.TestCase):
                     mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
                     mock.patch.object(device, "confirm_basename", return_value=None), \
                     mock.patch.object(device, "_run_baseline", return_value=None), \
-                    mock.patch.object(device, "run_esptool"), \
+                    mock.patch.object(device, "run_esptool") as recovery, \
                     mock.patch.object(device, "_run_esptool", side_effect=fake_esptool):
                 result, _ = self.run_main([
                     "--device", DEVICE, "flash-app0", str(image), "--live",
@@ -1965,9 +2003,78 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertNotEqual(result, 0)
         self.assertEqual(len(events), 3)
         self.assertNotIn("chip_id", events[-1])
+        self.assertEqual(recovery.call_count, 1)
+        self.assertEqual(recovery.call_args.args[1], device.RESET_TIMEOUT)
+        self.assertEqual(sum("read_flash" in command for command in events), 2)
+        self.assertEqual(sum("write_flash" in command for command in events), 1)
         self.assertTrue(all(
             command[command.index("--after") + 1] == "hard_reset"
             for command in events if "read_flash" in command
+        ))
+
+    def test_live_flash_partial_timeout_can_be_followed_by_full_overwrite(self):
+        events = []
+        reference = device.SerialDevice(DEVICE, TARGET)
+        image_bytes = b"firmware"
+        write_count = [0]
+        read_count = [0]
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            image = root / "build" / "idf" / "sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(image_bytes)
+            digest = hashlib.sha256(image_bytes).hexdigest()
+
+            def fake_esptool(arguments, _device, _timeout, **_kwargs):
+                events.append(arguments)
+                if "read_flash" in arguments:
+                    read_count[0] += 1
+                    pathlib.Path(arguments[-1]).write_bytes(
+                        b"old-data" if read_count[0] == 1 else b"wrong!!!"
+                    )
+                    return
+                if "write_flash" in arguments:
+                    write_count[0] += 1
+                    if write_count[0] == 1:
+                        raise usb_recovery.DeviceError("esptool timed out")
+                    return
+                if "verify_flash" in arguments:
+                    return
+                self.fail("unexpected esptool operation")
+
+            recovery = mock.Mock()
+            error = io.StringIO()
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value={"active_offset": device.APP_SLOT_OFFSETS["app1"]}), \
+                    mock.patch.object(device, "confirm_basename", return_value=None), \
+                    mock.patch.object(device, "_run_baseline", return_value=None), \
+                    mock.patch.object(device, "run_esptool", recovery), \
+                    mock.patch.object(device, "_run_esptool", side_effect=fake_esptool), \
+                    mock.patch("sys.stderr", error):
+                first_result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+                second_result, second_output = self.run_main([
+                    "--device", DEVICE, "flash-app0", str(image), "--live",
+                    "--confirm", "usb-test", "--sha256", digest,
+                ])
+
+        self.assertNotEqual(first_result, 0)
+        self.assertIn("app flash readback SHA-256 mismatch", error.getvalue())
+        self.assertEqual(recovery.call_count, 1)
+        self.assertEqual(read_count[0], 3)
+        self.assertEqual(write_count[0], 2)
+        self.assertEqual(sum("read_flash" in command for command in events[:3]), 2)
+        self.assertEqual(sum("write_flash" in command for command in events[:3]), 1)
+        self.assertEqual(second_result, 0)
+        self.assertEqual(json.loads(second_output)["status"], "flashed")
+        self.assertEqual(sum("verify_flash" in command for command in events), 1)
+        self.assertTrue(all(
+            command[command.index("--after") + 1] == "hard_reset"
+            for command in events
         ))
 
     def test_live_flash_pre_read_matching_is_explicit_noop(self):

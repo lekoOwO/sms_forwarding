@@ -86,8 +86,9 @@ CONTAINER_TIMEOUT = 30.0
 CONTAINER_STARTUP_TIMEOUT = 30.0
 CONTAINER_LIFECYCLE_TIMEOUT = CONTAINER_TIMEOUT + CONTAINER_STARTUP_TIMEOUT * 2
 CONTAINER_NAME_PREFIX = "sms-forwarding-device"
-FLASH_READBACK_MIN_BYTES_PER_SECOND = 8 * 1024
-FLASH_READBACK_OVERHEAD = 30.0
+FLASH_OPERATION_MIN_BYTES_PER_SECOND = 8 * 1024
+FLASH_OPERATION_OVERHEAD = 60.0
+FLASH_OPERATION_MAX_TIMEOUT = 300.0
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
@@ -2102,10 +2103,13 @@ def _is_esptool_timeout(error: BaseException) -> bool:
     )
 
 
-def _flash_readback_timeout(size: int) -> float:
-    return max(
-        RESET_TIMEOUT,
-        FLASH_READBACK_OVERHEAD + size / FLASH_READBACK_MIN_BYTES_PER_SECOND,
+def _flash_operation_timeout(size: int) -> float:
+    return min(
+        FLASH_OPERATION_MAX_TIMEOUT,
+        max(
+            RESET_TIMEOUT,
+            FLASH_OPERATION_OVERHEAD + size / FLASH_OPERATION_MIN_BYTES_PER_SECOND,
+        ),
     )
 
 
@@ -2212,9 +2216,9 @@ def _flash_command(args: argparse.Namespace) -> int:
         if active_offset == offset:
             raise usb_recovery.DeviceError("cannot flash the active app slot")
 
-        readback_timeout = _flash_readback_timeout(size)
+        operation_timeout = _flash_operation_timeout(size)
         before_digest = _read_app_flash_digest(
-            device_path, expected_target, offset, size, readback_timeout,
+            device_path, expected_target, offset, size, operation_timeout,
         )
         if before_digest == digest:
             plan.update({
@@ -2234,20 +2238,20 @@ def _flash_command(args: argparse.Namespace) -> int:
         reconciled = False
         try:
             _flash_esptool(
-                device_path, expected_target, arguments, RESET_TIMEOUT, image=snapshot,
+                device_path, expected_target, arguments, operation_timeout, image=snapshot,
             )
         except usb_recovery.DeviceError as error:
             if not _is_esptool_timeout(error):
                 raise
             after_digest = _read_app_flash_digest(
-                device_path, expected_target, offset, size, readback_timeout,
+                device_path, expected_target, offset, size, operation_timeout,
             )
             if after_digest != digest:
                 raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch") from error
             reconciled = True
         else:
             _verify_app_flash(
-                device_path, expected_target, snapshot, offset, RESET_TIMEOUT,
+                device_path, expected_target, snapshot, offset, operation_timeout,
             )
         plan.update({
             "status": "reconciled" if reconciled else "flashed",
