@@ -1672,6 +1672,12 @@ class DeviceCommandTest(unittest.TestCase):
         profile.mkdir(parents=True)
         image = profile / "sms_forwarding_idf.bin"
         image.write_bytes(b"active-bootstrap-image")
+        production_der = b"active-production-public-key"
+        production_path = root / "components" / "idf_web" / "ota_public_key.der.b64"
+        production_path.parent.mkdir(parents=True)
+        production_path.write_text(
+            base64.b64encode(production_der).decode("ascii") + "\n", encoding="ascii"
+        )
         if test_profile:
             key_der = b"active-test-public-key"
             key_path = profile / "ota_test_public_key.der.b64"
@@ -1686,10 +1692,7 @@ class DeviceCommandTest(unittest.TestCase):
                 encoding="ascii",
             )
         else:
-            key_der = b"active-production-public-key"
-            key_path = root / "components" / "idf_web" / "ota_public_key.der.b64"
-            key_path.parent.mkdir(parents=True)
-            key_path.write_text(base64.b64encode(key_der).decode("ascii") + "\n", encoding="ascii")
+            key_der = production_der
             (profile / "CMakeCache.txt").write_text(
                 "FIRMWARE_IS_RELEASE:STRING=0\n"
                 "SMS_USB_RECOVERY:STRING=1\n"
@@ -1719,6 +1722,15 @@ class DeviceCommandTest(unittest.TestCase):
             "--replace-active", "--confirm-active", "app1", "--live",
             "--confirm", "usb-test", "--sha256", digest, *extra,
         ]
+
+    def _rotate_args(self, image, digest, new_key, *extra):
+        return self._active_args(
+            image, digest, "--rotate-test-key", "--confirm-new-key", new_key, *extra,
+        )
+
+    @staticmethod
+    def _nonproduction_key():
+        return "1" * 64
 
     def test_replace_active_requires_both_exact_confirmations(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2150,6 +2162,196 @@ class DeviceCommandTest(unittest.TestCase):
                     resolve.assert_called_once()
                     esptool.assert_not_called()
                     cache.write_text(original, encoding="ascii")
+
+    def test_rotate_test_key_requires_replace_active_and_live(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp, test_profile=True)
+            cases = (
+                ["--rotate-test-key", "--confirm-new-key", key],
+                ["--replace-active", "--confirm-active", "app1", "--confirm-new-key", key],
+                ["--replace-active", "--confirm-active", "app1", "--live", "--confirm", "usb-test", "--rotate-test-key"],
+            )
+            for options in cases:
+                with self.subTest(options=options), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device") as resolve:
+                    try:
+                        result, _ = self.run_main([
+                            "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                            *options, "--sha256", digest,
+                        ])
+                    except SystemExit as exc:
+                        self.fail(f"rotation options were not accepted: {exc}")
+                self.assertNotEqual(result, 0)
+                resolve.assert_not_called()
+
+    def test_rotate_test_key_requires_exact_new_key_and_device_confirmations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            cases = (
+                ("missing-new-key", ["--rotate-test-key", "--confirm-active", "app1", "--live", "--confirm", "usb-test"]),
+                ("wrong-new-key", ["--replace-active", "--confirm-active", "app1", "--live", "--confirm", "usb-test", "--rotate-test-key", "--confirm-new-key", "0" * 64]),
+                ("missing-device", ["--rotate-test-key", "--confirm-active", "app1", "--live", "--confirm-new-key", new_key]),
+            )
+            for name, options in cases:
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                        mock.patch.object(device, "_ota_state", return_value=self._active_state(self._nonproduction_key())), \
+                        mock.patch.object(
+                            device, "confirm_basename",
+                            side_effect=(
+                                ValueError("exact device basename confirmation is required")
+                                if name == "missing-device" else None
+                            ),
+                        ), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_flash_esptool") as esptool:
+                    args = [
+                        "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                        *options, "--sha256", digest,
+                    ]
+                    error = io.StringIO()
+                    with mock.patch("sys.stderr", error):
+                        result, _ = self.run_main(args)
+                self.assertNotEqual(result, 0)
+                esptool.assert_not_called()
+                if name == "wrong-new-key":
+                    self.assertIn("--confirm-new-key must match", error.getvalue())
+
+    def test_rotate_test_key_rejects_production_or_null_current_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            production_key = hashlib.sha256(b"active-production-public-key").hexdigest()
+            for current_key in (production_key, None):
+                with self.subTest(current_key=current_key), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                        mock.patch.object(device, "_ota_state", return_value=self._active_state(current_key)), \
+                        mock.patch.object(device, "confirm_basename"), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_read_app_flash_digest") as readback, \
+                        mock.patch.object(device, "_flash_esptool") as esptool:
+                    result, _ = self.run_main(self._rotate_args(image, digest, new_key))
+                self.assertNotEqual(result, 0)
+                readback.assert_not_called()
+                esptool.assert_not_called()
+
+    def test_rotate_test_key_rejects_production_or_unhealthy_candidate_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, test_image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            production_image = root / "build" / "idf-usb-recovery" / "sms_forwarding_idf.bin"
+            production_image.parent.mkdir(parents=True)
+            production_image.write_bytes(test_image.read_bytes())
+            production_cache = production_image.parent / "CMakeCache.txt"
+            production_cache.write_text(
+                "FIRMWARE_IS_RELEASE:STRING=0\n"
+                "SMS_USB_RECOVERY:STRING=1\n"
+                "SMS_OTA_TEST_KEY:STRING=0\n"
+                "SMS_OTA_TEST_FAIL_HEALTH:STRING=0\n",
+                encoding="ascii",
+            )
+            for name, image, mutate in (
+                ("production", production_image, None),
+                ("unhealthy", test_image, "SMS_OTA_TEST_FAIL_HEALTH:STRING=0"),
+            ):
+                if mutate:
+                    cache = test_image.parent / "CMakeCache.txt"
+                    cache.write_text(
+                        cache.read_text(encoding="ascii").replace(mutate, "SMS_OTA_TEST_FAIL_HEALTH:STRING=1"),
+                        encoding="ascii",
+                    )
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                        mock.patch.object(device, "_ota_state", return_value=self._active_state(self._nonproduction_key())), \
+                        mock.patch.object(device, "confirm_basename"), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_read_app_flash_digest") as readback:
+                    result, _ = self.run_main(self._rotate_args(image, digest, new_key))
+                self.assertNotEqual(result, 0)
+                readback.assert_not_called()
+
+    def test_rotate_test_key_rejects_test_profile_with_production_embedded_key(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, _new_key = self._active_image_fixture(temp, test_profile=True)
+            production_der = b"active-production-public-key"
+            production_key = hashlib.sha256(production_der).hexdigest()
+            (image.parent / "ota_test_public_key.der.b64").write_text(
+                base64.b64encode(production_der).decode("ascii") + "\n", encoding="ascii"
+            )
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "_ota_state", return_value=self._active_state(self._nonproduction_key())), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest") as readback, \
+                    mock.patch.object(device, "_flash_esptool") as esptool:
+                result, _ = self.run_main(self._rotate_args(image, digest, production_key))
+        self.assertNotEqual(result, 0)
+        readback.assert_not_called()
+        esptool.assert_not_called()
+
+    def test_rotate_test_key_rejects_same_key_and_state_drift(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            same = self._active_state(new_key)
+            old = self._active_state(self._nonproduction_key())
+            drifted = self._active_state(self._nonproduction_key(), accepted=8)
+            for name, states in (("same-key", [same]), ("state-drift", [old, drifted])):
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                        mock.patch.object(device, "_ota_state", side_effect=states), \
+                        mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                        mock.patch.object(device, "confirm_basename"), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_read_app_flash_digest", return_value="0" * 64), \
+                        mock.patch.object(device, "_flash_esptool") as esptool:
+                    result, _ = self.run_main(self._rotate_args(image, digest, new_key))
+                self.assertNotEqual(result, 0)
+                esptool.assert_not_called()
+
+    def test_rotate_test_key_happy_path_writes_and_verifies_new_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            old = self._active_state(self._nonproduction_key())
+            new = self._active_state(new_key)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "_ota_state", side_effect=[old, old, new]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=["0" * 64, digest]), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool") as reset, \
+                    mock.patch.object(device, "_reset_state_after_boot", return_value={"boot_id": 12}):
+                result, _ = self.run_main(self._rotate_args(image, digest, new_key))
+        self.assertEqual(result, 0)
+        reset.assert_called_once()
+
+    def test_rotate_test_key_rejects_postboot_key_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, new_key = self._active_image_fixture(temp, test_profile=True)
+            old = self._active_state(self._nonproduction_key())
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                    mock.patch.object(device, "_ota_state", side_effect=[old, old, old]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=["0" * 64, digest]), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool"), \
+                    mock.patch.object(device, "_reset_state_after_boot", return_value={"boot_id": 12}):
+                error = io.StringIO()
+                with mock.patch("sys.stderr", error):
+                    result, _ = self.run_main(self._rotate_args(image, digest, new_key))
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app flash post-reset verification failed", error.getvalue())
 
     def test_live_flash_runs_baseline_before_hash_and_fixed_write(self):
         events = []
@@ -2583,10 +2785,13 @@ class DeviceCommandTest(unittest.TestCase):
                     image.write_bytes(b"firmware")
                     digest = hashlib.sha256(image.read_bytes()).hexdigest()
 
-                    def fake_esptool(arguments, _device, _timeout, **_kwargs):
-                        events.append(arguments)
+                    def fake_esptool(
+                        arguments, _device, _timeout, *, error=pre_read_error,
+                        _events=events, **_kwargs,
+                    ):
+                        _events.append(arguments)
                         if "read_flash" in arguments:
-                            raise pre_read_error
+                            raise error
 
                     recovery = mock.Mock()
                     with mock.patch.object(device, "ROOT", root), \

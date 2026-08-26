@@ -2224,34 +2224,53 @@ def _read_active_public_key(path: Path, *, encoded: bool, label: str) -> bytes:
     return key
 
 
+def _active_test_profile_identity(profile: Path) -> str:
+    expected = {
+        "FIRMWARE_IS_RELEASE": "0",
+        "SMS_USB_RECOVERY": "1",
+        "SMS_OTA_TEST_KEY": "1",
+        "SMS_OTA_TEST_FAIL_HEALTH": "0",
+    }
+    if _profile_cache_flags(profile) != expected:
+        raise usb_recovery.DeviceError("OTA test image requires a verified healthy dev profile")
+    configured_key = _profile_cache_value(profile, "SMS_OTA_TEST_PUBLIC_KEY")
+    key_path = profile / "ota_test_public_key.der.b64"
+    try:
+        configured_path = Path(configured_key)
+        cache_root = Path(_profile_cache_value(profile, "CMAKE_HOME_DIRECTORY"))
+        if not configured_path.is_absolute() or not cache_root.is_absolute():
+            raise ValueError("profile paths must be absolute")
+        if configured_path.relative_to(cache_root) != key_path.relative_to(ROOT):
+            raise ValueError("key path mismatch")
+    except (OSError, ValueError) as exc:
+        raise usb_recovery.DeviceError("OTA test image key profile is unavailable") from exc
+    key = _read_active_public_key(
+        key_path, encoded=True, label="OTA test public key",
+    )
+    return hashlib.sha256(key).hexdigest()
+
+
+def _production_image_identity() -> str:
+    key = _read_active_public_key(
+        ROOT / "components" / "idf_web" / "ota_public_key.der.b64",
+        encoded=True, label="production OTA public key",
+    )
+    return hashlib.sha256(key).hexdigest()
+
+
+def _active_test_image_identity(image: Path) -> str:
+    profile = image.parent.resolve(strict=True)
+    if profile != (ROOT / "build" / "idf-ota-test").resolve():
+        raise usb_recovery.DeviceError("test-key rotation requires an OTA test build profile")
+    return _active_test_profile_identity(profile)
+
+
 def _active_image_identity(image: Path) -> str:
     profile = image.parent.resolve(strict=True)
     ota_test_profile = (ROOT / "build" / "idf-ota-test").resolve()
     usb_profile = (ROOT / "build" / "idf-usb-recovery").resolve()
     if profile == ota_test_profile:
-        expected = {
-            "FIRMWARE_IS_RELEASE": "0",
-            "SMS_USB_RECOVERY": "1",
-            "SMS_OTA_TEST_KEY": "1",
-            "SMS_OTA_TEST_FAIL_HEALTH": "0",
-        }
-        if _profile_cache_flags(profile) != expected:
-            raise usb_recovery.DeviceError("OTA test image requires a verified healthy dev profile")
-        configured_key = _profile_cache_value(profile, "SMS_OTA_TEST_PUBLIC_KEY")
-        key_path = profile / "ota_test_public_key.der.b64"
-        try:
-            configured_path = Path(configured_key)
-            cache_root = Path(_profile_cache_value(profile, "CMAKE_HOME_DIRECTORY"))
-            if not configured_path.is_absolute() or not cache_root.is_absolute():
-                raise ValueError("profile paths must be absolute")
-            if configured_path.relative_to(cache_root) != key_path.relative_to(ROOT):
-                raise ValueError("key path mismatch")
-        except (OSError, ValueError) as exc:
-            raise usb_recovery.DeviceError("OTA test image key profile is unavailable") from exc
-        key = _read_active_public_key(
-            key_path, encoded=True, label="OTA test public key",
-        )
-        return hashlib.sha256(key).hexdigest()
+        return _active_test_profile_identity(profile)
     if profile != usb_profile or _profile_cache_flags(profile) != {
         "FIRMWARE_IS_RELEASE": "0",
         "SMS_USB_RECOVERY": "1",
@@ -2259,11 +2278,7 @@ def _active_image_identity(image: Path) -> str:
         "SMS_OTA_TEST_FAIL_HEALTH": "0",
     }:
         raise usb_recovery.DeviceError("active app replacement requires a USB recovery build profile")
-    key = _read_active_public_key(
-        ROOT / "components" / "idf_web" / "ota_public_key.der.b64",
-        encoded=True, label="production OTA public key",
-    )
-    return hashlib.sha256(key).hexdigest()
+    return _production_image_identity()
 
 
 def _active_ota_state(device: SerialDevice, deadline: float) -> dict[str, object]:
@@ -2274,7 +2289,7 @@ def _active_ota_state(device: SerialDevice, deadline: float) -> dict[str, object
 
 
 def _validate_active_ota_state(
-    state: dict[str, object], offset: int, identity: str,
+    state: dict[str, object], offset: int, identity: str, *, allow_key_mismatch: bool = False,
 ) -> None:
     pending = state.get("pending")
     pending_address = state.get("pending_address")
@@ -2285,7 +2300,7 @@ def _validate_active_ota_state(
         or not isinstance(pending, int) or isinstance(pending, bool) or pending != 0
         or not isinstance(pending_address, int)
         or isinstance(pending_address, bool) or pending_address != 0
-        or state.get("public_key_sha256") != identity
+        or (not allow_key_mismatch and state.get("public_key_sha256") != identity)
     ):
         raise usb_recovery.DeviceError("active app replacement OTA state is unsafe")
 
@@ -2299,11 +2314,11 @@ def _active_target(device_path: str, expected_target: str) -> SerialDevice:
 
 def _recheck_active_state(
     device_path: str, expected_target: str, offset: int,
-    identity: str, initial: dict[str, object], deadline: float,
+    identity: str, initial: dict[str, object], deadline: float, *, allow_key_mismatch: bool = False,
 ) -> SerialDevice:
     device = _active_target(device_path, expected_target)
     state = _active_ota_state(device, deadline)
-    _validate_active_ota_state(state, offset, identity)
+    _validate_active_ota_state(state, offset, identity, allow_key_mismatch=allow_key_mismatch)
     if state != initial:
         raise usb_recovery.DeviceError("active app replacement OTA state changed")
     return device
@@ -2312,13 +2327,26 @@ def _recheck_active_state(
 def _replace_active_app(
     device_path: str, expected_target: str, device: SerialDevice,
     image: Path, snapshot: Path, offset: int, size: int, digest: str,
-    plan: dict[str, object],
+    plan: dict[str, object], *, rotate_test_key: bool = False,
+    confirmed_identity: str | None = None,
 ) -> int:
-    identity = _active_image_identity(image)
+    identity = _active_test_image_identity(image) if rotate_test_key else _active_image_identity(image)
+    production_identity = _production_image_identity() if rotate_test_key else None
+    if rotate_test_key:
+        if confirmed_identity is None or confirmed_identity.lower() != identity:
+            raise ValueError("--confirm-new-key must match the candidate public-key SHA-256")
+        if identity == production_identity:
+            raise usb_recovery.DeviceError("test-key rotation requires a non-production candidate key")
     operation_timeout = _flash_operation_timeout(size)
     deadline = time.monotonic() + operation_timeout + RESET_TIMEOUT + STATE_TIMEOUT
     initial_state = _active_ota_state(device, deadline)
-    _validate_active_ota_state(initial_state, offset, identity)
+    if rotate_test_key:
+        current_identity = initial_state["public_key_sha256"]
+        if current_identity == production_identity or current_identity == identity:
+            raise usb_recovery.DeviceError("test-key rotation requires a different non-production key")
+    _validate_active_ota_state(
+        initial_state, offset, identity, allow_key_mismatch=rotate_test_key,
+    )
 
     try:
         _read_app_flash_digest(
@@ -2330,6 +2358,7 @@ def _replace_active_app(
 
     device = _recheck_active_state(
         device_path, expected_target, offset, identity, initial_state, deadline,
+        allow_key_mismatch=rotate_test_key,
     )
     runtime_state = _state(device, deadline=deadline)
     previous_boot_id = runtime_state.get("boot_id")
@@ -2461,6 +2490,21 @@ def _flash_command(args: argparse.Namespace) -> int:
     device_path = resolve_device(args.device)
     replace_active = bool(getattr(args, "replace_active", False))
     confirm_active = getattr(args, "confirm_active", None)
+    rotate_test_key = bool(getattr(args, "rotate_test_key", False))
+    confirm_new_key = getattr(args, "confirm_new_key", None)
+    if rotate_test_key and not replace_active:
+        raise ValueError("--rotate-test-key requires --replace-active")
+    if confirm_new_key is not None and not rotate_test_key:
+        raise ValueError("--confirm-new-key requires --rotate-test-key")
+    if rotate_test_key and not args.live:
+        raise ValueError("--rotate-test-key requires --live")
+    if rotate_test_key and args.live and confirm_new_key is None:
+        raise ValueError("--confirm-new-key is required for test-key rotation")
+    if confirm_new_key is not None and (
+        len(confirm_new_key) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in confirm_new_key)
+    ):
+        raise ValueError("--confirm-new-key must be a 64-character SHA-256 pin")
     if confirm_active is not None and not replace_active:
         raise ValueError("--confirm-active requires --replace-active")
     if replace_active and confirm_active is not None and confirm_active != args.slot:
@@ -2514,7 +2558,8 @@ def _flash_command(args: argparse.Namespace) -> int:
                 raise ValueError("--confirm-active must match --slot")
             return _replace_active_app(
                 device_path, expected_target, device, image, snapshot,
-                offset, size, digest, plan,
+                offset, size, digest, plan, rotate_test_key=rotate_test_key,
+                confirmed_identity=confirm_new_key,
             )
         _ensure_inactive_app_slot(device, offset)
 
@@ -2805,6 +2850,14 @@ def build_parser() -> argparse.ArgumentParser:
     flash.add_argument(
         "--confirm-active", choices=tuple(APP_SLOT_OFFSETS), default=None,
         help="repeat the active slot name for one-time recovery",
+    )
+    flash.add_argument(
+        "--rotate-test-key", action="store_true",
+        help="replace the active app with a new non-production OTA test key",
+    )
+    flash.add_argument(
+        "--confirm-new-key", default=None,
+        help="confirm the replacement OTA test public-key SHA-256",
     )
 
     flash0 = commands.add_parser("flash-app0", help="flash only the app0 slot")

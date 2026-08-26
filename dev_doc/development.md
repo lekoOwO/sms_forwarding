@@ -232,6 +232,26 @@ hard-reset，但失敗時不會寫入 flash，且會明確回報此狀態。確�
 可觀察的 compatibility identity；namespace 不作為 host 判斷依據。
 若 reset 後驗證失敗，不要盲目重試；先以唯讀 `ota-state` 確認目前 slot、state、pending metadata 與 key identity。
 
+若目前執行中的 USB recovery firmware 使用已遺失 private key 的非 production test key，
+可用下列一次性命令以新的 test key image 重建 active slot：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app1 \
+  build/idf-ota-test/sms_forwarding_idf.bin --replace-active --confirm-active app1 \
+  --rotate-test-key --confirm-new-key <new-public-key-sha256> --live \
+  --sha256 <64-hex-image-sha256> --confirm <by-id-basename>
+```
+
+`--rotate-test-key` 必須同時使用 active slot、裝置、image 與新的完整 SHA-256 confirmation；
+它只接受 non-release、USB recovery、`SMS_OTA_TEST_KEY=1`、`SMS_OTA_TEST_FAIL_HEALTH=0`
+且 cache 指向 embedded `ota_test_public_key.der.b64` 的 test profile。執行中的 key 必須存在、
+且不可是 production key；新 key 也不可與舊 key 相同。此模式不適用 production image，
+也不會放寬 pending、invalid、state drift 或 readback 檢查。
+
+新的 test private key 必須在建置時保留於 ignored profile，權限為 `0600`；不要把它加入版控，
+也不要用 test key 建立 release firmware。成功重開後，先確認 `ota-state` 顯示新的 key identity，
+再使用對應 private key 簽署後續 OTA。
+
 `ota-state` 回報 app0/app1 offset、映像狀態、目前 OTA metadata 與
 `public_key_sha256`；回報格式錯誤、
 未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。尚未完成實機 rollback、
