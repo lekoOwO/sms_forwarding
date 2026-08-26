@@ -803,3 +803,108 @@ test("missing AT and query parameters are immediate input errors", async () => {
 		await assertAction(await request(baseUrl, "/query"), 400, "ACTION_INPUT_INVALID");
 	});
 });
+
+test("modern eSIM contract masks identifiers and rejects stale or unsafe actions", async () => {
+	await withServer(async (baseUrl) => {
+		const unauthorized = await fetch(`${baseUrl}/api/esim`);
+		assert.equal(unauthorized.status, 401);
+		assert.equal(unauthorized.headers.get("cache-control"), "no-store, max-age=0");
+
+		const initial = await request(baseUrl, "/api/esim");
+		assert.equal(initial.status, 200);
+		assert.equal(initial.headers.get("cache-control"), "no-store, max-age=0");
+		const status = await initial.json();
+		assert.deepEqual(Object.keys(status).sort(), ["eid", "job", "profiles"]);
+		assert.deepEqual(Object.keys(status.eid).sort(), ["available", "length", "state"]);
+		assert.equal(typeof status.eid.available, "boolean");
+		assert.equal(typeof status.eid.length, "number");
+		assert.ok(status.profiles.length > 0);
+		assert.ok(status.profiles.every((profile) => {
+			assert.deepEqual(Object.keys(profile).sort(), ["displayId", "handle", "nickname", "profileClass", "state"]);
+			assert.equal(typeof profile.handle, "string");
+			assert.equal(typeof profile.displayId, "string");
+			assert.equal(profile.displayId, "••••");
+			return !JSON.stringify(profile).includes("8901234567890123456");
+		}));
+		assert.equal(JSON.stringify(status).includes("8901234567890123456"), false);
+
+		const query = await request(baseUrl, "/api/esim?unexpected=1");
+		assert.equal(query.status, 400);
+		assert.equal(query.headers.get("cache-control"), "no-store, max-age=0");
+		assert.equal((await query.json()).code, "ACTION_INPUT_INVALID");
+
+		const handle = status.profiles[0].handle;
+		const noCsrf = await fetch(`${baseUrl}/api/esim`, {
+			method: "POST", headers: { Authorization: auth, "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ action: "nickname", handle, nickname: "New name" })
+		});
+		assert.equal(noCsrf.status, 403);
+		assert.equal(noCsrf.headers.get("cache-control"), "no-store, max-age=0");
+		assert.equal((await noCsrf.json()).code, "ACTION_CSRF_INVALID");
+
+		const malformedHandle = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "delete", handle: "bad" })
+		});
+		assert.equal(malformedHandle.status, 400);
+		assert.equal(malformedHandle.headers.get("cache-control"), "no-store, max-age=0");
+		assert.equal((await malformedHandle.json()).code, "ACTION_INPUT_INVALID");
+
+		const unknownHandle = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "delete", handle: "p0000000000000000" })
+		});
+		assert.equal(unknownHandle.status, 409);
+		assert.equal(unknownHandle.headers.get("cache-control"), "no-store, max-age=0");
+		assert.equal((await unknownHandle.json()).code, "ACTION_ESIM_HANDLE_STALE");
+
+		const invalidNickname = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "nickname", handle, nickname: "x".repeat(65) })
+		});
+		assert.equal(invalidNickname.status, 400);
+		assert.equal(invalidNickname.headers.get("cache-control"), "no-store, max-age=0");
+		assert.equal((await invalidNickname.json()).code, "ACTION_INPUT_TOO_LONG");
+
+		const accepted = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "nickname", handle, nickname: "New name" })
+		});
+		assert.equal(accepted.status, 202);
+		assert.equal(accepted.headers.get("cache-control"), "no-store, max-age=0");
+		const acceptedBody = await accepted.json();
+		assert.deepEqual(Object.keys(acceptedBody).sort(), ["code", "data", "detail", "success"]);
+		assert.equal(acceptedBody.code, "ACTION_JOB_ACCEPTED");
+		assert.equal(typeof acceptedBody.data.jobId, "number");
+
+		const staleRefresh = await request(baseUrl, "/api/esim", { method: "POST", body: new URLSearchParams({ action: "refresh" }) });
+		assert.equal(staleRefresh.status, 202);
+		const stale = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "delete", handle })
+		});
+		assert.equal(stale.status, 409);
+		assert.equal((await stale.json()).code, "ACTION_ESIM_HANDLE_STALE");
+
+		const unsupportedMethod = await request(baseUrl, "/api/esim", { method: "PUT" });
+		assert.equal(unsupportedMethod.status, 405);
+		assert.equal(unsupportedMethod.headers.get("allow"), "GET, POST");
+		assert.equal(unsupportedMethod.headers.get("cache-control"), "no-store, max-age=0");
+	});
+});
+
+test("eSIM and API jobs admit in one direction at a time", async () => {
+	await withServer(async (baseUrl) => {
+		const apiPending = await request(baseUrl, "/ping", { method: "POST" });
+		assert.equal(apiPending.status, 202);
+		const esimBlocked = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "refresh" })
+		});
+		assert.equal(esimBlocked.status, 409);
+		assert.equal((await esimBlocked.json()).code, "ACTION_ESIM_BUSY");
+		await completed(baseUrl, apiPending);
+
+		const esimPending = await request(baseUrl, "/api/esim", {
+			method: "POST", body: new URLSearchParams({ action: "refresh" })
+		});
+		assert.equal(esimPending.status, 202);
+		const apiBlocked = await request(baseUrl, "/ping", { method: "POST" });
+		assert.equal(apiBlocked.status, 409);
+		assert.equal((await apiBlocked.json()).code, "ACTION_BUSY");
+	}, { jobDelayMs: 100 });
+});

@@ -62,6 +62,7 @@ static constexpr size_t BACKUP_CHUNK_BYTES = 8192;
 static constexpr uint32_t OTA_TTL_MS = 120000;
 static std::atomic<bool> s_device_restart_pending{false};
 static std::atomic<bool> s_push_test_admission_active{false};
+static std::atomic<bool> s_shared_admission_active{false};
 static std::atomic<bool> s_restore_restart_pending{false};
 static std::atomic<uint32_t> s_restore_restart_completed_ms{0};
 
@@ -96,6 +97,23 @@ static bool device_restart_pending()
            idf_web_ota_restart_pending();
 }
 
+static bool try_shared_admission(bool push_test_owner)
+{
+    if (!push_test_owner && s_push_test_admission_active.load(std::memory_order_acquire)) return false;
+    return !s_shared_admission_active.exchange(true, std::memory_order_acq_rel);
+}
+
+static void release_shared_admission()
+{
+    s_shared_admission_active.store(false, std::memory_order_release);
+}
+
+static bool shared_admission_active()
+{
+    return s_shared_admission_active.load(std::memory_order_acquire) ||
+           s_push_test_admission_active.load(std::memory_order_acquire);
+}
+
 static bool restore_restart_pending()
 {
     return s_restore_restart_pending.load(std::memory_order_acquire);
@@ -120,6 +138,7 @@ static uint32_t s_next_api_job_id = 1;
 static IdfWebTransfer s_backup_transfer;
 
 struct WebAsyncJob {
+    uint32_t id = 0;
     bool running = false;
     bool done = false;
     bool success = false;
@@ -131,6 +150,7 @@ struct WebAsyncJob {
 struct EsimWebCache {
     std::string eid;
     std::vector<IdfEsimProfile> profiles;
+    std::vector<std::string> handles;
     uint32_t updatedAt = 0;
 };
 
@@ -139,6 +159,7 @@ static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
 static EsimWebCache s_esim_cache;
+static uint32_t s_next_esim_job_id = 1;
 static bool s_modem_apply_running = false;
 static bool s_web_modem_action_running = false;
 
@@ -149,7 +170,7 @@ static bool cellular_job_active(bool allow_device_restart = false);
 static void set_json_no_cache(httpd_req_t* req);
 static bool get_query_param(httpd_req_t* req, const char* key, std::string& out, size_t max_query);
 static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::string& arg,
-                                 IdfWebOwnedBytes binary = {});
+                                 IdfWebOwnedBytes binary = {}, bool admission_claimed = false);
 static std::string run_save_job(const std::string& body);
 static bool valid_ussd_code(const std::string& code);
 static bool run_ussd(const std::string& code, std::string& resp_out);
@@ -287,9 +308,9 @@ static bool auth_matches_config(const char* auth)
     return idf_config_check_web_auth(decoded_text, colon + 1);
 }
 
-static bool check_auth(httpd_req_t* req)
+static bool check_auth(httpd_req_t* req, bool allow_ap = true)
 {
-    if (idf_web_ap_auth_bypass(idf_wifi_is_ap_mode(), request_is_on_ap_interface(req), req->uri)) return true;
+    if (allow_ap && idf_web_ap_auth_bypass(idf_wifi_is_ap_mode(), request_is_on_ap_interface(req), req->uri)) return true;
     char auth[512] = {};
     if (httpd_req_get_hdr_value_str(req, "Authorization", auth, sizeof(auth)) == ESP_OK &&
         auth_matches_config(auth)) {
@@ -301,6 +322,11 @@ static bool check_auth(httpd_req_t* req)
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"SMS Forwarding\"");
     httpd_resp_sendstr(req, "Unauthorized");
     return false;
+}
+
+static bool check_auth_strict(httpd_req_t* req)
+{
+    return check_auth(req, false);
 }
 
 static bool check_csrf(httpd_req_t* req)
@@ -1531,9 +1557,14 @@ static void api_job_task(void* raw)
 }
 
 static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::string& arg,
-                                 IdfWebOwnedBytes binary)
+                                 IdfWebOwnedBytes binary, bool admission_claimed)
 {
     set_json_no_cache(req);
+    if (!admission_claimed && !try_shared_admission(false)) {
+        idf_web_secure_clear(binary);
+        httpd_resp_set_status(req, "409 Conflict");
+        return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_BUSY\",\"data\":{},\"detail\":\"\"}");
+    }
     const bool backup_job = strcmp(type, "backup_export") == 0 || strcmp(type, "backup_restore") == 0;
     const bool crypto_job = backup_job || strcmp(type, "ota_finish") == 0;
     const bool ota_job = strcmp(type, "ota_finish") == 0;
@@ -1542,6 +1573,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
         ((device_restart_pending() || restore_restart_pending()) && strcmp(type, "query") != 0)) {
         idf_web_secure_clear(binary);
         if (backup_job) backup_clear_claim();
+        release_shared_admission();
         httpd_resp_set_status(req, "409 Conflict");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_BUSY\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1549,6 +1581,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
         idf_web_secure_clear(binary);
         if (backup_job) backup_clear_claim();
         if (ota_job) { uint32_t id = 0; if (parse_u32_strict(arg.c_str(), id, false)) idf_web_ota_cancel_finish(id); }
+        release_shared_admission();
         httpd_resp_set_status(req, "429 Too Many Requests");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_JOB_QUEUE_FULL\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1563,6 +1596,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
         idf_web_secure_clear(binary);
         if (backup_job) backup_clear_claim();
         if (ota_job) { uint32_t id = 0; if (parse_u32_strict(arg.c_str(), id, false)) idf_web_ota_cancel_finish(id); }
+        release_shared_admission();
         httpd_resp_set_status(req, "429 Too Many Requests");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_JOB_QUEUE_FULL\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1588,6 +1622,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
         xSemaphoreGive(s_api_job_mutex);
         if (backup_job) backup_clear_claim();
         if (ota_job) { uint32_t upload_id = 0; if (parse_u32_strict(arg.c_str(), upload_id, false)) idf_web_ota_cancel_finish(upload_id); }
+        release_shared_admission();
         httpd_resp_set_status(req, "429 Too Many Requests");
         return httpd_resp_sendstr(req, "{\"success\":false,\"code\":\"ACTION_JOB_QUEUE_FULL\",\"data\":{},\"detail\":\"\"}");
     }
@@ -1596,6 +1631,7 @@ static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::
              "{\"success\":true,\"code\":\"ACTION_JOB_ACCEPTED\",\"data\":{\"jobId\":%u},\"detail\":\"\"}",
              static_cast<unsigned>(id));
     idf_logf("API job accepted id=%u restore=%u", static_cast<unsigned>(id), restore_job ? 1U : 0U);
+    release_shared_admission();
     httpd_resp_set_status(req, "202 Accepted");
     return httpd_resp_sendstr(req, response);
 }
@@ -1704,7 +1740,7 @@ static bool reject_restart_while_backup_active(httpd_req_t* req)
 {
     if (!backup_transfer_active() && !ota_active() && !device_restart_pending() &&
         !restore_restart_pending() &&
-        !api_jobs_active() && !idf_push_test_active()) return false;
+        !api_jobs_active() && !shared_admission_active() && !idf_push_test_active()) return false;
     send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     return true;
 }
@@ -1744,12 +1780,20 @@ static esp_err_t handle_config_export(httpd_req_t* req)
     if (req->method != HTTP_POST) {
         return send_backup_result(req, "405 Method Not Allowed", false, "ACTION_INPUT_INVALID");
     }
+    if (!try_shared_admission(false)) {
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     if (ota_active() || device_restart_pending() || restore_restart_pending() ||
         idf_push_test_active()) {
+        release_shared_admission();
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
-    if (read_body(req, body, 1024) != ESP_OK) { idf_web_secure_clear(body); return ESP_OK; }
+    if (read_body(req, body, 1024) != ESP_OK) {
+        idf_web_secure_clear(body);
+        release_shared_admission();
+        return ESP_OK;
+    }
     IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 1);
     idf_web_secure_clear(body);
     std::string passphrase = decoded.valid && decoded.fields.size() == 1 &&
@@ -1757,6 +1801,7 @@ static esp_err_t handle_config_export(httpd_req_t* req)
     clear_form_fields(decoded);
     if (!idf_web_valid_backup_passphrase(passphrase)) {
         idf_web_secure_clear(passphrase);
+        release_shared_admission();
         return send_backup_result(req, "400 Bad Request", false, "ACTION_CONFIG_PASSPHRASE_INVALID");
     }
     bool claimed = false;
@@ -1772,8 +1817,10 @@ static esp_err_t handle_config_export(httpd_req_t* req)
     }
     if (!claimed) {
         idf_web_secure_clear(passphrase);
+        release_shared_admission();
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
+    release_shared_admission();
     const esp_err_t err = enqueue_api_job(req, "backup_export", passphrase);
     idf_web_secure_clear(passphrase);
     return err;
@@ -1784,12 +1831,19 @@ static esp_err_t handle_config_restore_start(httpd_req_t* req)
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
     if (!check_csrf(req)) return ESP_OK;
+    if (!try_shared_admission(false)) {
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     if (ota_active() || device_restart_pending() || restore_restart_pending() || idf_push_test_active() ||
         backup_transfer_active()) {
+        release_shared_admission();
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
-    if (read_body(req, body, 1024) != ESP_OK) return ESP_OK;
+    if (read_body(req, body, 1024) != ESP_OK) {
+        release_shared_admission();
+        return ESP_OK;
+    }
     IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 1);
     idf_web_secure_clear(body);
     uint32_t size = 0;
@@ -1797,8 +1851,12 @@ static esp_err_t handle_config_restore_start(httpd_req_t* req)
         parse_u32_strict(decoded.fields[0].second.c_str(), size, false) &&
         size >= BACKUP_HEADER_BYTES + BACKUP_TAG_BYTES && size <= MAX_ENCRYPTED_CONFIG_BYTES;
     clear_form_fields(decoded);
-    if (!valid) return send_backup_result(req, "400 Bad Request", false, "ACTION_CONFIG_RESTORE_INVALID");
+    if (!valid) {
+        release_shared_admission();
+        return send_backup_result(req, "400 Bad Request", false, "ACTION_CONFIG_RESTORE_INVALID");
+    }
     if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < size) {
+        release_shared_admission();
         return send_backup_result(req, "409 Conflict", false, "ACTION_CONFIG_RESTORE_START_FAILED");
     }
     const uint32_t id = next_transfer_id();
@@ -1809,7 +1867,11 @@ static esp_err_t handle_config_restore_start(httpd_req_t* req)
                                          id, size, web_now_ms());
         backup_unlock();
     }
-    if (!started) return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    if (!started) {
+        release_shared_admission();
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
+    release_shared_admission();
     const std::string data = "\"uploadId\":" + std::to_string(id) +
         ",\"chunkSize\":" + std::to_string(BACKUP_CHUNK_BYTES) + ",\"nextOffset\":0";
     return send_backup_result(req, "201 Created", true, "ACTION_CONFIG_RESTORE_STARTED", data);
@@ -1910,6 +1972,10 @@ static esp_err_t handle_config_restore_finish(httpd_req_t* req)
         backup_cancel_upload(id);
         return send_backup_result(req, "400 Bad Request", false, "ACTION_CONFIG_PASSPHRASE_INVALID");
     }
+    if (!try_shared_admission(false)) {
+        idf_web_secure_clear(passphrase);
+        return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     IdfWebOwnedBytes encrypted;
     bool complete = false;
     if (backup_lock(portMAX_DELAY)) {
@@ -1924,9 +1990,10 @@ static esp_err_t handle_config_restore_finish(httpd_req_t* req)
     }
     if (!complete) {
         idf_web_secure_clear(passphrase);
+        release_shared_admission();
         return send_backup_result(req, "409 Conflict", false, "ACTION_CONFIG_RESTORE_FINISH_INVALID");
     }
-    const esp_err_t err = enqueue_api_job(req, "backup_restore", passphrase, std::move(encrypted));
+    const esp_err_t err = enqueue_api_job(req, "backup_restore", passphrase, std::move(encrypted), true);
     idf_web_secure_clear(passphrase);
     idf_web_secure_clear(encrypted);
     return err;
@@ -1963,13 +2030,20 @@ static esp_err_t handle_ota_start(httpd_req_t* req)
 {
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
+    if (!try_shared_admission(false)) {
+        return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     if (device_restart_pending() || restore_restart_pending() || ota_active() || backup_transfer_active() ||
         idf_push_test_active() ||
         api_jobs_active() || cellular_job_active()) {
+        release_shared_admission();
         return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string body;
-    if (read_body(req, body, 1024) != ESP_OK) return ESP_OK;
+    if (read_body(req, body, 1024) != ESP_OK) {
+        release_shared_admission();
+        return ESP_OK;
+    }
     IdfWebFormDecodeResult decoded = idf_web_decode_form(body, 2);
     idf_web_secure_clear(body);
     std::string manifest;
@@ -1984,12 +2058,14 @@ static esp_err_t handle_ota_start(httpd_req_t* req)
     clear_form_fields(decoded);
     if (manifest.empty() || manifest.size() > IDF_WEB_OTA_MAX_MANIFEST_BYTES) {
         idf_web_secure_clear(manifest); idf_web_secure_clear(signature_hex);
+        release_shared_admission();
         return send_ota_result(req, "400 Bad Request", false, "ACTION_OTA_MANIFEST_INVALID");
     }
     uint8_t signature[72] = {};
     size_t signature_size = 0;
     if (!decode_lower_hex_signature(signature_hex, signature, signature_size)) {
         idf_web_secure_clear(manifest); idf_web_secure_clear(signature_hex);
+        release_shared_admission();
         return send_ota_result(req, "400 Bad Request", false, "ACTION_OTA_SIGNATURE_INVALID");
     }
     idf_web_secure_clear(signature_hex);
@@ -1999,19 +2075,24 @@ static esp_err_t handle_ota_start(httpd_req_t* req)
     memset(signature, 0, sizeof(signature));
     idf_web_secure_clear(manifest);
     if (result == IdfWebOtaCode::Ok) {
+        release_shared_admission();
         return send_ota_result(req, "201 Created", true, "ACTION_OTA_UPLOAD_STARTED",
             "\"uploadId\":" + std::to_string(id) + ",\"chunkSize\":" +
             std::to_string(IDF_WEB_OTA_CHUNK_BYTES) + ",\"nextOffset\":0");
     }
     if (result == IdfWebOtaCode::SignatureInvalid) {
+        release_shared_admission();
         return send_ota_result(req, "400 Bad Request", false, "ACTION_OTA_SIGNATURE_INVALID");
     }
     if (result == IdfWebOtaCode::ManifestInvalid || result == IdfWebOtaCode::Replay) {
+        release_shared_admission();
         return send_ota_result(req, "400 Bad Request", false, "ACTION_OTA_MANIFEST_INVALID");
     }
     if (result == IdfWebOtaCode::Busy) {
+        release_shared_admission();
         return send_ota_result(req, "409 Conflict", false, "ACTION_OTA_BUSY");
     }
+    release_shared_admission();
     return send_ota_result(req, "500 Internal Server Error", false,
         result == IdfWebOtaCode::MetadataFailed ? "ACTION_OTA_METADATA_FAILED" : "ACTION_OTA_BEGIN_FAILED");
 }
@@ -2020,6 +2101,9 @@ static esp_err_t handle_ota_chunk(httpd_req_t* req)
 {
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
+    if (shared_admission_active() || cellular_job_active()) {
+        return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
+    }
     std::string raw_id, raw_offset;
     uint32_t id = 0, offset = 0;
     if (!get_query_param(req, "id", raw_id, 128) || !parse_u32_strict(raw_id.c_str(), id, false) ||
@@ -3460,11 +3544,16 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     if (s_push_test_admission_active.exchange(true, std::memory_order_acq_rel)) {
         return send_push_test_failure(req, "409 Conflict", "Device is busy; try again later");
     }
+    if (!try_shared_admission(true)) {
+        s_push_test_admission_active.store(false, std::memory_order_release);
+        return send_push_test_failure(req, "409 Conflict", "Device is busy; try again later");
+    }
 
     std::string message;
     const bool blocked = backup_transfer_active() || ota_active() || device_restart_pending() ||
         restore_restart_pending() || api_jobs_active();
     const bool queued = !blocked && idf_push_enqueue_test(channel, message);
+    release_shared_admission();
     s_push_test_admission_active.store(false, std::memory_order_release);
     if (blocked) {
         return send_push_test_failure(req, "409 Conflict", "Device is busy; try again later");
@@ -3525,26 +3614,87 @@ static std::string esim_action_label(const std::string& action)
 
 static void copy_esim_cache(std::string& eid,
                             std::vector<IdfEsimProfile>& profiles,
+                            std::vector<std::string>& handles,
                             uint32_t& updated_at)
 {
     if (cell_job_lock()) {
         eid = s_esim_cache.eid;
         profiles = s_esim_cache.profiles;
+        handles = s_esim_cache.handles;
         updated_at = s_esim_cache.updatedAt;
         cell_job_unlock();
     }
 }
 
-static void append_esim_profile_json(std::string& body, const IdfEsimProfile& p)
+static std::string new_esim_handle()
+{
+    char buf[20];
+    snprintf(buf, sizeof(buf), "p%08x%08x", static_cast<unsigned>(esp_random()),
+             static_cast<unsigned>(esp_random()));
+    return buf;
+}
+
+static const char* modern_esim_state(const std::string& state)
+{
+    if (state == "enabled") return "enabled";
+    if (state == "disabled") return "disabled";
+    return "unknown";
+}
+
+static const char* modern_esim_class(const std::string& profile_class)
+{
+    if (profile_class == "operational") return "operational";
+    if (profile_class == "provisioning") return "provisioning";
+    return "unknown";
+}
+
+static bool wait_esim_modem_ready_and_idle(uint32_t timeout_ms)
+{
+    const uint64_t deadline = esp_timer_get_time() + static_cast<uint64_t>(timeout_ms) * 1000ULL;
+    while (esp_timer_get_time() < deadline) {
+        const IdfModemStatus status = idf_modem_get_status();
+        if (status.atReady && status.modemReady && idf_modem_at_idle()) return true;
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    return false;
+}
+
+static bool esim_transition_can_succeed(bool operation_ok, bool modem_ready, esp_err_t refresh_err)
+{
+    return operation_ok && modem_ready && refresh_err == ESP_OK;
+}
+
+static bool resolve_esim_handle(const std::string& handle, std::string& identifier)
+{
+    if (handle.size() != 17 || handle[0] != 'p' ||
+        !std::all_of(handle.begin() + 1, handle.end(), [](char ch) {
+            return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        })) return false;
+    if (!cell_job_lock()) return false;
+    auto it = std::find(s_esim_cache.handles.begin(), s_esim_cache.handles.end(), handle);
+    const size_t index = it == s_esim_cache.handles.end()
+        ? s_esim_cache.handles.size() : static_cast<size_t>(it - s_esim_cache.handles.begin());
+    const bool found = index < s_esim_cache.profiles.size();
+    if (found) {
+        const IdfEsimProfile& profile = s_esim_cache.profiles[index];
+        identifier = profile.iccid.empty() ? profile.isdpAid : profile.iccid;
+    }
+    cell_job_unlock();
+    return found && !identifier.empty();
+}
+
+static void append_modern_esim_profile_json(std::string& body,
+                                            const IdfEsimProfile& p,
+                                            const std::string& handle)
 {
     body += "{";
-    json_prop(body, "iccid", p.iccid); body += ",";
-    json_prop(body, "isdpAid", p.isdpAid); body += ",";
-    json_prop(body, "state", p.state); body += ",";
+    json_prop(body, "handle", handle); body += ",";
+    // The display value is intentionally non-identifying. The opaque handle is
+    // the only value that can select a profile for a later action.
+    json_prop(body, "displayId", "••••"); body += ",";
+    json_prop(body, "state", modern_esim_state(p.state)); body += ",";
     json_prop(body, "nickname", p.nickname); body += ",";
-    json_prop(body, "serviceProvider", p.serviceProvider); body += ",";
-    json_prop(body, "profileName", p.profileName); body += ",";
-    json_prop(body, "profileClass", p.profileClass);
+    json_prop(body, "profileClass", modern_esim_class(p.profileClass));
     body += "}";
 }
 
@@ -3568,33 +3718,70 @@ static void esim_task(void* arg_raw)
     std::vector<IdfEsimProfile> profiles;
     esp_err_t err = ESP_ERR_INVALID_ARG;
     bool cache_eid_only = false;
-    if (action == "refresh") {
+    if (action != "refresh" && action != "info") {
+        // Re-read the list before every opaque-handle mutation. A cached index
+        // is not sufficient after profile deletion or remote profile changes.
+        std::vector<IdfEsimProfile> current;
+        std::string current_eid;
+        std::string current_message;
+        bool current_match = false;
+        if (idf_esim_list_profiles(current, current_eid, current_message) == ESP_OK) {
+            for (const IdfEsimProfile& profile : current) {
+                const std::string current_identifier = profile.iccid.empty() ? profile.isdpAid : profile.iccid;
+                if (!current_identifier.empty() && current_identifier == identifier) {
+                    current_match = true;
+                    break;
+                }
+            }
+        }
+        if (!current_match) {
+            message = "Profile handle is stale";
+            err = ESP_ERR_NOT_FOUND;
+        }
+    }
+    if (err == ESP_ERR_INVALID_ARG && action == "refresh") {
         err = idf_esim_list_profiles(profiles, eid, message);
-    } else if (action == "info") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "info") {
         err = idf_esim_get_eid(eid, message);
         cache_eid_only = (err == ESP_OK);
-    } else if (action == "enable") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "enable") {
         err = idf_esim_enable_profile(identifier, message);
-    } else if (action == "disable") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "disable") {
         err = idf_esim_disable_profile(identifier, message);
-    } else if (action == "delete") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "delete") {
         err = idf_esim_delete_profile(identifier, message);
-    } else if (action == "nickname") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "nickname") {
         err = idf_esim_set_nickname(identifier, nickname, message);
-    } else if (action == "switch") {
+    } else if (err == ESP_ERR_INVALID_ARG && action == "switch") {
         err = idf_esim_switch_profile(identifier, message);
-    } else {
+    } else if (err == ESP_ERR_INVALID_ARG) {
         message = "Unknown eSIM action";
     }
 
     bool ok = (err == ESP_OK);
     // Enable, switch, and disable change the active card; reload the number, ICCID, and operator to avoid stale overview data.
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
+    bool transition_ready = true;
+    esp_err_t transition_refresh_err = ESP_OK;
     if (sim_changed) {
         idf_modem_invalidate_sim_identity();
+        transition_ready = wait_esim_modem_ready_and_idle(90000);
+        if (transition_ready) {
+            std::string refresh_message;
+            transition_refresh_err = idf_esim_list_profiles(profiles, eid, refresh_message);
+        } else {
+            transition_refresh_err = ESP_ERR_TIMEOUT;
+        }
+        ok = esim_transition_can_succeed(ok, transition_ready, transition_refresh_err);
+        if (!ok) {
+            message = transition_ready ? "eSIM profile state refresh failed" :
+                "eSIM profile state refresh timed out";
+        }
     }
     bool cache_ready = false;
-    if (ok && (action == "delete" || action == "nickname")) {
+    if (ok && sim_changed) {
+        cache_ready = true;
+    } else if (ok && (action == "delete" || action == "nickname")) {
         // For actions that do not affect the current UICC session, refresh the list cache immediately.
         std::string refresh_msg;
         std::vector<IdfEsimProfile> refreshed;
@@ -3622,11 +3809,15 @@ static void esim_task(void* arg_raw)
         } else if (cache_ready) {
             s_esim_cache.eid = eid;
             s_esim_cache.profiles = profiles;
+            s_esim_cache.handles.clear();
+            s_esim_cache.handles.reserve(profiles.size());
+            for (size_t i = 0; i < profiles.size(); ++i) s_esim_cache.handles.push_back(new_esim_handle());
             s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
-        } else if (ok) {
+        } else if (sim_changed) {
             // After a successful switch or enable-state change, the modem restarts on the new card.
             // Clear the stale list so it cannot prompt duplicate actions; refresh after the modem is ready.
             s_esim_cache.profiles.clear();
+            s_esim_cache.handles.clear();
             s_esim_cache.updatedAt = static_cast<uint32_t>(time(nullptr));
         }
         s_esim_job.running = false;
@@ -3636,7 +3827,8 @@ static void esim_task(void* arg_raw)
         s_esim_job.message = final_message;
         cell_job_unlock();
     }
-    idf_logf("%s: %s", esim_action_label(action).c_str(), ok ? "completed" : final_message.c_str());
+    idf_logf("%s: %s", esim_action_label(action).c_str(), ok ? "completed" : "failed");
+    release_shared_admission();
     vTaskDelete(nullptr);
 }
 
@@ -3647,17 +3839,33 @@ static bool start_esim_job(const std::string& action,
                            bool& already_running)
 {
     already_running = false;
+    if (!try_shared_admission(false)) {
+        already_running = true;
+        message = "A device operation is already running";
+        return false;
+    }
+    if (backup_transfer_active() || ota_active() || device_restart_pending() ||
+        restore_restart_pending() || api_jobs_active() || idf_push_test_active()) {
+        already_running = true;
+        message = "A device operation is already running";
+        release_shared_admission();
+        return false;
+    }
     if (!cell_job_lock()) {
         message = "eSIM task state lock is busy";
+        release_shared_admission();
         return false;
     }
     if (cellular_job_active_locked()) {
         already_running = true;
         message = "A cellular/eSIM task is already running in the background";
         cell_job_unlock();
+        release_shared_admission();
         return false;
     }
     s_esim_job = WebAsyncJob();
+    s_esim_job.id = s_next_esim_job_id++;
+    if (s_esim_job.id == 0) s_esim_job.id = s_next_esim_job_id++;
     s_esim_job.queued = true;
     s_esim_job.done = false;
     s_esim_job.success = false;
@@ -3675,6 +3883,7 @@ static bool start_esim_job(const std::string& action,
             cell_job_unlock();
         }
         message = "Could not create eSIM task: insufficient memory";
+        release_shared_admission();
         return false;
     }
     arg->action = action;
@@ -3690,6 +3899,7 @@ static bool start_esim_job(const std::string& action,
             cell_job_unlock();
         }
         message = "Could not create eSIM task";
+        release_shared_admission();
         return false;
     }
     message = esim_action_label(action) + " queued";
@@ -4058,6 +4268,7 @@ static bool system_idle_for_maintenance(bool include_done = false,
            !restart_busy &&
            (allow_restore_restart || !restore_restart_pending()) && !jobs_busy &&
            !s_push_test_admission_active.load(std::memory_order_acquire) &&
+           !shared_admission_active() &&
            !idf_push_busy() && !idf_push_test_active() &&
            idf_push_forward_queue_depth() == 0 &&
            idf_push_retry_queue_depth() == 0 &&
@@ -4472,90 +4683,123 @@ static esp_err_t handle_ping(httpd_req_t* req)
     return enqueue_api_job(req, "ping", "");
 }
 
-static esp_err_t handle_esim(httpd_req_t* req)
+static const char* modern_esim_job_code(const WebAsyncJob& job)
 {
-    if (!check_auth(req)) return ESP_OK;
-    if (!ensure_get_or_post(req)) return ESP_OK;
-    std::string action;
-    get_query_param(req, "action", action);
-    if (action.empty()) action = "status";
-    set_json_no_cache(req);
+    if (job.id == 0) return "ACTION_ESIM_IDLE";
+    if (job.queued || job.running) return "ACTION_ESIM_RUNNING";
+    return job.success ? "ACTION_ESIM_COMPLETE" : "ACTION_ESIM_FAILED";
+}
 
-    if (action == "status") {
+static esp_err_t send_modern_esim_error(httpd_req_t* req, const char* status,
+                                        const char* code, const char* detail = "")
+{
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, status);
+    return httpd_resp_sendstr(req, action_result(false, code, {}, detail).c_str());
+}
+
+static esp_err_t handle_api_esim(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth_strict(req)) return ESP_OK;
+    if (req->method != HTTP_GET && req->method != HTTP_POST) {
+        set_json_no_cache(req);
+        httpd_resp_set_status(req, "405 Method Not Allowed");
+        httpd_resp_set_hdr(req, "Allow", "GET, POST");
+        return httpd_resp_sendstr(req, action_result(false, "ACTION_INPUT_INVALID", {}, "method").c_str());
+    }
+    if (req->method == HTTP_POST && !check_csrf(req)) return ESP_OK;
+    if (strchr(req->uri, '?')) return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "query");
+    if (req->method == HTTP_GET) {
+        if (req->content_len != 0) return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
         WebAsyncJob job;
         std::string eid;
         std::vector<IdfEsimProfile> profiles;
+        std::vector<std::string> handles;
         uint32_t updated_at = 0;
         if (cell_job_lock()) {
             job = s_esim_job;
             cell_job_unlock();
         }
-        copy_esim_cache(eid, profiles, updated_at);
-        IdfConfigStatusView cfg = idf_config_get_status_view();
-        std::string body;
-        body.reserve(760 + profiles.size() * 260);
-        char buf[192];
-        snprintf(buf, sizeof(buf),
-                 "{\"jobQueued\":%s,\"jobRunning\":%s,\"jobDone\":%s,"
-                 "\"jobSuccess\":%s,\"success\":%s,\"queued\":%s,"
-                 "\"updatedAt\":%u,\"profileCount\":%u,",
-                 job.queued ? "true" : "false",
-                 job.running ? "true" : "false",
-                 job.done ? "true" : "false",
-                 job.success ? "true" : "false",
-                 job.success ? "true" : "false",
-                 (job.queued || job.running) ? "true" : "false",
-                 static_cast<unsigned>(updated_at),
-                 static_cast<unsigned>(profiles.size()));
-        body += buf;
-        json_prop(body, "action", job.action); body += ",";
-        json_prop(body, "eid", eid); body += ",";
-        json_prop(body, "updatedLocal", format_epoch_local(updated_at, cfg.tzOffsetMin)); body += ",";
-        json_prop(body, "jobMessage", job.message); body += ",";
-        json_prop(body, "message", job.message); body += ",";
-        body += "\"profiles\":[";
-        for (size_t i = 0; i < profiles.size(); ++i) {
+        copy_esim_cache(eid, profiles, handles, updated_at);
+        (void)updated_at;
+        std::string body = "{\"eid\":{";
+        body += "\"available\":";
+        body += eid.empty() ? "false" : "true";
+        body += ",\"state\":\"";
+        body += eid.empty() ? "unavailable" : "available";
+        body += "\",\"length\":";
+        body += std::to_string(eid.empty() ? 0 : eid.size());
+        body += "},\"profiles\":[";
+        const size_t count = std::min(profiles.size(), handles.size());
+        for (size_t i = 0; i < count; ++i) {
             if (i) body += ",";
-            append_esim_profile_json(body, profiles[i]);
+            append_modern_esim_profile_json(body, profiles[i], handles[i]);
         }
-        body += "]}";
+        body += "],\"job\":{";
+        body += "\"id\":" + std::to_string(job.id) + ",\"state\":\"";
+        body += job.id == 0 ? "idle" : (job.queued ? "queued" : (job.running ? "running" : (job.done ? (job.success ? "succeeded" : "failed") : "idle")));
+        body += ",";
+        json_prop(body, "action", job.action);
+        body += ",\"success\":";
+        body += job.success ? "true" : "false";
+        body += ",";
+        json_prop(body, "code", modern_esim_job_code(job));
+        body += "}}";
+        set_json_no_cache(req);
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
-    if (req->method != HTTP_POST) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"eSIM actions require POST\"}");
+    if (req->content_len == 0) return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+    std::string raw;
+    if (read_body(req, raw, 512) != ESP_OK) return ESP_OK;
+    const IdfWebFormDecodeResult decoded = idf_web_decode_form(raw, 3);
+    if (!decoded.valid || decoded.fields.empty() || decoded.too_many_fields) {
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+    }
+    std::string action;
+    std::string handle;
+    std::string nickname;
+    for (const auto& field : decoded.fields) {
+        if (field.first == "action" && action.empty()) action = field.second;
+        else if (field.first == "handle" && handle.empty()) handle = field.second;
+        else if (field.first == "nickname" && nickname.empty()) nickname = field.second;
+        else return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
     }
     if (!(action == "refresh" || action == "info" || action == "enable" || action == "disable" ||
-          action == "delete" ||
-          action == "nickname" || action == "switch")) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Unknown eSIM action\"}");
+          action == "delete" || action == "nickname" || action == "switch")) {
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "action");
+    }
+    if ((action == "refresh" || action == "info") ? !handle.empty() || !nickname.empty()
+                                                    : handle.empty()) {
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "handle");
+    }
+    if (action != "nickname" && !nickname.empty()) {
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "nickname");
+    }
+    if (nickname.size() > 64 || nickname.find_first_of("\r\n\t") != std::string::npos) {
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_TOO_LONG", "nickname");
     }
 
-    std::string raw;
-    if (read_body(req, raw, 768) != ESP_OK) return ESP_OK;
-    IdfFormFields fields = parse_urlencoded(raw);
     std::string identifier;
-    std::string nickname;
-    if (const std::string* v = find_field(fields, "id")) identifier = idf_util_trim_copy(*v);
-    if (const std::string* v = find_field(fields, "nickname")) nickname = idf_util_trim_copy(*v);
-    if (action != "refresh" && action != "info" && identifier.empty()) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Profile identifier is empty\"}");
+    if (!handle.empty() && !resolve_esim_handle(handle, identifier)) {
+        return send_modern_esim_error(req, "409 Conflict", "ACTION_ESIM_HANDLE_STALE");
     }
-    if (action == "nickname" && nickname.size() > 64) {
-        return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"Nickname is limited to 64 bytes\"}");
-    }
-
     std::string message;
     bool already_running = false;
-    bool ok = start_esim_job(action, identifier, nickname, message, already_running);
-    std::string body = "{\"success\":";
-    body += (ok || already_running) ? "true" : "false";
-    body += ",\"queued\":";
-    body += (ok || already_running) ? "true" : "false";
-    body += ",";
-    json_prop(body, "message", message);
-    body += "}";
-    return httpd_resp_send(req, body.c_str(), body.size());
+    const bool ok = start_esim_job(action, identifier, nickname, message, already_running);
+    if (!ok) {
+        return send_modern_esim_error(req, "409 Conflict", "ACTION_ESIM_BUSY");
+    }
+    WebAsyncJob job;
+    if (cell_job_lock()) {
+        job = s_esim_job;
+        cell_job_unlock();
+    }
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, "202 Accepted");
+    return httpd_resp_sendstr(req, action_result(true, "ACTION_JOB_ACCEPTED",
+                                                   std::string("\"jobId\":") + std::to_string(job.id)).c_str());
 }
 
 static esp_err_t handle_keepalive(httpd_req_t* req)
@@ -4872,7 +5116,8 @@ static esp_err_t handle_reboot(httpd_req_t* req)
     }
     if (backup_transfer_active() || ota_active() || idf_web_ota_restart_pending() ||
         restore_restart_pending() || api_jobs_active() ||
-        s_push_test_admission_active.load(std::memory_order_acquire) || idf_push_test_active()) {
+        shared_admission_active() || s_push_test_admission_active.load(std::memory_order_acquire) ||
+        idf_push_test_active()) {
         release_restart_owner();
         return send_backup_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
@@ -4911,6 +5156,8 @@ esp_err_t idf_web_start(void)
 {
     if (s_server) return ESP_OK;
     s_last_restore_job = ApiRestoreLifecycleSnapshot();
+    s_shared_admission_active.store(false, std::memory_order_release);
+    s_push_test_admission_active.store(false, std::memory_order_release);
     s_restore_restart_pending.store(false, std::memory_order_release);
     s_restore_restart_completed_ms.store(0, std::memory_order_release);
     if (s_csrf_token.empty()) {
@@ -4986,6 +5233,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/sms", register_handler(s_server, "/sms", HTTP_GET, handle_root));
     IDF_WEB_TRY_REGISTER("/assets/*", register_handler(s_server, "/assets/*", HTTP_GET, handle_asset));
     IDF_WEB_TRY_REGISTER("/api/config", register_handler(s_server, "/api/config", HTTP_GET, handle_api_config));
+    IDF_WEB_TRY_REGISTER("/api/esim", register_handler(s_server, "/api/esim", HTTP_ANY, handle_api_esim));
     IDF_WEB_TRY_REGISTER("/api/jobs", register_handler(s_server, "/api/jobs", HTTP_GET, handle_api_job));
     IDF_WEB_TRY_REGISTER("/api/config/export", register_handler(s_server, "/api/config/export", HTTP_ANY, handle_config_export));
     IDF_WEB_TRY_REGISTER("/api/config/restore/start", register_handler(s_server, "/api/config/restore/start", HTTP_POST, handle_config_restore_start));

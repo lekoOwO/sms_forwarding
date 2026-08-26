@@ -24,6 +24,30 @@ export type PushTestStatus = {
 	message: string;
 };
 
+export type EsimProfile = {
+	handle: string;
+	displayId: string;
+	state: "enabled" | "disabled" | "unknown";
+	nickname: string;
+	profileClass: "operational" | "provisioning" | "unknown";
+};
+
+export type EsimStatus = {
+	eid: {
+		available: boolean;
+		state: "available" | "unavailable";
+		length: number;
+	};
+	profiles: EsimProfile[];
+	job: {
+		id: number;
+		state: "idle" | "queued" | "running" | "succeeded" | "failed";
+		action: string;
+		success: boolean;
+		code: string;
+	};
+};
+
 export type WebAccount = {
 	username: string;
 	password: string;

@@ -56,7 +56,8 @@
     { "name": "UI" },
     { "name": "Configuration" },
     { "name": "Messaging" },
-    { "name": "Device" }
+    { "name": "Device" },
+    { "name": "Cellular & eSIM" }
   ],
   "paths": {
     "/": {
@@ -105,6 +106,34 @@
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "500": { "$ref": "#/components/responses/JsonSerializationFailure" }
+        }
+      }
+    },
+    "/api/esim": {
+      "get": {
+        "tags": ["Cellular & eSIM"],
+        "summary": "Get eSIM structural status and masked profiles",
+        "description": "Returns only EID structural metadata and opaque profile handles. ICCID, ISD-P AID, EID, operator, server, and modem identifiers never appear in this response. The response is not cached.",
+        "responses": {
+          "200": { "description": "The current cached eSIM view.", "headers": { "Cache-Control": { "schema": { "type": "string", "const": "no-store, max-age=0" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EsimStatus" } } } },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET and POST are supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET, POST" } } } }
+        }
+      },
+      "post": {
+        "tags": ["Cellular & eSIM"],
+        "summary": "Queue an eSIM profile action",
+        "description": "Queues refresh, EID info, enable, disable, delete, switch, or nickname actions. Mutations use a server-issued opaque handle. The firmware re-reads the current profile snapshot before it mutates a profile, so an old handle fails closed. The request body is form encoded and limited to action, handle, and nickname.",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "$ref": "#/components/schemas/EsimAction" } } } },
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "409": { "description": "The device is busy or the opaque handle is stale.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
         }
       }
     },
@@ -585,6 +614,12 @@
               "ACTION_CSRF_INVALID",
               "ACTION_JOB_ACCEPTED",
               "ACTION_JOB_NOT_FOUND",
+			  "ACTION_ESIM_IDLE",
+			  "ACTION_ESIM_RUNNING",
+			  "ACTION_ESIM_COMPLETE",
+			  "ACTION_ESIM_FAILED",
+			  "ACTION_ESIM_BUSY",
+			  "ACTION_ESIM_HANDLE_STALE",
 			  "ACTION_CONFIG_EXPORT_READY",
               "ACTION_CONFIG_RESTORED",
               "ACTION_OTA_UPLOAD_STARTED",
@@ -668,6 +703,60 @@
 		  "exportId": { "type": "integer" },
 		  "chunkSize": { "type": "integer", "maximum": 8192 },
 		  "nextOffset": { "type": "integer" }
+        }
+      },
+      "EsimAction": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 3,
+        "required": ["action"],
+        "properties": {
+          "action": { "type": "string", "enum": ["refresh", "info", "enable", "disable", "delete", "switch", "nickname"], "x-maxUtf8Bytes": 16 },
+          "handle": { "type": "string", "pattern": "^p[0-9a-f]{16}$", "x-maxUtf8Bytes": 17, "description": "Opaque profile selector issued by GET /api/esim." },
+          "nickname": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64 }
+        }
+      },
+      "EsimProfile": {
+        "type": "object",
+        "required": ["handle", "displayId", "state", "nickname", "profileClass"],
+        "additionalProperties": false,
+        "properties": {
+          "handle": { "type": "string", "pattern": "^p[0-9a-f]{16}$" },
+          "displayId": { "type": "string", "const": "••••", "description": "Non-identifying masked display value." },
+          "state": { "type": "string", "enum": ["enabled", "disabled", "unknown"] },
+          "nickname": { "type": "string", "x-maxUtf8Bytes": 64 },
+          "profileClass": { "type": "string", "enum": ["operational", "provisioning", "unknown"] }
+        }
+      },
+      "EsimJob": {
+        "type": "object",
+        "required": ["id", "state", "action", "success", "code"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "integer", "minimum": 0 },
+          "state": { "type": "string", "enum": ["idle", "queued", "running", "succeeded", "failed"] },
+          "action": { "type": "string", "enum": ["", "refresh", "info", "enable", "disable", "delete", "switch", "nickname"] },
+          "success": { "type": "boolean" },
+          "code": { "type": "string", "enum": ["ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED"] }
+        }
+      },
+      "EsimStatus": {
+        "type": "object",
+        "required": ["eid", "profiles", "job"],
+        "additionalProperties": false,
+        "properties": {
+          "eid": {
+            "type": "object",
+            "required": ["available", "state", "length"],
+            "additionalProperties": false,
+            "properties": {
+              "available": { "type": "boolean" },
+              "state": { "type": "string", "enum": ["available", "unavailable"] },
+              "length": { "type": "integer", "minimum": 0, "maximum": 32 }
+            }
+          },
+          "profiles": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/EsimProfile" } },
+          "job": { "$ref": "#/components/schemas/EsimJob" }
         }
       },
       "Job": {

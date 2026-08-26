@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from "svelte";
 	import MoonIcon from "@lucide/svelte/icons/moon";
+	import MenuIcon from "@lucide/svelte/icons/menu";
 	import SunIcon from "@lucide/svelte/icons/sun";
 	import ActionResult from "$lib/components/ActionResult.svelte";
 	import * as Accordion from "$lib/components/ui/accordion";
@@ -13,20 +14,20 @@
 	import { Input } from "$lib/components/ui/input";
 	import * as InputGroup from "$lib/components/ui/input-group";
 	import * as NativeSelect from "$lib/components/ui/native-select";
-	import * as NavigationMenu from "$lib/components/ui/navigation-menu";
 	import { Separator } from "$lib/components/ui/separator";
 	import { Skeleton } from "$lib/components/ui/skeleton";
 	import { Spinner } from "$lib/components/ui/spinner";
 	import { Switch } from "$lib/components/ui/switch";
 	import * as Tabs from "$lib/components/ui/tabs";
 	import { Textarea } from "$lib/components/ui/textarea";
-	import { demoMode, exportEncryptedConfig, loadLogs, loadSnapshot, postForm, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
+	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadSnapshot, postEsimAction, postForm, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
 	import { applyProviderTemplateDefaults, pushSecretRequired } from "$lib/push-template-defaults.js";
-	import type { DeviceSnapshot, Locale, PushChannel, PushTestStatus, UiResult } from "$lib/types";
+	import { closeEsimDeleteDialog, refreshEsimAfterTerminal } from "$lib/esim-ui.js";
+	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushChannel, PushTestStatus, UiResult } from "$lib/types";
 
-	type MainTab = "overview" | "notifications" | "messaging" | "device" | "security";
+	type MainTab = "overview" | "notifications" | "messaging" | "cellular" | "device" | "security";
 	type Theme = "light" | "dark";
 
 	const idle = (): UiResult => ({ state: "idle", code: "", data: {}, detail: "" });
@@ -49,16 +50,23 @@
 		"Discord Webhook",
 		"ntfy"
 	];
-	const navigation: { value: MainTab; label: TranslationKey }[] = [
-		{ value: "overview", label: "navOverview" },
-		{ value: "notifications", label: "navNotifications" },
-		{ value: "messaging", label: "navMessaging" },
-		{ value: "device", label: "navDevice" },
-		{ value: "security", label: "navSecurity" }
+	const navigationGroups: { label: TranslationKey; items: { value: MainTab; label: TranslationKey }[] }[] = [
+		{ label: "navGroupWorkspace", items: [
+			{ value: "overview", label: "navOverview" },
+			{ value: "messaging", label: "navMessaging" },
+			{ value: "notifications", label: "navNotifications" }
+		] },
+		{ label: "navGroupConnectivity", items: [{ value: "cellular", label: "navCellular" }] },
+		{ label: "navGroupDevice", items: [
+			{ value: "device", label: "navDeviceAccess" },
+			{ value: "security", label: "navSecurity" }
+		] }
 	];
+	const validTabs = new Set<MainTab>(["overview", "notifications", "messaging", "cellular", "device", "security"]);
 
 	let locale = $state<Locale>("zh-TW");
 	let mainTab = $state<MainTab>("overview");
+	let mobileNavDialog: HTMLDialogElement;
 	let pushTab = $state("0");
 	let wifiTab = $state("0");
 	let theme = $state<Theme>("light");
@@ -90,6 +98,15 @@
 	let emailEnabledDraft = $state(false);
 	let pushEnabledDraft = $state(false);
 	let notificationSwitchSaving = $derived(emailSwitchResult.state === "loading" || pushSwitchResult.state === "loading");
+	let esim = $state<EsimStatus | null>(null);
+	let esimLoading = $state(false);
+	let esimError = $state("");
+	let esimResult = $state(idle());
+	let esimPollTimer: number | undefined;
+	let esimPollBusy = false;
+	let deleteHandle = $state("");
+	let deleteOriginId = $state("");
+	let deleteDialog: HTMLDialogElement;
 	let configFileResult = $state(idle());
 	let otaResult = $state(idle());
 	let phone = $state("");
@@ -111,6 +128,12 @@
 	const t = (key: TranslationKey) => translate(locale, key);
 
 	onMount(() => {
+		const applyHash = () => {
+			const candidate = location.hash.slice(1) as MainTab;
+			mainTab = validTabs.has(candidate) ? candidate : "overview";
+		};
+		applyHash();
+		window.addEventListener("hashchange", applyHash);
 		const saved = localStorage.getItem("locale") as Locale | null;
 		locale = saved && ["zh-TW", "zh-CN", "en"].includes(saved) ? saved : detectLocale(navigator.language);
 		const savedTheme = localStorage.getItem("theme") as Theme | null;
@@ -119,6 +142,11 @@
 			: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 		document.documentElement.classList.toggle("dark", theme === "dark");
 		void refreshSnapshot();
+		void refreshEsim();
+		return () => {
+			window.removeEventListener("hashchange", applyHash);
+			if (esimPollTimer !== undefined) window.clearInterval(esimPollTimer);
+		};
 	});
 
 	$effect(() => {
@@ -148,6 +176,112 @@
 		} finally {
 			loading = false;
 		}
+	}
+
+	function openMobileNavigation() {
+		mobileNavDialog?.showModal();
+	}
+
+	function closeMobileNavigation() {
+		if (mobileNavDialog?.open) mobileNavDialog.close();
+		document.getElementById("mobile-nav-trigger")?.focus();
+	}
+
+	async function refreshEsim() {
+		esimLoading = true;
+		esimError = "";
+		try {
+			esim = await loadEsim();
+			if (esim.job.state === "queued" || esim.job.state === "running") startEsimPoll(esim.job.id);
+		} catch (error) {
+			esimError = error instanceof Error ? error.message : String(error);
+		} finally {
+			esimLoading = false;
+		}
+	}
+
+	function stopEsimPoll() {
+		if (esimPollTimer !== undefined) {
+			window.clearInterval(esimPollTimer);
+			esimPollTimer = undefined;
+		}
+	}
+
+	function startEsimPoll(jobId: number) {
+		stopEsimPoll();
+		const deadline = Date.now() + 90000;
+		const poll = async () => {
+			if (esimPollBusy) return;
+			esimPollBusy = true;
+			try {
+				const status = await loadEsim();
+				if (status.job.id >= jobId && (status.job.state === "succeeded" || status.job.state === "failed")) {
+					stopEsimPoll();
+					const freshStatus = await refreshEsimAfterTerminal(loadEsim, status);
+					esim = freshStatus;
+					esimResult = { state: freshStatus.job.success ? "success" : "error", code: freshStatus.job.code, data: {}, detail: "" };
+				} else if (Date.now() >= deadline) {
+					esim = status;
+					stopEsimPoll();
+					esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
+				} else {
+					esim = status;
+				}
+			} catch {
+				stopEsimPoll();
+				esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
+			} finally {
+				esimPollBusy = false;
+			}
+		};
+		void poll();
+		esimPollTimer = window.setInterval(() => void poll(), 750);
+	}
+
+	async function runEsimAction(actionName: string, profile?: EsimProfile, nickname?: string) {
+		esimResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
+		try {
+			const result = await postEsimAction(actionName, profile?.handle, nickname);
+			if (!result.success || result.code !== "ACTION_JOB_ACCEPTED") {
+				esimResult = { state: "error", code: result.code, data: {}, detail: "" };
+				if (result.code === "ACTION_ESIM_HANDLE_STALE") await refreshEsim();
+				return;
+			}
+			const jobId = Number(result.data.jobId);
+			if (!Number.isInteger(jobId)) throw new Error("Invalid eSIM job.");
+			startEsimPoll(jobId);
+		} catch {
+			esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
+		}
+	}
+
+	function askDelete(handle: string, originId: string) {
+		deleteHandle = handle;
+		deleteOriginId = originId;
+		deleteDialog?.showModal();
+	}
+
+	function clearDeleteDialog() {
+		const next = closeEsimDeleteDialog({ handle: deleteHandle, originId: deleteOriginId });
+		deleteHandle = next.handle;
+		deleteOriginId = next.originId;
+		if (next.focusId) document.getElementById(next.focusId)?.focus();
+	}
+
+	function closeDeleteDialog() {
+		if (deleteDialog?.open) deleteDialog.close();
+		else clearDeleteDialog();
+	}
+
+	function cancelDelete() {
+		closeDeleteDialog();
+	}
+
+	function confirmDelete() {
+		const handle = deleteHandle;
+		cancelDelete();
+		const profile = esim?.profiles.find((candidate) => candidate.handle === handle);
+		if (profile) void runEsimAction("delete", profile);
 	}
 
 	async function save(setResult: (value: UiResult) => void, values: Record<string, string | number | boolean>) {
@@ -409,6 +543,7 @@
 	<meta name="description" content={t("appSubtitle")} />
 </svelte:head>
 
+<a class="skip-link" href="#main-content">{t("skipToContent")}</a>
 <header class="border-b bg-background/95 supports-[backdrop-filter]:bg-background/80 sticky top-0 z-20 backdrop-blur">
 	<div class="mx-auto flex h-20 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
 		<div class="min-w-0">
@@ -416,6 +551,9 @@
 			<p class="truncate text-sm text-muted-foreground">{t("appSubtitle")}</p>
 		</div>
 		<div class="flex items-center gap-2">
+			<Button id="mobile-nav-trigger" class="lg:hidden" variant="outline" size="icon-sm" aria-label={t("navMenu")} aria-haspopup="dialog" onclick={openMobileNavigation}>
+				<MenuIcon />
+			</Button>
 			{#if demoMode}<Badge variant="secondary">{t("demoBadge")}</Badge>{/if}
 			<Button variant="outline" size="icon-sm" aria-label={theme === "dark" ? t("dayMode") : t("darkMode")} onclick={toggleTheme}>
 				{#if theme === "dark"}<SunIcon />{:else}<MoonIcon />{/if}
@@ -435,7 +573,28 @@
 	</div>
 </header>
 
-<main class="mx-auto max-w-6xl px-4 py-6 sm:px-6 sm:py-10">
+<dialog bind:this={mobileNavDialog} class="mobile-nav-dialog lg:hidden" aria-labelledby="mobile-nav-title" onclick={(event) => { if (event.target === mobileNavDialog) closeMobileNavigation(); }} onclose={() => document.getElementById("mobile-nav-trigger")?.focus()}>
+	<div class="flex items-center justify-between gap-4 border-b pb-4">
+		<h2 id="mobile-nav-title" class="text-lg font-semibold">{t("navMenuTitle")}</h2>
+		<Button variant="ghost" size="sm" onclick={closeMobileNavigation}>{t("commonClose")}</Button>
+	</div>
+	<nav class="flex flex-col gap-5 pt-5" aria-label={t("navMenuTitle")}>
+		{#each navigationGroups as group (group.label)}
+			<div class="flex flex-col gap-1">
+				<p class="px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t(group.label)}</p>
+				{#each group.items as item (item.value)}
+					<a class="sidebar-link" href={`#${item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+				{/each}
+			</div>
+		{/each}
+	</nav>
+</dialog>
+
+<main id="main-content" tabindex="-1" class="mx-auto max-w-6xl px-4 py-6 outline-none sm:px-6 sm:py-10">
+	<div class="sr-only" aria-hidden="true">
+		<span id="overview"></span><span id="notifications"></span><span id="messaging"></span>
+		<span id="cellular"></span><span id="device"></span><span id="security"></span>
+	</div>
 	{#if loading}
 		<div class="flex flex-col gap-6" aria-live="polite">
 			<div class="flex flex-col gap-2">
@@ -456,23 +615,20 @@
 			</Alert.Description>
 		</Alert.Root>
 	{:else}
-		<div class="flex flex-col gap-8">
-			<div class="overflow-x-auto pb-1">
-				<NavigationMenu.Root viewport={false} class="max-w-none">
-					<NavigationMenu.List class="w-max justify-start">
-						{#each navigation as item (item.value)}
-							<NavigationMenu.Item>
-								<NavigationMenu.Link
-									href={`#${item.value}`}
-									data-active={mainTab === item.value ? "" : undefined}
-									aria-current={mainTab === item.value ? "page" : undefined}
-									onclick={(event) => { event.preventDefault(); mainTab = item.value; }}
-								>{t(item.label)}</NavigationMenu.Link>
-							</NavigationMenu.Item>
-						{/each}
-					</NavigationMenu.List>
-				</NavigationMenu.Root>
-			</div>
+		<div class="app-layout">
+			<aside class="desktop-sidebar hidden lg:block" aria-label={t("navMenuTitle")}>
+				<nav class="flex flex-col gap-5">
+					{#each navigationGroups as group (group.label)}
+						<div class="flex flex-col gap-1">
+							<p class="px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t(group.label)}</p>
+							{#each group.items as item (item.value)}
+								<a class="sidebar-link" href={`#${item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+							{/each}
+						</div>
+					{/each}
+				</nav>
+			</aside>
+			<div class="min-w-0 flex flex-col gap-8">
 
 			{#if mainTab === "overview"}
 					<section class="flex flex-col gap-6">
@@ -513,8 +669,8 @@
 					<Separator />
 					<section class="flex flex-col gap-3"><div><h2 class="font-semibold">{t("overviewQuick")}</h2><p class="text-sm text-muted-foreground">{t("overviewQuickDescription")}</p></div><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=wifi")}>{t("overviewQueryWifi")}</Button><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=signal")}>{t("overviewQuerySignal")}</Button><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=network")}>{t("overviewQueryNetwork")}</Button></div><ActionResult result={overviewResult} title={t("resultTitle")} {locale} /></section>
 				</section>
-			{:else if mainTab === "notifications"}
-				<section class="flex flex-col gap-6">
+				{:else if mainTab === "notifications"}
+					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("notificationTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("notificationDescription")}</p></div>
 					<div class="grid gap-4 md:grid-cols-2">
 						<Card.Root>
@@ -564,15 +720,49 @@
 						</Accordion.Item>
 					</Accordion.Root>
 				</section>
-			{:else if mainTab === "messaging"}
-				<section class="flex flex-col gap-6">
+				{:else if mainTab === "messaging"}
+					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("messagingTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("messagingDescription")}</p></div>
 					<Accordion.Root type="single" value="sms">
 						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="forward-rules"><Accordion.Trigger>{t("forwardRulesTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("forwardRulesDescription")}</p><form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><Field.Group><Field.Field><Field.Label for="forward-rules">{t("forwardRulesTitle")}</Field.Label><Textarea id="forward-rules" rows={10} spellcheck={false} aria-describedby="forward-rules-hint" bind:value={snapshot.config.forwardRules} /><Field.Description id="forward-rules-hint">{t("forwardRulesHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
 					</Accordion.Root>
-				</section>
+					</section>
+				{:else if mainTab === "cellular"}
+					<section class="flex flex-col gap-6">
+						<div class="flex flex-wrap items-start justify-between gap-4">
+							<div><h1 class="text-2xl font-semibold tracking-tight">{t("esimTitle")}</h1><p class="mt-1 max-w-2xl text-sm text-muted-foreground">{t("esimDescription")}</p></div>
+							<Button variant="outline" onclick={() => void refreshEsim()} disabled={esimLoading}><span class="flex items-center gap-2">{#if esimLoading}<Spinner data-icon="inline-start" />{/if}{t("esimRefresh")}</span></Button>
+						</div>
+						{#if esimError}
+							<Alert.Root variant="destructive"><Alert.Title>{t("esimError")}</Alert.Title><Alert.Description class="flex flex-col items-start gap-3"><span>{t("esimErrorBody")}</span><Button variant="outline" onclick={() => void refreshEsim()}>{t("retry")}</Button></Alert.Description></Alert.Root>
+						{:else if esimLoading && !esim}
+							<div class="grid gap-4 sm:grid-cols-2"><Skeleton class="h-32" /><Skeleton class="h-32" /></div>
+						{:else if esim}
+							<Card.Root>
+								<Card.Header><Card.Title>{t("esimEid")}</Card.Title><Card.Description>{t(esim.eid.available ? "esimEidAvailable" : "esimEidUnavailable")}</Card.Description></Card.Header>
+								<Card.Content><dl class="grid gap-4 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimEidState")}</dt><dd class="mt-1"><Badge variant={esim.eid.available ? "default" : "outline"}>{t(esim.eid.available ? "esimEidAvailable" : "esimEidUnavailable")}</Badge></dd></div><div><dt class="text-sm text-muted-foreground">{t("esimEidLength")}</dt><dd class="mt-1 font-medium tabular-nums">{esim.eid.length}</dd></div></dl></Card.Content>
+							</Card.Root>
+							<section class="flex flex-col gap-4" aria-labelledby="esim-profiles-title">
+								<div><h2 id="esim-profiles-title" class="text-xl font-semibold">{t("esimProfiles")}</h2><p class="mt-1 text-sm text-muted-foreground">{t("esimProfilesDescription")}</p></div>
+								{#if esim.profiles.length === 0}
+									<Empty.Root><Empty.Header><Empty.Title>{t("esimEmpty")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={() => void runEsimAction("refresh")}>{t("esimRefresh")}</Button></Empty.Content></Empty.Root>
+								{:else}
+									<div class="grid gap-4 md:grid-cols-2">
+										{#each esim.profiles as profile, profileIndex (profile.handle)}
+											<Card.Root>
+												<Card.Header><div class="flex items-start justify-between gap-3"><div class="min-w-0"><Card.Title>{profile.nickname || t("esimProfileUnnamed")}</Card.Title><Card.Description>{t("esimProfileDisplayId")}: {profile.displayId}</Card.Description></div><Badge variant={profile.state === "enabled" ? "default" : "outline"}>{t(profile.state === "enabled" ? "esimProfileEnabled" : profile.state === "disabled" ? "esimProfileDisabled" : "esimProfileUnknown")}</Badge></div></Card.Header>
+												<Card.Content class="flex flex-col gap-4"><dl class="grid gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimNickname")}</dt><dd class="mt-1 font-medium">{profile.nickname || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProfileClass")}</dt><dd class="mt-1 font-medium">{t(profile.profileClass === "operational" ? "esimClassOperational" : profile.profileClass === "provisioning" ? "esimClassProvisioning" : "esimClassUnknown")}</dd></div></dl><form class="flex flex-col gap-3" onsubmit={(event) => { event.preventDefault(); void runEsimAction("nickname", profile, profile.nickname); }}><Field.Field><Field.Label for={`esim-nickname-${profile.handle}`}>{t("esimNickname")}</Field.Label><Input id={`esim-nickname-${profile.handle}`} maxlength={64} autocomplete="off" placeholder={t("esimNicknamePlaceholder")} bind:value={profile.nickname} /></Field.Field><Button type="submit" variant="outline" disabled={esimResult.state === "loading"}>{t("esimSaveNickname")}</Button></form></Card.Content>
+														<Card.Footer class="flex flex-wrap justify-end gap-2"><Button variant="outline" disabled={esimResult.state === "loading" || profile.state === "enabled"} onclick={() => void runEsimAction("enable", profile)}>{t("esimEnable")}</Button><Button variant="outline" disabled={esimResult.state === "loading" || profile.state !== "enabled"} onclick={() => void runEsimAction("disable", profile)}>{t("esimDisable")}</Button><Button variant="outline" disabled={esimResult.state === "loading"} onclick={() => void runEsimAction("switch", profile)}>{t("esimSwitch")}</Button><Button id={`esim-delete-${profileIndex}`} variant="destructive" disabled={esimResult.state === "loading"} onclick={() => askDelete(profile.handle, `esim-delete-${profileIndex}`)}>{t("esimDelete")}</Button></Card.Footer>
+											</Card.Root>
+										{/each}
+									</div>
+								{/if}
+								<ActionResult result={esimResult} title={t("resultTitle")} {locale} />
+							</section>
+						{/if}
+					</section>
 			{:else if mainTab === "device"}
 				<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("deviceTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("deviceDescription")}</p></div>
@@ -641,16 +831,24 @@
 					</Accordion.Root>
 					{#if hasMoreLogs}<div class="flex justify-center"><Button variant="outline" onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
 				</section>
-			{:else}
-				<section class="flex flex-col gap-6">
+				{:else}
+					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("securityTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("securityDescription")}</p></div>
 					<Alert.Root><Alert.Title>{t("securityWarningTitle")}</Alert.Title><Alert.Description>{t("securityWarningBody")}</Alert.Description></Alert.Root>
 					<section class="flex flex-col gap-5"><div><h2 class="font-semibold">{t("accountTitle")}</h2><p class="text-sm text-muted-foreground">{t("accountDescription")}</p></div><form id="security-form" onsubmit={(event) => { event.preventDefault(); void save((value) => securityResult = value, accountValues()); }}><Accordion.Root type="single" value="0">{#each snapshot.config.webAccounts as account, index (index)}<Accordion.Item value={String(index)}><Accordion.Trigger><span class="flex min-w-0 flex-1 items-center gap-3"><span class="shrink-0">{t("account")} {index + 1}</span><span class="min-w-0 flex-1 truncate text-sm font-normal text-muted-foreground">{account.username || t("commonDisabled")}</span><Badge variant={account.username ? "default" : "outline"}>{account.username ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger><Accordion.Content class="pt-3"><Field.Group><Field.Field><Field.Label for={`account-user-${index}`}>{t("username")}</Field.Label><Input id={`account-user-${index}`} autocomplete="username" bind:value={account.username} /></Field.Field><Field.Field><Field.Label for={`account-pass-${index}`}>{t("password")}</Field.Label><Input id={`account-pass-${index}`} type="password" autocomplete="new-password" bind:value={account.password} /><Field.Description>{t("passwordHint")}</Field.Description></Field.Field></Field.Group></Accordion.Content></Accordion.Item>{/each}</Accordion.Root></form><div class="flex justify-end"><Button type="submit" form="security-form" disabled={securityResult.state === "loading"}>{securityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={securityResult} title={t("resultTitle")} {locale} /></section>
 				</section>
 			{/if}
 		</div>
+		</div>
 	{/if}
 </main>
+
+<dialog bind:this={deleteDialog} class="confirm-dialog" aria-labelledby="esim-delete-title" aria-describedby="esim-delete-description" onclick={(event) => { if (event.target === deleteDialog) closeDeleteDialog(); }} onclose={clearDeleteDialog}>
+	<div class="flex flex-col gap-4">
+		<div><h2 id="esim-delete-title" class="text-lg font-semibold">{t("esimDeleteTitle")}</h2><p id="esim-delete-description" class="mt-1 text-sm text-muted-foreground">{t("esimDeleteDescription")}</p></div>
+		<div class="flex justify-end gap-2"><Button variant="outline" onclick={cancelDelete}>{t("esimDeleteCancel")}</Button><Button variant="destructive" onclick={confirmDelete}>{t("esimDeleteConfirm")}</Button></div>
+	</div>
+</dialog>
 
 {#if snapshot}
 	<footer class="px-4 py-6 text-center text-xs text-muted-foreground" aria-label="Firmware version">

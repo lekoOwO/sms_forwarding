@@ -500,6 +500,8 @@ const actionCodes = new Set([
 	"ACTION_OTA_CHUNK_INVALID", "ACTION_OTA_FINALIZE_FAILED", "ACTION_OTA_HASH_INVALID",
 	"ACTION_OTA_MANIFEST_INVALID", "ACTION_OTA_METADATA_FAILED", "ACTION_OTA_SESSION_INVALID",
 	"ACTION_OTA_SIGNATURE_INVALID", "ACTION_OTA_WRITE_FAILED", "ACTION_TOO_MANY_FIELDS"
+	, "ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED"
+	, "ACTION_ESIM_BUSY", "ACTION_ESIM_HANDLE_STALE"
 ]);
 
 function result(success, code, data = {}, detail = "") {
@@ -599,6 +601,50 @@ export function createApp({
 	let restoreRestartPending = false;
 	let nextId = 1;
 	let acceptedOtaCounter = otaAcceptedCounter;
+	const esim = {
+		eid: "89012345678901234567890123456789",
+		profiles: [
+			{ iccid: "8988212345678901234", isdpAid: "A0000005591010FFFFFFFF89000001", state: "enabled", nickname: "Primary", profileClass: "operational" },
+			{ iccid: "8988212345678905678", isdpAid: "A0000005591010FFFFFFFF89000002", state: "disabled", nickname: "Backup", profileClass: "operational" }
+		],
+		handles: ["p1111111111111111", "p2222222222222222"],
+		job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE" },
+		nextJobId: 1
+	};
+	const esimStatus = () => ({
+		eid: { available: Boolean(esim.eid), state: esim.eid ? "available" : "unavailable", length: esim.eid.length },
+		profiles: esim.profiles.map((profile, index) => ({
+			handle: esim.handles[index], displayId: "••••", state: profile.state,
+			nickname: profile.nickname, profileClass: profile.profileClass
+		})),
+		job: { ...esim.job }
+	});
+	const finishEsimJob = (job, action, handle, nickname) => {
+		if (job.state !== "queued" && job.state !== "running") return;
+		const index = handle ? esim.handles.indexOf(handle) : -1;
+		if (action !== "refresh" && action !== "info" && index < 0) {
+			job.state = "failed";
+			job.success = false;
+			job.code = "ACTION_ESIM_HANDLE_STALE";
+			return;
+		}
+		if (action === "refresh") {
+			esim.handles = esim.profiles.map((_, profileIndex) => `p${(profileIndex + 1).toString(16).padStart(16, "0")}`);
+		} else if (action === "info") {
+			// The mock keeps the same structural EID state.
+		} else if (action === "nickname") {
+			esim.profiles[index].nickname = nickname;
+		} else if (action === "delete") {
+			esim.profiles.splice(index, 1);
+			esim.handles.splice(index, 1);
+		} else {
+			if (action === "enable" || action === "switch") esim.profiles.forEach((profile, profileIndex) => { profile.state = profileIndex === index ? "enabled" : "disabled"; });
+			if (action === "disable") esim.profiles[index].state = "disabled";
+		}
+		job.state = "succeeded";
+		job.success = true;
+		job.code = "ACTION_ESIM_COMPLETE";
+	};
 	const expireUpload = () => {
 		if (upload && now() - upload.lastActivity >= 120000) upload = undefined;
 	};
@@ -633,6 +679,9 @@ export function createApp({
 	};
 	const acceptJob = (type, finalResult, response, { allowOta = false } = {}) => {
 		expireJobs();
+		if (!allowOta && (esim.job.state === "queued" || esim.job.state === "running")) {
+			return response.status(409).json(result(false, "ACTION_BUSY"));
+		}
 		if (!allowOta && upload?.kind === "ota") {
 			return response.status(409).json(result(false, "ACTION_BUSY"));
 		}
@@ -669,9 +718,14 @@ export function createApp({
 		"POST /save", "POST /sendsms", "POST /ping", "GET /flight", "GET /at", "GET /modem",
 		"GET /wifi", "GET /api/config/export", "POST /api/config/export", "POST /api/config/restore/start",
 		"POST /api/config/restore/chunk", "POST /api/config/restore/finish", "POST /api/ota/start",
-		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart", "POST /wificonfig"
+		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
+		"POST /api/esim", "POST /wificonfig"
 	]);
 	app.use(rejectEnvelope);
+	app.use("/api/esim", (_request, response, next) => {
+		response.set("Cache-Control", "no-store, max-age=0");
+		next();
+	});
 	app.use((request, response, next) => request.method === "HEAD" &&
 		!["/api/push/test", "/api/device/restart"].includes(request.path)
 		? response.set("Allow", "GET, POST").status(405).json(result(false, "ACTION_INPUT_INVALID"))
@@ -776,6 +830,43 @@ export function createApp({
 				}))
 			}
 		});
+	});
+
+	app.all("/api/esim", (request, response, next) => {
+		if (request.method === "GET" || request.method === "POST") return next();
+		return response.set({ "Allow": "GET, POST", "Cache-Control": "no-store, max-age=0" }).status(405)
+			.json(result(false, "ACTION_INPUT_INVALID", {}, "method"));
+	});
+	app.get("/api/esim", (request, response) => {
+		if (Object.keys(request.query).length || Number(request.headers["content-length"] ?? 0) > 0 || request.headers["transfer-encoding"])
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, Object.keys(request.query).length ? "query" : "body"));
+		return response.set("Cache-Control", "no-store, max-age=0").json(esimStatus());
+	});
+	app.post("/api/esim", (request, response) => {
+		if (!request.body || !Object.keys(request.body).length || Object.keys(request.body).length > 3)
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
+		if (Object.keys(request.query).length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "query"));
+		const allowed = new Set(["action", "handle", "nickname"]);
+		if (Object.keys(request.body).some((key) => !allowed.has(key)) || typeof request.body.action !== "string")
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
+		const action = request.body.action;
+		if (!["refresh", "info", "enable", "disable", "delete", "nickname", "switch"].includes(action))
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "action"));
+		const handle = typeof request.body.handle === "string" ? request.body.handle : "";
+		const nickname = typeof request.body.nickname === "string" ? request.body.nickname : "";
+		if ((action === "refresh" || action === "info") ? handle || nickname : !handle)
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "handle"));
+		if (action !== "nickname" && nickname) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "nickname"));
+		if (byteLength(nickname) > 64 || /[\r\n\t]/.test(nickname)) return response.status(400).json(result(false, "ACTION_INPUT_TOO_LONG", {}, "nickname"));
+		if (handle && !/^p[0-9a-f]{16}$/.test(handle)) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "handle"));
+		if (handle && !esim.handles.includes(handle)) return response.status(409).json(result(false, "ACTION_ESIM_HANDLE_STALE"));
+		if (esim.job.state === "queued" || esim.job.state === "running" || deviceRestartPending || otaRestartPending || restoreRestartPending || upload || pushTestActive() ||
+			[...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) return response.status(409).json(result(false, "ACTION_ESIM_BUSY"));
+		const job = esim.job = { id: esim.nextJobId++, state: "queued", action, success: false, code: "ACTION_ESIM_RUNNING" };
+		const finish = () => { job.state = "running"; finishEsimJob(job, action, handle, nickname); };
+		if (jobDelayMs > 0) setTimeout(finish, jobDelayMs);
+		else finish();
+		return response.status(202).json(result(true, "ACTION_JOB_ACCEPTED", { jobId: job.id }));
 	});
 
 	app.all("/api/device/restart", (request, response, next) => {

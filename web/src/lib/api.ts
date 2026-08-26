@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, Job, LogPage, PushTestStatus } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushTestStatus } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 
@@ -27,6 +27,14 @@ const demoLogs = ["Demo device started", "WiFi connected: DemoNetwork", "Cellula
 const demoPushTests: PushTestStatus[] = Array.from({ length: 5 }, () => ({
 	queued: false, running: false, done: false, success: false, message: "Test not started"
 }));
+const demoEsim: EsimStatus = {
+	eid: { available: true, state: "available", length: 32 },
+	profiles: [
+		{ handle: "p1111111111111111", displayId: "••••", state: "enabled", nickname: "Primary", profileClass: "operational" },
+		{ handle: "p2222222222222222", displayId: "••••", state: "disabled", nickname: "Backup", profileClass: "operational" }
+	],
+	job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE" }
+};
 
 function demoSnapshot(): DeviceSnapshot {
 	return {
@@ -61,6 +69,29 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 
 function demoResponse<T>(path: string, init?: RequestInit): T {
 	if (path === "/api/config") return demoSnapshot() as T;
+	if (path === "/api/esim") {
+		if (init?.method !== "POST") return structuredClone(demoEsim) as T;
+		const form = init.body instanceof URLSearchParams ? init.body : new URLSearchParams();
+		const action = form.get("action") ?? "";
+		const handle = form.get("handle") ?? "";
+		const profile = demoEsim.profiles.find((candidate) => candidate.handle === handle);
+		if (!["refresh", "info", "enable", "disable", "delete", "nickname", "switch"].includes(action)) {
+			return { success: false, code: "ACTION_INPUT_INVALID", data: {}, detail: "action" } as T;
+		}
+		if (action !== "refresh" && action !== "info" && !profile) {
+			return { success: false, code: "ACTION_ESIM_HANDLE_STALE", data: {}, detail: "" } as T;
+		}
+		if (profile && action === "nickname") profile.nickname = form.get("nickname") ?? profile.nickname;
+		if (profile && action === "enable") profile.state = "enabled";
+		if (profile && action === "disable") profile.state = "disabled";
+		if (profile && action === "switch") demoEsim.profiles.forEach((candidate) => {
+			candidate.state = candidate === profile ? "enabled" : "disabled";
+		});
+		if (profile && action === "delete") demoEsim.profiles = demoEsim.profiles.filter((candidate) => candidate !== profile);
+		if (action === "refresh") demoEsim.job = { id: demoEsim.job.id + 1, state: "succeeded", action, success: true, code: "ACTION_ESIM_COMPLETE" };
+		else demoEsim.job = { id: demoEsim.job.id + 1, state: "succeeded", action, success: true, code: "ACTION_ESIM_COMPLETE" };
+		return { success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: demoEsim.job.id }, detail: "" } as T;
+	}
 	if (path.startsWith("/api/push/test?")) {
 		const channel = Number(new URL(path, "http://device").searchParams.get("channel"));
 		if (!Number.isInteger(channel) || channel < 0 || channel >= demoPushTests.length) return {
@@ -187,6 +218,28 @@ export async function loadSnapshot(): Promise<DeviceSnapshot> {
 	const snapshot = await requestJson<DeviceSnapshot>("/api/config");
 	csrfToken = snapshot.csrfToken;
 	return snapshot;
+}
+
+export function loadEsim(): Promise<EsimStatus> {
+	return requestJson<EsimStatus>("/api/esim");
+}
+
+export function postEsimAction(action: string, handle?: string, nickname?: string): Promise<ActionResult> {
+	return postForm("/api/esim", {
+		action,
+		...(handle ? { handle } : {}),
+		...(nickname !== undefined ? { nickname } : {})
+	});
+}
+
+export async function waitForEsimJob(id: number, timeoutMs = 90000): Promise<EsimStatus> {
+	const deadline = Date.now() + Math.max(1, timeoutMs);
+	for (;;) {
+		const status = await loadEsim();
+		if (status.job.id >= id && ["succeeded", "failed"].includes(status.job.state)) return status;
+		if (Date.now() >= deadline) throw new Error("eSIM job polling timed out.");
+		await new Promise((resolve) => window.setTimeout(resolve, 750));
+	}
 }
 
 export function runAction(path: string, init?: RequestInit): Promise<ActionResult> {

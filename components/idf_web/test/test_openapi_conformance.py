@@ -80,6 +80,7 @@ def main() -> None:
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
         "POST /api/config/restore/finish", "POST /api/ota/start", "POST /api/ota/chunk",
         "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
+        "POST /api/esim",
     }
 
     push_test = SPEC["paths"]["/api/push/test"]
@@ -114,6 +115,8 @@ def main() -> None:
         "ACTION_PING_OK", "ACTION_PING_MODEM_ERROR", "ACTION_PING_UNREACHABLE", "ACTION_PING_TIMEOUT",
         "ACTION_PING_UNSUPPORTED",
         "ACTION_WIFI_RESTARTING", "ACTION_DEVICE_RESTARTING", "ACTION_AT_REJECTED", "ACTION_FLIGHT_FAILED",
+        "ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED",
+        "ACTION_ESIM_BUSY", "ACTION_ESIM_HANDLE_STALE",
     }
     assert required_codes <= action_codes
     ping = SPEC["paths"]["/ping"]["post"]

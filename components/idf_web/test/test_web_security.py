@@ -75,6 +75,7 @@ struct WebAsyncJob {{ bool running = false; bool queued = false; }};
 
 static std::atomic<bool> s_device_restart_pending{{false}};
 static std::atomic<bool> s_push_test_admission_active{{false}};
+static std::atomic<bool> s_shared_admission_active{{false}};
 static WebAsyncJob s_keepalive_job;
 static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
@@ -109,6 +110,10 @@ static unsigned idf_push_forward_queue_depth() {{ return g_forward_queue; }}
 static unsigned idf_push_retry_queue_depth() {{ return g_retry_queue; }}
 static unsigned idf_sms_outgoing_queue_depth() {{ return g_sms_queue; }}
 static unsigned idf_push_email_queue_depth() {{ return g_email_queue; }}
+[[maybe_unused]] static bool shared_admission_active() {{
+    return s_shared_admission_active.load(std::memory_order_acquire) ||
+           s_push_test_admission_active.load(std::memory_order_acquire);
+}}
 
 static bool cellular_job_active_locked(bool allow_device_restart)
 {{{cellular_locked}}}
@@ -138,6 +143,7 @@ static void reset_state()
     g_email_queue = 0;
     s_device_restart_pending.store(false);
     s_push_test_admission_active.store(false);
+    s_shared_admission_active.store(false);
     s_keepalive_job = WebAsyncJob{{}};
     s_esim_job = WebAsyncJob{{}};
     s_sched_job = WebAsyncJob{{}};
@@ -200,6 +206,155 @@ int main()
     with tempfile.TemporaryDirectory() as temp_dir:
         harness_path = Path(temp_dir) / "guard_seam_test.cpp"
         binary_path = Path(temp_dir) / "guard_seam_test"
+        harness_path.write_text(harness)
+        subprocess.run(
+            ["g++", "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
+             str(harness_path), "-o", str(binary_path)],
+            check=True,
+        )
+        return subprocess.run([str(binary_path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def run_admission_seam(source: str, mutate_try=None):
+    if "static bool try_shared_admission(" not in source:
+        return None
+    try_body = function_body(source, "try_shared_admission")
+    release_body = function_body(source, "release_shared_admission")
+    active_body = function_body(source, "shared_admission_active")
+    if mutate_try:
+        try_body = mutate_try(try_body)
+    harness = f'''
+#include <atomic>
+#include <cassert>
+#include <thread>
+
+static std::atomic<bool> s_shared_admission_active{{false}};
+static std::atomic<bool> s_push_test_admission_active{{false}};
+
+static bool try_shared_admission(bool push_test_owner)
+{{{try_body}}}
+
+static void release_shared_admission()
+{{{release_body}}}
+
+static bool shared_admission_active()
+{{{active_body}}}
+
+static bool admit_push_test()
+{{
+    if (s_push_test_admission_active.exchange(true, std::memory_order_acq_rel)) return false;
+    if (!try_shared_admission(true)) {{
+        s_push_test_admission_active.store(false, std::memory_order_release);
+        return false;
+    }}
+    return true;
+}}
+
+static void release_push_test()
+{{
+    release_shared_admission();
+    s_push_test_admission_active.store(false, std::memory_order_release);
+}}
+
+int main()
+{{
+    assert(try_shared_admission(false));
+    assert(shared_admission_active());
+    assert(!try_shared_admission(false));
+    release_shared_admission();
+    assert(!shared_admission_active());
+
+    s_push_test_admission_active.store(true, std::memory_order_release);
+    assert(!try_shared_admission(false));
+    s_push_test_admission_active.store(false, std::memory_order_release);
+
+    constexpr unsigned rounds = 200;
+    for (unsigned round = 0; round < rounds; ++round) {{
+        s_shared_admission_active.store(false, std::memory_order_release);
+        s_push_test_admission_active.store(false, std::memory_order_release);
+        std::atomic<bool> go{{false}};
+        bool esim_won = false;
+        bool push_won = false;
+        std::thread esim([&]() {{
+            while (!go.load(std::memory_order_acquire)) {{}}
+            esim_won = try_shared_admission(false);
+        }});
+        std::thread push([&]() {{
+            while (!go.load(std::memory_order_acquire)) {{}}
+            push_won = admit_push_test();
+        }});
+        go.store(true, std::memory_order_release);
+        esim.join();
+        push.join();
+        assert(static_cast<unsigned>(esim_won) + static_cast<unsigned>(push_won) == 1);
+        if (push_won) release_push_test();
+        else release_shared_admission();
+        assert(!shared_admission_active());
+    }}
+    return 0;
+}}
+'''
+    with tempfile.TemporaryDirectory() as temp_dir:
+        harness_path = Path(temp_dir) / "admission_seam_test.cpp"
+        binary_path = Path(temp_dir) / "admission_seam_test"
+        harness_path.write_text(harness)
+        subprocess.run(
+            ["g++", "-std=c++17", "-pthread", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
+             str(harness_path), "-o", str(binary_path)],
+            check=True,
+        )
+        return subprocess.run([str(binary_path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def run_esim_transition_seam(source: str):
+    if "static bool wait_esim_modem_ready_and_idle(" not in source or \
+            "static bool esim_transition_can_succeed(" not in source:
+        return None
+    wait_body = function_body(source, "wait_esim_modem_ready_and_idle")
+    result_body = function_body(source, "esim_transition_can_succeed")
+    harness = f'''
+#include <cassert>
+#include <cstdint>
+
+using esp_err_t = int;
+static constexpr esp_err_t ESP_OK = 0;
+static constexpr esp_err_t ESP_FAIL = -1;
+struct IdfModemStatus {{ bool atReady = false; bool modemReady = false; }};
+static IdfModemStatus g_status;
+static bool g_at_idle = false;
+static uint64_t g_now_us = 0;
+static IdfModemStatus idf_modem_get_status() {{ return g_status; }}
+static bool idf_modem_at_idle() {{ return g_at_idle; }}
+static uint64_t esp_timer_get_time() {{ return g_now_us; }}
+static unsigned pdMS_TO_TICKS(unsigned milliseconds) {{ return milliseconds; }}
+static void vTaskDelay(unsigned ticks) {{ g_now_us += static_cast<uint64_t>(ticks) * 1000ULL; }}
+
+static bool wait_esim_modem_ready_and_idle(unsigned timeout_ms)
+{{{wait_body}}}
+
+static bool esim_transition_can_succeed(bool operation_ok, bool modem_ready, esp_err_t refresh_err)
+{{{result_body}}}
+
+int main()
+{{
+    g_status = {{true, true}}; g_at_idle = true; g_now_us = 0;
+    assert(wait_esim_modem_ready_and_idle(1000));
+    g_status = {{false, true}}; g_at_idle = true; g_now_us = 0;
+    assert(!wait_esim_modem_ready_and_idle(1000));
+    g_status = {{true, false}}; g_at_idle = true; g_now_us = 0;
+    assert(!wait_esim_modem_ready_and_idle(1000));
+    g_status = {{true, true}}; g_at_idle = false; g_now_us = 0;
+    assert(!wait_esim_modem_ready_and_idle(1000));
+    assert(esim_transition_can_succeed(true, true, ESP_OK));
+    assert(!esim_transition_can_succeed(true, false, ESP_OK));
+    assert(!esim_transition_can_succeed(true, true, ESP_FAIL));
+    assert(!esim_transition_can_succeed(false, true, ESP_OK));
+    return 0;
+}}
+'''
+    with tempfile.TemporaryDirectory() as temp_dir:
+        harness_path = Path(temp_dir) / "esim_transition_seam_test.cpp"
+        binary_path = Path(temp_dir) / "esim_transition_seam_test"
         harness_path.write_text(harness)
         subprocess.run(
             ["g++", "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
@@ -469,8 +624,13 @@ int main() {
     source = (WEB / "idf_web.cpp").read_text()
     assert run_guard_seam(source).returncode == 0
     mutated_guard = run_guard_seam(source, lambda body: body.replace(
-        "!s_push_test_admission_active.load(std::memory_order_acquire) &&", "true &&", 1))
+        "!s_push_test_admission_active.load(std::memory_order_acquire) &&", "true &&", 1).replace(
+        "!shared_admission_active() &&", "true &&", 1))
     assert mutated_guard.returncode != 0
+    admission = run_admission_seam(source)
+    assert admission is not None and admission.returncode == 0
+    transition = run_esim_transition_seam(source)
+    assert transition is not None and transition.returncode == 0
     sdkconfig_defaults = (ROOT / "sdkconfig.defaults").read_text()
     assert "CONFIG_HTTPD_MAX_URI_LEN=2048" in sdkconfig_defaults
     assert "CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192" in sdkconfig_defaults
@@ -479,6 +639,7 @@ int main() {
     assert source.count('"X-SMS-CSRF"') == 1
     assert "colon == decoded_text" in source
     assert 'register_handler(s_server, "/api/config", HTTP_GET, handle_api_config)' in source
+    assert 'register_handler(s_server, "/api/esim", HTTP_ANY, handle_api_esim)' in source
     assert 'register_handler(s_server, "/query", HTTP_GET, handle_query)' in source
     assert 'register_handler(s_server, "/tools", HTTP_GET, handle_root)' in source
     assert 'register_handler(s_server, "/sms", HTTP_GET, handle_root)' in source
@@ -493,7 +654,7 @@ int main() {
     assert "handle_ota_update" not in source
     registered = set(re.findall(r'register_handler\(s_server, "([^"]+)"', source))
     assert registered == {
-        "/", "/tools", "/sms", "/assets/*", "/api/config", "/api/jobs", "/query", "/save", "/wifi",
+        "/", "/tools", "/sms", "/assets/*", "/api/config", "/api/esim", "/api/jobs", "/query", "/save", "/wifi",
         "/wifiscan", "/wificonfig", "/apstatus", "/log", "/at", "/ping", "/flight",
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
@@ -501,6 +662,14 @@ int main() {
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
     assert 'register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push)' in source
+    esim = function_body(source, "handle_api_esim")
+    assert esim.index("reject_oversized_body(req)") < esim.index("check_auth_strict(req)")
+    assert esim.index("check_auth_strict(req)") < esim.index("req->method != HTTP_GET")
+    assert esim.index("req->method != HTTP_GET") < esim.index("check_csrf(req)")
+    assert 'httpd_resp_set_hdr(req, "Allow", "GET, POST")' in esim
+    assert "ACTION_ESIM_HANDLE_STALE" in esim
+    assert 'json_prop(body, "displayId", "••••")' in source
+    assert "idf_esim_list_profiles(current" in source
     restart = function_body(source, "handle_reboot")
     assert restart.index("reject_oversized_body(req)") < restart.index("check_auth(req)")
     assert restart.index("check_auth(req)") < restart.index("req->method != HTTP_POST")
@@ -698,7 +867,7 @@ int main() {
     assert "API_JOB_TTL_MS" in api_job
     assert "now_ms - slot.meta.completed_ms" in api_job
     restore_finish = function_body(source, "handle_config_restore_finish")
-    assert 'enqueue_api_job(req, "backup_restore", passphrase, std::move(encrypted))' in restore_finish
+    assert 'enqueue_api_job(req, "backup_restore", passphrase, std::move(encrypted), true)' in restore_finish
     restore_job = function_body(source, "run_backup_restore_job")
     assert "backup_clear_claim()" not in restore_job
     backup_clear = function_body(source, "backup_clear_claim")
