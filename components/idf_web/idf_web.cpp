@@ -4739,7 +4739,7 @@ static esp_err_t handle_api_esim(httpd_req_t* req)
         body += "],\"job\":{";
         body += "\"id\":" + std::to_string(job.id) + ",\"state\":\"";
         body += job.id == 0 ? "idle" : (job.queued ? "queued" : (job.running ? "running" : (job.done ? (job.success ? "succeeded" : "failed") : "idle")));
-        body += ",";
+        body += "\",";
         json_prop(body, "action", job.action);
         body += ",\"success\":";
         body += job.success ? "true" : "false";

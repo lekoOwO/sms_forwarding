@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import subprocess
 import tempfile
 import re
@@ -364,6 +365,122 @@ int main()
         return subprocess.run([str(binary_path)], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def run_esim_status_json_seam(source: str, mutate_body=None):
+    json_prop = function_body(source, "json_prop")
+    modern_state = function_body(source, "modern_esim_state")
+    modern_class = function_body(source, "modern_esim_class")
+    profile_json = function_body(source, "append_modern_esim_profile_json")
+    job_code = function_body(source, "modern_esim_job_code")
+    status_start = source.index('        std::string body = "{\\"eid\\":{"')
+    status_end = source.index("        set_json_no_cache(req);", status_start)
+    status_body = source[status_start:status_end]
+    if mutate_body:
+        mutated = mutate_body(status_body)
+        assert mutated != status_body
+        status_body = mutated
+    harness = f'''
+#include <cassert>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include "idf_util.h"
+
+struct WebAsyncJob {{
+    unsigned id = 0;
+    bool running = false;
+    bool done = false;
+    bool success = false;
+    bool queued = false;
+    std::string action;
+}};
+
+struct IdfEsimProfile {{
+    std::string state;
+    std::string nickname;
+    std::string profileClass;
+}};
+
+static void json_prop(std::string& out, const char* key, const std::string& value)
+{{{json_prop}}}
+
+static const char* modern_esim_state(const std::string& state)
+{{{modern_state}}}
+
+static const char* modern_esim_class(const std::string& profile_class)
+{{{modern_class}}}
+
+static void append_modern_esim_profile_json(std::string& body,
+                                            const IdfEsimProfile& p,
+                                            const std::string& handle)
+{{{profile_json}}}
+
+static const char* modern_esim_job_code(const WebAsyncJob& job)
+{{{job_code}}}
+
+static std::string build_esim_status(const WebAsyncJob& job,
+                                     const std::string& eid,
+                                     const std::vector<IdfEsimProfile>& profiles,
+                                     const std::vector<std::string>& handles)
+{{
+{status_body}
+    return body;
+}}
+
+int main()
+{{
+    struct Case {{ unsigned id; bool queued; bool running; bool done; bool success; const char* action; const char* state; }};
+    const Case cases[] = {{
+        {{0, false, false, false, false, "", "disabled"}},
+        {{7, true, false, false, false, "refresh", "enabled"}},
+        {{8, false, true, false, false, "info", "disabled"}},
+        {{9, false, false, true, true, "nickname", "enabled"}},
+        {{10, false, false, true, false, "delete", "disabled"}},
+    }};
+    for (const Case& item : cases) {{
+        WebAsyncJob job;
+        job.id = item.id;
+        job.queued = item.queued;
+        job.running = item.running;
+        job.done = item.done;
+        job.success = item.success;
+        job.action = item.action;
+        const std::vector<IdfEsimProfile> profiles = {{{{item.state,
+            R"(carrier "quoted" \\ path)", "operational"}}}};
+        const std::vector<std::string> handles = {{"p0123456789abcdef"}};
+        std::cout << build_esim_status(job, item.id == 0 ? "" : "89012345678901234567890123456789",
+                                       profiles, handles) << '\\n';
+    }}
+    return 0;
+}}
+'''
+    with tempfile.TemporaryDirectory() as temp_dir:
+        harness_path = Path(temp_dir) / "esim_status_json_seam_test.cpp"
+        binary_path = Path(temp_dir) / "esim_status_json_seam_test"
+        harness_path.write_text(harness)
+        subprocess.run(
+            [
+                "g++", "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
+                f"-I{ROOT / 'components' / 'idf_logbuf' / 'include'}",
+                str(ROOT / "components" / "idf_logbuf" / "idf_util.cpp"),
+                str(harness_path), "-o", str(binary_path),
+            ],
+            check=True,
+        )
+        output = subprocess.run([str(binary_path)], check=True, stdout=subprocess.PIPE, text=True)
+        return output.stdout.splitlines()
+
+
+def parse_esim_status_json(lines):
+    parsed = []
+    for index, line in enumerate(lines):
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            raise AssertionError(f"eSIM status response {index} is invalid JSON: {error}") from error
+    return parsed
+
+
 def main() -> None:
     harness = r'''
 #include <cassert>
@@ -631,6 +748,19 @@ int main() {
     assert admission is not None and admission.returncode == 0
     transition = run_esim_transition_seam(source)
     assert transition is not None and transition.returncode == 0
+    status = parse_esim_status_json(run_esim_status_json_seam(source))
+    assert [item["job"]["state"] for item in status] == [
+        "idle", "queued", "running", "succeeded", "failed"
+    ]
+    assert status[1]["profiles"][0]["nickname"] == 'carrier "quoted" \\ path'
+    mutated_status = run_esim_status_json_seam(source, lambda body: body.replace(
+        'body += "\\\",";', 'body += ",";', 1))
+    try:
+        parse_esim_status_json(mutated_status)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("eSIM status mutation remained valid JSON")
     sdkconfig_defaults = (ROOT / "sdkconfig.defaults").read_text()
     assert "CONFIG_HTTPD_MAX_URI_LEN=2048" in sdkconfig_defaults
     assert "CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192" in sdkconfig_defaults
