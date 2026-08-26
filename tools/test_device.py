@@ -29,6 +29,7 @@ import usb_recovery  # noqa: E402
 
 DEVICE = "/dev/serial/by-id/usb-test"
 TARGET = "/dev/ttyACM0"
+USB_IDENTITY = ("serial-1", "303a", "1001", "usb1/1-2", "1-2:1.0")
 CONFIG_ENVELOPE_FIXTURE = json.loads(
     (ROOT / "mock_server/test/fixtures/config-envelope-v6.json").read_text(encoding="utf-8")
 )
@@ -55,10 +56,12 @@ class DevicePathTest(unittest.TestCase):
             link = by_id / "usb-test"
             link.symlink_to(target)
             with mock.patch.object(device, "DEVICE_PREFIX", f"{by_id}/"), \
-                    mock.patch.object(device.stat, "S_ISCHR", return_value=True):
+                    mock.patch.object(device.stat, "S_ISCHR", return_value=True), \
+                    mock.patch.object(device, "_serial_usb_identity", return_value=USB_IDENTITY):
                 resolved = device.resolve_serial_device(str(link))
             self.assertEqual(resolved.by_id, str(link))
             self.assertEqual(resolved.target, str(target.resolve()))
+            self.assertEqual(resolved.stable_identity, USB_IDENTITY)
 
     def test_by_id_rejects_non_character_target(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -73,6 +76,86 @@ class DevicePathTest(unittest.TestCase):
                     mock.patch.object(device.stat, "S_ISCHR", return_value=False):
                 with self.assertRaises(ValueError):
                     device.resolve_serial_device(str(link))
+
+    def test_usb_identity_includes_serial_vid_pid_topology_and_interface(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            devices = root / "sys" / "devices"
+            usb = devices / "platform" / "usb1" / "1-2"
+            interface = usb / "1-2:1.0"
+            interface.mkdir(parents=True)
+            (usb / "serial").write_text("USB-serial-1\n", encoding="ascii")
+            (usb / "idVendor").write_text("303a\n", encoding="ascii")
+            (usb / "idProduct").write_text("1001\n", encoding="ascii")
+            tty = root / "sys" / "class" / "tty" / "ttyACM0"
+            tty.mkdir(parents=True)
+            (tty / "device").symlink_to(interface)
+            with mock.patch.object(device, "SYSFS_TTY_ROOT", root / "sys" / "class" / "tty"), \
+                    mock.patch.object(device, "SYSFS_DEVICES_ROOT", devices):
+                identity = device._serial_usb_identity(pathlib.Path("/dev/ttyACM0"))
+        self.assertEqual(identity, (
+            "USB-serial-1", "303a", "1001", "platform/usb1/1-2", "platform/usb1/1-2/1-2:1.0",
+        ))
+
+    def test_esptool_uses_reenumerated_target_with_same_usb_identity(self):
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+        with mock.patch.object(device, "resolve_serial_device", return_value=fresh), \
+                mock.patch.object(device, "_run_esptool") as esptool:
+            device.run_esptool(initial, 1.0)
+        self.assertIs(esptool.call_args.args[1], fresh)
+
+    def test_esptool_rejects_changed_usb_identity_before_running(self):
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        for name, changed in (
+            ("serial", ("serial-2", *USB_IDENTITY[1:])),
+            ("vid", (USB_IDENTITY[0], "303b", *USB_IDENTITY[2:])),
+            ("pid", (USB_IDENTITY[0], USB_IDENTITY[1], "1002", *USB_IDENTITY[3:])),
+            ("topology", (*USB_IDENTITY[:3], "usb1/1-3", USB_IDENTITY[4])),
+            ("interface", (*USB_IDENTITY[:4], "1-2:1.1")),
+        ):
+            with self.subTest(name=name), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, "/dev/ttyACM1", changed)), \
+                    mock.patch.object(device, "_run_esptool") as esptool:
+                with self.assertRaises(usb_recovery.DeviceError):
+                    device.run_esptool(initial, 1.0)
+            esptool.assert_not_called()
+
+    def test_esptool_waits_for_alias_to_return_within_deadline(self):
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+        clock = [100.0]
+
+        def resolve(_path):
+            if clock[0] == 100.0:
+                raise device.SerialEndpointUnavailable("device symlink target is unavailable")
+            return fresh
+
+        with mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "_run_esptool") as esptool, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            device.run_esptool(initial, 1.0)
+        self.assertIs(esptool.call_args.args[1], fresh)
+
+    def test_esptool_fails_bounded_when_alias_never_returns(self):
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        clock = [100.0]
+        with mock.patch.object(device, "resolve_serial_device", side_effect=device.SerialEndpointUnavailable("device symlink target is unavailable")), \
+                mock.patch.object(device, "_run_esptool") as esptool, \
+                mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(device.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+            with self.assertRaises(usb_recovery.DeviceError):
+                device.run_esptool(initial, 0.1)
+        esptool.assert_not_called()
+
+    def test_esptool_fails_closed_when_usb_identity_is_unavailable(self):
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        with mock.patch.object(device, "resolve_serial_device", side_effect=device.DeviceIdentityError("unavailable")), \
+                mock.patch.object(device, "_run_esptool") as esptool:
+            with self.assertRaises(usb_recovery.DeviceError):
+                device.run_esptool(initial, 1.0)
+        esptool.assert_not_called()
 
 
 class DeviceCommandTest(unittest.TestCase):
@@ -1017,8 +1100,8 @@ class DeviceCommandTest(unittest.TestCase):
 
     def test_live_reset_requires_exact_basename_and_probes_state(self):
         esptool_calls = []
-        initial = device.SerialDevice(DEVICE, TARGET)
-        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
         resolve_results = iter((initial, fresh))
         state_devices = []
         states = iter((
@@ -1031,7 +1114,7 @@ class DeviceCommandTest(unittest.TestCase):
             return mock.Mock(returncode=0, stdout="", stderr="")
 
         def fake_resolve(_path):
-            return next(resolve_results)
+            return next(resolve_results, fresh)
 
         def fake_state(ref, *args, **kwargs):
             state_devices.append(ref)
@@ -1054,7 +1137,7 @@ class DeviceCommandTest(unittest.TestCase):
             "--after", "hard_reset",
             "chip_id",
         ])
-        self.assertEqual(resolve.call_args_list, [mock.call(DEVICE)] * 2)
+        self.assertEqual(resolve.call_args_list, [mock.call(DEVICE)] * 3)
         self.assertEqual(state_devices, [initial, fresh])
         self.assertEqual(json.loads(output)["state"]["sta_connected"], True)
 
@@ -1278,15 +1361,15 @@ class DeviceCommandTest(unittest.TestCase):
 
     def test_reset_falls_back_to_pinned_container_without_broad_device_access(self):
         calls = []
-        initial = device.SerialDevice(DEVICE, TARGET)
-        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+        initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+        fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
         resolve_results = iter((initial, fresh))
 
         def fake_run(command, **kwargs):
             calls.append((command, kwargs))
             return mock.Mock(returncode=0, stdout="", stderr="")
 
-        with mock.patch.object(device, "resolve_serial_device", side_effect=lambda _path: next(resolve_results)), \
+        with mock.patch.object(device, "resolve_serial_device", side_effect=lambda _path: next(resolve_results, fresh)), \
                 mock.patch.object(device, "resolve_esptool", return_value="container"), \
                 mock.patch.object(device, "_run_process", side_effect=fake_run), \
                 mock.patch.object(
@@ -1319,7 +1402,7 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertEqual(volume_values, [f"{device.ROOT.resolve()}:/workspace:ro"])
         self.assertFalse(any(value.endswith(":rw") for value in volume_values))
         self.assertIn("--device", command)
-        self.assertIn(f"{TARGET}:{device.CONTAINER_DEVICE_PATH}", command)
+        self.assertIn(f"{fresh.target}:{device.CONTAINER_DEVICE_PATH}", command)
         self.assertIn(device.CONTAINER_DEVICE_PATH, command)
         self.assertNotIn("--privileged", command)
         self.assertNotIn("/dev:/dev", command)
@@ -1731,6 +1814,144 @@ class DeviceCommandTest(unittest.TestCase):
     @staticmethod
     def _nonproduction_key():
         return "1" * 64
+
+    def _run_active_reenumeration_flow(self, root, image, digest, key, resolve, *, state=None):
+        events = []
+        image_bytes = image.read_bytes()
+        read_count = 0
+        active_state = state or self._active_state(key)
+
+        def run_esptool(arguments, _device, _timeout, **_kwargs):
+            nonlocal read_count
+            events.append(arguments)
+            if "read_flash" in arguments:
+                pathlib.Path(arguments[-1]).write_bytes(
+                    image_bytes if read_count else b"\x00" * len(image_bytes)
+                )
+                read_count += 1
+
+        error = io.StringIO()
+        with mock.patch.object(device, "ROOT", root), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=resolve), \
+                mock.patch.object(device, "_ota_state", return_value=active_state), \
+                mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                mock.patch.object(device, "confirm_basename"), \
+                mock.patch.object(device, "_run_baseline"), \
+                mock.patch.object(device, "_run_esptool", side_effect=run_esptool), \
+                mock.patch.object(device, "_reset_state_after_boot", return_value={"boot_id": 12}), \
+                mock.patch("sys.stderr", error):
+            result, _ = self.run_main(self._active_args(image, digest))
+        return result, error.getvalue(), events
+
+    def test_replace_active_pre_read_accepts_same_identity_reenumeration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+            fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+            calls = [0]
+
+            def resolve(_path):
+                calls[0] += 1
+                return initial if calls[0] == 1 else fresh
+
+            result, error, events = self._run_active_reenumeration_flow(
+                root, image, digest, key, resolve,
+            )
+        self.assertEqual(result, 0, error)
+        self.assertTrue(any("write_flash" in command for command in events))
+
+    def test_replace_active_retries_transient_identity_unavailability_before_pre_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+            fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+            calls = [0]
+
+            def resolve(_path):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return initial
+                if calls[0] == 2:
+                    raise device.DeviceIdentityError("sysfs is not ready", retryable=True)
+                return fresh
+
+            with mock.patch.object(device.time, "sleep") as sleep:
+                result, error, events = self._run_active_reenumeration_flow(
+                    root, image, digest, key, resolve,
+                )
+        self.assertEqual(result, 0, error)
+        self.assertGreaterEqual(sleep.call_count, 1)
+        self.assertTrue(any("write_flash" in command for command in events))
+
+    def test_replace_active_blocks_identity_drift_before_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+            fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+            changed = device.SerialDevice(DEVICE, "/dev/ttyACM2", ("serial-2", *USB_IDENTITY[1:]))
+            calls = [0]
+
+            def resolve(_path):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return initial
+                if calls[0] == 2:
+                    return fresh
+                return changed
+
+            result, error, events = self._run_active_reenumeration_flow(
+                root, image, digest, key, resolve,
+            )
+        self.assertNotEqual(result, 0)
+        self.assertIn("USB device identity changed", error)
+        self.assertFalse(any("write_flash" in command for command in events))
+
+    def test_replace_active_blocks_identity_drift_before_final_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+            fresh = device.SerialDevice(DEVICE, "/dev/ttyACM1", USB_IDENTITY)
+            changed = device.SerialDevice(DEVICE, "/dev/ttyACM2", ("serial-2", *USB_IDENTITY[1:]))
+            calls = [0]
+
+            def resolve(_path):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return initial
+                if calls[0] < 7:
+                    return fresh
+                return changed
+
+            result, error, events = self._run_active_reenumeration_flow(
+                root, image, digest, key, resolve,
+            )
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app flash post-reset verification failed", error)
+        self.assertTrue(any("write_flash" in command for command in events))
+        self.assertFalse(any("chip_id" in command for command in events))
+
+    def test_replace_active_bounds_alias_absence_before_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET, USB_IDENTITY)
+            clock = [100.0]
+            calls = [0]
+
+            def resolve(_path):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return initial
+                raise device.SerialEndpointUnavailable("device symlink target is unavailable")
+
+            with mock.patch.object(device, "_flash_operation_timeout", return_value=0.1), \
+                    mock.patch.object(device.time, "monotonic", side_effect=lambda: clock[0]), \
+                    mock.patch.object(device.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)):
+                result, error, events = self._run_active_reenumeration_flow(
+                    root, image, digest, key, resolve,
+                )
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app pre-read failed; no flash was written", error)
+        self.assertFalse(any("write_flash" in command for command in events))
 
     def test_replace_active_requires_both_exact_confirmations(self):
         with tempfile.TemporaryDirectory() as temp:

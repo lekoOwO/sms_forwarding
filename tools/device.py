@@ -55,6 +55,8 @@ IDF_IMAGE = EXPECTED_IDF_IMAGE
 CONTAINER_PYTHON = "/opt/esp/python_env/idf5.5_py3.12_env/bin/python"
 CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
+SYSFS_TTY_ROOT = Path("/sys/class/tty")
+SYSFS_DEVICES_ROOT = Path("/sys/devices")
 APP_OFFSET = 0x10000
 BOOTLOADER_OFFSET = 0x0
 APP_SLOT_OFFSETS = {
@@ -136,6 +138,54 @@ _BATCH_ALLOWED_KEYS = frozenset((
 class SerialDevice:
     by_id: str
     target: str
+    stable_identity: tuple[str, ...] | None = None
+
+
+class DeviceIdentityError(ValueError):
+    """USB identity cannot be established from the serial endpoint."""
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class SerialEndpointUnavailable(ValueError):
+    """The explicit by-id alias has no current target."""
+
+
+def _serial_usb_identity(target: Path) -> tuple[str, ...]:
+    tty_device = SYSFS_TTY_ROOT / target.name / "device"
+    try:
+        interface = tty_device.resolve(strict=True)
+        devices_root = SYSFS_DEVICES_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise DeviceIdentityError("USB identity is unavailable", retryable=True) from exc
+    try:
+        interface_relative = interface.relative_to(devices_root)
+    except ValueError as exc:
+        raise DeviceIdentityError("USB identity is unavailable") from exc
+    usb_device = interface.parent
+    while (
+        usb_device != devices_root
+        and usb_device.is_relative_to(devices_root)
+        and not (usb_device / "idVendor").is_file()
+    ):
+        usb_device = usb_device.parent
+    if usb_device == devices_root:
+        raise DeviceIdentityError("USB identity is unavailable")
+    try:
+        serial = (usb_device / "serial").read_text(encoding="ascii").strip()
+        vendor = (usb_device / "idVendor").read_text(encoding="ascii").strip().lower()
+        product = (usb_device / "idProduct").read_text(encoding="ascii").strip().lower()
+        usb_relative = usb_device.relative_to(devices_root)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise DeviceIdentityError("USB identity is unavailable", retryable=True) from exc
+    if (
+        not serial or not re.fullmatch(r"[0-9a-f]{4}", vendor)
+        or not re.fullmatch(r"[0-9a-f]{4}", product)
+    ):
+        raise DeviceIdentityError("USB identity is unavailable")
+    return (serial, vendor, product, usb_relative.as_posix(), interface_relative.as_posix())
 
 
 def resolve_device(value: str | None) -> str:
@@ -160,10 +210,10 @@ def resolve_serial_device(value: str | None) -> SerialDevice:
         target = link.resolve(strict=True)
         mode = target.stat().st_mode
     except OSError as exc:
-        raise ValueError("device symlink target is unavailable") from exc
+        raise SerialEndpointUnavailable("device symlink target is unavailable") from exc
     if not stat.S_ISCHR(mode):
         raise ValueError("device symlink target is not a character device")
-    return SerialDevice(by_id, str(target))
+    return SerialDevice(by_id, str(target), _serial_usb_identity(target))
 
 
 def _remaining(deadline: float) -> float:
@@ -419,6 +469,7 @@ def _run_esptool(
 
 def run_esptool(device: SerialDevice, timeout: float) -> None:
     """以固定 reset options 執行 esptool chip_id。"""
+    device = _resolve_esptool_device(device, timeout)
     _run_esptool([
         "--chip", "esp32c3",
         "--port", device.by_id,
@@ -426,6 +477,43 @@ def run_esptool(device: SerialDevice, timeout: float) -> None:
         "--after", "hard_reset",
         "chip_id",
     ], device, timeout)
+
+
+def _resolve_esptool_device(device: SerialDevice, timeout: float) -> SerialDevice:
+    return _resolve_pinned_device(
+        device.by_id, device.target, device.stable_identity,
+        time.monotonic() + timeout,
+    )
+
+
+def _resolve_pinned_device(
+    device_path: str, expected_target: str,
+    stable_identity: tuple[str, ...] | None, deadline: float,
+) -> SerialDevice:
+    while True:
+        try:
+            fresh = resolve_serial_device(device_path)
+        except DeviceIdentityError as exc:
+            if not exc.retryable:
+                raise usb_recovery.DeviceError("USB device identity is unavailable") from exc
+            last_error = exc
+        except SerialEndpointUnavailable as exc:
+            last_error = exc
+        except ValueError as exc:
+            raise usb_recovery.DeviceError("USB device is unavailable") from exc
+        else:
+            if fresh.by_id != device_path:
+                raise usb_recovery.DeviceError("device target changed")
+            if stable_identity is None:
+                if fresh.target != expected_target:
+                    raise usb_recovery.DeviceError("device target changed")
+            elif fresh.stable_identity != stable_identity:
+                raise usb_recovery.DeviceError("USB device identity changed")
+            return fresh
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise usb_recovery.DeviceError("USB device is unavailable") from last_error
+        time.sleep(min(0.05, remaining))
 
 
 def sha256_file(path: Path) -> str:
@@ -2305,18 +2393,23 @@ def _validate_active_ota_state(
         raise usb_recovery.DeviceError("active app replacement OTA state is unsafe")
 
 
-def _active_target(device_path: str, expected_target: str) -> SerialDevice:
-    device = resolve_serial_device(device_path)
-    if device.by_id != device_path or device.target != expected_target:
-        raise usb_recovery.DeviceError("device target changed")
-    return device
+def _active_target(
+    device_path: str, expected_target: str,
+    stable_identity: tuple[str, ...] | None = None,
+    deadline: float | None = None,
+) -> SerialDevice:
+    return _resolve_pinned_device(
+        device_path, expected_target, stable_identity,
+        deadline if deadline is not None else time.monotonic() + STATE_TIMEOUT,
+    )
 
 
 def _recheck_active_state(
     device_path: str, expected_target: str, offset: int,
     identity: str, initial: dict[str, object], deadline: float, *, allow_key_mismatch: bool = False,
+    stable_identity: tuple[str, ...] | None = None,
 ) -> SerialDevice:
-    device = _active_target(device_path, expected_target)
+    device = _active_target(device_path, expected_target, stable_identity, deadline)
     state = _active_ota_state(device, deadline)
     _validate_active_ota_state(state, offset, identity, allow_key_mismatch=allow_key_mismatch)
     if state != initial:
@@ -2332,6 +2425,7 @@ def _replace_active_app(
 ) -> int:
     identity = _active_test_image_identity(image) if rotate_test_key else _active_image_identity(image)
     production_identity = _production_image_identity() if rotate_test_key else None
+    stable_identity = device.stable_identity
     if rotate_test_key:
         if confirmed_identity is None or confirmed_identity.lower() != identity:
             raise ValueError("--confirm-new-key must match the candidate public-key SHA-256")
@@ -2351,7 +2445,7 @@ def _replace_active_app(
     try:
         _read_app_flash_digest(
             device_path, expected_target, offset, size, operation_timeout,
-            after="hard_reset", recover=False,
+            after="hard_reset", recover=False, stable_identity=stable_identity,
         )
     except (OSError, ValueError, usb_recovery.DeviceError, subprocess.SubprocessError) as error:
         raise usb_recovery.DeviceError(ACTIVE_PRE_READ_FAILURE) from error
@@ -2359,6 +2453,7 @@ def _replace_active_app(
     device = _recheck_active_state(
         device_path, expected_target, offset, identity, initial_state, deadline,
         allow_key_mismatch=rotate_test_key,
+        stable_identity=stable_identity,
     )
     runtime_state = _state(device, deadline=deadline)
     previous_boot_id = runtime_state.get("boot_id")
@@ -2376,15 +2471,15 @@ def _replace_active_app(
     try:
         _flash_esptool(
             device_path, expected_target, arguments, operation_timeout,
-            image=snapshot, recover=False,
+            image=snapshot, recover=False, stable_identity=stable_identity,
         )
         _verify_app_flash(
             device_path, expected_target, snapshot, offset, operation_timeout,
-            after="no_reset", recover=False,
+            after="no_reset", recover=False, stable_identity=stable_identity,
         )
         after_digest = _read_app_flash_digest(
             device_path, expected_target, offset, size, operation_timeout,
-            after="no_reset", recover=False,
+            after="no_reset", recover=False, stable_identity=stable_identity,
         )
         if after_digest != digest:
             raise usb_recovery.DeviceError("active app flash readback mismatch")
@@ -2392,7 +2487,7 @@ def _replace_active_app(
         raise usb_recovery.DeviceError(ACTIVE_FLASH_FAILURE) from error
 
     try:
-        final_device = _active_target(device_path, expected_target)
+        final_device = _active_target(device_path, expected_target, stable_identity, deadline)
         run_esptool(final_device, min(RESET_TIMEOUT, _remaining(deadline)))
         fresh_runtime = _reset_state_after_boot(device_path, previous_boot_id, deadline)
         fresh_boot_id = fresh_runtime.get("boot_id")
@@ -2403,7 +2498,7 @@ def _replace_active_app(
             or fresh_boot_id == previous_boot_id
         ):
             raise usb_recovery.DeviceError("USB device did not report a fresh boot id")
-        post_device = _active_target(device_path, expected_target)
+        post_device = _active_target(device_path, expected_target, stable_identity, deadline)
         post_state = _active_ota_state(post_device, deadline)
         _validate_active_ota_state(post_state, offset, identity)
     except (OSError, ValueError, usb_recovery.DeviceError, subprocess.SubprocessError) as error:
@@ -2442,10 +2537,11 @@ def _flash_esptool(
     device_path: str, expected_target: str, arguments: list[str], timeout: float,
     *, image: Path | None = None, output: Path | None = None,
     output_mount: Path | None = None, recover: bool = True,
+    stable_identity: tuple[str, ...] | None = None,
 ) -> None:
-    device = resolve_serial_device(device_path)
-    if device.by_id != device_path or device.target != expected_target:
-        raise usb_recovery.DeviceError("device target changed")
+    device = _resolve_esptool_device(
+        SerialDevice(device_path, expected_target, stable_identity), timeout,
+    )
     try:
         _run_esptool(
             arguments, device, timeout, image=image, output=output,
@@ -2460,6 +2556,7 @@ def _flash_esptool(
 def _read_app_flash_digest(
     device_path: str, expected_target: str, offset: int, size: int, timeout: float,
     *, after: str = "hard_reset", recover: bool = True,
+    stable_identity: tuple[str, ...] | None = None,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="sms-forwarding-flash-") as directory:
         output = Path(directory) / "readback.bin"
@@ -2469,6 +2566,7 @@ def _read_app_flash_digest(
                 "--before", "usb_reset", "--after", after,
                 "read_flash", f"0x{offset:X}", str(size), str(output),
             ], timeout, output=output, output_mount=Path(directory), recover=recover,
+            stable_identity=stable_identity,
         )
         if output.stat().st_size != size:
             raise usb_recovery.DeviceError("app flash readback length mismatch")
@@ -2478,12 +2576,13 @@ def _read_app_flash_digest(
 def _verify_app_flash(
     device_path: str, expected_target: str, image: Path, offset: int, timeout: float,
     *, after: str = "hard_reset", recover: bool = True,
+    stable_identity: tuple[str, ...] | None = None,
 ) -> None:
     _flash_esptool(device_path, expected_target, [
         "--chip", "esp32c3", "--port", device_path,
         "--before", "usb_reset", "--after", after,
         "verify_flash", f"0x{offset:X}", str(image),
-    ], timeout, image=image, recover=recover)
+    ], timeout, image=image, recover=recover, stable_identity=stable_identity)
 
 
 def _flash_command(args: argparse.Namespace) -> int:
@@ -2567,6 +2666,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         try:
             before_digest = _read_app_flash_digest(
                 device_path, expected_target, offset, size, operation_timeout,
+                stable_identity=device.stable_identity,
             )
         except usb_recovery.DeviceError as error:
             if not _is_recoverable_app_flash_readback_error(error):
@@ -2592,13 +2692,15 @@ def _flash_command(args: argparse.Namespace) -> int:
         reconciled = False
         try:
             _flash_esptool(
-                device_path, expected_target, arguments, operation_timeout, image=snapshot,
+                device_path, expected_target, arguments, operation_timeout,
+                image=snapshot, stable_identity=device.stable_identity,
             )
         except usb_recovery.DeviceError as error:
             if not _is_esptool_timeout(error):
                 raise
             after_digest = _read_app_flash_digest(
                 device_path, expected_target, offset, size, operation_timeout,
+                stable_identity=device.stable_identity,
             )
             if after_digest != digest:
                 raise usb_recovery.DeviceError("app flash readback SHA-256 mismatch") from error
@@ -2606,6 +2708,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         else:
             _verify_app_flash(
                 device_path, expected_target, snapshot, offset, operation_timeout,
+                stable_identity=device.stable_identity,
             )
         plan.update({
             "status": "reconciled" if reconciled else "flashed",
@@ -2660,6 +2763,7 @@ def _flash_bootloader_command(args: argparse.Namespace) -> int:
         f"0x{BOOTLOADER_OFFSET:X}",
         str(image),
     ]
+    device = _resolve_esptool_device(device, RESET_TIMEOUT)
     _run_esptool(arguments, device, RESET_TIMEOUT, image=image)
     plan["sha256"] = digest
     print(json.dumps(plan, sort_keys=True))
