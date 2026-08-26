@@ -3764,11 +3764,10 @@ static void esim_task(void* arg_raw)
     bool ok = (err == ESP_OK);
     // Enable, switch, and disable change the active card; reload the number, ICCID, and operator to avoid stale overview data.
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
-    bool transition_ready = true;
     esp_err_t transition_refresh_err = ESP_OK;
     if (sim_changed) {
         idf_modem_invalidate_sim_identity();
-        transition_ready = wait_esim_modem_ready_and_idle(90000);
+        const bool transition_ready = wait_esim_modem_ready_and_idle(90000);
         if (transition_ready) {
             std::string refresh_message;
             transition_refresh_err = idf_esim_list_profiles(profiles, eid, refresh_message);
