@@ -42,7 +42,8 @@ def check_public_key_hash_function(source: str) -> None:
     assert fixtures[0][1] != fixtures[1][1]
     for der, expected in fixtures:
         encoded = base64.b64encode(der)
-        byte_list = lambda value: ",".join(str(byte) for byte in value)
+        def byte_list(value):
+            return ",".join(str(byte) for byte in value)
         harness = f'''
 #include <cassert>
 #include <cstddef>
