@@ -92,6 +92,9 @@ DEFAULT_WEB_HOST = "192.168.20.30"
 DEFAULT_WEB_USER = "admin"
 RESET_TIMEOUT = 90.0
 STATE_TIMEOUT = 5.0
+ACTIVE_FLASH_FAILURE = "active app flash failed; device left in ROM loader"
+ACTIVE_PRE_READ_FAILURE = "active app pre-read failed; no flash was written"
+ACTIVE_POST_RESET_FAILURE = "active app flash post-reset verification failed"
 DIAG_INNER_TIMEOUT = 3.0
 CPOL_DIAG_INNER_TIMEOUT = 8.0
 DIAG_OUTER_TIMEOUT = 30.0
@@ -2165,6 +2168,230 @@ def _ensure_inactive_app_slot(device: SerialDevice, offset: int) -> None:
         raise usb_recovery.DeviceError("cannot flash the active app slot")
 
 
+def _profile_cache_flags(profile: Path) -> dict[str, str]:
+    cache = profile / "CMakeCache.txt"
+    if cache.is_symlink() or not _is_regular_file(cache):
+        raise usb_recovery.DeviceError("app build profile cache is unavailable")
+    try:
+        lines = cache.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise usb_recovery.DeviceError("app build profile cache is unavailable") from exc
+    flags: dict[str, str] = {}
+    for key in (
+        "FIRMWARE_IS_RELEASE", "SMS_USB_RECOVERY", "SMS_OTA_TEST_KEY",
+        "SMS_OTA_TEST_FAIL_HEALTH",
+    ):
+        matches = [
+            line.split("=", 1)[1]
+            for line in lines
+            if line.startswith(f"{key}:") and "=" in line
+        ]
+        if len(matches) != 1:
+            raise usb_recovery.DeviceError("app build profile identity is unavailable")
+        flags[key] = matches[0]
+    return flags
+
+
+def _profile_cache_value(profile: Path, key: str) -> str:
+    cache = profile / "CMakeCache.txt"
+    if cache.is_symlink() or not _is_regular_file(cache):
+        raise usb_recovery.DeviceError("app build profile cache is unavailable")
+    try:
+        lines = cache.read_text(encoding="ascii").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise usb_recovery.DeviceError("app build profile cache is unavailable") from exc
+    matches = [
+        line.split("=", 1)[1]
+        for line in lines
+        if line.startswith(f"{key}:") and "=" in line
+    ]
+    if len(matches) != 1:
+        raise usb_recovery.DeviceError("app build profile identity is unavailable")
+    return matches[0]
+
+
+def _read_active_public_key(path: Path, *, encoded: bool, label: str) -> bytes:
+    _reject_symlink_components(path)
+    if path.is_symlink() or not _is_regular_file(path):
+        raise usb_recovery.DeviceError(f"{label} is unavailable")
+    try:
+        raw = path.read_bytes()
+        key = base64.b64decode(raw.strip(), validate=True) if encoded else raw
+    except (OSError, ValueError) as exc:
+        raise usb_recovery.DeviceError(f"{label} is unavailable") from exc
+    if not key:
+        raise usb_recovery.DeviceError(f"{label} is unavailable")
+    return key
+
+
+def _active_image_identity(image: Path) -> str:
+    profile = image.parent.resolve(strict=True)
+    ota_test_profile = (ROOT / "build" / "idf-ota-test").resolve()
+    usb_profile = (ROOT / "build" / "idf-usb-recovery").resolve()
+    if profile == ota_test_profile:
+        expected = {
+            "FIRMWARE_IS_RELEASE": "0",
+            "SMS_USB_RECOVERY": "1",
+            "SMS_OTA_TEST_KEY": "1",
+            "SMS_OTA_TEST_FAIL_HEALTH": "0",
+        }
+        if _profile_cache_flags(profile) != expected:
+            raise usb_recovery.DeviceError("OTA test image requires a verified healthy dev profile")
+        configured_key = _profile_cache_value(profile, "SMS_OTA_TEST_PUBLIC_KEY")
+        key_path = profile / "ota_test_public_key.der.b64"
+        try:
+            configured_path = Path(configured_key)
+            cache_root = Path(_profile_cache_value(profile, "CMAKE_HOME_DIRECTORY"))
+            if not configured_path.is_absolute() or not cache_root.is_absolute():
+                raise ValueError("profile paths must be absolute")
+            if configured_path.relative_to(cache_root) != key_path.relative_to(ROOT):
+                raise ValueError("key path mismatch")
+        except (OSError, ValueError) as exc:
+            raise usb_recovery.DeviceError("OTA test image key profile is unavailable") from exc
+        key = _read_active_public_key(
+            key_path, encoded=True, label="OTA test public key",
+        )
+        return hashlib.sha256(key).hexdigest()
+    if profile != usb_profile or _profile_cache_flags(profile) != {
+        "FIRMWARE_IS_RELEASE": "0",
+        "SMS_USB_RECOVERY": "1",
+        "SMS_OTA_TEST_KEY": "0",
+        "SMS_OTA_TEST_FAIL_HEALTH": "0",
+    }:
+        raise usb_recovery.DeviceError("active app replacement requires a USB recovery build profile")
+    key = _read_active_public_key(
+        ROOT / "components" / "idf_web" / "ota_public_key.der.b64",
+        encoded=True, label="production OTA public key",
+    )
+    return hashlib.sha256(key).hexdigest()
+
+
+def _active_ota_state(device: SerialDevice, deadline: float) -> dict[str, object]:
+    state = _ota_state(device, deadline=deadline, legacy=False)
+    if state.get("public_key_sha256") is None:
+        raise usb_recovery.DeviceError("active app replacement requires extended OTA state")
+    return state
+
+
+def _validate_active_ota_state(
+    state: dict[str, object], offset: int, identity: str,
+) -> None:
+    pending = state.get("pending")
+    pending_address = state.get("pending_address")
+    if (
+        state.get("active_offset") != offset
+        or state.get("image_state") != "valid"
+        or state.get("pending_verify") is not False
+        or not isinstance(pending, int) or isinstance(pending, bool) or pending != 0
+        or not isinstance(pending_address, int)
+        or isinstance(pending_address, bool) or pending_address != 0
+        or state.get("public_key_sha256") != identity
+    ):
+        raise usb_recovery.DeviceError("active app replacement OTA state is unsafe")
+
+
+def _active_target(device_path: str, expected_target: str) -> SerialDevice:
+    device = resolve_serial_device(device_path)
+    if device.by_id != device_path or device.target != expected_target:
+        raise usb_recovery.DeviceError("device target changed")
+    return device
+
+
+def _recheck_active_state(
+    device_path: str, expected_target: str, offset: int,
+    identity: str, initial: dict[str, object], deadline: float,
+) -> SerialDevice:
+    device = _active_target(device_path, expected_target)
+    state = _active_ota_state(device, deadline)
+    _validate_active_ota_state(state, offset, identity)
+    if state != initial:
+        raise usb_recovery.DeviceError("active app replacement OTA state changed")
+    return device
+
+
+def _replace_active_app(
+    device_path: str, expected_target: str, device: SerialDevice,
+    image: Path, snapshot: Path, offset: int, size: int, digest: str,
+    plan: dict[str, object],
+) -> int:
+    identity = _active_image_identity(image)
+    operation_timeout = _flash_operation_timeout(size)
+    deadline = time.monotonic() + operation_timeout + RESET_TIMEOUT + STATE_TIMEOUT
+    initial_state = _active_ota_state(device, deadline)
+    _validate_active_ota_state(initial_state, offset, identity)
+
+    try:
+        _read_app_flash_digest(
+            device_path, expected_target, offset, size, operation_timeout,
+            after="hard_reset", recover=False,
+        )
+    except (OSError, ValueError, usb_recovery.DeviceError, subprocess.SubprocessError) as error:
+        raise usb_recovery.DeviceError(ACTIVE_PRE_READ_FAILURE) from error
+
+    device = _recheck_active_state(
+        device_path, expected_target, offset, identity, initial_state, deadline,
+    )
+    runtime_state = _state(device, deadline=deadline)
+    previous_boot_id = runtime_state.get("boot_id")
+    if (
+        not isinstance(previous_boot_id, int)
+        or isinstance(previous_boot_id, bool)
+        or not 0 < previous_boot_id <= 0xFFFFFFFF
+    ):
+        raise usb_recovery.DeviceError("USB state has an invalid boot id")
+    arguments = [
+        "--chip", "esp32c3", "--port", device_path,
+        "--before", "usb_reset", "--after", "no_reset",
+        "write_flash", f"0x{offset:X}", str(snapshot),
+    ]
+    try:
+        _flash_esptool(
+            device_path, expected_target, arguments, operation_timeout,
+            image=snapshot, recover=False,
+        )
+        _verify_app_flash(
+            device_path, expected_target, snapshot, offset, operation_timeout,
+            after="no_reset", recover=False,
+        )
+        after_digest = _read_app_flash_digest(
+            device_path, expected_target, offset, size, operation_timeout,
+            after="no_reset", recover=False,
+        )
+        if after_digest != digest:
+            raise usb_recovery.DeviceError("active app flash readback mismatch")
+    except (OSError, ValueError, usb_recovery.DeviceError, subprocess.SubprocessError) as error:
+        raise usb_recovery.DeviceError(ACTIVE_FLASH_FAILURE) from error
+
+    try:
+        final_device = _active_target(device_path, expected_target)
+        run_esptool(final_device, min(RESET_TIMEOUT, _remaining(deadline)))
+        fresh_runtime = _reset_state_after_boot(device_path, previous_boot_id, deadline)
+        fresh_boot_id = fresh_runtime.get("boot_id")
+        if (
+            not isinstance(fresh_boot_id, int)
+            or isinstance(fresh_boot_id, bool)
+            or not 0 < fresh_boot_id <= 0xFFFFFFFF
+            or fresh_boot_id == previous_boot_id
+        ):
+            raise usb_recovery.DeviceError("USB device did not report a fresh boot id")
+        post_device = _active_target(device_path, expected_target)
+        post_state = _active_ota_state(post_device, deadline)
+        _validate_active_ota_state(post_state, offset, identity)
+    except (OSError, ValueError, usb_recovery.DeviceError, subprocess.SubprocessError) as error:
+        raise usb_recovery.DeviceError(ACTIVE_POST_RESET_FAILURE) from error
+
+    plan.update({
+        "activation": "replace-active",
+        "reset": "hard_reset",
+        "sha256": digest,
+        "status": "flashed",
+        "verification": "readback_sha256+fresh_ota_state",
+        "written": True,
+    })
+    print(json.dumps(plan, sort_keys=True))
+    return 0
+
+
 def _flash_operation_timeout(size: int) -> float:
     return min(
         FLASH_OPERATION_MAX_TIMEOUT,
@@ -2185,7 +2412,7 @@ def _recover_app_flash(device: SerialDevice) -> None:
 def _flash_esptool(
     device_path: str, expected_target: str, arguments: list[str], timeout: float,
     *, image: Path | None = None, output: Path | None = None,
-    output_mount: Path | None = None,
+    output_mount: Path | None = None, recover: bool = True,
 ) -> None:
     device = resolve_serial_device(device_path)
     if device.by_id != device_path or device.target != expected_target:
@@ -2196,21 +2423,23 @@ def _flash_esptool(
             output_mount=output_mount,
         )
     except BaseException:
-        _recover_app_flash(device)
+        if recover:
+            _recover_app_flash(device)
         raise
 
 
 def _read_app_flash_digest(
     device_path: str, expected_target: str, offset: int, size: int, timeout: float,
+    *, after: str = "hard_reset", recover: bool = True,
 ) -> str:
     with tempfile.TemporaryDirectory(prefix="sms-forwarding-flash-") as directory:
         output = Path(directory) / "readback.bin"
         _flash_esptool(
             device_path, expected_target, [
                 "--chip", "esp32c3", "--port", device_path,
-                "--before", "usb_reset", "--after", "hard_reset",
+                "--before", "usb_reset", "--after", after,
                 "read_flash", f"0x{offset:X}", str(size), str(output),
-            ], timeout, output=output, output_mount=Path(directory),
+            ], timeout, output=output, output_mount=Path(directory), recover=recover,
         )
         if output.stat().st_size != size:
             raise usb_recovery.DeviceError("app flash readback length mismatch")
@@ -2219,16 +2448,25 @@ def _read_app_flash_digest(
 
 def _verify_app_flash(
     device_path: str, expected_target: str, image: Path, offset: int, timeout: float,
+    *, after: str = "hard_reset", recover: bool = True,
 ) -> None:
     _flash_esptool(device_path, expected_target, [
         "--chip", "esp32c3", "--port", device_path,
-        "--before", "usb_reset", "--after", "hard_reset",
+        "--before", "usb_reset", "--after", after,
         "verify_flash", f"0x{offset:X}", str(image),
-    ], timeout, image=image)
+    ], timeout, image=image, recover=recover)
 
 
 def _flash_command(args: argparse.Namespace) -> int:
     device_path = resolve_device(args.device)
+    replace_active = bool(getattr(args, "replace_active", False))
+    confirm_active = getattr(args, "confirm_active", None)
+    if confirm_active is not None and not replace_active:
+        raise ValueError("--confirm-active requires --replace-active")
+    if replace_active and confirm_active is not None and confirm_active != args.slot:
+        raise ValueError("--confirm-active must match --slot")
+    if replace_active and args.live and confirm_active is None:
+        raise ValueError("--confirm-active must match --slot")
     if args.image and args.image_option:
         raise ValueError("choose one app image")
     try:
@@ -2247,7 +2485,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         "offset": f"0x{offset:X}",
         "slot": args.slot,
         "size": size,
-        "activation": "none",
+        "activation": "replace-active" if replace_active else "none",
     }
     if not args.live:
         print(json.dumps(plan, sort_keys=True))
@@ -2271,6 +2509,13 @@ def _flash_command(args: argparse.Namespace) -> int:
         if pin.lower() != digest:
             raise ValueError("SHA-256 pin does not match app image")
         confirm_basename(device_path, args.confirm)
+        if replace_active:
+            if confirm_active != args.slot:
+                raise ValueError("--confirm-active must match --slot")
+            return _replace_active_app(
+                device_path, expected_target, device, image, snapshot,
+                offset, size, digest, plan,
+            )
         _ensure_inactive_app_slot(device, offset)
 
         operation_timeout = _flash_operation_timeout(size)
@@ -2553,6 +2798,14 @@ def build_parser() -> argparse.ArgumentParser:
     flash.add_argument("--live", action="store_true", help="perform the flash")
     flash.add_argument("--confirm", "--confirm-device", dest="confirm", help="exact device basename confirmation")
     flash.add_argument("--sha256", "--sha256-pin", dest="sha256_pin", default="")
+    flash.add_argument(
+        "--replace-active", action="store_true",
+        help="replace the selected active app slot during one-time recovery",
+    )
+    flash.add_argument(
+        "--confirm-active", choices=tuple(APP_SLOT_OFFSETS), default=None,
+        help="repeat the active slot name for one-time recovery",
+    )
 
     flash0 = commands.add_parser("flash-app0", help="flash only the app0 slot")
     flash0.add_argument("image", nargs="?")

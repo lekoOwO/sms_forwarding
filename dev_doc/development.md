@@ -214,6 +214,24 @@ python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app0
 
 需要寫入 app1 時，只將 `--slot app0` 改為 `--slot app1`；其餘安全檢查相同。
 
+若裝置必須以一次性方式重建目前 active app slot，才可使用下列明確的 recovery 旗標：
+
+```sh
+python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app1 \
+  build/idf-usb-recovery/sms_forwarding_idf.bin --replace-active \
+  --confirm-active app1 --live --sha256 <64-hex-image-sha256> \
+  --confirm <by-id-basename>
+```
+
+此模式需要 extended `ota-state`、valid running image、零 pending metadata、相同的 OTA public-key identity，
+以及固定的 `build/idf-usb-recovery` 或 `build/idf-ota-test` profile；不會猜測其他 build 目錄。
+`flash-app` 預設仍拒絕 active slot，`flash-app0` 不提供 active replacement。active 寫入、verify 或 readback
+失敗時不會自動 hard-reset，裝置會留在 ROM loader，錯誤輸出固定且不包含 process detail；pre-read 可能先
+hard-reset，但失敗時不會寫入 flash，且會明確回報此狀態。確認裝置狀態與 image pin 後才可重新執行。
+成功時才會 hard-reset，並檢查 fresh boot、相同 slot、valid state 與 key identity。`public_key_sha256` 是唯一
+可觀察的 compatibility identity；namespace 不作為 host 判斷依據。
+若 reset 後驗證失敗，不要盲目重試；先以唯讀 `ota-state` 確認目前 slot、state、pending metadata 與 key identity。
+
 `ota-state` 回報 app0/app1 offset、映像狀態、目前 OTA metadata 與
 `public_key_sha256`；回報格式錯誤、
 未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。尚未完成實機 rollback、

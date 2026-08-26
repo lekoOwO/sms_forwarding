@@ -1665,6 +1665,492 @@ class DeviceCommandTest(unittest.TestCase):
             mock.call(reference, legacy=True),
         ])
 
+    def _active_image_fixture(self, temp, *, test_profile=False):
+        root = pathlib.Path(temp)
+        profile_name = "idf-ota-test" if test_profile else "idf-usb-recovery"
+        profile = root / "build" / profile_name
+        profile.mkdir(parents=True)
+        image = profile / "sms_forwarding_idf.bin"
+        image.write_bytes(b"active-bootstrap-image")
+        if test_profile:
+            key_der = b"active-test-public-key"
+            key_path = profile / "ota_test_public_key.der.b64"
+            key_path.write_text(base64.b64encode(key_der).decode("ascii") + "\n", encoding="ascii")
+            (profile / "CMakeCache.txt").write_text(
+                "FIRMWARE_IS_RELEASE:STRING=0\n"
+                "SMS_USB_RECOVERY:STRING=1\n"
+                "SMS_OTA_TEST_KEY:STRING=1\n"
+                "SMS_OTA_TEST_FAIL_HEALTH:STRING=0\n"
+                "SMS_OTA_TEST_PUBLIC_KEY:FILEPATH=/workspace/build/idf-ota-test/ota_test_public_key.der.b64\n"
+                "CMAKE_HOME_DIRECTORY:INTERNAL=/workspace\n",
+                encoding="ascii",
+            )
+        else:
+            key_der = b"active-production-public-key"
+            key_path = root / "components" / "idf_web" / "ota_public_key.der.b64"
+            key_path.parent.mkdir(parents=True)
+            key_path.write_text(base64.b64encode(key_der).decode("ascii") + "\n", encoding="ascii")
+            (profile / "CMakeCache.txt").write_text(
+                "FIRMWARE_IS_RELEASE:STRING=0\n"
+                "SMS_USB_RECOVERY:STRING=1\n"
+                "SMS_OTA_TEST_KEY:STRING=0\n"
+                "SMS_OTA_TEST_FAIL_HEALTH:STRING=0\n",
+                encoding="ascii",
+            )
+        return root, image, hashlib.sha256(image.read_bytes()).hexdigest(), hashlib.sha256(key_der).hexdigest()
+
+    @staticmethod
+    def _active_state(key, **overrides):
+        state = {
+            "active_offset": 0x1F0000,
+            "image_state": "valid",
+            "pending_verify": False,
+            "accepted": 7,
+            "pending": 0,
+            "pending_address": 0,
+            "public_key_sha256": key,
+        }
+        state.update(overrides)
+        return state
+
+    def _active_args(self, image, digest, *extra):
+        return [
+            "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+            "--replace-active", "--confirm-active", "app1", "--live",
+            "--confirm", "usb-test", "--sha256", digest, *extra,
+        ]
+
+    def test_replace_active_requires_both_exact_confirmations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            state = self._active_state(key)
+            cases = (
+                ("missing-active-confirmation", ["--replace-active", "--live", "--confirm", "usb-test"]),
+                ("wrong-active-confirmation", ["--replace-active", "--confirm-active", "app0", "--live", "--confirm", "usb-test"]),
+                ("missing-device-confirmation", ["--replace-active", "--confirm-active", "app1", "--live"]),
+            )
+            for name, options in cases:
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=device.SerialDevice(DEVICE, TARGET)), \
+                        mock.patch.object(device, "_ota_state", return_value=state), \
+                        mock.patch.object(device, "confirm_basename", side_effect=ValueError("exact device basename confirmation is required")), \
+                        mock.patch.object(device, "_run_baseline") as baseline, \
+                        mock.patch.object(device, "_flash_esptool") as esptool:
+                    result, _ = self.run_main([
+                        "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                        *options, "--sha256", digest,
+                    ])
+                self.assertNotEqual(result, 0)
+                esptool.assert_not_called()
+                if name != "missing-device-confirmation":
+                    baseline.assert_not_called()
+
+    def test_flash_app_default_still_rejects_active_slot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value=self._active_state(key)) as ota_state, \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest") as readback, \
+                    mock.patch.object(device, "_flash_esptool") as esptool, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                result, _ = self.run_main([
+                    "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                    "--live", "--confirm", "usb-test", "--sha256", digest,
+                ])
+        self.assertNotEqual(result, 0)
+        ota_state.assert_called_once_with(reference, legacy=True)
+        readback.assert_not_called()
+        esptool.assert_not_called()
+        reset.assert_not_called()
+
+    def test_replace_active_rejects_unsafe_extended_ota_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            cases = (
+                ("wrong-slot", self._active_state(key, active_offset=0x10000)),
+                ("pending-verify", self._active_state(key, image_state="pending-verify", pending_verify=True)),
+                ("invalid-image", self._active_state(key, image_state="other")),
+                ("pending-counter", self._active_state(key, pending=1)),
+                ("pending-address", self._active_state(key, pending_address=0x1F0000)),
+                ("null-key", self._active_state(None)),
+                ("wrong-key", self._active_state("0" * 64)),
+            )
+            for name, state in cases:
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                        mock.patch.object(device, "_ota_state", return_value=state), \
+                        mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                        mock.patch.object(device, "confirm_basename"), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_read_app_flash_digest") as readback, \
+                        mock.patch.object(device, "_flash_esptool") as esptool, \
+                        mock.patch.object(device, "run_esptool") as reset:
+                    result, _ = self.run_main(self._active_args(image, digest))
+                self.assertNotEqual(result, 0)
+                readback.assert_not_called()
+                esptool.assert_not_called()
+                reset.assert_not_called()
+
+    def test_replace_active_pre_read_failure_is_fatal_without_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", return_value=self._active_state(key)), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=usb_recovery.DeviceError("private pre-read detail")), \
+                    mock.patch.object(device, "_flash_esptool") as esptool, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                error = io.StringIO()
+                with mock.patch("sys.stderr", error):
+                    result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app pre-read failed; no flash was written", error.getvalue())
+        self.assertNotIn("private pre-read detail", error.getvalue())
+        esptool.assert_not_called()
+        reset.assert_not_called()
+
+    def test_replace_active_captures_boot_id_after_pre_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            pre_read_finished = False
+            recheck_finished = False
+
+            def readback(*_args, **_kwargs):
+                nonlocal pre_read_finished
+                if not pre_read_finished:
+                    pre_read_finished = True
+                    return "0" * 64
+                return digest
+
+            def ota_state(*_args, **_kwargs):
+                nonlocal recheck_finished
+                if pre_read_finished:
+                    recheck_finished = True
+                return self._active_state(key)
+
+            def runtime_state(*_args, **_kwargs):
+                return {"boot_id": 22 if recheck_finished else 11}
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=ota_state), \
+                    mock.patch.object(device, "_state", side_effect=runtime_state), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=readback), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool") as reset, \
+                    mock.patch.object(device, "_reset_state_after_boot", return_value={"boot_id": 23}) as fresh:
+                result, _ = self.run_main(self._active_args(image, digest))
+        self.assertEqual(result, 0)
+        self.assertTrue(pre_read_finished)
+        self.assertTrue(recheck_finished)
+        self.assertEqual(fresh.call_args.args[1], 22)
+        reset.assert_called_once()
+
+    def test_replace_active_dry_run_is_explicit_and_does_not_touch_device(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, _key = self._active_image_fixture(temp)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device") as resolve, \
+                    mock.patch.object(device, "_run_baseline") as baseline:
+                result, output = self.run_main([
+                    "--device", DEVICE, "flash-app", "--slot", "app1", str(image),
+                    "--replace-active", "--sha256", digest,
+                ])
+        self.assertEqual(result, 0)
+        resolve.assert_not_called()
+        baseline.assert_not_called()
+        plan = json.loads(output)
+        self.assertEqual(plan["activation"], "replace-active")
+        self.assertFalse(plan["live"])
+
+    def test_replace_active_rechecks_state_and_target_before_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            initial = self._active_state(key)
+            drifted = self._active_state(key, pending=1)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=[initial, drifted]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", return_value="f" * 64), \
+                    mock.patch.object(device, "_flash_esptool") as esptool, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        esptool.assert_not_called()
+        reset.assert_not_called()
+
+    def test_replace_active_rejects_target_drift_before_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial = device.SerialDevice(DEVICE, TARGET)
+            changed = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", side_effect=[initial, changed]), \
+                    mock.patch.object(device, "_ota_state", return_value=self._active_state(key)), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", return_value="f" * 64), \
+                    mock.patch.object(device, "_flash_esptool") as esptool, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        esptool.assert_not_called()
+        reset.assert_not_called()
+
+    def test_replace_active_rejects_by_id_retarget_before_final_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            changed = device.SerialDevice(DEVICE, "/dev/ttyACM1")
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", side_effect=[reference, reference, changed]), \
+                    mock.patch.object(device, "_ota_state", side_effect=[self._active_state(key), self._active_state(key)]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=["0" * 64, digest]), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool") as reset:
+                result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        reset.assert_not_called()
+
+    def test_replace_active_write_failure_leaves_rom_loader_without_recovery_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            events = []
+
+            def run_esptool(arguments, *_args, **_kwargs):
+                events.append(arguments)
+                if "write_flash" in arguments:
+                    raise usb_recovery.DeviceError("private write detail")
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=[self._active_state(key), self._active_state(key)]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", return_value="f" * 64), \
+                    mock.patch.object(device, "_run_esptool", side_effect=run_esptool), \
+                    mock.patch.object(device, "_recover_app_flash") as recover, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                error = io.StringIO()
+                with mock.patch("sys.stderr", error):
+                    result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app flash failed; device left in ROM loader", error.getvalue())
+        self.assertNotIn("private write detail", error.getvalue())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][events[0].index("--after") + 1], "no_reset")
+        self.assertEqual(events[0][events[0].index("write_flash") + 1], "0x1F0000")
+        recover.assert_not_called()
+        reset.assert_not_called()
+
+    def test_replace_active_verify_failure_leaves_rom_loader_without_recovery_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            events = []
+
+            def flash(_device_path, _expected_target, arguments, *_args, **_kwargs):
+                events.append(arguments)
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=[self._active_state(key), self._active_state(key)]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", return_value="f" * 64), \
+                    mock.patch.object(device, "_flash_esptool", side_effect=flash), \
+                    mock.patch.object(device, "_verify_app_flash", side_effect=usb_recovery.DeviceError("private verify detail")) as verify, \
+                    mock.patch.object(device, "run_esptool") as reset:
+                error = io.StringIO()
+                with mock.patch("sys.stderr", error):
+                    result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app flash failed; device left in ROM loader", error.getvalue())
+        self.assertNotIn("private verify detail", error.getvalue())
+        self.assertEqual(len(events), 1)
+        verify.assert_called_once()
+        self.assertEqual(verify.call_args.kwargs["after"], "no_reset")
+        self.assertFalse(verify.call_args.kwargs["recover"])
+        reset.assert_not_called()
+
+    def test_replace_active_readback_mismatch_leaves_rom_loader_without_reset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=[self._active_state(key), self._active_state(key)]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=["f" * 64, "0" * 64]), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool") as reset:
+                error = io.StringIO()
+                with mock.patch("sys.stderr", error):
+                    result, _ = self.run_main(self._active_args(image, digest))
+        self.assertNotEqual(result, 0)
+        self.assertIn("active app flash failed; device left in ROM loader", error.getvalue())
+        reset.assert_not_called()
+
+    def test_replace_active_happy_path_uses_exact_slot_readback_reset_and_poststate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            initial_device = device.SerialDevice(DEVICE, TARGET)
+            rechecked_device = device.SerialDevice(DEVICE, TARGET)
+            final_device = device.SerialDevice(DEVICE, TARGET)
+            post_device = device.SerialDevice(DEVICE, TARGET)
+            initial = self._active_state(key)
+            events = []
+            readback = mock.Mock(side_effect=["0" * 64, digest])
+            post_runtime = {"boot_id": 12}
+
+            def flash(_device_path, _expected_target, arguments, *_args, **_kwargs):
+                events.append(arguments)
+
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(
+                        device, "resolve_serial_device",
+                        side_effect=[initial_device, rechecked_device, final_device, post_device],
+                    ), \
+                    mock.patch.object(device, "_ota_state", side_effect=[initial, initial, initial]), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", readback), \
+                    mock.patch.object(device, "_flash_esptool", side_effect=flash), \
+                    mock.patch.object(device, "_verify_app_flash") as verify, \
+                    mock.patch.object(device, "run_esptool") as reset, \
+                    mock.patch.object(device, "_reset_state_after_boot", return_value=post_runtime) as fresh:
+                result, output = self.run_main(self._active_args(image, digest))
+        self.assertEqual(result, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][events[0].index("write_flash") + 1], "0x1F0000")
+        self.assertEqual(events[0][events[0].index("--after") + 1], "no_reset")
+        self.assertEqual(readback.call_count, 2)
+        self.assertEqual(readback.call_args_list[0].args[2:4], (0x1F0000, len(b"active-bootstrap-image")))
+        self.assertEqual(readback.call_args_list[0].kwargs["after"], "hard_reset")
+        self.assertFalse(readback.call_args_list[0].kwargs["recover"])
+        self.assertEqual(readback.call_args_list[1].kwargs["after"], "no_reset")
+        self.assertFalse(readback.call_args_list[1].kwargs["recover"])
+        verify.assert_called_once()
+        self.assertEqual(verify.call_args.args[3], 0x1F0000)
+        self.assertEqual(verify.call_args.kwargs["after"], "no_reset")
+        self.assertFalse(verify.call_args.kwargs["recover"])
+        reset.assert_called_once_with(final_device, mock.ANY)
+        fresh.assert_called_once()
+        plan = json.loads(output)
+        self.assertEqual(plan["status"], "flashed")
+        self.assertEqual(plan["activation"], "replace-active")
+        self.assertEqual(plan["verification"], "readback_sha256+fresh_ota_state")
+
+    def test_replace_active_rejects_unsafe_post_reset_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            initial = self._active_state(key)
+            cases = (
+                ("unchanged-boot", {"boot_id": 11}, initial),
+                ("wrong-slot", {"boot_id": 12}, self._active_state(key, active_offset=0x10000)),
+                ("invalid-image", {"boot_id": 12}, self._active_state(key, image_state="other")),
+                ("key-drift", {"boot_id": 12}, self._active_state("0" * 64)),
+            )
+            for name, fresh_runtime, post_state in cases:
+                with self.subTest(name=name), \
+                        mock.patch.object(device, "ROOT", root), \
+                        mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                        mock.patch.object(device, "_ota_state", side_effect=[initial, initial, post_state]), \
+                        mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                        mock.patch.object(device, "confirm_basename"), \
+                        mock.patch.object(device, "_run_baseline"), \
+                        mock.patch.object(device, "_read_app_flash_digest", side_effect=["0" * 64, digest]), \
+                        mock.patch.object(device, "_flash_esptool"), \
+                        mock.patch.object(device, "_verify_app_flash"), \
+                        mock.patch.object(device, "run_esptool") as reset, \
+                        mock.patch.object(device, "_reset_state_after_boot", return_value=fresh_runtime):
+                    error = io.StringIO()
+                    with mock.patch("sys.stderr", error):
+                        result, _ = self.run_main(self._active_args(image, digest))
+                self.assertNotEqual(result, 0)
+                self.assertIn("active app flash post-reset verification failed", error.getvalue())
+                reset.assert_called_once()
+
+    def test_replace_active_accepts_matching_test_profile_key_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, key = self._active_image_fixture(temp, test_profile=True)
+            reference = device.SerialDevice(DEVICE, TARGET)
+            with mock.patch.object(device, "ROOT", root), \
+                    mock.patch.object(device, "resolve_serial_device", return_value=reference), \
+                    mock.patch.object(device, "_ota_state", side_effect=[self._active_state(key)] * 3), \
+                    mock.patch.object(device, "_state", return_value={"boot_id": 11}), \
+                    mock.patch.object(device, "confirm_basename"), \
+                    mock.patch.object(device, "_run_baseline"), \
+                    mock.patch.object(device, "_read_app_flash_digest", side_effect=["0" * 64, digest]), \
+                    mock.patch.object(device, "_flash_esptool"), \
+                    mock.patch.object(device, "_verify_app_flash"), \
+                    mock.patch.object(device, "run_esptool"), \
+                    mock.patch.object(device, "_reset_state_after_boot", return_value={"boot_id": 12}):
+                result, _ = self.run_main(self._active_args(image, digest))
+        self.assertEqual(result, 0)
+
+    def test_replace_active_rejects_unhealthy_or_unpinned_test_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, image, digest, _key = self._active_image_fixture(temp, test_profile=True)
+            cache = image.parent / "CMakeCache.txt"
+            original = cache.read_text(encoding="ascii")
+            embedded_key_path = "/workspace/build/idf-ota-test/ota_test_public_key.der.b64"
+            for name, replacement in (
+                ("fail-health", "SMS_OTA_TEST_FAIL_HEALTH:STRING=1"),
+                ("wrong-key-pointer", f"SMS_OTA_TEST_PUBLIC_KEY:FILEPATH={root / 'other.der.b64'}"),
+            ):
+                with self.subTest(name=name):
+                    cache.write_text(
+                        original.replace(
+                            "SMS_OTA_TEST_FAIL_HEALTH:STRING=0", replacement
+                        ) if name == "fail-health" else original.replace(
+                            f"SMS_OTA_TEST_PUBLIC_KEY:FILEPATH={embedded_key_path}",
+                            replacement,
+                        ),
+                        encoding="ascii",
+                    )
+                    with mock.patch.object(device, "ROOT", root), \
+                            mock.patch.object(device, "resolve_serial_device") as resolve, \
+                            mock.patch.object(device, "_run_baseline"), \
+                            mock.patch.object(device, "_flash_esptool") as esptool:
+                        result, _ = self.run_main(self._active_args(image, digest))
+                    self.assertNotEqual(result, 0)
+                    resolve.assert_called_once()
+                    esptool.assert_not_called()
+                    cache.write_text(original, encoding="ascii")
+
     def test_live_flash_runs_baseline_before_hash_and_fixed_write(self):
         events = []
 
