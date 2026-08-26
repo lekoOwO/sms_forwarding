@@ -61,9 +61,20 @@ def definition_body(source: str, declaration: str) -> str:
     raise AssertionError(f"unterminated definition: {declaration}")
 
 
-def run_guard_seam(source: str, mutate_idle=None):
-    cellular_locked = definition_body(source, "static bool cellular_job_active_locked(bool allow_device_restart)")
-    cellular_active = definition_body(source, "static bool cellular_job_active(bool allow_device_restart)")
+def run_guard_seam(source: str, mutate_idle=None, mutate_cellular=None):
+    def guard_body(name):
+        for declaration in (
+            f"static bool {name}(bool allow_device_restart, bool allow_current_ota)",
+            f"static bool {name}(bool allow_device_restart)",
+        ):
+            if declaration in source:
+                return definition_body(source, declaration)
+        raise AssertionError(f"missing guard definition: {name}")
+
+    cellular_locked = guard_body("cellular_job_active_locked")
+    cellular_active = guard_body("cellular_job_active")
+    if mutate_cellular:
+        cellular_locked = mutate_cellular(cellular_locked)
     idle = definition_body(source, "static bool system_idle_for_maintenance(bool include_done = false,")
     if mutate_idle:
         idle = mutate_idle(idle)
@@ -86,6 +97,7 @@ static bool s_web_modem_action_running = false;
 static bool g_lock_available = true;
 static bool g_backup_transfer = false;
 static bool g_ota_active = false;
+static unsigned g_ota_active_calls = 0;
 static bool g_ota_restart_pending = false;
 static bool g_restore_restart_pending = false;
 static bool g_api_jobs_active = false;
@@ -100,7 +112,7 @@ static unsigned g_email_queue = 0;
 static bool cell_job_lock(TickType_t = 0) {{ return g_lock_available; }}
 static void cell_job_unlock() {{}}
 static bool backup_transfer_active() {{ return g_backup_transfer; }}
-static bool ota_active() {{ return g_ota_active; }}
+static bool ota_active() {{ ++g_ota_active_calls; return g_ota_active; }}
 static bool idf_web_ota_restart_pending() {{ return g_ota_restart_pending; }}
 static bool restore_restart_pending() {{ return g_restore_restart_pending; }}
 static bool api_jobs_active() {{ return g_api_jobs_active; }}
@@ -116,11 +128,17 @@ static unsigned idf_push_email_queue_depth() {{ return g_email_queue; }}
            s_push_test_admission_active.load(std::memory_order_acquire);
 }}
 
-static bool cellular_job_active_locked(bool allow_device_restart)
-{{{cellular_locked}}}
+static bool cellular_job_active_locked(bool allow_device_restart, bool allow_current_ota = false)
+{{
+    (void)allow_current_ota;
+{cellular_locked}
+}}
 
-static bool cellular_job_active(bool allow_device_restart)
-{{{cellular_active}}}
+static bool cellular_job_active(bool allow_device_restart, bool allow_current_ota = false)
+{{
+    (void)allow_current_ota;
+{cellular_active}
+}}
 
 static bool system_idle_for_maintenance(bool include_done = false,
                                          bool allow_restore_restart = false,
@@ -132,6 +150,7 @@ static void reset_state()
     g_lock_available = true;
     g_backup_transfer = false;
     g_ota_active = false;
+    g_ota_active_calls = 0;
     g_ota_restart_pending = false;
     g_restore_restart_pending = false;
     g_api_jobs_active = false;
@@ -158,8 +177,50 @@ static void expect_idle(bool expected, bool allow_device_restart = true,
     assert(system_idle_for_maintenance(include_done, allow_restore_restart, allow_device_restart) == expected);
 }}
 
+static void expect_busy_with_current_ota()
+{{
+    g_ota_active = true;
+    assert(cellular_job_active(false, true));
+    reset_state();
+}}
+
 int main()
 {{
+    reset_state();
+    g_ota_active = true;
+    const bool current_ota_busy = cellular_job_active(false, true);
+    assert(g_ota_active_calls == 1);  // OTA expiry must still be evaluated.
+    assert(!current_ota_busy);         // The chunk owner may continue its session.
+
+    reset_state();
+    g_ota_active = true;
+    assert(cellular_job_active(false, false));  // Default callers remain blocked.
+
+    reset_state();
+    s_device_restart_pending.store(true);
+    expect_busy_with_current_ota();
+    g_ota_restart_pending = true;
+    expect_busy_with_current_ota();
+    s_keepalive_job.running = true;
+    expect_busy_with_current_ota();
+    s_keepalive_job.queued = true;
+    expect_busy_with_current_ota();
+    s_esim_job.running = true;
+    expect_busy_with_current_ota();
+    s_esim_job.queued = true;
+    expect_busy_with_current_ota();
+    s_sched_job.running = true;
+    expect_busy_with_current_ota();
+    s_sched_job.queued = true;
+    expect_busy_with_current_ota();
+    s_modem_apply_running = true;
+    expect_busy_with_current_ota();
+    s_web_modem_action_running = true;
+    expect_busy_with_current_ota();
+    g_lock_available = false;
+    g_ota_active = false;
+    assert(cellular_job_active(false, true));  // Lock failure stays fail-safe busy.
+
     reset_state();
     expect_idle(true);
 
@@ -740,6 +801,9 @@ int main() {
 
     source = (WEB / "idf_web.cpp").read_text()
     assert run_guard_seam(source).returncode == 0
+    mutated_ota_guard = run_guard_seam(source, mutate_cellular=lambda body: body.replace(
+        "(!allow_current_ota && ota_busy)", "ota_busy", 1))
+    assert mutated_ota_guard.returncode != 0
     mutated_guard = run_guard_seam(source, lambda body: body.replace(
         "!s_push_test_admission_active.load(std::memory_order_acquire) &&", "true &&", 1).replace(
         "!shared_admission_active() &&", "true &&", 1))
@@ -910,9 +974,12 @@ int main() {
     assert restore_restart.count("release_restart_owner()") == 2
     maintenance = function_body(source, "system_idle_for_maintenance")
     cellular = function_body(source, "cellular_job_active_locked")
-    assert "static bool cellular_job_active_locked(bool allow_device_restart)" in source
+    assert "static bool cellular_job_active_locked(bool allow_device_restart = false," in source
+    assert "bool allow_current_ota = false);" in source
     assert "(!allow_device_restart && s_device_restart_pending.load" in cellular
     assert "idf_web_ota_restart_pending()" in cellular
+    assert "const bool ota_busy = ota_active();" in cellular
+    assert "(!allow_current_ota && ota_busy)" in cellular
     assert "s_keepalive_job.running" in cellular
     assert "s_esim_job.running" in cellular
     assert "cellular_job_active(allow_device_restart)" in maintenance
@@ -922,6 +989,8 @@ int main() {
     assert "api_jobs_visible()" in maintenance
     assert "include_done" in maintenance
     assert "backup_transfer_active()" in maintenance
+    ota_chunk = function_body(source, "handle_ota_chunk")
+    assert "cellular_job_active(false, true)" in ota_chunk
     assert "ota_active()" in maintenance
     assert "restore_restart_pending()" in maintenance
     restore_due = function_body(source, "restore_restart_due")

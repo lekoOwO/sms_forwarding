@@ -165,8 +165,10 @@ static bool s_web_modem_action_running = false;
 
 static bool cell_job_lock(TickType_t ticks = pdMS_TO_TICKS(300));
 static void cell_job_unlock(void);
-static bool cellular_job_active_locked(bool allow_device_restart = false);
-static bool cellular_job_active(bool allow_device_restart = false);
+static bool cellular_job_active_locked(bool allow_device_restart = false,
+                                       bool allow_current_ota = false);
+static bool cellular_job_active(bool allow_device_restart = false,
+                                bool allow_current_ota = false);
 static void set_json_no_cache(httpd_req_t* req);
 static bool get_query_param(httpd_req_t* req, const char* key, std::string& out, size_t max_query);
 static esp_err_t enqueue_api_job(httpd_req_t* req, const char* type, const std::string& arg,
@@ -2101,7 +2103,7 @@ static esp_err_t handle_ota_chunk(httpd_req_t* req)
 {
     if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
-    if (shared_admission_active() || cellular_job_active()) {
+    if (shared_admission_active() || cellular_job_active(false, true)) {
         return send_ota_result(req, "409 Conflict", false, "ACTION_BUSY");
     }
     std::string raw_id, raw_offset;
@@ -3581,12 +3583,13 @@ static void cell_job_unlock(void)
     xSemaphoreGive(s_cell_job_mutex);
 }
 
-static bool cellular_job_active_locked(bool allow_device_restart)
+static bool cellular_job_active_locked(bool allow_device_restart, bool allow_current_ota)
 {
     const bool restart_busy =
         (!allow_device_restart && s_device_restart_pending.load(std::memory_order_relaxed)) ||
         idf_web_ota_restart_pending();
-    return restart_busy || ota_active() ||
+    const bool ota_busy = ota_active();
+    return restart_busy || (!allow_current_ota && ota_busy) ||
            s_keepalive_job.running || s_keepalive_job.queued ||
            s_esim_job.running || s_esim_job.queued ||
            s_sched_job.running || s_sched_job.queued ||
@@ -4277,13 +4280,13 @@ static bool system_idle_for_maintenance(bool include_done = false,
            !cellular_job_active(allow_device_restart);
 }
 
-static bool cellular_job_active(bool allow_device_restart)
+static bool cellular_job_active(bool allow_device_restart, bool allow_current_ota)
 {
     // Treat lock failure as busy (fail-safe) before maintenance restart. A false idle result could restart
     // during eSIM switch or keepalive work and leave the device on the wrong card.
     bool active = true;
     if (cell_job_lock()) {
-        active = cellular_job_active_locked(allow_device_restart);
+        active = cellular_job_active_locked(allow_device_restart, allow_current_ota);
         cell_job_unlock();
     }
     return active;
