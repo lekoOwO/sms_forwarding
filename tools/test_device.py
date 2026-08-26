@@ -6,10 +6,12 @@ from __future__ import annotations
 import contextlib
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
 import pathlib
+import ssl
 import struct
 import sys
 import subprocess
@@ -3031,7 +3033,7 @@ class _FakeTransferClient:
         if host != "fake-host" or user != "alice" or password != "secret":
             raise AssertionError("fake auth mismatch")
 
-    def request(self, method, path, *, body=b"", headers=None, max_bytes=16384):
+    def request(self, method, path, *, body=b"", headers=None, max_bytes=16384, stage=None):
         state = self.state
         headers = headers or {}
         state.requests.append((method, path, headers, body))
@@ -3050,7 +3052,17 @@ class _FakeTransferClient:
             if state.job_mode == "timeout":
                 body = b'{"id":9,"type":"job","state":"running"}'
             elif state.job_mode == "failed":
-                body = b'{"id":9,"type":"job","state":"failed","result":{"success":false,"code":"ACTION_JOB_FAILED","data":{},"detail":""}}'
+                body = json.dumps({
+                    "id": 9,
+                    "type": "job",
+                    "state": "failed",
+                    "result": {
+                        "success": False,
+                        "code": state.job_error_code,
+                        "data": {},
+                        "detail": state.job_error_detail,
+                    },
+                }).encode()
             else:
                 code = "ACTION_CONFIG_EXPORT_READY" if state.job_kind == "backup" else "ACTION_OTA_READY"
                 data = {"exportId": 12} if state.job_kind == "backup" else {}
@@ -3087,7 +3099,7 @@ class WebTransferTest(unittest.TestCase):
         return result, output.getvalue(), errors.getvalue()
 
     def serve(self):
-        state = type("State", (), {"requests": [], "config": _config_fixture(), "job_kind": "backup", "job_mode": "success", "wrong_status": False, "ota_start_error": None, "chunks": [], "manifest": "", "signature": ""})()
+        state = type("State", (), {"requests": [], "config": _config_fixture(), "job_kind": "backup", "job_mode": "success", "job_error_code": "ACTION_JOB_FAILED", "job_error_detail": "", "wrong_status": False, "ota_start_error": None, "chunks": [], "manifest": "", "signature": ""})()
         return state, "fake-host"
 
     def test_ota_dry_run_does_not_use_network_and_rejects_bad_hash(self):
@@ -3407,6 +3419,86 @@ class WebTransferTest(unittest.TestCase):
         response = device.WebResponse(400, {"content-type": "application/json"}, b"not-json")
         with self.assertRaisesRegex(device.DeviceTransferError, "OTA start returned unexpected HTTP status"):
             device._action(response, "OTA start", 201)
+
+    def test_unknown_action_error_code_stays_generic(self):
+        cases = (
+            "https://private.example/path?body=private-body",
+            "ACTION_UNKNOWN\nprivate-newline",
+            "ACTION_" + ("private-overlong" * 100),
+        )
+        for code in cases:
+            with self.subTest(code_kind=code[:16]):
+                response = device.WebResponse(
+                    400,
+                    {"content-type": "application/json"},
+                    json.dumps({
+                        "success": False,
+                        "code": code,
+                        "data": {},
+                        "detail": "private-detail",
+                    }).encode(),
+                )
+                with self.assertRaises(device.DeviceTransferError) as raised:
+                    device._action(response, "OTA start", 201)
+                self.assertEqual(str(raised.exception), "OTA start returned HTTP 400")
+                self.assertNotIn(code, str(raised.exception))
+                self.assertNotIn("private-detail", str(raised.exception))
+
+    def test_ota_terminal_failure_reports_safe_action_code_and_stage(self):
+        server, host = self.serve()
+        server.job_mode = "failed"
+        server.job_error_code = "ACTION_OTA_METADATA_FAILED"
+        server.job_error_detail = "private-detail signature=010203"
+        _FakeTransferClient.state = server
+        with tempfile.TemporaryDirectory() as temp, mock.patch.dict(
+                os.environ, {"SMS_WEB_PASSWORD": "secret"}, clear=True):
+            package = pathlib.Path(temp) / "update.smsota"
+            package.write_bytes(_ota_fixture())
+            with mock.patch.object(device, "WebClient", _FakeTransferClient):
+                result, output, error = self.run_main([
+                    "ota-upload", str(package), "--host", host, "--user", "alice",
+                    "--live", "--confirm-host", host,
+                ])
+        self.assertEqual(result, 1)
+        self.assertEqual(output, "")
+        self.assertEqual(error.strip(), "OTA validation failed (ACTION_OTA_METADATA_FAILED)")
+        self.assertNotIn("private-detail", output + error)
+        self.assertNotIn("010203", output + error)
+        self.assertNotIn("secret", output + error)
+
+    def test_webclient_transport_failures_are_stage_safe(self):
+        cases = (
+            ("timeout", TimeoutError("private-timeout"), "constructor"),
+            ("connect", ConnectionRefusedError("private-connect"), "constructor"),
+            ("tls", ssl.SSLError("private-tls"), "constructor"),
+            ("protocol", http.client.BadStatusLine("private-protocol"), "response"),
+        )
+        for category, transport_error, failure_point in cases:
+            with self.subTest(category=category):
+                connection = mock.Mock()
+                if failure_point == "response":
+                    connection.getresponse.side_effect = transport_error
+                    patcher = mock.patch.object(
+                        device.http.client, "HTTPConnection", return_value=connection,
+                    )
+                else:
+                    patcher = mock.patch.object(
+                        device.http.client, "HTTPConnection", side_effect=transport_error,
+                    )
+                with patcher:
+                    client = device.WebClient("private-host", "user", "private-password")
+                    with self.assertRaises(device.DeviceTransferError) as raised:
+                        client.request(
+                            "POST", "/private-path", body=b"private-body",
+                            stage="private-stage https://private.example/path\nbody=private-body",
+                        )
+                self.assertEqual(str(raised.exception), f"request failed ({category})")
+                for marker in (
+                    "private-timeout", "private-connect", "private-tls", "private-protocol",
+                    "private-host", "private-path", "private-body", "private-password",
+                    "private-stage", "private.example",
+                ):
+                    self.assertNotIn(marker, str(raised.exception))
 
     def test_live_transfers_reject_wrong_status_and_failed_or_timed_out_job(self):
         server, host = self.serve()

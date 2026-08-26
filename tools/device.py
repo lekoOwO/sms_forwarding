@@ -14,6 +14,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import ssl
 import sys
 import tempfile
 import time
@@ -69,6 +70,21 @@ CONFIG_VERIFY_TIMEOUT = 10.0
 OTA_MAGIC = b"SMSOTA1\n"
 OTA_MAX_MANIFEST_BYTES = 512
 OTA_CHUNK_BYTES = 8192
+OTA_ACTION_CODES = frozenset((
+    "ACTION_OTA_READY", "ACTION_OTA_HASH_INVALID", "ACTION_OTA_FINALIZE_FAILED",
+    "ACTION_OTA_METADATA_FAILED", "ACTION_OTA_WRITE_FAILED", "ACTION_OTA_SESSION_INVALID",
+))
+WEB_ACTION_CODES = frozenset((
+    "ACTION_BUSY", "ACTION_CONFIG_PASSPHRASE_INVALID", "ACTION_CSRF_INVALID",
+    "ACTION_INPUT_INVALID", "ACTION_JOB_ACCEPTED", "ACTION_JOB_QUEUE_FULL",
+    "ACTION_OTA_BEGIN_FAILED", "ACTION_OTA_BUSY", "ACTION_OTA_CHUNK_INVALID",
+    "ACTION_OTA_CHUNK_OK", "ACTION_OTA_MANIFEST_INVALID", "ACTION_OTA_SIGNATURE_INVALID",
+    "ACTION_OTA_UPLOAD_STARTED", *OTA_ACTION_CODES,
+))
+WEB_REQUEST_STAGES = frozenset((
+    "Web request", "config snapshot", "config export", "OTA start", "OTA chunk",
+    "OTA finish", "job status", "configuration download",
+))
 WEB_REQUEST_TIMEOUT = 10.0
 JOB_TIMEOUT = 45.0
 JOB_POLL_INTERVAL = 0.75
@@ -445,6 +461,24 @@ class WebResponse:
     body: bytes
 
 
+def _safe_web_error_class(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, ssl.SSLError):
+        return "tls"
+    if isinstance(error, http.client.HTTPException):
+        return "protocol"
+    if isinstance(error, (ConnectionError, OSError)):
+        return "connect"
+    return "external-error"
+
+
+def _safe_web_stage(stage: object) -> str:
+    if isinstance(stage, str) and stage in WEB_REQUEST_STAGES:
+        return stage
+    return "request"
+
+
 def _parse_web_host(value: str) -> WebEndpoint:
     if not value or value != value.strip() or any(char in value for char in "\r\n"):
         raise DeviceTransferError("host is invalid")
@@ -488,6 +522,7 @@ class WebClient:
         body: bytes = b"",
         headers: dict[str, str] | None = None,
         max_bytes: int = 16384,
+        stage: str = "Web request",
     ) -> WebResponse:
         if not path.startswith("/") or "\r" in path or "\n" in path:
             raise DeviceTransferError("request path is invalid")
@@ -514,8 +549,10 @@ class WebClient:
             )
         except DeviceTransferError:
             raise
-        except (OSError, TimeoutError, http.client.HTTPException):
-            raise DeviceTransferError("Web request failed") from None
+        except (OSError, TimeoutError, http.client.HTTPException) as error:
+            raise DeviceTransferError(
+                f"{_safe_web_stage(stage)} failed ({_safe_web_error_class(error)})"
+            ) from None
         finally:
             if connection is not None:
                 try:
@@ -594,6 +631,7 @@ def _json_object(response: WebResponse, stage: str, expected_status: int, *, che
 
 
 def _action(response: WebResponse, stage: str, expected_status: int) -> dict[str, object]:
+    stage = _safe_web_stage(stage)
     error_status = response.status != expected_status
     if error_status and not 400 <= response.status <= 599:
         raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
@@ -608,6 +646,8 @@ def _action(response: WebResponse, stage: str, expected_status: int) -> dict[str
             raise DeviceTransferError(f"{stage} returned unexpected HTTP status")
         raise DeviceTransferError(f"{stage} returned invalid action result")
     if error_status:
+        if value["code"] not in WEB_ACTION_CODES:
+            raise DeviceTransferError(f"{stage} returned HTTP {response.status}")
         raise DeviceTransferError(f"{stage} returned HTTP {response.status} ({value['code']})")
     return value
 
@@ -619,7 +659,10 @@ def _positive_int(value: object, label: str) -> int:
 
 
 def _csrf(client: WebClient) -> str:
-    snapshot = _json_object(client.request("GET", "/api/config", max_bytes=16384), "config snapshot", 200)
+    snapshot = _json_object(
+        client.request("GET", "/api/config", max_bytes=16384, stage="config snapshot"),
+        "config snapshot", 200,
+    )
     token = snapshot.get("csrfToken")
     if not isinstance(token, str) or not 1 <= len(token.encode("utf-8")) < 40 or any(ord(char) < 0x20 or ord(char) > 0x7e for char in token):
         raise DeviceTransferError("config snapshot returned an invalid CSRF token")
@@ -628,14 +671,14 @@ def _csrf(client: WebClient) -> str:
 
 def _post_form(client: WebClient, path: str, token: str, values: dict[str, object], stage: str, status: int) -> dict[str, object]:
     encoded = urllib.parse.urlencode({key: str(value) for key, value in values.items()}).encode("ascii")
-    return _action(client.request("POST", path, body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "application/x-www-form-urlencoded"}, max_bytes=4096), stage, status)
+    return _action(client.request("POST", path, body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "application/x-www-form-urlencoded"}, max_bytes=4096, stage=stage), stage, status)
 
 
 def _job(client: WebClient, job_id: int, token: str, timeout: float | None = None) -> dict[str, object]:
     timeout = JOB_TIMEOUT if timeout is None else timeout
     deadline = time.monotonic() + timeout
     while True:
-        response = client.request("GET", f"/api/jobs?id={job_id}", headers={"X-CSRF-Token": token}, max_bytes=4096)
+        response = client.request("GET", f"/api/jobs?id={job_id}", headers={"X-CSRF-Token": token}, max_bytes=4096, stage="job status")
         value = _json_object(response, "job status", 200)
         if set(value) not in ({"id", "type", "state"}, {"id", "type", "state", "result"}):
             raise DeviceTransferError("job status is invalid")
@@ -851,7 +894,7 @@ def _backup_command(args: argparse.Namespace) -> int:
     if result["success"] is not True:
         raise DeviceTransferError("configuration export job failed")
     export_id = _positive_int(result["data"].get("exportId"), "export id")
-    downloaded = client.request("GET", f"/api/config/export?id={export_id}", headers={"X-CSRF-Token": token, "Accept": "application/vnd.sms-forwarding.config"}, max_bytes=CONFIG_MAX_BYTES)
+    downloaded = client.request("GET", f"/api/config/export?id={export_id}", headers={"X-CSRF-Token": token, "Accept": "application/vnd.sms-forwarding.config"}, max_bytes=CONFIG_MAX_BYTES, stage="configuration download")
     if downloaded.status != 200 or downloaded.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/vnd.sms-forwarding.config":
         raise DeviceTransferError("configuration download returned an unexpected response")
     _exclusive_atomic_write(output, _validate_config_backup(downloaded.body), passphrase)
@@ -892,7 +935,7 @@ def _ota_upload_command(args: argparse.Namespace) -> int:
     while offset < len(package.firmware):
         chunk = package.firmware[offset:offset + OTA_CHUNK_BYTES]
         encoded = base64.b64encode(chunk)
-        result = _action(client.request("POST", f"/api/ota/chunk?id={upload_id}&offset={offset}", body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "text/plain"}, max_bytes=4096), "OTA chunk", 200)
+        result = _action(client.request("POST", f"/api/ota/chunk?id={upload_id}&offset={offset}", body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "text/plain"}, max_bytes=4096, stage="OTA chunk"), "OTA chunk", 200)
         if result["success"] is not True or result["code"] != "ACTION_OTA_CHUNK_OK" or result["data"].get("nextOffset") != offset + len(chunk):
             raise DeviceTransferError("OTA chunk was rejected")
         offset += len(chunk)
@@ -902,7 +945,9 @@ def _ota_upload_command(args: argparse.Namespace) -> int:
     job_id = _positive_int(finished["data"].get("jobId"), "OTA job id")
     result = _job(client, job_id, token)
     if result["success"] is not True or result["code"] != "ACTION_OTA_READY":
-        raise DeviceTransferError("OTA validation failed")
+        if result["code"] not in OTA_ACTION_CODES:
+            raise DeviceTransferError("OTA validation failed")
+        raise DeviceTransferError(f"OTA validation failed ({result['code']})")
     plan["code"] = "ACTION_OTA_READY"
     print(json.dumps(plan, sort_keys=True))
     return 0
