@@ -340,7 +340,27 @@ python3 scripts/generate-firmware-version.py --check
 
 裝置只保存 public key。不要將 private key、測試憑證或未遮蔽 secret 寫入 repository。
 
-目前 checkout 沒有 matching private key。硬體 rollback/replay evidence 仍未完成，因此目前不能把 signed OTA 標記為 READY。
+目前 checkout 沒有 matching private key。2026-08-27 的 TEST-key hardware evidence 已證明 test-key package pipeline、health rollback 與 replay rejection，但不證明 production signing-key ownership。因此目前不能把 signed OTA 標記為 READY。
+
+### 2026-08-27 TEST-key OTA hardware evidence
+
+Board and modem details are intentionally omitted from this sanitized record.
+Input: TEST-key signed OTA package flows and a replay request.
+
+The healthy signed package was accepted and booted the inactive app.
+Health validation accepted the image, and the accepted counter increased by one.
+
+The forced fail-health package was staged and booted.
+Automatic rollback restored the prior healthy app, and the accepted counter stayed unchanged.
+
+A replay of the accepted counter returned HTTP 400 `ACTION_OTA_MANIFEST_INVALID`.
+The active slot, accepted counter, and pending state stayed unchanged.
+
+This record proves the TEST-key package pipeline, health rollback, and replay rejection.
+It does not prove production signing-key ownership or authorize a release.
+Keep `components/idf_web/OTA_RUNTIME_READY` absent. The formal release gate must fail closed.
+
+The ignored test private key remains mode 0600. Encrypted configuration backups remain retained.
 
 ## Focused checks
 

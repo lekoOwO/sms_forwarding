@@ -155,7 +155,7 @@ USB recovery 的使用者 `ota-state` 會顯示執行中韌體用於簽章驗證
 SubjectPublicKeyInfo DER SHA-256。這只是可觀察的 trust key identity，不是
 attestation；被修改的韌體仍可回報任意值。`public_key_sha256: null` 只表示較舊韌體
 無法觀察此欄位，不表示 production key。
-`components/idf_web/OTA_RUNTIME_READY` 仍不存在；matching private key 與硬體 rollback/replay evidence 也未具備。
+`components/idf_web/OTA_RUNTIME_READY` 仍不存在。Production hardware rollback/replay evidence 與 matching production private key 仍不可用。
 因此目前不能宣稱 signed OTA 已達到 READY。
 
 ## 分區
