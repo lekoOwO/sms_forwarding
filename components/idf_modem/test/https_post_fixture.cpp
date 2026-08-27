@@ -178,7 +178,7 @@ static std::vector<std::string> expected_writes()
         "AT+MHTTPCFG=\"header\",7,1",
         "AT+MHTTPHEADER=7,1,30,\"Content-Type: application/json\"",
         "AT+MHTTPHEADER=7,0,19,\"X-Device: forwarder\"",
-        "AT+MHTTPCONTENT=7,22",
+        "AT+MHTTPCONTENT=7,0,22",
         "AT+MHTTPREQUEST=7,2,0,2F6170692F6E6F746966793F736F757263653D736D73",
         "AT+MHTTPTERM=7",
         "AT+MHTTPDEL=7",
@@ -240,6 +240,14 @@ int main()
     assert(owner.prompt_seen);
     assert(owner.raw_body == request.body);
     assert(owner.raw_body.find('\x1a') == std::string::npos);
+    assert(idf_modem_https_content_command(7, IDF_MODEM_HTTPS_POST_MAX_BODY) ==
+           "AT+MHTTPCONTENT=7,0,4096");
+
+    IdfModemHttpsPostRequest empty_body = request;
+    empty_body.body.clear();
+    OwnerTransportFixture empty;
+    assert(!empty.run(empty_body, "ML307A", 1, cert_response));
+    assert(empty.writes.empty());
     assert(idf_modem_https_timeout_command(7, 1001) ==
            "AT+MHTTPCFG=\"timeout\",7,2");
     assert(idf_modem_https_timeout_command(7, IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS) ==

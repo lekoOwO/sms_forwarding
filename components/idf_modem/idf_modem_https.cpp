@@ -196,8 +196,8 @@ bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,
         !idf_modem_https_parse_url(request.url, target, error)) {
         return false;
     }
-    if (request.body.size() > IDF_MODEM_HTTPS_POST_MAX_BODY) {
-        error = "HTTPS POST body is too large";
+    if (request.body.empty() || request.body.size() > IDF_MODEM_HTTPS_POST_MAX_BODY) {
+        error = request.body.empty() ? "HTTPS POST body is empty" : "HTTPS POST body is too large";
         return false;
     }
     if (request.contentType.empty() || request.contentType.size() > IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE ||
@@ -525,7 +525,7 @@ std::string idf_modem_https_header_command(uint8_t httpId, bool more, std::strin
 
 std::string idf_modem_https_content_command(uint8_t httpId, size_t length)
 {
-    return "AT+MHTTPCONTENT=" + std::to_string(httpId) + "," + std::to_string(length);
+    return "AT+MHTTPCONTENT=" + std::to_string(httpId) + ",0," + std::to_string(length);
 }
 
 std::string idf_modem_https_request_command(uint8_t httpId, std::string_view path)
