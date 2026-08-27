@@ -11,6 +11,9 @@ namespace {
 
 constexpr std::string_view kHttpsPrefix = "https://";
 constexpr size_t kMaxLine = 768;
+constexpr size_t kMaxPinnedCertificate = 8192;
+
+enum class PinnedCertificateListResult { missing, present, invalid };
 
 const char* pre_create_failure_message(size_t index)
 {
@@ -119,6 +122,68 @@ void append_urc_line(std::string& output, std::string_view line)
 {
     output.append(line.data(), line.size());
     output += "\r\n";
+}
+
+PinnedCertificateListResult inspect_pinned_certificate_list(
+    std::string_view response, size_t expected_length)
+{
+    constexpr std::string_view prefix = "+MSSLLIST:";
+    bool present = false;
+    size_t start = 0;
+    while (start < response.size()) {
+        const size_t end = response.find_first_of("\r\n", start);
+        std::string_view line = response.substr(
+            start, end == std::string_view::npos ? response.size() - start : end - start);
+        if (starts_with(line, prefix)) {
+            line.remove_prefix(prefix.size());
+            while (!line.empty() && line.front() == ' ') line.remove_prefix(1);
+            if (line.size() < 4 || line.front() != '"') {
+                return PinnedCertificateListResult::invalid;
+            }
+            const size_t quote = line.find('"', 1);
+            if (quote == std::string_view::npos || quote + 2 > line.size() ||
+                line[quote + 1] != ',') {
+                return PinnedCertificateListResult::invalid;
+            }
+            uint32_t length = 0;
+            if (!parse_uint(line.substr(quote + 2), length)) {
+                return PinnedCertificateListResult::invalid;
+            }
+            if (line.substr(1, quote - 1) == IDF_MODEM_HTTPS_PINNED_CERT_NAME) {
+                if (present || length != expected_length) {
+                    return PinnedCertificateListResult::invalid;
+                }
+                present = true;
+            }
+        }
+        if (end == std::string_view::npos) break;
+        start = end + 1;
+        while (start < response.size() &&
+               (response[start] == '\r' || response[start] == '\n')) ++start;
+    }
+    return present ? PinnedCertificateListResult::present
+                   : PinnedCertificateListResult::missing;
+}
+
+bool pinned_certificate_readback_matches(std::string_view response,
+                                         std::string_view certificate)
+{
+    constexpr std::string_view prefix = "+MSSLCERTRD:";
+    const size_t found = response.find(prefix);
+    if (found == std::string_view::npos) return false;
+    size_t length_start = found + prefix.size();
+    while (length_start < response.size() && response[length_start] == ' ') ++length_start;
+    const size_t comma = response.find(',', length_start);
+    if (comma == std::string_view::npos) return false;
+    uint32_t declared_length = 0;
+    if (!parse_uint(response.substr(length_start, comma - length_start), declared_length) ||
+        declared_length != certificate.size()) {
+        return false;
+    }
+    const size_t payload_start = comma + 1;
+    return payload_start <= response.size() &&
+           declared_length <= response.size() - payload_start &&
+           response.compare(payload_start, declared_length, certificate) == 0;
 }
 
 }  // namespace
@@ -238,11 +303,6 @@ std::string idf_modem_https_create_command(std::string_view host)
     return std::string("AT+MHTTPCREATE=\"https://") + std::string(host) + "\"";
 }
 
-std::string idf_modem_https_cert_query_command()
-{
-    return "AT+MSSLCFG=\"cert\",1";
-}
-
 std::string idf_modem_https_cert_bind_command(std::string_view name)
 {
     if (name.empty() ||
@@ -252,36 +312,6 @@ std::string idf_modem_https_cert_bind_command(std::string_view name)
         return {};
     }
     return std::string("AT+MSSLCFG=\"cert\",1,\"") + std::string(name) + "\"";
-}
-
-bool idf_modem_https_parse_cert_binding(std::string_view response, std::string& name)
-{
-    name.clear();
-    constexpr std::string_view prefix = "+MSSLCFG:";
-    constexpr std::string_view field = "\"cert\",1,\"";
-    size_t line_start = response.find(prefix);
-    while (line_start != std::string_view::npos) {
-        const size_t line_end = response.find_first_of("\r\n", line_start);
-        const std::string_view line = response.substr(
-            line_start, line_end == std::string_view::npos ? response.size() - line_start
-                                                             : line_end - line_start);
-        const size_t value_start = line.find(field);
-        if (value_start != std::string_view::npos) {
-            const size_t name_start = value_start + field.size();
-            const size_t name_end = line.find('"', name_start);
-            if (name_end == std::string_view::npos || name_end == name_start ||
-                name_end - name_start > 128) {
-                return false;
-            }
-            const std::string_view candidate = line.substr(name_start, name_end - name_start);
-            if (idf_modem_https_cert_bind_command(candidate).empty()) return false;
-            name.assign(candidate.data(), candidate.size());
-            return true;
-        }
-        if (line_end == std::string_view::npos) break;
-        line_start = response.find(prefix, line_end + 1);
-    }
-    return false;
 }
 
 bool idf_modem_https_build_post_wire(const IdfModemHttpsPostRequest& request,
@@ -345,6 +375,11 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         result.message = "HTTPS callbacks unavailable";
         return IdfModemHttpsRunResult::invalid_request;
     }
+    if (callbacks.pinnedCertificate.empty() ||
+        callbacks.pinnedCertificate.size() > kMaxPinnedCertificate) {
+        result.message = "HTTPS pinned certificate is unavailable";
+        return IdfModemHttpsRunResult::invalid_request;
+    }
 
     std::string response;
     int http_id = -1;
@@ -383,6 +418,39 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
                                      false);
     };
 
+    auto cert_result = send("AT+MSSLLIST=1");
+    if (cert_result != IdfModemHttpsCommandResult::ok) {
+        result.message = "HTTPS pinned certificate list failed";
+        return finish(command_failure(cert_result));
+    }
+    const PinnedCertificateListResult list_result = inspect_pinned_certificate_list(
+        response, callbacks.pinnedCertificate.size());
+    if (list_result == PinnedCertificateListResult::invalid) {
+        result.message = "HTTPS pinned certificate list mismatch";
+        return finish(IdfModemHttpsRunResult::command_failed);
+    }
+    if (list_result == PinnedCertificateListResult::missing) {
+        const std::string write_command =
+            "AT+MSSLCERTWR=\"" + std::string(IDF_MODEM_HTTPS_PINNED_CERT_NAME) +
+            "\",0," + std::to_string(callbacks.pinnedCertificate.size());
+        cert_result = send(write_command, callbacks.pinnedCertificate);
+        if (cert_result != IdfModemHttpsCommandResult::ok) {
+            result.message = "HTTPS pinned certificate write failed";
+            return finish(command_failure(cert_result));
+        }
+    }
+    const std::string read_command =
+        "AT+MSSLCERTRD=\"" + std::string(IDF_MODEM_HTTPS_PINNED_CERT_NAME) + "\"";
+    cert_result = send(read_command);
+    if (cert_result != IdfModemHttpsCommandResult::ok) {
+        result.message = "HTTPS pinned certificate read failed";
+        return finish(command_failure(cert_result));
+    }
+    if (!pinned_certificate_readback_matches(response, callbacks.pinnedCertificate)) {
+        result.message = "HTTPS pinned certificate readback mismatch";
+        return finish(IdfModemHttpsRunResult::command_failed);
+    }
+
     const std::string apn = trim_spaces(request.apn);
     if (!apn.empty()) {
         const std::string command = "AT+CGDCONT=1,\"IP\",\"" + apn + "\"";
@@ -410,16 +478,9 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         }
     }
 
-    const auto cert_result = send(idf_modem_https_cert_query_command());
-    std::string cert_name;
-    if (cert_result != IdfModemHttpsCommandResult::ok ||
-        !idf_modem_https_parse_cert_binding(response, cert_name)) {
-        result.message = "HTTPS TLS context 1 has no pre-provisioned certificate";
-        return finish(command_failure(cert_result));
-    }
-
     IdfModemHttpsPostWire wire;
-    if (!idf_modem_https_build_post_wire(request, target, cert_name, 0, wire, error)) {
+    if (!idf_modem_https_build_post_wire(request, target, IDF_MODEM_HTTPS_PINNED_CERT_NAME,
+                                         0, wire, error)) {
         result.message = error;
         return finish(IdfModemHttpsRunResult::command_failed);
     }
@@ -446,7 +507,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         return finish(IdfModemHttpsRunResult::command_failed);
     }
 
-    if (!idf_modem_https_build_post_wire(request, target, cert_name,
+    if (!idf_modem_https_build_post_wire(request, target, IDF_MODEM_HTTPS_PINNED_CERT_NAME,
                                          static_cast<uint8_t>(http_id), wire, error)) {
         result.message = error;
         return finish(IdfModemHttpsRunResult::command_failed);

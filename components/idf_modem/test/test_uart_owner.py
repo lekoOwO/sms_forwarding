@@ -1,3 +1,4 @@
+import hashlib
 import re
 import shutil
 import subprocess
@@ -401,8 +402,13 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIsNotNone(compiler, "the host HTTPS fixture requires g++")
         fixture = SOURCE.parent / "test" / "https_post_fixture.cpp"
         implementation = SOURCE.parent / "idf_modem_https.cpp"
+        certificate = SOURCE.parent / "certs" / "gts_root_r4_7e8b80d078d3.pem"
         self.assertTrue(fixture.exists(), "missing executable HTTPS POST fixture")
         self.assertTrue(implementation.exists(), "missing HTTPS POST protocol implementation")
+        self.assertEqual(
+            hashlib.sha256(certificate.read_bytes()).hexdigest(),
+            "7e8b80d078d3dd77d3ed2108dd2b33412c12d7d72cb0965741c70708691776a2",
+        )
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(
@@ -412,8 +418,22 @@ class UartOwnerContractTest(unittest.TestCase):
                 check=False, capture_output=True, text=True,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
-            run_result = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+            run_result = subprocess.run(
+                [str(binary), str(certificate)], check=False, capture_output=True, text=True
+            )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
+
+    def test_https_owner_routes_each_nonempty_raw_payload_through_prompt_transport(self):
+        source = SOURCE.read_text()
+        adapter = function_body(source, "owner_https_send_command")
+        self.assertIn("if (!raw_payload.empty())", adapter)
+        self.assertNotIn('command.rfind("AT+MHTTPCONTENT=", 0)', adapter)
+        self.assertIn("owner_send_raw_prompt_payload", adapter)
+        prompt = function_body(source, "owner_send_raw_prompt_payload")
+        self.assertIn("scan.find('>') == std::string::npos", prompt)
+        self.assertIn("return ESP_ERR_TIMEOUT", prompt)
+        self.assertIn("owner_uart_write(payload.data(), payload.size())", prompt)
+        self.assertIn("!= static_cast<int>(payload.size())", prompt)
 
     def test_https_queue_wait_covers_both_cleanup_attempts_and_propagates_deadline(self):
         source = SOURCE.read_text()

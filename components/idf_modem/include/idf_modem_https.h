@@ -14,6 +14,8 @@ static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME = 64;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE = 512;
 static constexpr uint32_t IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS = 30000;
 static constexpr uint32_t IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS = 90000;
+static constexpr std::string_view IDF_MODEM_HTTPS_PINNED_CERT_NAME =
+    "gts_root_r4_7e8b80d078d3.pem";
 
 struct IdfModemHttpsPostRequest {
     std::string url;
@@ -76,6 +78,7 @@ struct IdfModemHttpsCallbacks {
     void* context = nullptr;
     IdfModemHttpsSendCommand sendCommand = nullptr;
     IdfModemHttpsWaitResponse waitResponse = nullptr;
+    std::string_view pinnedCertificate;
 };
 
 bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,
@@ -94,9 +97,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
 
 int idf_modem_https_parse_create_id(std::string_view response);
 std::string idf_modem_https_create_command(std::string_view host);
-std::string idf_modem_https_cert_query_command();
 std::string idf_modem_https_cert_bind_command(std::string_view name);
-bool idf_modem_https_parse_cert_binding(std::string_view response, std::string& name);
 std::string idf_modem_https_ssl_command(uint8_t httpId);
 std::string idf_modem_https_timeout_command(uint8_t httpId, uint32_t timeoutMs);
 std::string idf_modem_https_header_command(uint8_t httpId, bool more,
