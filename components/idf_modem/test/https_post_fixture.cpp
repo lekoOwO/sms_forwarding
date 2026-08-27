@@ -145,8 +145,8 @@ IdfModemHttpsCommandResult OwnerTransportFixture::wait_response(
     }
     IdfModemHttpsUrcParser parser(http_id);
     for (const std::string_view chunk : {
-             std::string_view("+MHTTPURC: \"header\",7,204,0\r\n"),
-             std::string_view("+MHTTPURC: \"content\",7,5,5,0\r\nhello"),
+             std::string_view("+MHTTPURC: \"header\",7,200,19,X-Test: forward\r\n\r\n"),
+             std::string_view("+MHTTPURC: \"content\",7,5,5,5,hello"),
          }) {
         parser.feed(chunk);
     }
@@ -175,11 +175,10 @@ static std::vector<std::string> expected_writes()
         "AT+MHTTPCREATE=\"https://push.example.test\"",
         "AT+MHTTPCFG=\"ssl\",7,1,1",
         "AT+MHTTPCFG=\"timeout\",7,30",
-        "AT+MHTTPCFG=\"header\",7,1",
         "AT+MHTTPHEADER=7,1,30,\"Content-Type: application/json\"",
         "AT+MHTTPHEADER=7,0,19,\"X-Device: forwarder\"",
         "AT+MHTTPCONTENT=7,0,22",
-        "AT+MHTTPREQUEST=7,2,0,2F6170692F6E6F746966793F736F757263653D736D73",
+        "AT+MHTTPREQUEST=7,2,0,\"/api/notify?source=sms\"",
         "AT+MHTTPTERM=7",
         "AT+MHTTPDEL=7",
         "AT+CGACT=0,1",
@@ -189,20 +188,20 @@ static std::vector<std::string> expected_writes()
 static void feed_fragmented_success()
 {
     IdfModemHttpsUrcParser parser(7);
-    for (const std::string_view chunk : {
-             std::string_view("+MHTTPURC: \"header\",7,204"),
-             std::string_view(",0\r\n+CMT: \"+886900000\",145\r\n0011"),
-             std::string_view("2233445566778899AABBCCDDEEFF\r\nRING\r\n"),
-             std::string_view("+CLIP: \"+886911111\",145\r\n+CEREG: 1,1\r\n"),
-             std::string_view("+MHTTPURC: \"content\",7,5,5,2\r\nhe"),
-             std::string_view("+MHTTPURC: \"content\",7,5,5,3\r\nllo"),
-             std::string_view("+MHTTPURC: \"content\",7,5,5,0\r\n"),
-         }) {
-        parser.feed(chunk);
+    const std::string wire =
+        "+MHTTPURC: \"header\",7,200,19,X-Test: forward\r\n\r\n"
+        "+CMT: \"+886900000\",145\r\n00112233445566778899AABBCCDDEEFF\r\n"
+        "RING\r\n+CLIP: \"+886911111\",145\r\n+CEREG: 1,1\r\n"
+        "+MHTTPURC: \"content\",7,5,2,2,he"
+        "+MHTTPURC: \"content\",7,5,5,3,llo";
+    for (size_t offset = 0, fragment = 1; offset < wire.size(); fragment = fragment % 3 + 1) {
+        const size_t count = std::min(fragment, wire.size() - offset);
+        parser.feed(std::string_view(wire).substr(offset, count));
+        offset += count;
     }
     assert(parser.complete());
     assert(!parser.failed());
-    assert(parser.result().httpStatus == 204);
+    assert(parser.result().httpStatus == 200);
     assert(parser.result().expectedResponseBytes == 5);
     assert(parser.result().responseBytes == 5);
     assert(parser.urcs().find("+CMT:") != std::string::npos);
@@ -219,8 +218,8 @@ static void feed_fragmented_success()
     assert(error_parser.result().mhttpError == 4);
 
     IdfModemHttpsUrcParser non_2xx(7);
-    non_2xx.feed("+MHTTPURC: \"header\",7,503,0\r\n");
-    non_2xx.feed("+MHTTPURC: \"content\",7,0,0,0\r\n");
+    non_2xx.feed("+MHTTPURC: \"header\",7,503,0,");
+    non_2xx.feed("+MHTTPURC: \"content\",7,0,0,0,");
     assert(non_2xx.complete());
     assert(!idf_modem_https_status_success(non_2xx.result().httpStatus));
 
@@ -322,7 +321,7 @@ int main()
                      "AT+MHTTPCFG=\"ssl\",7,1,1") != short_setup.writes.end());
     assert(!short_setup.prompt_seen);
     assert(std::find(short_setup.writes.begin(), short_setup.writes.end(),
-                     "AT+MHTTPREQUEST=7,2,0,2F6170692F6E6F746966793F736F757263653D736D73") ==
+                     "AT+MHTTPREQUEST=7,2,0,\"/api/notify?source=sms\"") ==
            short_setup.writes.end());
 
     OwnerTransportFixture no_certificate;
@@ -362,6 +361,9 @@ int main()
     assert(!idf_modem_https_validate_request(oversized, error));
     oversized = request;
     oversized.headerValue.assign(IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE + 1, 'x');
+    assert(!idf_modem_https_validate_request(oversized, error));
+    oversized = request;
+    oversized.url = "https://push.example.test/\xE9\x80\x9A\xE7\x9F\xA5";
     assert(!idf_modem_https_validate_request(oversized, error));
 
     feed_fragmented_success();

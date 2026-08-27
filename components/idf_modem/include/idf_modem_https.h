@@ -99,7 +99,6 @@ std::string idf_modem_https_cert_bind_command(std::string_view name);
 bool idf_modem_https_parse_cert_binding(std::string_view response, std::string& name);
 std::string idf_modem_https_ssl_command(uint8_t httpId);
 std::string idf_modem_https_timeout_command(uint8_t httpId, uint32_t timeoutMs);
-std::string idf_modem_https_header_config_command(uint8_t httpId);
 std::string idf_modem_https_header_command(uint8_t httpId, bool more,
                                            std::string_view line);
 std::string idf_modem_https_content_command(uint8_t httpId, size_t length);
@@ -119,6 +118,7 @@ public:
 private:
     void feed_line_byte(char byte);
     void finish_line();
+    bool begin_inline_payload();
     void parse_line(std::string_view line);
     void fail(std::string_view message);
 
@@ -127,8 +127,9 @@ private:
     std::string line_;
     std::string urcs_;
     size_t content_remaining_ = 0;
+    size_t discard_remaining_ = 0;
     bool waiting_for_cmt_payload_ = false;
-    bool skip_lf_after_content_header_ = false;
+    bool content_seen_ = false;
     bool complete_ = false;
     bool failed_ = false;
 };

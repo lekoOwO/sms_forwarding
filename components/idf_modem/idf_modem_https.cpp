@@ -48,7 +48,7 @@ std::string trim_spaces(std::string_view value)
 bool contains_control_or_space(std::string_view value)
 {
     return std::any_of(value.begin(), value.end(), [](unsigned char ch) {
-        return ch < 0x20 || ch == 0x7f || ch == ' ';
+        return ch < 0x20 || ch > 0x7e || ch == ' ';
     });
 }
 
@@ -100,24 +100,6 @@ bool parse_uint_fields(std::string_view value, uint32_t* fields, size_t minimum,
         start = comma + 1;
     }
     return count >= minimum;
-}
-
-char hex_digit(uint8_t value)
-{
-    value &= 0x0f;
-    return value < 10 ? static_cast<char>('0' + value)
-                      : static_cast<char>('A' + value - 10);
-}
-
-std::string hex_encode(std::string_view value)
-{
-    std::string encoded;
-    encoded.reserve(value.size() * 2);
-    for (unsigned char byte : value) {
-        encoded += hex_digit(static_cast<uint8_t>(byte >> 4));
-        encoded += hex_digit(byte);
-    }
-    return encoded;
 }
 
 bool starts_with(std::string_view value, std::string_view prefix)
@@ -334,7 +316,6 @@ bool idf_modem_https_build_post_wire(const IdfModemHttpsPostRequest& request,
     wire.postCreate = {
         {false, idf_modem_https_ssl_command(httpId)},
         {false, idf_modem_https_timeout_command(httpId, request.timeoutMs)},
-        {false, idf_modem_https_header_config_command(httpId)},
         {false, idf_modem_https_header_command(httpId, has_extra_header,
                                                "Content-Type: " + request.contentType)},
     };
@@ -512,11 +493,6 @@ std::string idf_modem_https_timeout_command(uint8_t httpId, uint32_t timeoutMs)
            std::to_string(timeoutSeconds);
 }
 
-std::string idf_modem_https_header_config_command(uint8_t httpId)
-{
-    return "AT+MHTTPCFG=\"header\"," + std::to_string(httpId) + ",1";
-}
-
 std::string idf_modem_https_header_command(uint8_t httpId, bool more, std::string_view line)
 {
     return "AT+MHTTPHEADER=" + std::to_string(httpId) + "," + (more ? "1," : "0,") +
@@ -530,7 +506,8 @@ std::string idf_modem_https_content_command(uint8_t httpId, size_t length)
 
 std::string idf_modem_https_request_command(uint8_t httpId, std::string_view path)
 {
-    return "AT+MHTTPREQUEST=" + std::to_string(httpId) + ",2,0," + hex_encode(path);
+    return "AT+MHTTPREQUEST=" + std::to_string(httpId) + ",2,0,\"" +
+           std::string(path) + "\"";
 }
 
 IdfModemHttpsUrcParser::IdfModemHttpsUrcParser(uint8_t httpId) : http_id_(httpId) {}
@@ -546,9 +523,11 @@ void IdfModemHttpsUrcParser::fail(std::string_view message)
 void IdfModemHttpsUrcParser::feed(std::string_view bytes)
 {
     for (size_t index = 0; index < bytes.size(); ++index) {
-        if (skip_lf_after_content_header_) {
-            skip_lf_after_content_header_ = false;
-            if (bytes[index] == '\n') continue;
+        if (discard_remaining_ > 0) {
+            const size_t count = std::min(discard_remaining_, bytes.size() - index);
+            discard_remaining_ -= count;
+            index += count - 1;
+            continue;
         }
         if (content_remaining_ > 0) {
             const size_t count = std::min(content_remaining_, bytes.size() - index);
@@ -575,7 +554,6 @@ void IdfModemHttpsUrcParser::feed_line_byte(char byte)
 {
     if (byte == '\r' || byte == '\n') {
         finish_line();
-        if (byte == '\r' && content_remaining_ > 0) skip_lf_after_content_header_ = true;
         return;
     }
     if (line_.size() >= kMaxLine) {
@@ -583,6 +561,7 @@ void IdfModemHttpsUrcParser::feed_line_byte(char byte)
         return;
     }
     line_ += byte;
+    if (byte == ',') begin_inline_payload();
 }
 
 void IdfModemHttpsUrcParser::finish_line()
@@ -591,6 +570,75 @@ void IdfModemHttpsUrcParser::finish_line()
     const std::string line = trim_spaces(line_);
     line_.clear();
     if (!line.empty()) parse_line(line);
+}
+
+bool IdfModemHttpsUrcParser::begin_inline_payload()
+{
+    constexpr std::string_view header_prefix = "+MHTTPURC: \"header\",";
+    constexpr std::string_view content_prefix = "+MHTTPURC: \"content\",";
+    const bool header = starts_with(line_, header_prefix);
+    const bool content = starts_with(line_, content_prefix);
+    if (!header && !content) return false;
+
+    const std::string_view prefix = header ? header_prefix : content_prefix;
+    if (line_.size() <= prefix.size()) return false;
+    const size_t expected_fields = header ? 3 : 4;
+    const std::string_view fields_text(line_.data() + prefix.size(),
+                                       line_.size() - prefix.size() - 1);
+    const size_t separators = static_cast<size_t>(
+        std::count(fields_text.begin(), fields_text.end(), ','));
+    if (separators + 1 < expected_fields) return false;
+    if (separators + 1 > expected_fields) {
+        fail(header ? "Malformed HTTPS response header"
+                    : "Malformed HTTPS response content");
+        return true;
+    }
+
+    uint32_t fields[4] = {};
+    size_t field_count = 0;
+    if (!parse_uint_fields(fields_text, fields, expected_fields, expected_fields, field_count) ||
+        field_count != expected_fields) {
+        fail(header ? "Malformed HTTPS response header"
+                    : "Malformed HTTPS response content");
+        return true;
+    }
+    line_.clear();
+
+    if (header) {
+        if (fields[2] > IDF_MODEM_HTTPS_POST_MAX_BODY * 4U) {
+            fail("HTTPS response header length is invalid");
+            return true;
+        }
+        discard_remaining_ = fields[2];
+        if (fields[0] == http_id_) {
+            result_.httpStatus = fields[1] > INT_MAX ? -1 : static_cast<int>(fields[1]);
+        }
+        return true;
+    }
+
+    if (fields[3] > IDF_MODEM_HTTPS_POST_MAX_BODY * 4U) {
+        fail("HTTPS response content length is invalid");
+        return true;
+    }
+    if (fields[0] != http_id_) {
+        discard_remaining_ = fields[3];
+        return true;
+    }
+    const uint64_t next_bytes = static_cast<uint64_t>(result_.responseBytes) + fields[3];
+    if (fields[1] > IDF_MODEM_HTTPS_POST_MAX_BODY * 4U || fields[2] > fields[1] ||
+        fields[3] > fields[2] || next_bytes != fields[2] ||
+        (content_seen_ && result_.expectedResponseBytes != fields[1])) {
+        fail("HTTPS response content length is invalid");
+        return true;
+    }
+    content_seen_ = true;
+    result_.expectedResponseBytes = fields[1];
+    content_remaining_ = fields[3];
+    if (content_remaining_ == 0) {
+        complete_ = fields[2] == fields[1];
+        if (!complete_) fail("HTTPS response content ended early");
+    }
+    return true;
 }
 
 void IdfModemHttpsUrcParser::parse_line(std::string_view line)
@@ -606,38 +654,11 @@ void IdfModemHttpsUrcParser::parse_line(std::string_view line)
     constexpr std::string_view error_prefix = "+MHTTPURC: \"err\",";
     const bool is_http_line = starts_with(line, "+MHTTPURC:");
     if (starts_with(line, header_prefix)) {
-        uint32_t fields[8] = {};
-        size_t field_count = 0;
-        if (!parse_uint_fields(line.substr(header_prefix.size()), fields, 2, 8, field_count)) {
-            fail("Malformed HTTPS response header");
-            return;
-        }
-        if (fields[0] != http_id_) return;
-        result_.httpStatus = fields[1] > INT_MAX ? -1 : static_cast<int>(fields[1]);
+        fail("Malformed HTTPS response header");
         return;
     }
     if (starts_with(line, content_prefix)) {
-        uint32_t fields[8] = {};
-        size_t field_count = 0;
-        if (!parse_uint_fields(line.substr(content_prefix.size()), fields, 4, 8, field_count)) {
-            fail("Malformed HTTPS response content");
-            return;
-        }
-        if (fields[0] != http_id_) return;
-        if (fields[1] > IDF_MODEM_HTTPS_POST_MAX_BODY * 4U || fields[3] > fields[1]) {
-            fail("HTTPS response content length is invalid");
-            return;
-        }
-        result_.expectedResponseBytes = fields[1];
-        content_remaining_ = fields[3];
-        if (content_remaining_ == 0 && fields[2] < fields[1] &&
-            result_.responseBytes < result_.expectedResponseBytes) {
-            fail("HTTPS response content ended early");
-            return;
-        }
-        if (content_remaining_ == 0 || result_.responseBytes >= result_.expectedResponseBytes) {
-            complete_ = true;
-        }
+        fail("Malformed HTTPS response content");
         return;
     }
     if (starts_with(line, error_prefix)) {
