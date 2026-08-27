@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 
 #include "idf_config.h"
@@ -16,9 +17,11 @@ struct IdfPushHttpRequest {
 };
 
 struct IdfPushTransportResult {
+    static constexpr size_t MAX_MESSAGE = 96;
     int error = -1;
     int httpStatus = -1;
     bool ok = false;
+    std::string message;
 };
 
 using IdfPushWifiRequest = int (*)(const IdfPushHttpRequest& request, int& statusCode);

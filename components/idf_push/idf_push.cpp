@@ -1102,7 +1102,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
                             const char* text_raw, const char* timestamp_raw,
                             const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
                             IdfPushNetworkDecision network,
-                            bool notify = false)
+                            bool notify = false, std::string* failure_message = nullptr)
 {
     if (!channel_valid(channel)) return false;
 
@@ -1280,6 +1280,9 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     const esp_err_t err = static_cast<esp_err_t>(transport.error);
     const int code = transport.httpStatus;
     const bool ok = dispatched && transport.ok;
+    if (!ok && failure_message && !transport.message.empty()) {
+        *failure_message = transport.message;
+    }
     // Combine the send and response lines. Keep the channel name and result in one concise log entry.
     if (err == ESP_OK) idf_logf("%s push %s (HTTP %d)", name.c_str(), ok ? "succeeded" : "failed", code);
     else idf_logf("%s push failed: %s", name.c_str(), esp_err_to_name(err));
@@ -1867,9 +1870,10 @@ static bool process_test_one()
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "Test", "This is a test push from SMS Forwarder",
                              ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi,
-                             network);
+                             network, false, &result);
         s_busy.store(false, std::memory_order_relaxed);
-        result = ok ? "Test push sent" : "Test push failed; see the log";
+        if (ok) result = "Test push sent";
+        else if (result.empty()) result = "Test push failed; see the log";
     }
 
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {

@@ -1,5 +1,6 @@
 #include "idf_push_transport.h"
 
+#include <algorithm>
 #include <cctype>
 
 namespace {
@@ -91,6 +92,8 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     IdfModemHttpsPostResult cellular_result;
     result.error = cellular_post(cellular_request, cellular_result);
     result.httpStatus = cellular_result.httpStatus;
+    result.message.assign(cellular_result.message.data(),
+                          std::min(cellular_result.message.size(), IdfPushTransportResult::MAX_MESSAGE));
     result.ok = result.error == 0 && cellular_result.ok &&
                 result.httpStatus >= 200 && result.httpStatus < 300;
     return result.ok;

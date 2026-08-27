@@ -97,6 +97,11 @@ int main() {
     assert "fail_push_job_without_retry" in unsupported
     assert "Cellular push is not supported" in unsupported
     assert "job.attempts++" not in unsupported
+    send = source.split("static bool send_to_channel", 1)[1].split(
+        "static bool enqueue_push_job_locked", 1
+    )[0]
+    assert "std::string* failure_message = nullptr" in send
+    assert "*failure_message = transport.message" in send
     locked_selection = push_worker.split(
         "for (size_t i = 0; i < s_push_jobs.size(); ++i)", 1
     )[1].split("xSemaphoreGive(s_mutex)", 1)[0]
@@ -115,6 +120,8 @@ int main() {
     assert 'fail_pending_tests("Cellular push is not supported; test stopped")' in tests
     assert "channel_waits_for_time(cfg.pushChannels[i])" in tests
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
+    assert "network, false, &result" in tests
+    assert "else if (result.empty()) result = \"Test push failed; see the log\"" in tests
 
     assert "bool idf_push_test_active(void)" in source
     assert "bool idf_push_test_channel_active(uint8_t channel)" in header
@@ -146,7 +153,7 @@ int main() {
     )[0]
     assert "expire_test_jobs_locked" in process_test
     assert process_test.index("expire_test_jobs_locked") < process_test.index("IdfPushNetworkDecision::Defer")
-    completion = process_test.split("result = ok ?", 1)[1]
+    completion = process_test.split('if (ok) result = "Test push sent";', 1)[1]
     assert "xSemaphoreTake(s_mutex, portMAX_DELAY)" in completion
     status = source.split("std::string idf_push_test_status_json", 1)[1]
     assert "expire_test_jobs_locked" in status
