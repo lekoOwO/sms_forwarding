@@ -12,6 +12,30 @@ namespace {
 constexpr std::string_view kHttpsPrefix = "https://";
 constexpr size_t kMaxLine = 768;
 
+const char* pre_create_failure_message(size_t index)
+{
+    constexpr const char* messages[] = {
+        "HTTPS TLS certificate binding failed",
+        "HTTPS TLS auth failed",
+        "HTTPS TLS encoding failed",
+        "HTTPS TLS negotiation timeout failed",
+        "HTTPS TLS version failed",
+        "HTTPS TLS timestamp check failed",
+        "HTTPS TLS certificate verification failed",
+        "HTTPS connection creation failed",
+    };
+    return index < std::size(messages) ? messages[index] : "HTTPS TLS setup failed";
+}
+
+const char* post_create_failure_message(size_t index)
+{
+    constexpr const char* messages[] = {
+        "HTTPS SSL binding failed",
+        "HTTPS HTTP timeout configuration failed",
+    };
+    return index < std::size(messages) ? messages[index] : "HTTPS POST request setup failed";
+}
+
 std::string trim_spaces(std::string_view value)
 {
     size_t start = 0;
@@ -419,7 +443,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         const IdfModemHttpsWireStep& step = wire.preCreate[index];
         const auto command_result = send(step.command);
         if (command_result != IdfModemHttpsCommandResult::ok) {
-            result.message = "HTTPS TLS or connection setup failed";
+            result.message = pre_create_failure_message(index);
             return finish(command_failure(command_result));
         }
         if (index + 1 == wire.preCreate.size()) {
@@ -442,11 +466,12 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         result.message = error;
         return finish(IdfModemHttpsRunResult::command_failed);
     }
-    for (const IdfModemHttpsWireStep& step : wire.postCreate) {
+    for (size_t index = 0; index < wire.postCreate.size(); ++index) {
+        const IdfModemHttpsWireStep& step = wire.postCreate[index];
         const auto command_result = send(step.command, step.rawPayload ? request.body : "");
         if (command_result != IdfModemHttpsCommandResult::ok) {
             result.message = step.rawPayload ? "HTTPS request body upload failed"
-                                             : "HTTPS POST request setup failed";
+                                             : post_create_failure_message(index);
             return finish(command_failure(command_result));
         }
     }

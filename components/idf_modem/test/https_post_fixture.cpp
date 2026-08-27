@@ -20,6 +20,19 @@ static IdfModemHttpsPostRequest request_fixture()
 
 struct OwnerTransportFixture {
     enum class StaleFailure { none, modem_error, transport_failure };
+    enum class FailureStage {
+        none,
+        auth,
+        cert_bind,
+        encoding,
+        negotime,
+        version,
+        ignorestamp,
+        ignoreverify,
+        create,
+        timeout,
+        ssl,
+    };
 
     std::vector<std::string> writes;
     std::string raw_body;
@@ -32,6 +45,8 @@ struct OwnerTransportFixture {
     bool short_setup_write = false;
     bool non_2xx_response = false;
     std::string cert_response;
+    FailureStage fail_stage = FailureStage::none;
+    IdfModemHttpsPostResult last_result;
 
     static IdfModemHttpsCommandResult send_command(
         void* context, std::string_view command, std::string& response,
@@ -49,8 +64,10 @@ struct OwnerTransportFixture {
         this->cert_response.assign(cert_response.data(), cert_response.size());
         IdfModemHttpsCallbacks callbacks{this, &send_command, &wait_response};
         IdfModemHttpsPostResult result;
-        return idf_modem_https_run_post(request, callbacks, result) ==
-               IdfModemHttpsRunResult::ok;
+        const bool ok = idf_modem_https_run_post(request, callbacks, result) ==
+                        IdfModemHttpsRunResult::ok;
+        last_result = result;
+        return ok;
     }
 };
 
@@ -78,6 +95,29 @@ IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
         command == "AT+MHTTPCFG=\"ssl\",7,1,1") {
         return IdfModemHttpsCommandResult::failed;
     }
+    const auto fail = [&](OwnerTransportFixture::FailureStage stage) {
+        return fixture.fail_stage == stage;
+    };
+    if (fail(OwnerTransportFixture::FailureStage::auth) &&
+        command == "AT+MSSLCFG=\"auth\",1,1") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::cert_bind) &&
+        command == "AT+MSSLCFG=\"cert\",1,\"root-ca.pem\"") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::encoding) &&
+        command == "AT+MSSLCFG=\"encoding\",1,2") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::negotime) &&
+        command == "AT+MSSLCFG=\"negotime\",1,60") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::version) &&
+        command == "AT+MSSLCFG=\"version\",1,3") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::ignorestamp) &&
+        command == "AT+MSSLCFG=\"ignorestamp\",1,0") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::ignoreverify) &&
+        command == "AT+MSSLCFG=\"ignoreverify\",1,0") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::create) &&
+        command == idf_modem_https_create_command("push.example.test")) return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::timeout) &&
+        command == "AT+MHTTPCFG=\"timeout\",7,30000") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::ssl) &&
+        command == "AT+MHTTPCFG=\"ssl\",7,1,1") return IdfModemHttpsCommandResult::failed;
     if (cleanup && command == "AT+MHTTPDEL=7" && fixture.first_cleanup_timeout) {
         return IdfModemHttpsCommandResult::timeout;
     }
@@ -195,6 +235,26 @@ int main()
     assert(owner.prompt_seen);
     assert(owner.raw_body == request.body);
     assert(owner.raw_body.find('\x1a') == std::string::npos);
+
+    const std::pair<OwnerTransportFixture::FailureStage, const char*> tls_failures[] = {
+        {OwnerTransportFixture::FailureStage::auth, "HTTPS TLS auth failed"},
+        {OwnerTransportFixture::FailureStage::cert_bind, "HTTPS TLS certificate binding failed"},
+        {OwnerTransportFixture::FailureStage::encoding, "HTTPS TLS encoding failed"},
+        {OwnerTransportFixture::FailureStage::negotime, "HTTPS TLS negotiation timeout failed"},
+        {OwnerTransportFixture::FailureStage::version, "HTTPS TLS version failed"},
+        {OwnerTransportFixture::FailureStage::ignorestamp, "HTTPS TLS timestamp check failed"},
+        {OwnerTransportFixture::FailureStage::ignoreverify, "HTTPS TLS certificate verification failed"},
+        {OwnerTransportFixture::FailureStage::create, "HTTPS connection creation failed"},
+        {OwnerTransportFixture::FailureStage::timeout, "HTTPS HTTP timeout configuration failed"},
+        {OwnerTransportFixture::FailureStage::ssl, "HTTPS SSL binding failed"},
+    };
+    for (const auto& failure : tls_failures) {
+        OwnerTransportFixture failed_tls;
+        failed_tls.fail_stage = failure.first;
+        assert(!failed_tls.run(request, "ML307A", 1, cert_response));
+        assert(failed_tls.last_result.message == failure.second);
+        assert(failed_tls.writes.back() == "AT+CGACT=0,1");
+    }
 
     OwnerTransportFixture cleanup_failure;
     cleanup_failure.cleanup_ok = false;
