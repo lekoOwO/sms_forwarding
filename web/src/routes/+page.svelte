@@ -4,6 +4,7 @@
 	import MenuIcon from "@lucide/svelte/icons/menu";
 	import SunIcon from "@lucide/svelte/icons/sun";
 	import ActionResult from "$lib/components/ActionResult.svelte";
+	import CellularCaResult from "$lib/components/CellularCaResult.svelte";
 	import * as Accordion from "$lib/components/ui/accordion";
 	import * as Alert from "$lib/components/ui/alert";
 	import { Badge } from "$lib/components/ui/badge";
@@ -20,12 +21,12 @@
 	import { Switch } from "$lib/components/ui/switch";
 	import * as Tabs from "$lib/components/ui/tabs";
 	import { Textarea } from "$lib/components/ui/textarea";
-	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadSnapshot, postEsimAction, postForm, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
+	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
 	import { applyProviderTemplateDefaults, pushSecretRequired } from "$lib/push-template-defaults.js";
 	import { closeEsimDeleteDialog, refreshEsimAfterTerminal } from "$lib/esim-ui.js";
-	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushChannel, PushTestStatus, UiResult } from "$lib/types";
+	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushCaStatus, PushChannel, PushTestStatus, UiResult } from "$lib/types";
 
 	type MainTab = "overview" | "notifications" | "messaging" | "cellular" | "device" | "security";
 	type Theme = "light" | "dark";
@@ -79,6 +80,10 @@
 	let pushResult = $state(idle());
 	let pushTestResults = $state(Array.from({ length: 5 }, idlePushTest));
 	let pushTestBusy = $state(Array.from({ length: 5 }, () => false));
+	let pushCaResults = $state(Array.from({ length: 5 }, idle));
+	let pushCellularSaveResults = $state(Array.from({ length: 5 }, idle));
+	let pushCaStatuses = $state<Array<PushCaStatus | null>>(Array.from({ length: 5 }, () => null));
+	let cellularUrlClears = $state(Array.from({ length: 5 }, () => false));
 	let wifiResult = $state(idle());
 	let networkModeResult = $state(idle());
 	let routingResult = $state(idle());
@@ -166,6 +171,8 @@
 		loadError = "";
 		try {
 			snapshot = await loadSnapshot();
+			pushCaStatuses = await Promise.all(snapshot.config.pushChannels.map((_channel, index) => loadPushCaStatus(index).catch(() => null)));
+			cellularUrlClears = Array.from({ length: 5 }, () => false);
 			emailEnabledDraft = snapshot.config.emailEnabled;
 			pushEnabledDraft = snapshot.config.pushEnabled;
 			originalWifiSsids = snapshot.config.wifiProfiles.map((profile) => profile.ssid);
@@ -294,7 +301,12 @@
 		try {
 			const response = await waitForAccepted(await postForm("/save", values));
 			setResult({ state: response.success ? "success" : "error", code: response.code, data: response.data, detail: response.detail });
-			if (response.success) await refreshSnapshot();
+			if (response.success) {
+				const cellularField = Object.keys(values).find((field) => /^push[0-4]cellularEnabled$/.test(field));
+				const cellularIndex = cellularField ? Number(cellularField[4]) : -1;
+				await refreshSnapshot();
+				if (cellularIndex >= 0 && snapshot?.config.pushChannels[cellularIndex]?.cellularEnabled) await provisionCa(cellularIndex);
+			}
 		} catch (error) {
 			setResult({ state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) });
 		}
@@ -326,6 +338,23 @@
 		} finally {
 			pushTestBusy[index] = false;
 		}
+	}
+
+	async function provisionCa(index: number) {
+		pushCaResults[index] = { state: "loading", code: "commonRunning", data: {}, detail: "" };
+		try {
+			const response = await provisionPushCa(index);
+			pushCaStatuses[index] = await loadPushCaStatus(index);
+			pushCaResults[index] = { state: response.success && pushCaStatuses[index]?.configured ? "success" : "error", code: response.code, data: response.data, detail: response.detail };
+		} catch (error) {
+			pushCaStatuses[index] = { configured: false, sha256: "" };
+			pushCaResults[index] = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+		}
+	}
+
+	function saveCellular(index: number) {
+		pushTab = String(index);
+		void save((value) => pushCellularSaveResults[index] = value, pushValues());
 	}
 
 	async function sendSms() {
@@ -464,6 +493,9 @@
 		const channel = snapshot?.config.pushChannels[index];
 		if (!channel) return values;
 		values[`push${index}en`] = channel.enabled;
+		values[`push${index}cellularEnabled`] = channel.cellularEnabled ? 1 : 0;
+		if (channel.cellularUrl) values[`push${index}cellularUrl`] = channel.cellularUrl;
+		else if (cellularUrlClears[index]) values[`push${index}cellularUrlClear`] = 1;
 		values[`push${index}type`] = channel.type;
 		values[`push${index}name`] = channel.name;
 		if (channel.url) values[`push${index}url`] = channel.url;
@@ -498,6 +530,8 @@
 		if (/^wifi\d+open$/.test(field)) return 32;
 		if (/^push\d+name$/.test(field)) return 64;
 		if (/^push\d+(en|type)$/.test(field)) return 32;
+		if (/^push\d+cellular(Enabled|UrlClear)$/.test(field)) return 32;
+		if (/^push\d+cellularUrl$/.test(field)) return 512;
 		if (/^push\d+url$/.test(field)) return 512;
 		if (/^push\d+key[12]$/.test(field)) return 256;
 		if (/^push\d+body$/.test(field)) return CONFIG_FIELD_LIMITS.pushCustomBody;
@@ -717,6 +751,18 @@
 						<Accordion.Item value="push">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("pushTitle")}</span><Badge variant={snapshot.status.enabledPushChannels > 0 ? "secondary" : "outline"}>{snapshot.status.enabledPushChannels} / 5</Badge></span></Accordion.Trigger>
 							<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-url-${index}`}>{t("endpoint")}</Field.Label><Input id={`push-url-${index}`} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if [4, 5, 6, 8, 9, 10].includes(channel.type)}<Field.Field><Field.Label for={`push-key1-${index}`}>{keyLabels(channel.type)[0]}</Field.Label><Input id={`push-key1-${index}`} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}</Field.Field><Field.Field><Field.Label for={`push-key2-${index}`}>{keyLabels(channel.type)[1]}</Field.Label><Input id={`push-key2-${index}`} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2"><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} rows={5} class="font-mono" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><p class="text-sm text-muted-foreground" role={pushTestResults[index].done && !pushTestResults[index].success ? "alert" : "status"} aria-live="polite">{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</p></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button onclick={() => save((v) => pushResult = v, pushValues())} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+						</Accordion.Item>
+						<Accordion.Item value="push-cellular">
+							<Accordion.Trigger>{t("cellularPushTitle")}</Accordion.Trigger>
+							<Accordion.Content class="grid gap-5 lg:grid-cols-2">
+								{#each snapshot.config.pushChannels as channel, index (index)}
+									<Card.Root>
+										<Card.Header><Card.Title>{channel.name || `${t("pushChannel")} ${index + 1}`}</Card.Title><Card.Description>{t("cellularPushDescription")}</Card.Description></Card.Header>
+										<Card.Content><Field.Group><Field.Field orientation="horizontal"><Field.Label for={`push-cellular-enabled-${index}`}>{t("cellularPushEnabled")}</Field.Label><Switch id={`push-cellular-enabled-${index}`} bind:checked={channel.cellularEnabled} /></Field.Field><Field.Field><Field.Label for={`push-cellular-url-${index}`}>{t("cellularPushUrl")}</Field.Label><Input id={`push-cellular-url-${index}`} type="url" placeholder={t("cellularPushUrlInherited")} bind:value={channel.cellularUrl} />{#if savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}<Field.Description>{savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}</Field.Description>{/if}<Button type="button" variant="ghost" disabled={!channel.cellularUrlSet && !channel.cellularUrl} onclick={() => { channel.cellularUrl = ""; cellularUrlClears[index] = true; }}>{t("cellularPushUrlClear")}</Button></Field.Field><CellularCaResult status={pushCaStatuses[index]} saveResult={pushCellularSaveResults[index]} result={pushCaResults[index]} title={t("cellularCaStatus")} saveTitle={t("resultTitle")} ready={t("cellularCaReady")} notReady={t("cellularCaNotReady")} {locale} /></Field.Group></Card.Content>
+										<Card.Footer class="flex-wrap justify-end gap-2"><Button variant="outline" disabled={pushCaResults[index].state === "loading" || !channel.cellularEnabled} onclick={() => void provisionCa(index)}>{#if pushCaResults[index].state === "loading"}<Spinner data-icon="inline-start" />{/if}{t("cellularCaProvision")}</Button><Button disabled={pushCellularSaveResults[index].state === "loading"} onclick={() => saveCellular(index)}>{t("commonSave")}</Button></Card.Footer>
+									</Card.Root>
+								{/each}
+							</Accordion.Content>
 						</Accordion.Item>
 					</Accordion.Root>
 				</section>

@@ -16,6 +16,17 @@ const PASSPHRASE = FIXTURE.passphrase;
 const PLAINTEXT = Buffer.from(FIXTURE.plaintextHex, "hex");
 const ENCRYPTED = Buffer.from(FIXTURE.smscfgHex, "hex");
 
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (~crc) >>> 0;
+}
+
 function encryptedBackup({ plaintext = PLAINTEXT, authenticateHeader = true, changeHeader } = {}) {
   const header = Buffer.alloc(44);
   header.write("SMSCFG01", 0, 8, "ascii");
@@ -74,6 +85,22 @@ test("accepts the existing v6 portable backup fixture and emits only sanitized m
   });
   assert.equal(result.filesUnchanged, true);
   assert.doesNotMatch(result.stdout + result.stderr, /correct horse battery staple|smtp-secret/);
+});
+
+test("accepts a v7 CFG2 backup without weakening the envelope checks", async () => {
+  const plaintext = Buffer.from(PLAINTEXT);
+  plaintext.writeUInt16LE(7, 4);
+  plaintext.writeUInt32LE(crc32(plaintext.subarray(20)), 16);
+  const artifact = encryptedBackup({ plaintext });
+  const result = await invoke(artifact);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    bytes: artifact.length,
+    envelopeVersion: 1,
+    generation: 0,
+    schema: 7,
+  });
 });
 
 test("rejects authentication and CFG2 boundary failures", async (t) => {

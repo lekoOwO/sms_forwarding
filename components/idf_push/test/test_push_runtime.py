@@ -13,7 +13,14 @@ def main() -> None:
 #include <cassert>
 #include <string>
 
+#include "idf_push_ca_policy.h"
 #include "idf_push_core.h"
+
+static_assert(!idf_push_ca_extensions_valid(false, false, false));
+static_assert(!idf_push_ca_extensions_valid(false, true, true));
+static_assert(idf_push_ca_extensions_valid(true, false, false));
+static_assert(idf_push_ca_extensions_valid(true, true, true));
+static_assert(!idf_push_ca_extensions_valid(true, true, false));
 
 int main() {
     IdfPushTemplateValues values{
@@ -63,7 +70,8 @@ int main() {
         subprocess.run(
             [
                 "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                f"-I{PUSH / 'include'}", f"-I{ROOT / 'components/idf_config/include'}",
+                f"-I{PUSH}", f"-I{PUSH / 'include'}",
+                f"-I{ROOT / 'components/idf_config/include'}",
                 str(PUSH / "idf_push_core.cpp"), str(harness_path), "-o", str(binary_path),
             ],
             check=True,

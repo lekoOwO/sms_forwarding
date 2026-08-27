@@ -64,6 +64,21 @@ esp_err_t nvs_flash_init_partition(const char*);
 esp_err_t nvs_flash_erase_partition(const char*);
 """
 
+ESP_OTA_OPS_H = r"""#pragma once
+#include "esp_err.h"
+typedef struct esp_partition_t { int unused; } esp_partition_t;
+typedef enum {
+    ESP_OTA_IMG_NEW = 0,
+    ESP_OTA_IMG_PENDING_VERIFY = 1,
+    ESP_OTA_IMG_VALID = 2,
+    ESP_OTA_IMG_INVALID = 3,
+    ESP_OTA_IMG_ABORTED = 4,
+    ESP_OTA_IMG_UNDEFINED = 5,
+} esp_ota_img_states_t;
+const esp_partition_t* esp_ota_get_running_partition(void);
+esp_err_t esp_ota_get_state_partition(const esp_partition_t*, esp_ota_img_states_t*);
+"""
+
 
 HOST_TEST_CPP = r"""#include <algorithm>
 #include <cstdio>
@@ -125,6 +140,7 @@ struct FakeStore {
 
 static FakeStore* fake_store = nullptr;
 static bool fake_legacy_open = false;
+static esp_ota_img_states_t fake_ota_state = ESP_OTA_IMG_VALID;
 static std::unordered_map<std::string, std::string> fake_legacy_strings;
 static std::unordered_map<std::string, int32_t> fake_legacy_i32;
 static std::unordered_map<std::string, uint8_t> fake_legacy_u8;
@@ -135,6 +151,16 @@ int xSemaphoreTake(SemaphoreHandle_t, uint32_t) { return pdTRUE; }
 int xSemaphoreGive(SemaphoreHandle_t) { return pdTRUE; }
 void idf_log_line(const char*) {}
 void idf_logf(const char*, ...) {}
+
+const esp_partition_t* esp_ota_get_running_partition(void) {
+    static esp_partition_t running{};
+    return &running;
+}
+esp_err_t esp_ota_get_state_partition(const esp_partition_t*, esp_ota_img_states_t* state) {
+    if (!state) return ESP_ERR_INVALID_ARG;
+    *state = fake_ota_state;
+    return ESP_OK;
+}
 
 esp_err_t nvs_open(const char* namespace_name, nvs_open_mode_t, nvs_handle_t* handle) {
     if (fake_legacy_open && std::strcmp(namespace_name, "sms_config") == 0) {
@@ -262,6 +288,8 @@ int main() {
     };
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         require(factory.pushChannels[i].name == default_channel_names[i]);
+        require(factory.pushChannels[i].cellularEnabled);
+        require(factory.pushChannels[i].cellularUrl.empty());
     }
 
     IdfConfig reset_target = defaults();
@@ -318,7 +346,7 @@ int main() {
     uint32_t migrated_tz_generation = 0;
     require(decodeBlob(migrated_tz_blob, migrated_tz_config, migrated_tz_schema,
                        migrated_tz_generation) == DecodeResult::Valid);
-    require(migrated_tz_schema == CONFIG_SCHEMA_VERSION &&
+    require(migrated_tz_schema == 6 &&
             migrated_tz_config.tzOffsetMin == -300);
     IdfConfig overlay = defaults();
     require(overlayLegacyConnectivity(overlay));
@@ -439,6 +467,23 @@ int main() {
     require(portable_decoded.schedTasks[0].profile == portable_target.schedTasks[0].profile);
     require(portable_decoded.schedTasks[0].lastRun == portable_target.schedTasks[0].lastRun);
 
+    IdfConfig v6_cellular_target = defaults();
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        v6_cellular_target.pushChannels[i].cellularEnabled = (i % 2) != 0;
+        v6_cellular_target.pushChannels[i].cellularUrl =
+            "https://target-" + std::to_string(i) + ".example/message";
+    }
+    IdfConfig v6_cellular_decoded;
+    require(idf_config_storage_decode_portable(
+                kV6PortableFixture, sizeof(kV6PortableFixture), v6_cellular_target,
+                v6_cellular_decoded) == IdfPortableConfigStatus::Ok);
+    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+        require(v6_cellular_decoded.pushChannels[i].cellularEnabled ==
+                v6_cellular_target.pushChannels[i].cellularEnabled);
+        require(v6_cellular_decoded.pushChannels[i].cellularUrl ==
+                v6_cellular_target.pushChannels[i].cellularUrl);
+    }
+
     IdfConfig v5_fixture_target = defaults();
     v5_fixture_target.kaTrafficKB = 4321;
     IdfConfig v5_fixture_migrated;
@@ -470,7 +515,7 @@ int main() {
     require(decode_oom && decode_output.smtpServer == "unchanged");
 
     std::vector<uint8_t> portable_nonzero_generation = portable;
-    writeHeader(portable_nonzero_generation, CONFIG_SCHEMA_VERSION, 1, kHeaderBytes);
+    writeHeader(portable_nonzero_generation, 6, 1, kHeaderBytes);
     require(idf_config_storage_decode_portable(portable_nonzero_generation.data(),
                                                portable_nonzero_generation.size(), portable_target,
                                                portable_decoded) == IdfPortableConfigStatus::Invalid);
@@ -513,7 +558,7 @@ int main() {
     bool direct_ok = decodeV5(direct_reader, direct_decoded);
     require(direct_ok && direct_reader.atEnd() && semanticallyValid(direct_decoded));
     require(decodeBlob(blob, decoded, schema, generation) == DecodeResult::Valid);
-    require(schema == CONFIG_SCHEMA_VERSION && generation == 42);
+    require(schema == 6 && generation == 42);
     require(decoded.deviceName == original.deviceName);
     require(decoded.hostname == original.hostname);
     require(decoded.notificationLocale == original.notificationLocale);
@@ -521,6 +566,18 @@ int main() {
     require(decoded.pushChannels[0].customBody == "{message}");
     require(decoded.wifiNetworks[0].pass == "password");
     require(!decoded.roamingEnabled);
+    require(decoded.pushChannels[0].cellularEnabled && decoded.pushChannels[0].cellularUrl.empty());
+
+    IdfConfig cellular = original;
+    cellular.pushChannels[0].cellularEnabled = false;
+    cellular.pushChannels[1].cellularUrl = "https://cellular.example:8443";
+    std::vector<uint8_t> v7_blob;
+    require(!encodeV6(cellular, 43, v7_blob));
+    require(encodeV7(cellular, 43, v7_blob));
+    require(decodeBlob(v7_blob, decoded, schema, generation) == DecodeResult::Valid);
+    require(schema == 7 && generation == 43);
+    require(!decoded.pushChannels[0].cellularEnabled);
+    require(decoded.pushChannels[1].cellularUrl == "https://cellular.example:8443");
 
     require(encodeV5(defaults(), 43, v5_blob));
     require(decodeBlob(v5_blob, decoded, schema, generation) == DecodeResult::Valid);
@@ -570,6 +627,7 @@ int main() {
         maximum.pushChannels[i].key1.assign(MAX_PUSH_KEY1_BYTES, '1');
         maximum.pushChannels[i].key2.assign(MAX_PUSH_KEY2_BYTES, '2');
         maximum.pushChannels[i].customBody.assign(MAX_CUSTOM_BODY_BYTES, 'c');
+        maximum.pushChannels[i].cellularUrl.assign(MAX_PUSH_CELLULAR_URL_BYTES, 'C');
     }
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
         maximum.wifiNetworks[i].ssid.assign(MAX_WIFI_SSID_BYTES, 'w');
@@ -610,7 +668,7 @@ int main() {
     }
     require(semanticallyValid(maximum));
     std::vector<uint8_t> maximum_blob;
-    require(encodeV6(maximum, 44, maximum_blob));
+    require(encodeV7(maximum, 44, maximum_blob));
     require(maximum_blob.size() <= MAX_CONFIG_BLOB_SIZE);
     size_t maximum_portable_size = 0;
     require(idf_config_storage_encode_portable(maximum, portable_storage,
@@ -635,7 +693,7 @@ int main() {
                         public_portable_storage + public_maximum_size - 1,
                         [](uint8_t value) { return value == 0; }));
     std::vector<uint8_t> live_after_failure;
-    require(encodeV6(s_config, 44, live_after_failure));
+    require(encodeV7(s_config, 44, live_after_failure));
     require(live_after_failure == maximum_blob &&
             s_config.smtpServer == live_smtp_before_failure);
     require(idf_config_export_portable(nullptr, sizeof(public_portable_storage),
@@ -833,6 +891,24 @@ int main() {
             allocation_failure_store.markers[1].empty());
     fake_store = &store;
     install_pair(store, 0, slot_blob, 10);
+    s_activeSlot = 0;
+    s_activeGeneration = 10;
+    IdfConfig first_v7 = slot_value;
+    first_v7.pushChannels[0].cellularEnabled = false;
+    fake_ota_state = ESP_OTA_IMG_PENDING_VERIFY;
+    const std::vector<uint8_t> pending_blob = store.blobs[0];
+    const std::vector<uint8_t> pending_marker = store.markers[0];
+    require(idf_config_storage_save(first_v7) == ESP_ERR_INVALID_STATE);
+    require(store.blobs[0] == pending_blob && store.markers[0] == pending_marker &&
+            store.blobs[1].empty() && store.markers[1].empty());
+    fake_ota_state = ESP_OTA_IMG_VALID;
+    require(idf_config_storage_save(first_v7) == ESP_OK);
+    require(store.blobs[1].size() >= kHeaderBytes && store.blobs[1][4] == 7);
+
+    store.blobs[1].clear();
+    store.markers[1].clear();
+    s_activeSlot = 0;
+    s_activeGeneration = 10;
     store.blobs[1] = {0x01, 0x02, 0x03};
     store.markers[1] = store.markers[0];
     Slot slots[2];
@@ -872,7 +948,7 @@ int main() {
     require(active == -1 && unsupported);
 
     std::vector<uint8_t> wrap_supported = slot_blob;
-    writeHeader(wrap_supported, CONFIG_SCHEMA_VERSION, UINT32_MAX, kHeaderBytes);
+    writeHeader(wrap_supported, 6, UINT32_MAX, kHeaderBytes);
     install_pair(store, 0, wrap_supported, UINT32_MAX);
     std::vector<uint8_t> wrap_future = newer_future;
     writeHeader(wrap_future, static_cast<uint16_t>(CONFIG_SCHEMA_VERSION + 1), 0, kHeaderBytes);
@@ -930,6 +1006,7 @@ class IdfConfigCodecTest(unittest.TestCase):
             (temp / "esp_log.h").write_text(ESP_LOG_H, encoding="utf-8")
             (temp / "nvs.h").write_text(NVS_H, encoding="utf-8")
             (temp / "nvs_flash.h").write_text(NVS_FLASH_H, encoding="utf-8")
+            (temp / "esp_ota_ops.h").write_text(ESP_OTA_OPS_H, encoding="utf-8")
             (temp / "freertos").mkdir()
             (temp / "freertos" / "FreeRTOS.h").write_text(
                 "#pragma once\n#include <stdint.h>\n#define pdTRUE 1\n#define portMAX_DELAY UINT32_MAX\n",

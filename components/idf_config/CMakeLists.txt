@@ -1,9 +1,11 @@
 idf_component_register(
-  SRCS "idf_config.cpp" "idf_config_storage.cpp"
+  SRCS "idf_config.cpp" "idf_config_storage.cpp" "idf_config_ca_store.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
+    app_update
     freertos
     idf_logbuf
+    mbedtls
     nvs_flash
 )
 

@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <array>
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "idf_config.h"
 #include "idf_modem_https.h"
@@ -14,6 +17,8 @@ struct IdfPushHttpRequest {
     std::string headerName;
     std::string headerValue;
     std::string body;
+    std::vector<uint8_t> rootCertificateDer;
+    std::array<uint8_t, 32> rootCertificateSha256{};
 };
 
 struct IdfPushTransportResult {

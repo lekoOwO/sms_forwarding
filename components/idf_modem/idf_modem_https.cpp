@@ -125,7 +125,7 @@ void append_urc_line(std::string& output, std::string_view line)
 }
 
 PinnedCertificateListResult inspect_pinned_certificate_list(
-    std::string_view response, size_t expected_length)
+    std::string_view response, std::string_view expected_name, size_t expected_length)
 {
     constexpr std::string_view prefix = "+MSSLLIST:";
     bool present = false;
@@ -149,7 +149,7 @@ PinnedCertificateListResult inspect_pinned_certificate_list(
             if (!parse_uint(line.substr(quote + 2), length)) {
                 return PinnedCertificateListResult::invalid;
             }
-            if (line.substr(1, quote - 1) == IDF_MODEM_HTTPS_PINNED_CERT_NAME) {
+            if (line.substr(1, quote - 1) == expected_name) {
                 if (present || length != expected_length) {
                     return PinnedCertificateListResult::invalid;
                 }
@@ -163,6 +163,45 @@ PinnedCertificateListResult inspect_pinned_certificate_list(
     }
     return present ? PinnedCertificateListResult::present
                    : PinnedCertificateListResult::missing;
+}
+
+bool root_der_to_pem(const IdfModemHttpsPostRequest& request, std::string& name,
+                     std::string& pem)
+{
+    static constexpr char b64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (request.rootCertificateDer.empty() ||
+        request.rootCertificateDer.size() > IDF_MODEM_HTTPS_ROOT_DER_MAX) return false;
+    const bool hash_present = std::any_of(request.rootCertificateSha256.begin(),
+                                          request.rootCertificateSha256.end(),
+                                          [](uint8_t byte) { return byte != 0; });
+    name = "ca_";
+    static constexpr char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < 28; ++i) {
+        const uint8_t byte = request.rootCertificateSha256[i];
+        name += hex[byte >> 4];
+        name += hex[byte & 0x0f];
+    }
+    name += ".pem";
+    if (!hash_present || name.size() > IDF_MODEM_HTTPS_CERT_NAME_MAX) return false;
+    pem = "-----BEGIN CERTIFICATE-----\n";
+    size_t column = 0;
+    for (size_t offset = 0; offset < request.rootCertificateDer.size(); offset += 3) {
+        const size_t left = request.rootCertificateDer.size() - offset;
+        const uint32_t value = static_cast<uint32_t>(request.rootCertificateDer[offset]) << 16 |
+            (left > 1 ? static_cast<uint32_t>(request.rootCertificateDer[offset + 1]) << 8 : 0) |
+            (left > 2 ? request.rootCertificateDer[offset + 2] : 0);
+        const char encoded[4] = {b64[(value >> 18) & 63], b64[(value >> 12) & 63],
+                                 left > 1 ? b64[(value >> 6) & 63] : '=',
+                                 left > 2 ? b64[value & 63] : '='};
+        for (char ch : encoded) {
+            pem += ch;
+            if (++column == 64) { pem += '\n'; column = 0; }
+        }
+    }
+    if (column != 0) pem += '\n';
+    pem += "-----END CERTIFICATE-----\n";
+    return pem.size() <= kMaxPinnedCertificate;
 }
 
 bool pinned_certificate_readback_matches(std::string_view response,
@@ -375,8 +414,9 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         result.message = "HTTPS callbacks unavailable";
         return IdfModemHttpsRunResult::invalid_request;
     }
-    if (callbacks.pinnedCertificate.empty() ||
-        callbacks.pinnedCertificate.size() > kMaxPinnedCertificate) {
+    std::string certificate_name;
+    std::string pinned_certificate;
+    if (!root_der_to_pem(request, certificate_name, pinned_certificate)) {
         result.message = "HTTPS pinned certificate is unavailable";
         return IdfModemHttpsRunResult::invalid_request;
     }
@@ -424,29 +464,29 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         return finish(command_failure(cert_result));
     }
     const PinnedCertificateListResult list_result = inspect_pinned_certificate_list(
-        response, callbacks.pinnedCertificate.size());
+        response, certificate_name, pinned_certificate.size());
     if (list_result == PinnedCertificateListResult::invalid) {
         result.message = "HTTPS pinned certificate list mismatch";
         return finish(IdfModemHttpsRunResult::command_failed);
     }
     if (list_result == PinnedCertificateListResult::missing) {
         const std::string write_command =
-            "AT+MSSLCERTWR=\"" + std::string(IDF_MODEM_HTTPS_PINNED_CERT_NAME) +
-            "\",0," + std::to_string(callbacks.pinnedCertificate.size());
-        cert_result = send(write_command, callbacks.pinnedCertificate);
+            "AT+MSSLCERTWR=\"" + certificate_name +
+            "\",0," + std::to_string(pinned_certificate.size());
+        cert_result = send(write_command, pinned_certificate);
         if (cert_result != IdfModemHttpsCommandResult::ok) {
             result.message = "HTTPS pinned certificate write failed";
             return finish(command_failure(cert_result));
         }
     }
     const std::string read_command =
-        "AT+MSSLCERTRD=\"" + std::string(IDF_MODEM_HTTPS_PINNED_CERT_NAME) + "\"";
+        "AT+MSSLCERTRD=\"" + certificate_name + "\"";
     cert_result = send(read_command);
     if (cert_result != IdfModemHttpsCommandResult::ok) {
         result.message = "HTTPS pinned certificate read failed";
         return finish(command_failure(cert_result));
     }
-    if (!pinned_certificate_readback_matches(response, callbacks.pinnedCertificate)) {
+    if (!pinned_certificate_readback_matches(response, pinned_certificate)) {
         result.message = "HTTPS pinned certificate readback mismatch";
         return finish(IdfModemHttpsRunResult::command_failed);
     }
@@ -479,7 +519,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
     }
 
     IdfModemHttpsPostWire wire;
-    if (!idf_modem_https_build_post_wire(request, target, IDF_MODEM_HTTPS_PINNED_CERT_NAME,
+    if (!idf_modem_https_build_post_wire(request, target, certificate_name,
                                          0, wire, error)) {
         result.message = error;
         return finish(IdfModemHttpsRunResult::command_failed);
@@ -507,7 +547,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         return finish(IdfModemHttpsRunResult::command_failed);
     }
 
-    if (!idf_modem_https_build_post_wire(request, target, IDF_MODEM_HTTPS_PINNED_CERT_NAME,
+    if (!idf_modem_https_build_post_wire(request, target, certificate_name,
                                          static_cast<uint8_t>(http_id), wire, error)) {
         result.message = error;
         return finish(IdfModemHttpsRunResult::command_failed);

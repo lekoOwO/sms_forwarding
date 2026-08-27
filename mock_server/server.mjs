@@ -69,9 +69,11 @@ function defaultConfig() {
 		})),
 		pushChannels: Array.from({ length: 5 }, (_, index) => ({
 			enabled: false,
+			cellularEnabled: true,
 			type: 1,
 			name: `Channel ${index + 1}`,
 			url: "",
+			cellularUrl: "",
 			key1: "",
 			key2: "",
 			customBody: "",
@@ -137,6 +139,8 @@ function portableConfig(config) {
 		u8(channel.enabled ? 1 : 0);
 		u32(channel.type);
 		for (const value of [channel.name, channel.url, channel.key1, channel.key2, channel.titleTemplate, channel.bodyTemplate, channel.customBody]) string(value);
+		u8(channel.cellularEnabled ? 1 : 0);
+		string(channel.cellularUrl);
 	}
 	u8(5);
 	for (const profile of config.wifiProfiles) {
@@ -186,13 +190,13 @@ function portableConfig(config) {
 	u32(config.kaTrafficKB);
 	const payload = Buffer.concat(parts);
 	const header = Buffer.alloc(20);
-	header.write("CFG2"); header.writeUInt16LE(6, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
+	header.write("CFG2"); header.writeUInt16LE(7, 4); header.writeUInt32LE(payload.length, 12); header.writeUInt32LE(crc32(payload), 16);
 	return Buffer.concat([header, payload]);
 }
 
 function decodePortableConfig(bytes, target) {
 	const schemaVersion = bytes.length >= 6 ? bytes.readUInt16LE(4) : 0;
-	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || ![1, 2, 3, 4, 5, 6].includes(schemaVersion) ||
+	if (bytes.length < 20 || bytes.subarray(0, 4).toString() !== "CFG2" || ![1, 2, 3, 4, 5, 6, 7].includes(schemaVersion) ||
 		bytes.readUInt16LE(6) !== 0 || bytes.readUInt32LE(8) !== 0 || bytes.readUInt32LE(12) !== bytes.length - 20 ||
 		bytes.readUInt32LE(16) !== crc32(bytes.subarray(20))) throw new Error("portable");
 	let offset = 20;
@@ -241,7 +245,9 @@ function decodePortableConfig(bytes, target) {
 			const type = u32();
 			if (type < 1 || type > 12) throw new Error("portable");
 			const [name, url, key1, key2, titleTemplate, bodyTemplate, customBody] = Array.from({ length: 7 }, string);
-			return { enabled, type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
+			const cellularEnabled = schemaVersion >= 7 ? boolean() : true;
+			const cellularUrl = schemaVersion >= 7 ? string() : "";
+			return { enabled, cellularEnabled, cellularUrl, type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
 		});
 		if (u8() !== 5) throw new Error("portable");
 		decoded.wifiProfiles = Array.from({ length: 5 }, () => ({ ssid: string(), password: string() }));
@@ -283,7 +289,7 @@ function decodePortableConfig(bytes, target) {
 			enabled: boolean(), name: string(), profile: string(), switchBack: boolean(),
 			intervalDays: u32(), action: u32(), target: string(), payload: string(), lastRun: u32()
 		}));
-		decoded.kaTrafficKB = schemaVersion === 6 ? u32() : target.kaTrafficKB;
+		decoded.kaTrafficKB = schemaVersion >= 6 ? u32() : target.kaTrafficKB;
 		if (offset !== bytes.length) throw new Error("portable");
 		if (!configSemanticallyValid(decoded)) throw new Error("portable");
 		decoded.deviceName = target.deviceName;
@@ -333,7 +339,7 @@ function decodePortableConfig(bytes, target) {
 		const titleTemplate = schemaVersion === 1 ? "" : values[4];
 		const bodyTemplate = schemaVersion === 1 ? "" : values[5];
 		const customBody = schemaVersion === 1 ? (type === 7 ? values[4] : "") : values[6];
-		return { enabled, type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
+		return { enabled, cellularEnabled: true, cellularUrl: "", type, name, url, key1, key2, titleTemplate, bodyTemplate, customBody };
 	});
 	if (schemaVersion === 4) {
 		decoded.wifiProfiles = Array.from({ length: 5 }, () => ({ ssid: string(), password: string() }));
@@ -426,7 +432,7 @@ function configSemanticallyValid(config) {
 			!integer(task.action, 0, 3) || !bounded(task.target, 128) || !bounded(task.payload, 128) ||
 			!integer(task.lastRun, 0, 0xffffffff))) return false;
 	return config.pushChannels.every((channel) => integer(channel.type, 1, 12) &&
-		boolean(channel.enabled) && bounded(channel.name, 64) && bounded(channel.url, 512) &&
+		boolean(channel.enabled) && boolean(channel.cellularEnabled) && bounded(channel.name, 64) && bounded(channel.url, 512) && bounded(channel.cellularUrl, 512) &&
 		bounded(channel.key1, 256) && bounded(channel.key2, 256) && bounded(channel.titleTemplate, 256) &&
 		bounded(channel.bodyTemplate, 2048) && bounded(channel.customBody, 2048) && !/[\r\n]/.test(channel.titleTemplate) &&
 		(channel.type === 7 ? !channel.titleTemplate && !channel.bodyTemplate : !channel.customBody));
@@ -502,6 +508,8 @@ const actionCodes = new Set([
 	"ACTION_OTA_SIGNATURE_INVALID", "ACTION_OTA_WRITE_FAILED", "ACTION_TOO_MANY_FIELDS"
 	, "ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED"
 	, "ACTION_ESIM_BUSY", "ACTION_ESIM_HANDLE_STALE"
+	, "PUSH_CA_PROBE_READY", "PUSH_CA_PROBE_FAILED", "PUSH_CA_INSTALLED", "PUSH_CA_STALE"
+	, "PUSH_CA_REJECTED", "PUSH_CA_STORE_FAILED", "PUSH_CA_STATUS"
 ]);
 
 function result(success, code, data = {}, detail = "") {
@@ -546,7 +554,7 @@ function saveFieldFamily(field) {
 	if (match) return { family: "accounts" };
 	match = field.match(/^wifi([0-4])(ssid|pass|open)$/);
 	if (match) return { family: "wifi", index: Number(match[1]) };
-	match = field.match(/^push([0-4])(en|type|name|url|key1|key2|body|title|template)$/);
+	match = field.match(/^push([0-4])(en|type|name|url|key1|key2|body|title|template|cellularEnabled|cellularUrl|cellularUrlClear)$/);
 	return match ? { family: "push", index: Number(match[1]) } : undefined;
 }
 
@@ -583,6 +591,7 @@ export function createApp({
 	apLocalAddress = "192.168.1.1",
 	now = Date.now,
 	jobDelayMs = 0,
+	pushCaRejectCount = 0,
 	otaPublicKey = defaultOtaPublicKey,
 	otaAcceptedCounter = 0
 } = {}) {
@@ -594,6 +603,8 @@ export function createApp({
 		queued: false, running: false, done: false, success: false, message: "Test not started"
 	}));
 	const pushTestDeadlines = Array(5).fill(0);
+	const pushCa = Array.from({ length: 5 }, () => ({ configured: false, sha256: "" }));
+	const pushCaNonces = new Map();
 	const exportsById = new Map();
 	let upload;
 	let deviceRestartPending = false;
@@ -601,6 +612,7 @@ export function createApp({
 	let restoreRestartPending = false;
 	let nextId = 1;
 	let acceptedOtaCounter = otaAcceptedCounter;
+	let remainingPushCaRejections = pushCaRejectCount;
 	const esim = {
 		eid: "89012345678901234567890123456789",
 		profiles: [
@@ -719,7 +731,7 @@ export function createApp({
 		"GET /wifi", "GET /api/config/export", "POST /api/config/export", "POST /api/config/restore/start",
 		"POST /api/config/restore/chunk", "POST /api/config/restore/finish", "POST /api/ota/start",
 		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
-		"POST /api/esim", "POST /wificonfig"
+		"POST /api/esim", "POST /wificonfig", "POST /api/push/ca/probe", "POST /api/push/ca/install"
 	]);
 	app.use(rejectEnvelope);
 	app.use("/api/esim", (_request, response, next) => {
@@ -727,7 +739,7 @@ export function createApp({
 		next();
 	});
 	app.use((request, response, next) => request.method === "HEAD" &&
-		!["/api/push/test", "/api/device/restart"].includes(request.path)
+		!["/api/push/test", "/api/device/restart", "/api/push/ca/status", "/api/push/ca/probe", "/api/push/ca/install"].includes(request.path)
 		? response.set("Allow", "GET, POST").status(405).json(result(false, "ACTION_INPUT_INVALID"))
 		: next());
 
@@ -752,6 +764,7 @@ export function createApp({
 		next();
 	});
 
+	app.use(express.raw({ type: "application/pkix-cert", limit: 8192 }));
 	app.use(express.urlencoded({ extended: false, limit: 16384 }));
 	app.use((request, _response, next) => {
 		request.body ??= {};
@@ -823,6 +836,7 @@ export function createApp({
 				wifiProfiles: config.wifiProfiles.map((profile) => ({ ssid: profile.ssid, password: "", open: Boolean(profile.ssid && !profile.password) })),
 				pushChannels: config.pushChannels.map((channel) => ({
 					...channel,
+					cellularUrl: undefined, cellularUrlSet: Boolean(channel.cellularUrl),
 					url: "", urlSet: Boolean(channel.url),
 					key1: "", key1Set: Boolean(channel.key1),
 					key2: "", key2Set: Boolean(channel.key2),
@@ -946,6 +960,63 @@ export function createApp({
 		return response.status(202).json(status);
 	});
 
+	app.use("/api/push/ca", (_request, response, next) => {
+		response.set("Cache-Control", "no-store, max-age=0");
+		next();
+	});
+	for (const [route, allow] of [["/api/push/ca/status", "GET"], ["/api/push/ca/probe", "POST"], ["/api/push/ca/install", "POST"]]) {
+		app.all(route, (request, response, next) => request.method === allow ? next() : response.set("Allow", allow).status(405)
+			.json(result(false, "ACTION_INPUT_INVALID", {}, "method")));
+	}
+
+	app.get("/api/push/ca/status", (request, response) => {
+		const channel = boundedUnsigned(request.query.channel, 0, 4);
+		if (channel === undefined || Object.keys(request.query).length !== 1 || request.headers["transfer-encoding"] ||
+			Number(request.headers["content-length"] ?? 0) > 0 || Object.keys(request.body).length) {
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "channel"));
+		}
+		return response.json(result(true, "PUSH_CA_STATUS", { ...pushCa[channel] }));
+	});
+
+	app.post("/api/push/ca/probe", (request, response) => {
+		const channel = boundedUnsigned(request.query.channel, 0, 4);
+		if (channel === undefined || Object.keys(request.query).length !== 1 || request.headers["transfer-encoding"] ||
+			Number(request.headers["content-length"] ?? 0) > 0 || Object.keys(request.body).length) {
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "channel"));
+		}
+		if (!state.config.pushChannels[channel].cellularEnabled) return response.status(409).json(result(false, "PUSH_CA_PROBE_FAILED"));
+		return acceptJob("push_ca_probe", () => {
+			const nonce = randomBytes(16).toString("hex");
+			pushCaNonces.set(nonce, { channel, expiresAt: now() + 30000 });
+			return result(true, "PUSH_CA_PROBE_READY", {
+				nonce, expiresInMs: 30000,
+				chain: [{ certSha256: "0".repeat(64), issuerDer: "MAMBAQ==", aki: "" }]
+			});
+		}, response);
+	});
+
+	app.post("/api/push/ca/install", (request, response) => {
+		const channel = boundedUnsigned(request.query.channel, 0, 4);
+		const nonce = typeof request.query.nonce === "string" && /^[0-9a-f]{32}$/.test(request.query.nonce) ? request.query.nonce : "";
+		if (channel === undefined || !nonce || Object.keys(request.query).length !== 2) return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
+		if (request.headers["content-type"] !== "application/pkix-cert") return response.status(415).json(result(false, "ACTION_INPUT_INVALID"));
+		const contentLength = typeof request.headers["content-length"] === "string" && /^\d+$/.test(request.headers["content-length"])
+			? Number(request.headers["content-length"]) : 0;
+		if (request.headers["transfer-encoding"] || !Buffer.isBuffer(request.body) || request.body.length < 1 ||
+			request.body.length > 8192 || contentLength !== request.body.length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
+		const admission = pushCaNonces.get(nonce);
+		pushCaNonces.delete(nonce);
+		if (!admission || admission.channel !== channel || now() >= admission.expiresAt) return response.status(409).json(result(false, "PUSH_CA_STALE"));
+		const certificate = Buffer.from(request.body);
+		return acceptJob("push_ca_install", () => {
+			if (remainingPushCaRejections > 0) { remainingPushCaRejections -= 1; return result(false, "PUSH_CA_REJECTED"); }
+			if (certificate[0] !== 0x30) return result(false, "PUSH_CA_REJECTED");
+			const sha256 = createHash("sha256").update(certificate).digest("hex");
+			pushCa[channel] = { configured: true, sha256 };
+			return result(true, "PUSH_CA_INSTALLED", { sha256 });
+		}, response);
+	});
+
 	app.post("/save", (request, response) => {
 		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
 		const body = request.body;
@@ -988,7 +1059,7 @@ export function createApp({
 				const field = `wifi${index}${suffix}`;
 				if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
 			}
-			for (const [suffix, limit] of [["en", 32], ["type", 32], ["name", 64], ["url", 512], ["key1", 256], ["key2", 256], ["body", 2048], ["title", 256], ["template", 2048]]) {
+			for (const [suffix, limit] of [["en", 32], ["type", 32], ["name", 64], ["url", 512], ["key1", 256], ["key2", 256], ["body", 2048], ["title", 256], ["template", 2048], ["cellularEnabled", 32], ["cellularUrl", 512], ["cellularUrlClear", 32]]) {
 				const field = `push${index}${suffix}`;
 				if (Object.hasOwn(body, field) && overLimit(field, body[field], limit)) return rejectField(response, field);
 			}
@@ -1070,10 +1141,17 @@ export function createApp({
 
 		for (let index = 0; index < 5; index += 1) {
 			const prefix = `push${index}`;
-			const suffixes = ["en", "type", "url", "name", "key1", "key2", "body", "title", "template"];
+			const suffixes = ["en", "type", "url", "name", "key1", "key2", "body", "title", "template", "cellularEnabled", "cellularUrl", "cellularUrlClear"];
 			if (!suffixes.some((suffix) => Object.hasOwn(body, `${prefix}${suffix}`))) continue;
 			const channel = config.pushChannels[index];
 			const previousType = channel.type;
+			if (Object.hasOwn(body, `${prefix}cellularEnabled`)) {
+				if (!["0", "1"].includes(body[`${prefix}cellularEnabled`])) return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, `${prefix}cellularEnabled`), response);
+				channel.cellularEnabled = body[`${prefix}cellularEnabled`] === "1";
+			}
+			if (body[`${prefix}cellularUrl`] && body[`${prefix}cellularUrlClear`] === "1") return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, `${prefix}cellularUrl`), response);
+			if (body[`${prefix}cellularUrlClear`] === "1") channel.cellularUrl = "";
+			else if (body[`${prefix}cellularUrl`]) channel.cellularUrl = body[`${prefix}cellularUrl`];
 			channel.enabled = body[`${prefix}en`] === "on";
 			if (Object.hasOwn(body, `${prefix}type`)) channel.type = Number.parseInt(body[`${prefix}type`], 10) || 0;
 			if (channel.type !== previousType) {
@@ -1216,7 +1294,7 @@ export function createApp({
 		if (!item) return response.status(404).json(result(false, "ACTION_CONFIG_EXPORT_NOT_FOUND"));
 		return response.set({
 			"Content-Type": "application/vnd.sms-forwarding.config",
-			"X-Config-Schema-Version": "6",
+			"X-Config-Schema-Version": "7",
 			"Content-Disposition": 'attachment; filename="sms-forwarding.smscfg"'
 		}).send(item.bytes);
 	});

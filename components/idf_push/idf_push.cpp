@@ -1,5 +1,6 @@
 #include "idf_push.h"
 #include "idf_push_core.h"
+#include "idf_push_cellular.h"
 #include "idf_push_transport.h"
 
 #include <errno.h>
@@ -29,6 +30,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_config.h"
+#include "idf_config_ca_store.h"
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
@@ -425,6 +427,17 @@ static std::string hmac_sha256_base64(const std::string& data, const std::string
     size_t out_len = 0;
     if (mbedtls_base64_encode(out, sizeof(out), &out_len, hmac, sizeof(hmac)) != 0) return {};
     return std::string(reinterpret_cast<char*>(out), out_len);
+}
+
+static bool sha256_matches(const std::vector<uint8_t>& data,
+                           const std::array<uint8_t, 32>& expected)
+{
+    std::array<uint8_t, 32> actual{};
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    const bool ok = info && !data.empty() &&
+        mbedtls_md(info, data.data(), data.size(), actual.data()) == 0 && actual == expected;
+    std::fill(actual.begin(), actual.end(), 0);
+    return ok;
 }
 
 static int64_t utc_millis()
@@ -1098,13 +1111,35 @@ static void replace_all(std::string& value, const char* from, const char* to)
     }
 }
 
-static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
+static bool send_to_channel(const IdfPushChannel& input_channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
                             const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
                             IdfPushNetworkDecision network,
-                            bool notify = false, std::string* failure_message = nullptr)
+                            bool notify = false, std::string* failure_message = nullptr,
+                            bool* permanent_failure = nullptr)
 {
-    if (!channel_valid(channel)) return false;
+    if (permanent_failure) *permanent_failure = false;
+    if (!channel_valid(input_channel)) return false;
+
+    IdfPushCellularTarget cellular_target;
+    std::vector<uint8_t> cellular_root_der;
+    IdfConfigCaStatus cellular_ca_status;
+    if (network == IdfPushNetworkDecision::Cellular) {
+        if (!idf_push_prepare_cellular_target(input_channel, cellular_target) ||
+            idf_config_ca_lookup(cellular_target.canonicalOrigin, cellular_root_der,
+                                 &cellular_ca_status) != ESP_OK ||
+            !cellular_ca_status.configured ||
+            !sha256_matches(cellular_root_der, cellular_ca_status.sha256)) {
+            if (failure_message) *failure_message = "Cellular CA is not provisioned";
+            if (permanent_failure) *permanent_failure = true;
+            return false;
+        }
+    }
+    IdfPushChannel effective_channel = input_channel;
+    if (network == IdfPushNetworkDecision::Cellular) {
+        effective_channel.url = cellular_target.effectiveUrl;
+    }
+    const IdfPushChannel& channel = effective_channel;
 
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
@@ -1270,6 +1305,10 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     request.headerName = extra_header_name ? extra_header_name : "";
     request.headerValue = extra_header_name ? extra_header_value : "";
     request.body = body;
+    if (network == IdfPushNetworkDecision::Cellular) {
+        request.rootCertificateDer = std::move(cellular_root_der);
+        request.rootCertificateSha256 = cellular_ca_status.sha256;
+    }
     const IdfConfigStatusView modem_config = network == IdfPushNetworkDecision::Cellular
                                                   ? idf_config_get_status_view()
                                                   : IdfConfigStatusView();
@@ -1671,11 +1710,18 @@ static bool process_push_one()
         return true;
     }
 
+    bool permanent_failure = false;
     bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
-                              job.timestamp.c_str(), cfg, wifi, network, job.notify);
+                              job.timestamp.c_str(), cfg, wifi, network, job.notify,
+                              nullptr, &permanent_failure);
     note_channel_result(job.channel, ok);
     if (ok) {
         note_forward_target_success(job.completionId);
+        s_busy.store(false, std::memory_order_relaxed);
+        return true;
+    }
+    if (permanent_failure) {
+        fail_push_job_without_retry(job, "Cellular CA is not provisioned; task stopped");
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }

@@ -23,7 +23,8 @@
 
 static const char* TAG = "idf_config";
 static IdfConfig s_config;
-static_assert(sizeof(IdfConfig) == 3216, "IdfConfig size changed; review stack/heap persistence bounds");
+static_assert(sizeof(IdfConfig) == 3356, "IdfConfig size changed; review stack/heap persistence bounds");
+static uint64_t s_config_generation = 0;
 static SemaphoreHandle_t s_config_mutex = nullptr;
 static SemaphoreHandle_t s_persist_mutex = nullptr;
 static IdfConfigLoadStatus s_config_load_status = IdfConfigLoadStatus::Unknown;
@@ -76,6 +77,7 @@ static esp_err_t replace_config(IdfConfig& next)
     using std::swap;
     static_assert(noexcept(swap(s_config, next)), "IdfConfig publication must not allocate");
     swap(s_config, next);
+    ++s_config_generation;
     xSemaphoreGive(s_config_mutex);
     return ESP_OK;
 }
@@ -339,6 +341,15 @@ IdfConfigLoadStatus idf_config_last_load_status(void)
     return s_config_load_status;
 }
 
+uint64_t idf_config_generation(void)
+{
+    if (ensure_config_mutex() != ESP_OK) return 0;
+    xSemaphoreTake(s_config_mutex, portMAX_DELAY);
+    const uint64_t generation = s_config_generation;
+    xSemaphoreGive(s_config_mutex);
+    return generation;
+}
+
 std::string idf_config_export_text(bool full_export)
 {
     std::unique_ptr<IdfConfig> c(new (std::nothrow) IdfConfig(idf_config_get()));
@@ -426,6 +437,10 @@ std::string idf_config_export_text(bool full_export)
         append_kv(out, key, full_export ? ch.key2 : redact_secret(ch.key2));
         snprintf(key, sizeof(key), "push%dbody", i);
         append_kv(out, key, full_export ? ch.customBody : redact_secret(ch.customBody));
+        snprintf(key, sizeof(key), "push%dcellularEnabled", i);
+        append_kv_i(out, key, ch.cellularEnabled ? 1 : 0);
+        snprintf(key, sizeof(key), "push%dcellularUrl", i);
+        append_kv(out, key, full_export ? ch.cellularUrl : redact_secret(ch.cellularUrl));
     }
 
     for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
@@ -551,6 +566,8 @@ static void apply_import_key(IdfConfig& c, const std::string& key, const std::st
         else if (suffix == "k1" && !is_redacted_secret(value)) ch.key1 = value;
         else if (suffix == "k2" && !is_redacted_secret(value)) ch.key2 = value;
         else if (suffix == "body" && !is_redacted_secret(value)) ch.customBody = value;
+        else if (suffix == "cellularEnabled") ch.cellularEnabled = bool_from_text(value);
+        else if (suffix == "cellularUrl" && !is_redacted_secret(value)) ch.cellularUrl = value;
     }
 }
 
@@ -1362,6 +1379,7 @@ IdfConfigWebView idf_config_get_web_view(void)
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         view.pushChannels[i] = s_config.pushChannels[i];
         view.pushUrlSet[i] = !s_config.pushChannels[i].url.empty();
+        view.pushCellularUrlSet[i] = !s_config.pushChannels[i].cellularUrl.empty();
         view.pushCustomBodySet[i] = !s_config.pushChannels[i].customBody.empty();
         view.pushKey1Set[i] = !s_config.pushChannels[i].key1.empty();
         view.pushKey2Set[i] = !s_config.pushChannels[i].key2.empty();

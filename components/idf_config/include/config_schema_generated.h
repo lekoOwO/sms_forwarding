@@ -7,14 +7,14 @@
 
 constexpr const char CONFIG_FORMAT[] = "sms-forwarding-config";
 constexpr const char CONFIG_MIME_TYPE[] = "application/vnd.sms-forwarding.config";
-constexpr uint16_t CONFIG_SCHEMA_VERSION = 6;
+constexpr uint16_t CONFIG_SCHEMA_VERSION = 7;
 constexpr size_t MAX_CONFIG_BLOB_SIZE = 32768;
 constexpr size_t CONFIG_WIRE_HEADER_BYTES = 20;
 constexpr size_t CONFIG_WIRE_STRING_LENGTH_PREFIX_BYTES = 2;
 constexpr size_t CONFIG_WIRE_ARRAY_COUNT_BYTES = 1;
-constexpr size_t CONFIG_WIRE_PAYLOAD_BYTES = 26736;
-constexpr size_t CONFIG_WORST_CASE_BINARY_BYTES = 26756;
-constexpr size_t CONFIG_BINARY_HEADROOM_BYTES = 6012;
+constexpr size_t CONFIG_WIRE_PAYLOAD_BYTES = 29311;
+constexpr size_t CONFIG_WORST_CASE_BINARY_BYTES = 29331;
+constexpr size_t CONFIG_BINARY_HEADROOM_BYTES = 3437;
 constexpr const char BACKUP_ENVELOPE_MAGIC[] = "SMSCFG01";
 constexpr uint16_t BACKUP_ENVELOPE_VERSION = 1;
 constexpr uint8_t BACKUP_KDF_ID = 1;
@@ -107,6 +107,7 @@ constexpr uint16_t MAX_KEEPALIVE_TRAFFIC_KB = 10000;
 constexpr uint16_t DEFAULT_KEEPALIVE_TRAFFIC_KB = 1;
 constexpr size_t MAX_PUSH_NAME_BYTES = 64;
 constexpr size_t MAX_PUSH_URL_BYTES = 512;
+constexpr size_t MAX_PUSH_CELLULAR_URL_BYTES = 512;
 constexpr size_t MAX_PUSH_KEY1_BYTES = 256;
 constexpr size_t MAX_PUSH_KEY2_BYTES = 256;
 constexpr size_t MAX_TITLE_TEMPLATE_BYTES = 256;

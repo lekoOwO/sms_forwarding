@@ -4235,6 +4235,42 @@ class WebTransferTest(unittest.TestCase):
             self.assertEqual(metadata["schema"], 6)
             self.assertEqual(verifier_input, [bytearray(len(CONFIG_PASSPHRASE.encode("utf-8")))])
 
+    def test_backup_metadata_accepts_v6_and_v7_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            backup = pathlib.Path(temp) / "backup.smscfg"
+            backup.write_bytes(_config_fixture())
+            for schema in (6, 7):
+                with self.subTest(schema=schema), mock.patch.object(
+                    device.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps({
+                            "bytes": len(_config_fixture()),
+                            "envelopeVersion": 1,
+                            "generation": 0,
+                            "schema": schema,
+                        }).encode("utf-8"), b"",
+                    ),
+                ):
+                    self.assertEqual(
+                        device._run_config_backup_verifier(backup, CONFIG_PASSPHRASE)["schema"],
+                        schema,
+                    )
+            for schema in (5, 8):
+                with self.subTest(schema=schema), mock.patch.object(
+                    device.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, json.dumps({
+                            "bytes": len(_config_fixture()),
+                            "envelopeVersion": 1,
+                            "generation": 0,
+                            "schema": schema,
+                        }).encode("utf-8"), b"",
+                    ),
+                ), self.assertRaises(device.DeviceTransferError):
+                    device._run_config_backup_verifier(backup, CONFIG_PASSPHRASE)
+
     def test_verify_backup_resolves_relative_path_from_callers_directory(self):
         previous = pathlib.Path.cwd()
         with tempfile.TemporaryDirectory() as temp, mock.patch.dict(

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,8 +15,8 @@ static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME = 64;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE = 512;
 static constexpr uint32_t IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS = 30000;
 static constexpr uint32_t IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS = 90000;
-static constexpr std::string_view IDF_MODEM_HTTPS_PINNED_CERT_NAME =
-    "gts_root_r4_7e8b80d078d3.pem";
+static constexpr size_t IDF_MODEM_HTTPS_ROOT_DER_MAX = 8192;
+static constexpr size_t IDF_MODEM_HTTPS_CERT_NAME_MAX = 64;
 
 struct IdfModemHttpsPostRequest {
     std::string url;
@@ -24,6 +25,8 @@ struct IdfModemHttpsPostRequest {
     std::string headerName;
     std::string headerValue;
     std::string apn;
+    std::vector<uint8_t> rootCertificateDer;
+    std::array<uint8_t, 32> rootCertificateSha256{};
     bool dataEnabled = false;
     uint32_t timeoutMs = IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS;
 };
@@ -78,7 +81,6 @@ struct IdfModemHttpsCallbacks {
     void* context = nullptr;
     IdfModemHttpsSendCommand sendCommand = nullptr;
     IdfModemHttpsWaitResponse waitResponse = nullptr;
-    std::string_view pinnedCertificate;
 };
 
 bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,

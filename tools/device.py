@@ -887,16 +887,15 @@ def _run_config_backup_verifier(path: Path, passphrase: str) -> dict[str, int]:
     ):
         raise DeviceTransferError("configuration backup changed during verification")
     size = after.st_size
-    if not isinstance(value, dict) or set(value) != {
-        "bytes", "envelopeVersion", "schema", "generation",
-    } or any(
-        not isinstance(value[key], int) or isinstance(value[key], bool) for key in value
-    ) or value != {
-        "bytes": size,
-        "envelopeVersion": 1,
-        "schema": 6,
-        "generation": 0,
-    }:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"bytes", "envelopeVersion", "schema", "generation"}
+        or any(not isinstance(value[key], int) or isinstance(value[key], bool) for key in value)
+        or value["bytes"] != size
+        or value["envelopeVersion"] != 1
+        or value["schema"] not in (6, 7)
+        or value["generation"] != 0
+    ):
         raise DeviceTransferError("configuration backup verification failed")
     return value
 
@@ -2909,7 +2908,7 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--dry-run", action="store_true", help="validate the output target without contacting the device")
 
     verify_backup = commands.add_parser(
-        "verify-config-backup", help="verify a current v6 encrypted configuration backup offline"
+        "verify-config-backup", help="verify a v6 or v7 encrypted configuration backup offline"
     )
     verify_backup.add_argument("backup", help="existing .smscfg backup path")
     verify_backup.add_argument("--passphrase-file", default=None)

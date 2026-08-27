@@ -89,6 +89,12 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     cellular_request.headerValue = request.headerValue;
     cellular_request.apn = config.apn;
     cellular_request.dataEnabled = config.dataEnabled;
+    cellular_request.rootCertificateDer = request.rootCertificateDer;
+    cellular_request.rootCertificateSha256 = request.rootCertificateSha256;
+    if (cellular_request.rootCertificateDer.empty()) {
+        result.message = "Cellular CA is not provisioned";
+        return false;
+    }
     IdfModemHttpsPostResult cellular_result;
     result.error = cellular_post(cellular_request, cellular_result);
     result.httpStatus = cellular_result.httpStatus;

@@ -67,6 +67,8 @@ struct IdfPushChannel {
     std::string titleTemplate;
     std::string bodyTemplate;
     std::string customBody;
+    bool cellularEnabled = true;
+    std::string cellularUrl;
 };
 
 struct IdfConfig {
@@ -153,6 +155,9 @@ enum class IdfPortableConfigStatus : uint8_t {
 
 esp_err_t idf_config_load(void);
 IdfConfigLoadStatus idf_config_last_load_status(void);
+// Monotonic for this boot. It changes only after a complete config is durably
+// saved and published (or loaded and published at boot).
+uint64_t idf_config_generation(void);
 // Put a new or updated network in slot 0. Remove the oldest entry if the list is full.
 esp_err_t idf_config_save_wifi(const std::string& ssid, const std::string& pass);
 esp_err_t idf_config_save_wifi(const char* ssid, size_t ssid_length,
@@ -301,6 +306,7 @@ struct IdfConfigWebView {
     // responses must use these presence bits and blank the corresponding
     // values before serialization.
     bool pushUrlSet[IDF_MAX_PUSH_CHANNELS] = {};
+    bool pushCellularUrlSet[IDF_MAX_PUSH_CHANNELS] = {};
     bool pushCustomBodySet[IDF_MAX_PUSH_CHANNELS] = {};
     bool pushKey1Set[IDF_MAX_PUSH_CHANNELS] = {};
     bool pushKey2Set[IDF_MAX_PUSH_CHANNELS] = {};

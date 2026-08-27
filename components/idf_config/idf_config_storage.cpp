@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "config_schema_generated.h"
+#include "esp_ota_ops.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -382,7 +383,8 @@ bool semanticallyValid(const IdfConfig& value, bool portable = false)
             !bounded(channel.url, MAX_PUSH_URL_BYTES) || !bounded(channel.key1, MAX_PUSH_KEY1_BYTES) ||
             !bounded(channel.key2, MAX_PUSH_KEY2_BYTES) || !bounded(channel.titleTemplate, MAX_TITLE_TEMPLATE_BYTES) ||
             !bounded(channel.bodyTemplate, MAX_BODY_TEMPLATE_BYTES, false) ||
-            !bounded(channel.customBody, MAX_CUSTOM_BODY_BYTES, false)) return false;
+            !bounded(channel.customBody, MAX_CUSTOM_BODY_BYTES, false) ||
+            !bounded(channel.cellularUrl, MAX_PUSH_CELLULAR_URL_BYTES)) return false;
         const bool invalidTemplates = channel.type == PUSH_TYPE_CUSTOM
                                           ? (!channel.titleTemplate.empty() || !channel.bodyTemplate.empty())
                                           : !channel.customBody.empty();
@@ -416,6 +418,26 @@ bool semanticallyValid(const IdfConfig& value, bool portable = false)
             task.intervalDays < 1 || task.intervalDays > 3650 || task.action > 3) return false;
     }
     return true;
+}
+
+bool requiresV7(const IdfConfig& value)
+{
+    for (const IdfPushChannel& channel : value.pushChannels) {
+        if (!channel.cellularEnabled || !channel.cellularUrl.empty()) return true;
+    }
+    return false;
+}
+
+esp_err_t allowFirstV7Write(uint16_t activeSchema)
+{
+    if (activeSchema >= 7) return ESP_OK;
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    if (!running) return ESP_ERR_INVALID_STATE;
+    esp_ota_img_states_t state = ESP_OTA_IMG_UNDEFINED;
+    const esp_err_t err = esp_ota_get_state_partition(running, &state);
+    if (err == ESP_ERR_NOT_FOUND) return ESP_OK;
+    if (err != ESP_OK) return err;
+    return state == ESP_OTA_IMG_PENDING_VERIFY ? ESP_ERR_INVALID_STATE : ESP_OK;
 }
 
 void writeHeader(std::vector<uint8_t>& blob, uint16_t schema, uint32_t generation, size_t payloadOffset)
@@ -824,7 +846,7 @@ bool loadLegacy(IdfConfig& value, bool& existed)
 bool decodeString(Reader& reader, std::string& value, size_t maxBytes) { return reader.string(value, maxBytes); }
 
 bool decodePush(Reader& reader, IdfPushChannel& channel, bool legacyV1, uint8_t maxType,
-                bool wideType = false)
+                bool wideType = false, bool includeCellular = false)
 {
     uint8_t enabled = 0;
     uint32_t type = 0;
@@ -853,6 +875,12 @@ bool decodePush(Reader& reader, IdfPushChannel& channel, bool legacyV1, uint8_t 
         return false;
     }
     if (legacyV1 && channel.type != PUSH_TYPE_CUSTOM) channel.customBody.clear();
+    if (includeCellular) {
+        uint8_t cellularEnabled = 0;
+        if (!reader.u8(cellularEnabled) || cellularEnabled > 1 ||
+            !decodeString(reader, channel.cellularUrl, MAX_PUSH_CELLULAR_URL_BYTES)) return false;
+        channel.cellularEnabled = cellularEnabled != 0;
+    }
     return true;
 }
 
@@ -924,7 +952,7 @@ bool decodeV4(Reader& reader, IdfConfig& value)
     return semanticallyValid(value);
 }
 
-bool decodeV5(Reader& reader, IdfConfig& value)
+bool decodeV5(Reader& reader, IdfConfig& value, bool includeCellular = false)
 {
     initializeDefaults(value);
     uint32_t raw = 0;
@@ -947,7 +975,8 @@ bool decodeV5(Reader& reader, IdfConfig& value)
     }
     if (!reader.u8(count) || count != IDF_MAX_PUSH_CHANNELS) return false;
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-        if (!decodePush(reader, value.pushChannels[i], false, PUSH_TYPE_NTFY, true)) return false;
+        if (!decodePush(reader, value.pushChannels[i], false, PUSH_TYPE_NTFY, true,
+                        includeCellular)) return false;
     }
     if (!reader.u8(count) || count != IDF_MAX_WIFI_NETWORKS) return false;
     for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
@@ -1024,6 +1053,15 @@ bool decodeV6(Reader& reader, IdfConfig& value)
     return semanticallyValid(value);
 }
 
+bool decodeV7(Reader& reader, IdfConfig& value)
+{
+    if (!decodeV5(reader, value, true)) return false;
+    uint32_t raw = 0;
+    if (!reader.u32(raw) || raw < MIN_KEEPALIVE_TRAFFIC_KB || raw > MAX_KEEPALIVE_TRAFFIC_KB) return false;
+    value.kaTrafficKB = static_cast<int>(raw);
+    return semanticallyValid(value);
+}
+
 DecodeResult decodeBlob(const uint8_t* blob, size_t length, IdfConfig& value,
                         uint16_t& schema, uint32_t& generation)
 {
@@ -1049,7 +1087,8 @@ DecodeResult decodeBlob(const uint8_t* blob, size_t length, IdfConfig& value,
               schema == 2 ? decodeV2Common(reader, value, PUSH_TYPE_TELEGRAM) :
               schema == 3 ? decodeV2Common(reader, value, PUSH_TYPE_NTFY) :
               schema == 4 ? decodeV4(reader, value) :
-              schema == 5 ? decodeV5(reader, value) : decodeV6(reader, value);
+              schema == 5 ? decodeV5(reader, value) :
+              schema == 6 ? decodeV6(reader, value) : decodeV7(reader, value);
     return ok && reader.atEnd() ? DecodeResult::Valid : DecodeResult::Invalid;
 }
 
@@ -1078,7 +1117,8 @@ DecodeResult decodeBlob(const std::vector<uint8_t>& blob, IdfConfig& value,
 }
 
 template <typename OutputWriter>
-void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable, bool includeTraffic = false)
+void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable,
+                    bool includeTraffic = false, bool includeCellular = false)
 {
     writer.u32(static_cast<uint32_t>(value.smtpPort));
     if (portable) {
@@ -1116,6 +1156,10 @@ void encodeV5Fields(const IdfConfig& value, OutputWriter& writer, bool portable,
         writer.string(channel.titleTemplate);
         writer.string(channel.bodyTemplate);
         writer.string(channel.customBody);
+        if (includeCellular) {
+            writer.u8(channel.cellularEnabled ? 1 : 0);
+            writer.string(channel.cellularUrl);
+        }
     }
     writer.u8(IDF_MAX_WIFI_NETWORKS);
     for (const IdfWifiNetwork& profile : value.wifiNetworks) {
@@ -1203,14 +1247,27 @@ bool encodeV5(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>&
 
 bool encodeV6(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
 {
-    if (!semanticallyValid(value)) return false;
+    if (!semanticallyValid(value) || requiresV7(value)) return false;
     Writer writer;
     encodeV5Fields(value, writer, false, true);
     std::vector<uint8_t> payload = writer.take();
     if (payload.size() + kHeaderBytes > MAX_CONFIG_BLOB_SIZE) return false;
     blob.assign(kHeaderBytes, 0);
     blob.insert(blob.end(), payload.begin(), payload.end());
-    writeHeader(blob, CONFIG_SCHEMA_VERSION, generation, kHeaderBytes);
+    writeHeader(blob, 6, generation, kHeaderBytes);
+    return true;
+}
+
+bool encodeV7(const IdfConfig& value, uint32_t generation, std::vector<uint8_t>& blob)
+{
+    if (!semanticallyValid(value)) return false;
+    Writer writer;
+    encodeV5Fields(value, writer, false, true, true);
+    std::vector<uint8_t> payload = writer.take();
+    if (payload.size() + kHeaderBytes > MAX_CONFIG_BLOB_SIZE) return false;
+    blob.assign(kHeaderBytes, 0);
+    blob.insert(blob.end(), payload.begin(), payload.end());
+    writeHeader(blob, 7, generation, kHeaderBytes);
     return true;
 }
 
@@ -1277,7 +1334,8 @@ Slot readSlot(nvs_handle_t nvs, int index)
             return slot;
         }
         DecodeResult decoded = decodeBlob(blob, *decodedValue, slot.schema, slot.generation);
-        slot.resumableBlob = decoded == DecodeResult::Valid && slot.schema == CONFIG_SCHEMA_VERSION;
+        slot.resumableBlob = decoded == DecodeResult::Valid && slot.schema >= 6 &&
+                             slot.schema <= CONFIG_SCHEMA_VERSION;
         slot.hardInvalid = !slot.resumableBlob;
         return slot;
     }
@@ -1427,13 +1485,14 @@ esp_err_t idf_config_storage_encode_portable(const IdfConfig& source, uint8_t* o
 
     const size_t payloadCapacity = usableCapacity - kHeaderBytes;
     FixedWriter writer(output + kHeaderBytes, payloadCapacity);
-    encodeV5Fields(source, writer, true, true);
+    const bool useV7 = requiresV7(source);
+    encodeV5Fields(source, writer, true, true, useV7);
     if (!writer.ok()) {
         std::memset(output, 0, usableCapacity);
         return ESP_ERR_INVALID_SIZE;
     }
     const size_t total = kHeaderBytes + writer.size();
-    writeHeader(output, total, CONFIG_SCHEMA_VERSION, 0, kHeaderBytes);
+    writeHeader(output, total, useV7 ? 7 : 6, 0, kHeaderBytes);
     *written = total;
     return ESP_OK;
 }
@@ -1480,6 +1539,12 @@ IdfPortableConfigStatus idf_config_storage_decode_portable(const uint8_t* bytes,
         for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) value.schedTasks[i] = target.schedTasks[i];
     }
     if (schema < 6) value.kaTrafficKB = target.kaTrafficKB;
+    if (schema < 7) {
+        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+            value.pushChannels[i].cellularEnabled = target.pushChannels[i].cellularEnabled;
+            value.pushChannels[i].cellularUrl = target.pushChannels[i].cellularUrl;
+        }
+    }
 
     value.deviceName = target.deviceName;
     value.hostname = target.hostname;
@@ -1544,14 +1609,25 @@ esp_err_t idf_config_storage_save(const IdfConfig& candidate)
     }
     const int target = active < 0 ? 0 : active == 0 ? 1 : 0;
     const uint32_t nextGeneration = generation + 1U;
-    if (!encodeV6(candidate, nextGeneration, blob)) {
+    const uint16_t targetSchema = requiresV7(candidate) ? 7 : 6;
+    const uint16_t activeSchema = active >= 0 ? slots[active].schema : 0;
+    if (targetSchema == 7) {
+        err = allowFirstV7Write(activeSchema);
+        if (err != ESP_OK) {
+            nvs_close(nvs);
+            return err;
+        }
+    }
+    const bool encoded = targetSchema == 7 ? encodeV7(candidate, nextGeneration, blob)
+                                           : encodeV6(candidate, nextGeneration, blob);
+    if (!encoded) {
         nvs_close(nvs);
         return ESP_ERR_INVALID_ARG;
     }
     const uint32_t expectedBlobLength = static_cast<uint32_t>(blob.size());
     const uint32_t expectedBlobCrc = crc32(blob.data(), blob.size());
     std::vector<uint8_t> marker;
-    writeMarker(marker, CONFIG_SCHEMA_VERSION, nextGeneration, expectedBlobLength, expectedBlobCrc);
+    writeMarker(marker, targetSchema, nextGeneration, expectedBlobLength, expectedBlobCrc);
     // The inactive slot may still carry its previous marker.  Remove it in a
     // separate commit before replacing the blob so a power cut between blob
     // and marker commits leaves an incomplete slot, never a mismatched
@@ -1568,7 +1644,7 @@ esp_err_t idf_config_storage_save(const IdfConfig& candidate)
         err = readBlob(nvs, kBlobKeys[target], blob, present);
         if (err == ESP_OK && (!present || blob.size() != expectedBlobLength ||
                               crc32(blob.data(), blob.size()) != expectedBlobCrc ||
-                              !blobEnvelopeValid(blob.data(), blob.size(), CONFIG_SCHEMA_VERSION,
+                              !blobEnvelopeValid(blob.data(), blob.size(), targetSchema,
                                                  nextGeneration))) {
             err = ESP_ERR_INVALID_STATE;
         }
@@ -1666,7 +1742,7 @@ esp_err_t idf_config_storage_load(IdfConfig& out, IdfConfigLoadStatus* status)
             if (status) *status = IdfConfigLoadStatus::StorageError;
             return ESP_ERR_INVALID_STATE;
         }
-        const bool migrated = activeSchema < CONFIG_SCHEMA_VERSION;
+        const bool migrated = activeSchema < 6;
         nvs_close(nvs);
         nvsOpen = false;
         if (migrated) {

@@ -2,6 +2,9 @@ export type Locale = "zh-TW" | "zh-CN" | "en";
 
 export type PushChannel = {
 	enabled: boolean;
+	cellularEnabled: boolean;
+	cellularUrl: string;
+	cellularUrlSet: boolean;
 	type: number;
 	name: string;
 	url: string;
@@ -23,6 +26,8 @@ export type PushTestStatus = {
 	success: boolean;
 	message: string;
 };
+
+export type PushCaStatus = { configured: boolean; sha256: string };
 
 export type EsimProfile = {
 	handle: string;

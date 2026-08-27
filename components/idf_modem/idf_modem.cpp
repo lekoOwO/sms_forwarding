@@ -27,11 +27,6 @@
 #include "idf_util.h"
 #include "nvs.h"
 
-extern const uint8_t s_pinned_ca_start[]
-    asm("_binary_gts_root_r4_7e8b80d078d3_pem_start");
-extern const uint8_t s_pinned_ca_end[]
-    asm("_binary_gts_root_r4_7e8b80d078d3_pem_end");
-
 static const char* TAG = "idf_modem";
 
 static constexpr uart_port_t MODEM_UART = UART_NUM_1;
@@ -1913,13 +1908,9 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
         result.message = "Cellular HTTPS requires home registration";
         return ESP_ERR_INVALID_STATE;
     }
-    size_t pinned_ca_size = static_cast<size_t>(s_pinned_ca_end - s_pinned_ca_start);
-    if (pinned_ca_size > 0 && s_pinned_ca_start[pinned_ca_size - 1] == '\0') --pinned_ca_size;
-    const std::string_view pinned_ca(
-        reinterpret_cast<const char*>(s_pinned_ca_start), pinned_ca_size);
     OwnerHttpsCallbackContext context{deadline};
     const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command,
-                                           &owner_https_wait_response, pinned_ca};
+                                           &owner_https_wait_response};
     const IdfModemHttpsRunResult run_result =
         idf_modem_https_run_post(request, callbacks, result);
     switch (run_result) {

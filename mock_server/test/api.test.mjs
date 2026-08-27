@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, pbkdf2Sync, sign } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { connect } from "node:net";
 import test from "node:test";
 import { createApp } from "../server.mjs";
 
@@ -16,6 +17,18 @@ async function withServer(run, options = {}) {
 
 function request(baseUrl, path, init = {}) {
 	return fetch(`${baseUrl}${path}`, { ...init, headers: { ...headers, ...init.headers } });
+}
+
+function rawHttp(baseUrl, raw) {
+	const { hostname, port } = new URL(baseUrl);
+	return new Promise((resolve, reject) => {
+		let response = "";
+		const socket = connect(Number(port), hostname, () => socket.end(raw));
+		socket.setEncoding("utf8");
+		socket.on("data", (chunk) => response += chunk);
+		socket.on("end", () => resolve(response));
+		socket.on("error", reject);
+	});
 }
 
 function form(baseUrl, path, values) {
@@ -168,6 +181,98 @@ test("masked secrets retain blank same-type values and clear them on provider ch
 			snapshot.config.pushChannels[0].urlSet,
 			snapshot.config.pushChannels[0].key1Set
 		], [10, false, false]);
+	});
+});
+
+test("cellular overrides stay redacted and rejected CA candidates require a fresh per-channel probe", async () => {
+	await withServer(async (baseUrl) => {
+		let saved = await completed(baseUrl, await form(baseUrl, "/save", {
+			push1en: "on", push1type: 9, push1name: "Cellular",
+			push1url: "https://push.example/message", push1key1: "token",
+			push1cellularEnabled: "1", push1cellularUrl: "https://cell.example/message",
+			push1title: "{sender}", push1template: "{message}"
+		}));
+		assert.equal(saved.code, "ACTION_CONFIG_SAVED");
+		let snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([
+			snapshot.config.pushChannels[1].cellularEnabled,
+			snapshot.config.pushChannels[1].cellularUrlSet,
+			snapshot.config.pushChannels[1].cellularUrl
+		], [true, true, undefined]);
+
+		saved = await completed(baseUrl, await form(baseUrl, "/save", {
+			push1en: "on", push1type: 9, push1name: "Cellular",
+			push1cellularEnabled: "0", push1cellularUrl: "",
+			push1title: "{sender}", push1template: "{message}"
+		}));
+		assert.equal(saved.success, true);
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([snapshot.config.pushChannels[1].cellularEnabled, snapshot.config.pushChannels[1].cellularUrlSet], [false, true]);
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push1cellularEnabled: "1", push1cellularUrlClear: "1"
+		}))).success, true);
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.pushChannels[1].cellularUrlSet, false);
+	});
+	await withServer(async (baseUrl) => {
+		const initialStatus = await (await request(baseUrl, "/api/push/ca/status?channel=1")).json();
+		assert.deepEqual(initialStatus.data, { configured: false, sha256: "" });
+		const probe = await request(baseUrl, "/api/push/ca/probe?channel=1", { method: "POST" });
+		assert.equal(probe.status, 202);
+		const probeResult = await completed(baseUrl, probe);
+		assert.equal(probeResult.code, "PUSH_CA_PROBE_READY");
+		assert.deepEqual(Object.keys(probeResult.data).sort(), ["chain", "expiresInMs", "nonce"]);
+		assert.equal(probeResult.data.chain.length > 0, true);
+		assert.deepEqual(Object.keys(probeResult.data.chain[0]).sort(), ["aki", "certSha256", "issuerDer"]);
+		assert.equal(probeResult.data.expiresInMs, 30000);
+		assert.match(probeResult.data.chain[0].certSha256, /^[0-9a-f]{64}$/);
+		assert.equal(typeof probeResult.data.chain[0].issuerDer, "string");
+		assert.match(probeResult.data.chain[0].aki, /^(?:[0-9a-f]{2}){0,32}$/);
+		assert.match(probeResult.data.nonce, /^[0-9a-f]{32}$/);
+		let install = await request(baseUrl,
+			`/api/push/ca/install?channel=1&nonce=${probeResult.data.nonce}`, {
+				method: "POST", headers: { "Content-Type": "application/pkix-cert" }, body: Buffer.from([0x30, 0x01])
+			});
+		assert.equal(install.status, 202);
+		assert.equal((await completed(baseUrl, install)).code, "PUSH_CA_REJECTED");
+		install = await request(baseUrl, `/api/push/ca/install?channel=1&nonce=${probeResult.data.nonce}`, {
+			method: "POST", headers: { "Content-Type": "application/pkix-cert" }, body: Buffer.from([0x30, 0x01])
+		});
+		assert.equal((await install.json()).code, "PUSH_CA_STALE");
+		const reprobe = await completed(baseUrl, await request(baseUrl, "/api/push/ca/probe?channel=1", { method: "POST" }));
+		install = await request(baseUrl, `/api/push/ca/install?channel=1&nonce=${reprobe.data.nonce}`, {
+			method: "POST", headers: { "Content-Type": "application/pkix-cert" }, body: Buffer.from([0x30, 0x01])
+		});
+		assert.equal((await completed(baseUrl, install)).code, "PUSH_CA_INSTALLED");
+		const ready = await (await request(baseUrl, "/api/push/ca/status?channel=1")).json();
+		assert.equal(ready.data.configured, true);
+		assert.match(ready.data.sha256, /^[0-9a-f]{64}$/);
+	}, { pushCaRejectCount: 1 });
+});
+
+test("CA routes reject chunked bodies and unsupported methods with route-specific Allow headers", async () => {
+	await withServer(async (baseUrl) => {
+		for (const [path, allow] of [
+			["/api/push/ca/status?channel=0", "GET"],
+			["/api/push/ca/probe?channel=0", "POST"],
+			["/api/push/ca/install?channel=0&nonce=00000000000000000000000000000000", "POST"]
+		]) {
+			const response = await request(baseUrl, path, { method: "PUT" });
+			assert.equal(response.status, 405);
+			assert.equal(response.headers.get("allow"), allow);
+			assert.deepEqual(await response.json(), { success: false, code: "ACTION_INPUT_INVALID", data: {}, detail: "method" });
+		}
+		for (const [method, path, contentType] of [
+			["GET", "/api/push/ca/status?channel=0", "application/x-www-form-urlencoded"],
+			["POST", "/api/push/ca/probe?channel=0", "application/x-www-form-urlencoded"],
+			["POST", "/api/push/ca/install?channel=0&nonce=00000000000000000000000000000000", "application/pkix-cert"]
+		]) {
+			const url = new URL(baseUrl);
+			const response = await rawHttp(baseUrl,
+				`${method} ${path} HTTP/1.1\r\nHost: ${url.host}\r\nAuthorization: ${auth}\r\nX-CSRF-Token: mock-csrf-token\r\nContent-Type: ${contentType}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n`);
+			assert.match(response, /^HTTP\/1\.1 400 /);
+			assert.match(response, /"code":"ACTION_INPUT_INVALID"/);
+		}
 	});
 });
 
@@ -566,7 +671,7 @@ test("log pages are chronological and bounded", async () => {
 	});
 });
 
-test("the independent v6 fixture restores, preserves local identity, and matches export bytes", async () => {
+test("the independent v6 fixture restores with legacy defaults and re-exports as v7", async () => {
 	const fixture = JSON.parse(await readFile(new URL("./fixtures/config-envelope-v6.json", import.meta.url), "utf8"));
 	const encrypted = Buffer.from(fixture.smscfgHex, "hex");
 	const plaintext = decrypt(encrypted, fixture.passphrase);
@@ -593,8 +698,12 @@ test("the independent v6 fixture restores, preserves local identity, and matches
 		], ["Target gateway", "target-gateway", "operator", "en", "smtp.example.com", "Office WiFi", 2, false, 24, true, 200, 4321]);
 		const ready = await completed(baseUrl, await form(baseUrl, "/api/config/export", { passphrase: fixture.passphrase }));
 		const response = await request(baseUrl, `/api/config/export?id=${ready.data.exportId}`);
-		assert.equal(response.headers.get("x-config-schema-version"), "6");
-		assert.equal(decrypt(await response.arrayBuffer(), fixture.passphrase).toString("hex"), fixture.plaintextHex);
+		assert.equal(response.headers.get("x-config-schema-version"), "7");
+		const exported = decrypt(await response.arrayBuffer(), fixture.passphrase);
+		assert.equal(exported.readUInt16LE(4), 7);
+		assert.equal(exported.readUInt32LE(12), exported.length - 20);
+		assert.equal(exported.readUInt32LE(16), crc32(exported.subarray(20)));
+		assert.notEqual(exported.toString("hex"), fixture.plaintextHex);
 	});
 });
 

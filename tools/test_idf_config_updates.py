@@ -137,6 +137,7 @@ static void require(bool condition) {
 
 static void reset() {
     s_config = IdfConfig();
+    s_config_generation = 0;
     s_config.wifiNetworks[1] = {"untouched", "untouched-pass"};
     s_config.wifiNetworks[2] = {"old-name", "old-password"};
     save_count = 0;
@@ -155,9 +156,11 @@ static void reset() {
 
 int run_config_tests() {
     reset();
+    require(idf_config_generation() == 0);
     require(idf_config_save_wifi_profile(2, "old-name", "", false, true) == ESP_OK);
     require(save_count == 1 && saved.wifiNetworks[2].pass == "old-password");
     require(saved.wifiNetworks[1].ssid == "untouched");
+    require(idf_config_generation() == 1);
 
     reset();
     require(idf_config_save_wifi_profile(2, "new-name", "", false, true) == ESP_ERR_INVALID_ARG);
@@ -262,6 +265,7 @@ int run_config_tests() {
     require(status == IdfPortableConfigStatus::Ok);
     require(save_count == 1 && saved.smtpServer == "candidate.example");
     require(s_config.smtpServer == "live.example");
+    require(idf_config_generation() == 0);
 
     reset();
     s_config.smtpServer = "decode-live.example";

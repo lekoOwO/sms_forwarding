@@ -54,6 +54,34 @@ test("all locales show the runtime provisioning SSID", () => {
 	}
 });
 
+test("a channel CA result renders its code and detail in its own live region", async () => {
+	const previousCwd = process.cwd();
+	let server;
+	try {
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const [{ render }, component] = await Promise.all([
+			server.ssrLoadModule("svelte/server"),
+			server.ssrLoadModule("/src/lib/components/CellularCaResult.svelte")
+		]);
+		const { body } = render(component.default, { props: {
+			status: { configured: false, sha256: "" },
+			saveResult: { state: "error", code: "ACTION_CONFIG_INVALID", data: {}, detail: "push1cellularUrl" },
+			result: { state: "error", code: "PUSH_CA_REJECTED", data: {}, detail: "candidate rejected" },
+			title: "Root CA status", saveTitle: "Save result", ready: "Ready", notReady: "Not ready", locale: "en"
+		} });
+		assert.match(body, /Not ready/);
+		assert.match(body, /configuration is invalid/i);
+		assert.match(body, /push1cellularUrl/);
+		assert.match(body, /device rejected all matching root CA candidates/i);
+		assert.match(body, /candidate rejected/);
+		assert.match(body, /aria-live="polite"/);
+	} finally {
+		try { await server?.close(); } finally { process.chdir(previousCwd); }
+	}
+});
+
 test("demo API rejects invalid forwarding regex and tests only configured push channels", async () => {
 	const previousMode = process.env.VITE_DEMO_MODE;
 	const previousCwd = process.cwd();

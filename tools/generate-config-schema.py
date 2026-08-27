@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the native ESP-IDF configuration constants from schema v6."""
+"""Generate native ESP-IDF and Web constants from the current config schema."""
 
 from __future__ import annotations
 
@@ -239,6 +239,7 @@ constexpr uint16_t MAX_KEEPALIVE_TRAFFIC_KB = {config['kaTrafficKB']['maximum']}
 constexpr uint16_t DEFAULT_KEEPALIVE_TRAFFIC_KB = {config['kaTrafficKB']['default']};
 constexpr size_t MAX_PUSH_NAME_BYTES = {channel['name']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PUSH_URL_BYTES = {channel['url']['x-maxUtf8Bytes']};
+constexpr size_t MAX_PUSH_CELLULAR_URL_BYTES = {channel['cellularUrl']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PUSH_KEY1_BYTES = {channel['key1']['x-maxUtf8Bytes']};
 constexpr size_t MAX_PUSH_KEY2_BYTES = {channel['key2']['x-maxUtf8Bytes']};
 constexpr size_t MAX_TITLE_TEMPLATE_BYTES = {channel['titleTemplate']['x-maxUtf8Bytes']};
@@ -279,6 +280,7 @@ def render_web(schema: dict, manifest: dict) -> str:
         ("wifiPassword", wifi["password"]),
         ("pushName", channel["name"]),
         ("pushUrl", channel["url"]),
+        ("pushCellularUrl", channel["cellularUrl"]),
         ("pushKey1", channel["key1"]),
         ("pushKey2", channel["key2"]),
         ("pushTitleTemplate", channel["titleTemplate"]),
@@ -323,8 +325,8 @@ def load_inputs() -> tuple[dict, dict]:
     version = str(manifest["currentVersion"])
     schema_path = MANIFEST_PATH.parent / manifest["versions"][version]
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    if version != "6" or schema["properties"]["schemaVersion"]["const"] != 6:
-        raise ValueError("current schema must be v6")
+    if version != "7" or schema["properties"]["schemaVersion"]["const"] != 7:
+        raise ValueError("current schema must be v7")
     if schema["properties"]["format"]["const"] != manifest["format"]:
         raise ValueError("manifest and current schema formats differ")
     envelope = manifest["backupEnvelope"]

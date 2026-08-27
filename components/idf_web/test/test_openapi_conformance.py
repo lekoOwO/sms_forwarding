@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = (ROOT / "components/idf_web/idf_web.cpp").read_text()
 SPEC = json.loads((ROOT / "dev_doc/openapi.json").read_text())
-CONFIG_SCHEMA = json.loads((ROOT / "dev_doc/config-schema/v6.json").read_text())
+CONFIG_SCHEMA = json.loads((ROOT / "dev_doc/config-schema/v7.json").read_text())
 
 
 def main() -> None:
@@ -26,7 +26,7 @@ def main() -> None:
     assert set(provisioning["unauthenticatedRoutes"]) == {
         "GET /", "GET /wifiscan", "GET /apstatus", "POST /wificonfig"
     }
-    assert SPEC["x-configSchema"]["currentVersion"] == 6
+    assert SPEC["x-configSchema"]["currentVersion"] == 7
     assert set(SPEC["paths"]["/api/ota/start"]["post"]["responses"]) == {
         "201", "400", "401", "403", "409", "413", "500"
     }
@@ -80,7 +80,58 @@ def main() -> None:
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
         "POST /api/config/restore/finish", "POST /api/ota/start", "POST /api/ota/chunk",
         "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
-        "POST /api/esim",
+        "POST /api/esim", "POST /api/push/ca/probe", "POST /api/push/ca/install",
+    }
+
+    assert set(SPEC["paths"]["/api/push/ca/probe"]) == {"post"}
+    assert set(SPEC["paths"]["/api/push/ca/install"]) == {"post"}
+    assert set(SPEC["paths"]["/api/push/ca/status"]) == {"get"}
+    assert SPEC["paths"]["/api/push/ca/install"]["post"]["requestBody"]["content"]["application/pkix-cert"]["schema"]["maxLength"] == 8192
+    for path, verb, allow in (
+        ("/api/push/ca/probe", "post", "POST"),
+        ("/api/push/ca/install", "post", "POST"),
+        ("/api/push/ca/status", "get", "GET"),
+    ):
+        operation = SPEC["paths"][path][verb]
+        method_error = operation["responses"]["405"]
+        assert method_error["headers"]["Allow"]["schema"] == {
+            "type": "string", "const": allow,
+        }
+        assert method_error["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ActionResult",
+        }
+    assert "only query key" in SPEC["paths"]["/api/push/ca/probe"]["post"]["description"]
+    assert "only query key" in SPEC["paths"]["/api/push/ca/status"]["get"]["description"]
+    install_description = SPEC["paths"]["/api/push/ca/install"]["post"]["description"]
+    for phrase in ("only query keys", "Content-Length", "Transfer-Encoding"):
+        assert phrase in install_description
+    action_data = SPEC["components"]["schemas"]["ActionData"]
+    assert action_data["additionalProperties"] is False
+    ca_data = action_data["properties"]
+    assert ca_data["nonce"] == {
+        "type": "string", "minLength": 32, "maxLength": 32,
+        "pattern": "^[0-9a-f]{32}$",
+    }
+    assert ca_data["expiresInMs"] == {
+        "type": "integer", "minimum": 1, "maximum": 120000,
+    }
+    assert ca_data["configured"] == {"type": "boolean"}
+    assert ca_data["sha256"] == {
+        "type": "string", "pattern": "^(?:|[0-9a-f]{64})$",
+    }
+    chain = ca_data["chain"]
+    assert {key: chain[key] for key in ("type", "minItems", "maxItems")} == {
+        "type": "array", "minItems": 1, "maxItems": 4,
+    }
+    entry = chain["items"]
+    assert entry["additionalProperties"] is False
+    assert set(entry["required"]) == {"certSha256", "issuerDer", "aki"}
+    assert entry["properties"] == {
+        "certSha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "issuerDer": {
+            "type": "string", "contentEncoding": "base64", "maxLength": 216,
+        },
+        "aki": {"type": "string", "pattern": "^(?:[0-9a-f]{2}){0,32}$"},
     }
 
     push_test = SPEC["paths"]["/api/push/test"]
@@ -125,12 +176,20 @@ def main() -> None:
     assert "enables the PDP context" not in ping["description"]
 
     config_update = SPEC["components"]["schemas"]["ConfigUpdate"]
-    assert config_update["maxProperties"] == 51
+    assert config_update["maxProperties"] == 66
     snapshot_config = SPEC["components"]["schemas"]["DeviceSnapshot"]["properties"]["config"]
     for field in ("emailEnabled", "pushEnabled"):
         assert field in snapshot_config["required"]
         assert snapshot_config["properties"][field]["type"] == "boolean"
         assert config_update["properties"][field]["enum"] == ["0", "1"]
+    push_channel = SPEC["components"]["schemas"]["PushChannel"]
+    assert {"cellularEnabled", "cellularUrlSet"} <= set(push_channel["required"])
+    assert "cellularUrl" not in push_channel["properties"]
+    for pattern in (
+        "^push[0-4]cellularEnabled$", "^push[0-4]cellularUrl$",
+        "^push[0-4]cellularUrlClear$",
+    ):
+        assert pattern in config_update["patternProperties"]
     config_properties = CONFIG_SCHEMA["properties"]["config"]["properties"]
     update_properties = config_update["properties"]
     assert "forwardRules" in snapshot_config["required"]

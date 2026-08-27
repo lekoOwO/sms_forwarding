@@ -853,9 +853,20 @@ int main() {
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
         "/api/ota/chunk", "/api/ota/finish", "/api/push/test", "/api/device/restart", "/*",
+        "/api/push/ca/probe", "/api/push/ca/install", "/api/push/ca/status",
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
     assert 'register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push)' in source
+    for route, handler in (
+        ("/api/push/ca/probe", "handle_push_ca_probe"),
+        ("/api/push/ca/install", "handle_push_ca_install"),
+        ("/api/push/ca/status", "handle_push_ca_status"),
+    ):
+        assert f'register_handler(s_server, "{route}", HTTP_ANY, {handler})' in source
+    ca_method = function_body(source, "send_ca_method_error")
+    assert 'httpd_resp_set_status(req, "405 Method Not Allowed")' in ca_method
+    assert 'httpd_resp_set_hdr(req, "Allow", allow)' in ca_method
+    assert 'action_result(false, "ACTION_INPUT_INVALID", {}, "method")' in ca_method
     esim = function_body(source, "handle_api_esim")
     assert esim.index("reject_oversized_body(req)") < esim.index("check_auth_strict(req)")
     assert esim.index("check_auth_strict(req)") < esim.index("req->method != HTTP_GET")

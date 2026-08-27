@@ -1,6 +1,7 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushTestStatus } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestStatus } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
+import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
 
 let csrfToken = "";
 export const demoMode = import.meta.env.VITE_DEMO_MODE === "1";
@@ -19,6 +20,7 @@ const demoConfig: DeviceSnapshot["config"] = {
 	kaEnabled: false, kaIntervalDays: 175, kaTrafficKB: 1,
 	pushChannels: Array.from({ length: 5 }, (_, index) => ({
 		enabled: index === 0, type: 1, name: `Channel ${index + 1}`, url: "", urlSet: index === 0,
+		cellularEnabled: true, cellularUrl: "", cellularUrlSet: false,
 		key1: "", key1Set: false, key2: "", key2Set: false, customBody: "", customBodySet: false,
 		titleTemplate: "", bodyTemplate: ""
 	}))
@@ -27,6 +29,7 @@ const demoLogs = ["Demo device started", "WiFi connected: DemoNetwork", "Cellula
 const demoPushTests: PushTestStatus[] = Array.from({ length: 5 }, () => ({
 	queued: false, running: false, done: false, success: false, message: "Test not started"
 }));
+const demoPushCa: PushCaStatus[] = Array.from({ length: 5 }, () => ({ configured: false, sha256: "" }));
 const demoEsim: EsimStatus = {
 	eid: { available: true, state: "available", length: 32 },
 	profiles: [
@@ -112,6 +115,10 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 		}
 		return structuredClone(demoPushTests[channel]) as T;
 	}
+	if (path.startsWith("/api/push/ca/status?")) {
+		const channel = Number(new URL(path, "http://device").searchParams.get("channel"));
+		return { success: true, code: "PUSH_CA_STATUS", data: structuredClone(demoPushCa[channel]), detail: "" } as T;
+	}
 	if (path.startsWith("/log?")) return {
 		entries: demoLogs.map((message, index) => ({ id: index + 1, message })), nextCursor: 1, hasMore: false
 	} as T;
@@ -161,9 +168,12 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 		}
 		for (let index = 0; index < demoConfig.pushChannels.length; index += 1) {
 			const prefix = `push${index}`;
-			if (!["en", "type", "name", "url", "key1", "key2", "body", "title", "template"].some((suffix) => form.has(`${prefix}${suffix}`))) continue;
+			if (!["en", "type", "name", "url", "key1", "key2", "body", "title", "template", "cellularEnabled", "cellularUrl", "cellularUrlClear"].some((suffix) => form.has(`${prefix}${suffix}`))) continue;
 			const channel = demoConfig.pushChannels[index];
 			const type = Number(init.body.get(`${prefix}type`) ?? channel.type);
+			if (form.has(`${prefix}cellularEnabled`)) channel.cellularEnabled = form.get(`${prefix}cellularEnabled`) === "1";
+			if (form.get(`${prefix}cellularUrlClear`) === "1") { channel.cellularUrl = ""; channel.cellularUrlSet = false; }
+			else if (form.get(`${prefix}cellularUrl`)) { channel.cellularUrl = ""; channel.cellularUrlSet = true; }
 			if (type !== channel.type) {
 				channel.url = ""; channel.urlSet = false;
 				channel.key1 = ""; channel.key1Set = false;
@@ -217,7 +227,71 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 export async function loadSnapshot(): Promise<DeviceSnapshot> {
 	const snapshot = await requestJson<DeviceSnapshot>("/api/config");
 	csrfToken = snapshot.csrfToken;
+	snapshot.config?.pushChannels.forEach((channel) => channel.cellularUrl = "");
 	return snapshot;
+}
+
+function decodeBase64(value: string) {
+	if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new Error("Invalid certificate metadata.");
+	const binary = atob(value);
+	return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+function probeMetadata(response: ActionResult) {
+	const nonce = typeof response.data.nonce === "string" ? response.data.nonce : "";
+	const expiresInMs = Number(response.data.expiresInMs);
+	const chain = Array.isArray(response.data.chain) ? response.data.chain as Array<Record<string, unknown>> : [];
+	if (response.code !== "PUSH_CA_PROBE_READY" || !/^[0-9a-f]{32}$/.test(nonce) ||
+		!Number.isInteger(expiresInMs) || expiresInMs < 1 || expiresInMs > 120000 || chain.length < 1 || chain.length > 4) {
+		throw new Error("Invalid certificate probe response.");
+	}
+	const issuers = chain.map((entry) => {
+		if (typeof entry.certSha256 !== "string" || !/^[0-9a-f]{64}$/.test(entry.certSha256) ||
+			typeof entry.issuerDer !== "string" || typeof entry.aki !== "string" || !/^(?:[0-9a-f]{2}){0,32}$/.test(entry.aki)) {
+			throw new Error("Invalid certificate probe response.");
+		}
+		const issuer = decodeBase64(entry.issuerDer);
+		if (issuer.length < 1 || issuer.length > 160) throw new Error("Invalid certificate probe response.");
+		return issuer;
+	});
+	return { nonce, issuers };
+}
+
+export async function loadPushCaStatus(channel: number): Promise<PushCaStatus> {
+	const response = await runAction(`/api/push/ca/status?channel=${channel}`);
+	return response.data as PushCaStatus;
+}
+
+export async function provisionPushCa(channel: number): Promise<ActionResult> {
+	if (demoMode) {
+		demoPushCa[channel] = { configured: true, sha256: "0".repeat(64) };
+		return { success: true, code: "PUSH_CA_INSTALLED", data: { sha256: demoPushCa[channel].sha256 }, detail: "" };
+	}
+	const current = await loadPushCaStatus(channel);
+	if (current.configured) return { success: true, code: "PUSH_CA_STATUS", data: current, detail: "" };
+	let probe = await waitForAccepted(await runAction(`/api/push/ca/probe?channel=${channel}`, { method: "POST" }));
+	if (!probe.success || probe.code !== "PUSH_CA_PROBE_READY") return probe;
+	let metadata = probeMetadata(probe);
+	const candidates = selectMozillaRootCandidates(await fetchMozillaCertData(), metadata.issuers);
+	if (!candidates.length) return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
+	for (let index = 0; index < candidates.length; index += 1) {
+		if (index > 0) {
+			probe = await waitForAccepted(await runAction(`/api/push/ca/probe?channel=${channel}`, { method: "POST" }));
+			if (!probe.success) return probe;
+			metadata = probeMetadata(probe);
+		}
+		const certificate = decodeBase64(candidates[index].derBase64);
+		if (certificate.length < 1 || certificate.length > 8192) continue;
+		const installed = await waitForAccepted(await runAction(`/api/push/ca/install?channel=${channel}&nonce=${metadata.nonce}`, {
+			method: "POST", headers: { "Content-Type": "application/pkix-cert" }, body: certificate.buffer as ArrayBuffer
+		}));
+		if (installed.success) {
+			const status = await loadPushCaStatus(channel);
+			return status.configured ? installed : { success: false, code: "PUSH_CA_STORE_FAILED", data: {}, detail: "" };
+		}
+		if (!["PUSH_CA_REJECTED", "PUSH_CA_STALE"].includes(installed.code)) return installed;
+	}
+	return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
 }
 
 export function loadEsim(): Promise<EsimStatus> {

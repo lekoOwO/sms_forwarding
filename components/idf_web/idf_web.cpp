@@ -39,6 +39,7 @@
 #include "idf_log.h"
 #include "idf_modem.h"
 #include "idf_push.h"
+#include "idf_push_ca.h"
 #include "idf_sms.h"
 #include "idf_util.h"
 #include "idf_wifi.h"
@@ -702,6 +703,11 @@ static esp_err_t handle_status(httpd_req_t* req)
         bool key2_redacted = push_key_sensitive(ch.type, 2);
         json_prop(body, "name", ch.name); body += ",";
         json_prop(body, "url", ch.url); body += ",";
+        body += "\"cellularEnabled\":";
+        body += ch.cellularEnabled ? "true" : "false";
+        body += ",\"cellularUrlSet\":";
+        body += ch.cellularUrl.empty() ? "false" : "true";
+        body += ",";
         json_prop(body, "key1", key1_redacted ? std::string() : ch.key1); body += ",";
         snprintf(buf, sizeof(buf), "\"key1Set\":%s,\"key1Redacted\":%s,",
                  ch.key1.empty() ? "false" : "true", key1_redacted ? "true" : "false");
@@ -806,6 +812,10 @@ static esp_err_t handle_api_config(httpd_req_t* req)
         json_prop(body, "name", channel.name); body += ",";
         json_prop(body, "url", ""); body += ",\"urlSet\":";
         body += cfg.pushUrlSet[i] ? "true" : "false"; body += ",";
+        body += "\"cellularEnabled\":";
+        body += channel.cellularEnabled ? "true" : "false";
+        body += ",\"cellularUrlSet\":";
+        body += cfg.pushCellularUrlSet[i] ? "true" : "false"; body += ",";
         json_prop(body, "key1", ""); body += ",\"key1Set\":";
         body += cfg.pushKey1Set[i] ? "true" : "false"; body += ",";
         json_prop(body, "key2", ""); body += ",\"key2Set\":";
@@ -1258,6 +1268,78 @@ static std::string run_backup_restore_job(uint32_t job_id, const std::string& pa
     return action_result(false, "ACTION_CONFIG_RESTORE_SAVE_FAILED");
 }
 
+static std::string hex_bytes(const uint8_t* data, size_t size)
+{
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string output;
+    output.reserve(size * 2);
+    for (size_t i = 0; i < size; ++i) {
+        output += hex[data[i] >> 4];
+        output += hex[data[i] & 15];
+    }
+    return output;
+}
+
+static std::string base64_bytes(const std::vector<uint8_t>& data)
+{
+    if (data.empty()) return {};
+    std::string output(((data.size() + 2) / 3) * 4 + 1, '\0');
+    size_t length = 0;
+    if (mbedtls_base64_encode(reinterpret_cast<unsigned char*>(output.data()), output.size(),
+                              &length, data.data(), data.size()) != 0) return {};
+    output.resize(length);
+    return output;
+}
+
+static std::string run_push_ca_probe_job(const std::string& payload)
+{
+    uint32_t channel = 0;
+    if (!parse_u32_strict(payload.c_str(), channel, true) || channel >= IDF_MAX_PUSH_CHANNELS) {
+        return action_result(false, "PUSH_CA_PROBE_FAILED");
+    }
+    IdfPushCaProbeResult probe;
+    if (idf_push_ca_probe(static_cast<uint8_t>(channel), probe) != ESP_OK ||
+        probe.chain.empty() || probe.chain.size() > IDF_PUSH_CA_CHAIN_MAX) {
+        return action_result(false, "PUSH_CA_PROBE_FAILED");
+    }
+    std::string data = "\"nonce\":\"" + probe.nonce + "\",\"expiresInMs\":" +
+        std::to_string(probe.expiresInMs) + ",\"chain\":[";
+    for (size_t i = 0; i < probe.chain.size(); ++i) {
+        if (i) data += ',';
+        const auto& cert = probe.chain[i];
+        data += "{\"certSha256\":\"" + hex_bytes(cert.sha256.data(), cert.sha256.size()) +
+                "\",\"issuerDer\":\"" + base64_bytes(cert.issuerDer) +
+                "\",\"aki\":\"" + hex_bytes(cert.authorityKeyIdentifier.data(),
+                                              cert.authorityKeyIdentifier.size()) + "\"}";
+    }
+    data += ']';
+    std::string result = action_result(true, "PUSH_CA_PROBE_READY", data);
+    return result.size() <= 1800 ? result : action_result(false, "PUSH_CA_PROBE_FAILED");
+}
+
+static std::string run_push_ca_install_job(const std::string& payload,
+                                           IdfWebOwnedBytes& binary)
+{
+    const size_t separator = payload.find(':');
+    uint32_t channel = 0;
+    if (separator == std::string::npos ||
+        !parse_u32_strict(payload.substr(0, separator).c_str(), channel, true) ||
+        channel >= IDF_MAX_PUSH_CHANNELS) {
+        return action_result(false, "PUSH_CA_STALE");
+    }
+    IdfConfigCaStatus status;
+    const esp_err_t err = idf_push_ca_install(static_cast<uint8_t>(channel),
+        payload.substr(separator + 1), binary.data.get(), binary.size, status);
+    if (err == ESP_ERR_NOT_FOUND || err == ESP_ERR_INVALID_STATE) {
+        return action_result(false, "PUSH_CA_STALE");
+    }
+    if (err == ESP_ERR_INVALID_ARG) return action_result(false, "PUSH_CA_REJECTED");
+    if (err != ESP_OK) return action_result(false, "PUSH_CA_STORE_FAILED");
+    return action_result(true, "PUSH_CA_INSTALLED",
+                         "\"sha256\":\"" +
+                         hex_bytes(status.sha256.data(), status.sha256.size()) + "\"");
+}
+
 static const char* ota_action_code(IdfWebOtaCode code)
 {
     switch (code) {
@@ -1481,6 +1563,10 @@ static void api_job_task(void* raw)
             result = run_backup_restore_job(job.meta.id, job.input.payload, job.binary);
         }
         else if (job.input.type == "ota_finish") result = run_ota_finish_job(job.input.payload);
+        else if (job.input.type == "push_ca_probe") result = run_push_ca_probe_job(job.input.payload);
+        else if (job.input.type == "push_ca_install") {
+            result = run_push_ca_install_job(job.input.payload, job.binary);
+        }
         else result = action_result(false, "ACTION_JOB_FAILED");
         if (needs_modem) api_job_modem_end();
     }
@@ -2455,7 +2541,7 @@ static void parse_push_channels_form(const IdfFormFields& fields,
                                      IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS])
 {
     for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-        char key[24];
+        char key[32];
         snprintf(key, sizeof(key), "push%ddelete", i);
         if (has_field(fields, key)) {
             // Deletion takes precedence over other fields in the form so redacted-secret retention cannot restore the old value.
@@ -2468,6 +2554,21 @@ static void parse_push_channels_form(const IdfFormFields& fields,
         channels[i].type = field_u8(fields, key, 1);
         snprintf(key, sizeof(key), "push%durl", i);
         channels[i].url = field_text(fields, key);
+        snprintf(key, sizeof(key), "push%dcellularEnabled", i);
+        channels[i].cellularEnabled = previous[i].cellularEnabled;
+        if (has_field(fields, key)) {
+            const std::string value = field_text(fields, key);
+            if (value == "0" || value == "1") channels[i].cellularEnabled = value == "1";
+        }
+        char cellular_url_key[32];
+        char cellular_clear_key[32];
+        snprintf(cellular_url_key, sizeof(cellular_url_key), "push%dcellularUrl", i);
+        snprintf(cellular_clear_key, sizeof(cellular_clear_key), "push%dcellularUrlClear", i);
+        channels[i].cellularUrl = previous[i].cellularUrl;
+        if (field_text(fields, cellular_clear_key) == "1") channels[i].cellularUrl.clear();
+        else if (!field_text(fields, cellular_url_key).empty()) {
+            channels[i].cellularUrl = field_text(fields, cellular_url_key);
+        }
         snprintf(key, sizeof(key), "push%dname", i);
         channels[i].name = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dkey1", i);
@@ -2559,7 +2660,8 @@ static ModernSaveFamily modern_save_field_family(const std::string& key)
     if (key == "kaEnabled" || key == "kaIntervalDays" || key == "kaTrafficKB") {
         return ModernSaveFamily::Keepalive;
     }
-    for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template"}) {
+    for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template",
+                               "cellularEnabled", "cellularUrl", "cellularUrlClear"}) {
         if (indexed_save_key(key, "push", suffix, IDF_MAX_PUSH_CHANNELS) >= 0) return ModernSaveFamily::Push;
     }
     for (const char* suffix : {"ssid", "pass", "open"}) {
@@ -2597,9 +2699,10 @@ static size_t modern_field_limit(const std::string& key)
             return strcmp(suffix, "user") == 0 ? 64 : 96;
         }
     }
-    for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template"}) {
+    for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template",
+                               "cellularEnabled", "cellularUrl", "cellularUrlClear"}) {
         if (indexed_save_key(key, "push", suffix, IDF_MAX_PUSH_CHANNELS) >= 0) {
-            if (strcmp(suffix, "url") == 0) return 512;
+            if (strcmp(suffix, "url") == 0 || strcmp(suffix, "cellularUrl") == 0) return 512;
             if (strcmp(suffix, "key1") == 0 || strcmp(suffix, "key2") == 0 || strcmp(suffix, "title") == 0) return 256;
             if (strcmp(suffix, "body") == 0 || strcmp(suffix, "template") == 0) return 2048;
             return strcmp(suffix, "name") == 0 ? 64 : 32;
@@ -2752,7 +2855,8 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         for (const auto& field : fields) {
             if (field.first == "pushEnabled") continue;
             int parsed = -1;
-            for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template"}) {
+            for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template",
+                                       "cellularEnabled", "cellularUrl", "cellularUrlClear"}) {
                 parsed = indexed_save_key(field.first, "push", suffix, IDF_MAX_PUSH_CHANNELS);
                 if (parsed >= 0) break;
             }
@@ -2773,7 +2877,7 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         if (index < 0) {
             return send_modern_save_result(req, idf_config_save_push(enabled, channels), "push");
         }
-        char key[24];
+        char key[32];
         snprintf(key, sizeof(key), "push%dtype", index);
         int type = current.pushChannels[index].type;
         if ((has_field(fields, key) && !parse_int_strict(field_text(fields, key), type)) || type < 1 || type > 12) {
@@ -2785,6 +2889,28 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         snprintf(key, sizeof(key), "push%den", index); next.enabled = has_field(fields, key);
         snprintf(key, sizeof(key), "push%dname", index); if (has_field(fields, key)) next.name = field_text(fields, key);
         snprintf(key, sizeof(key), "push%durl", index); if (!field_text(fields, key).empty()) next.url = field_text(fields, key);
+        snprintf(key, sizeof(key), "push%dcellularEnabled", index);
+        if (has_field(fields, key)) {
+            const std::string value = field_text(fields, key);
+            if (value != "0" && value != "1") {
+                return send_modern_save_result(req, ESP_ERR_INVALID_ARG, key);
+            }
+            next.cellularEnabled = value == "1";
+        }
+        char cellular_url_key[32];
+        char cellular_clear_key[32];
+        snprintf(cellular_url_key, sizeof(cellular_url_key), "push%dcellularUrl", index);
+        snprintf(cellular_clear_key, sizeof(cellular_clear_key), "push%dcellularUrlClear", index);
+        const std::string cellular_url = field_text(fields, cellular_url_key);
+        const bool cellular_clear = has_field(fields, cellular_clear_key);
+        if (cellular_clear && field_text(fields, cellular_clear_key) != "1") {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, cellular_clear_key);
+        }
+        if (cellular_clear && !cellular_url.empty()) {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, cellular_url_key);
+        }
+        if (cellular_clear) next.cellularUrl.clear();
+        else if (!cellular_url.empty()) next.cellularUrl = cellular_url;
         snprintf(key, sizeof(key), "push%dkey1", index); if (!field_text(fields, key).empty()) next.key1 = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dkey2", index); if (!field_text(fields, key).empty()) next.key2 = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dbody", index); if (!field_text(fields, key).empty()) next.customBody = field_text(fields, key);
@@ -3020,6 +3146,19 @@ static esp_err_t handle_save(httpd_req_t* req)
     if (push_form) {
         IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS];
         IdfConfigWebView current = idf_config_get_web_view();
+        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+            char enabled_key[32], url_key[32], clear_key[32];
+            snprintf(enabled_key, sizeof(enabled_key), "push%dcellularEnabled", i);
+            snprintf(url_key, sizeof(url_key), "push%dcellularUrl", i);
+            snprintf(clear_key, sizeof(clear_key), "push%dcellularUrlClear", i);
+            const std::string enabled_value = field_text(fields, enabled_key);
+            const std::string clear_value = field_text(fields, clear_key);
+            if ((has_field(fields, enabled_key) && enabled_value != "0" && enabled_value != "1") ||
+                (has_field(fields, clear_key) && clear_value != "1") ||
+                (clear_value == "1" && !field_text(fields, url_key).empty())) {
+                return fail(ESP_ERR_INVALID_ARG);
+            }
+        }
         parse_push_channels_form(fields, current.pushChannels, channels);
         esp_err_t err = idf_config_save_push(has_field(fields, "pushEnabled"), channels);
         if (err != ESP_OK) return fail(err);
@@ -3570,6 +3709,198 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     }
     set_json_no_cache(req);
     const std::string body = idf_push_test_status_json(channel);
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static esp_err_t send_ca_error(httpd_req_t* req, const char* status, const char* code,
+                               const char* detail = "")
+{
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, status);
+    const std::string body = action_result(false, code, {}, detail);
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static esp_err_t send_ca_method_error(httpd_req_t* req, const char* allow)
+{
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, "405 Method Not Allowed");
+    httpd_resp_set_hdr(req, "Allow", allow);
+    const std::string body = action_result(false, "ACTION_INPUT_INVALID", {}, "method");
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static bool ca_require_method(httpd_req_t* req, httpd_method_t method, const char* allow)
+{
+    if (req->method == method) return true;
+    (void)send_ca_method_error(req, allow);
+    return false;
+}
+
+static bool ca_has_transfer_encoding(httpd_req_t* req)
+{
+    char empty[1] = {};
+    return httpd_req_get_hdr_value_len(req, "Transfer-Encoding") != 0 ||
+           httpd_req_get_hdr_value_str(req, "Transfer-Encoding", empty, sizeof(empty)) == ESP_OK;
+}
+
+static bool ca_parse_query(httpd_req_t* req, bool include_nonce, uint8_t& channel,
+                           std::string* nonce)
+{
+    char query[128] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+    const size_t expected = include_nonce ? 2 : 1;
+    const IdfWebFormDecodeResult decoded = idf_web_decode_form(query, expected);
+    if (!decoded.valid || decoded.fields.size() != expected || (include_nonce && !nonce)) {
+        return false;
+    }
+    const std::string* channel_raw = nullptr;
+    const std::string* nonce_raw = nullptr;
+    for (const auto& field : decoded.fields) {
+        if (field.first == "channel" && !channel_raw) channel_raw = &field.second;
+        else if (include_nonce && field.first == "nonce" && !nonce_raw) nonce_raw = &field.second;
+        else return false;
+    }
+    uint32_t value = 0;
+    if (!channel_raw || !parse_u32_strict(channel_raw->c_str(), value, true) ||
+        value >= IDF_MAX_PUSH_CHANNELS || (include_nonce && !nonce_raw)) {
+        return false;
+    }
+    channel = static_cast<uint8_t>(value);
+    if (include_nonce) *nonce = *nonce_raw;
+    return true;
+}
+
+static bool ca_content_length_matches(httpd_req_t* req)
+{
+    char raw[16] = {};
+    const size_t length = httpd_req_get_hdr_value_len(req, "Content-Length");
+    if (length == 0 || length >= sizeof(raw) ||
+        httpd_req_get_hdr_value_str(req, "Content-Length", raw, sizeof(raw)) != ESP_OK) {
+        return false;
+    }
+    size_t parsed = 0;
+    for (size_t i = 0; i < length; ++i) {
+        if (raw[i] < '0' || raw[i] > '9') return false;
+        const size_t digit = static_cast<size_t>(raw[i] - '0');
+        if (parsed > (SIZE_MAX - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    return parsed == req->content_len;
+}
+
+static bool ca_job_active(uint8_t channel)
+{
+    if (!s_api_job_mutex || xSemaphoreTake(s_api_job_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return true;
+    }
+    const std::string prefix = std::to_string(channel);
+    bool active = false;
+    for (const auto& job : s_api_jobs) {
+        if ((job.meta.state == IdfWebJobState::Queued ||
+             job.meta.state == IdfWebJobState::Running) &&
+            (job.input.type == "push_ca_probe" || job.input.type == "push_ca_install") &&
+            (job.input.payload == prefix || job.input.payload.rfind(prefix + ":", 0) == 0)) {
+            active = true;
+            break;
+        }
+    }
+    xSemaphoreGive(s_api_job_mutex);
+    return active;
+}
+
+static esp_err_t handle_push_ca_probe(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth(req)) return ESP_OK;
+    if (!ca_require_method(req, HTTP_POST, "POST")) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+    uint8_t channel = 0;
+    if (ca_has_transfer_encoding(req) || req->content_len != 0 ||
+        !ca_parse_query(req, false, channel, nullptr)) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "channel");
+    }
+    if (!idf_wifi_get_status().staConnected || ca_job_active(channel)) {
+        return send_ca_error(req, "409 Conflict", "ACTION_BUSY");
+    }
+    return enqueue_api_job(req, "push_ca_probe", std::to_string(channel));
+}
+
+static bool exact_pkix_content_type(httpd_req_t* req)
+{
+    constexpr char expected[] = "application/pkix-cert";
+    char value[sizeof(expected)] = {};
+    return httpd_req_get_hdr_value_len(req, "Content-Type") == sizeof(expected) - 1 &&
+           httpd_req_get_hdr_value_str(req, "Content-Type", value, sizeof(value)) == ESP_OK &&
+           strcmp(value, expected) == 0;
+}
+
+static bool valid_nonce(const std::string& nonce)
+{
+    return nonce.size() == 32 && std::all_of(nonce.begin(), nonce.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
+
+static esp_err_t handle_push_ca_install(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth(req)) return ESP_OK;
+    if (!ca_require_method(req, HTTP_POST, "POST")) return ESP_OK;
+    if (!check_csrf(req)) return ESP_OK;
+    uint8_t channel = 0;
+    std::string nonce;
+    if (!ca_parse_query(req, true, channel, &nonce) || !valid_nonce(nonce)) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID");
+    }
+    if (!exact_pkix_content_type(req)) {
+        return send_ca_error(req, "415 Unsupported Media Type", "ACTION_INPUT_INVALID");
+    }
+    if (ca_has_transfer_encoding(req) || req->content_len == 0 ||
+        !ca_content_length_matches(req)) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+    }
+    if (req->content_len > IDF_CONFIG_CA_MAX_DER_BYTES) {
+        return send_ca_error(req, "413 Payload Too Large", "ACTION_INPUT_TOO_LONG");
+    }
+    if (ca_job_active(channel)) return send_ca_error(req, "409 Conflict", "ACTION_BUSY");
+    std::string body;
+    if (read_body(req, body, IDF_CONFIG_CA_MAX_DER_BYTES) != ESP_OK) return ESP_OK;
+    IdfWebOwnedBytes candidate;
+    if (!idf_web_allocate_owned_bytes(candidate, body.size())) {
+        idf_web_secure_clear(body);
+        return send_ca_error(req, "429 Too Many Requests", "ACTION_JOB_QUEUE_FULL");
+    }
+    memcpy(candidate.data.get(), body.data(), body.size());
+    candidate.size = body.size();
+    idf_web_secure_clear(body);
+    return enqueue_api_job(req, "push_ca_install",
+                           std::to_string(channel) + ":" + nonce,
+                           std::move(candidate));
+}
+
+static esp_err_t handle_push_ca_status(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth(req)) return ESP_OK;
+    if (!ca_require_method(req, HTTP_GET, "GET")) return ESP_OK;
+    uint8_t channel = 0;
+    if (ca_has_transfer_encoding(req) || req->content_len != 0 ||
+        !ca_parse_query(req, false, channel, nullptr)) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "channel");
+    }
+    IdfConfigCaStatus status;
+    const esp_err_t err = idf_push_ca_status(channel, status);
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID");
+    }
+    std::string data = "\"configured\":";
+    data += status.configured ? "true" : "false";
+    data += ",\"sha256\":\"";
+    if (status.configured) data += hex_bytes(status.sha256.data(), status.sha256.size());
+    data += '"';
+    set_json_no_cache(req);
+    const std::string body = action_result(true, "PUSH_CA_STATUS", data);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
@@ -5246,6 +5577,9 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/ota/finish", register_handler(s_server, "/api/ota/finish", HTTP_POST, handle_ota_finish));
     IDF_WEB_TRY_REGISTER("/api/device/restart", register_handler(s_server, "/api/device/restart", HTTP_ANY, handle_reboot));
     IDF_WEB_TRY_REGISTER("/api/push/test", register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push));
+    IDF_WEB_TRY_REGISTER("/api/push/ca/probe", register_handler(s_server, "/api/push/ca/probe", HTTP_ANY, handle_push_ca_probe));
+    IDF_WEB_TRY_REGISTER("/api/push/ca/install", register_handler(s_server, "/api/push/ca/install", HTTP_ANY, handle_push_ca_install));
+    IDF_WEB_TRY_REGISTER("/api/push/ca/status", register_handler(s_server, "/api/push/ca/status", HTTP_ANY, handle_push_ca_status));
     IDF_WEB_TRY_REGISTER("/query", register_handler(s_server, "/query", HTTP_GET, handle_query));
     IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, handle_save));
     IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_GET, handle_wifi));

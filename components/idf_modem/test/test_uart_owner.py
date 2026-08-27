@@ -1,4 +1,3 @@
-import hashlib
 import re
 import shutil
 import subprocess
@@ -402,13 +401,8 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIsNotNone(compiler, "the host HTTPS fixture requires g++")
         fixture = SOURCE.parent / "test" / "https_post_fixture.cpp"
         implementation = SOURCE.parent / "idf_modem_https.cpp"
-        certificate = SOURCE.parent / "certs" / "gts_root_r4_7e8b80d078d3.pem"
         self.assertTrue(fixture.exists(), "missing executable HTTPS POST fixture")
         self.assertTrue(implementation.exists(), "missing HTTPS POST protocol implementation")
-        self.assertEqual(
-            hashlib.sha256(certificate.read_bytes()).hexdigest(),
-            "7e8b80d078d3dd77d3ed2108dd2b33412c12d7d72cb0965741c70708691776a2",
-        )
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(
@@ -419,7 +413,7 @@ class UartOwnerContractTest(unittest.TestCase):
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
             run_result = subprocess.run(
-                [str(binary), str(certificate)], check=False, capture_output=True, text=True
+                [str(binary)], check=False, capture_output=True, text=True
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
 

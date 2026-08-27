@@ -87,7 +87,7 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertNotIn("Slot slots[2]", storage)
         self.assertIn("std::unique_ptr<Slot[]>", storage)
         self.assertIn("-Werror=frame-larger-than=4096", cmake)
-        self.assertIn("sizeof(IdfConfig) == 3216", config)
+        self.assertIn("sizeof(IdfConfig) == 3356", config)
 
         # A bad sibling must not erase a valid prior; only a newer authenticated
         # future schema blocks startup.  The implementation-connected codec test
@@ -103,6 +103,8 @@ class ConfigPersistenceTest(unittest.TestCase):
         self.assertIn("idf_config_storage_factory_reset", config)
         self.assertIn("idf_config_save_accounts", header)
         self.assertIn("idf_config_save_accounts", config)
+        self.assertIn("pushCellularUrlSet", header)
+        self.assertIn("view.pushCellularUrlSet[i] = !s_config.pushChannels[i].cellularUrl.empty();", config)
         self.assertNotIn("save_config_to_nvs", config)
         for api in (
             "idf_config_save_identity", "idf_config_save_notification_locale",

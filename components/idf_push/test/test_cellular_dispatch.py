@@ -60,6 +60,8 @@ int main() {
     config.dataEnabled = true;
     request.headerName = "X-Device";
     request.headerValue = "sms-forwarder";
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    request.rootCertificateSha256.fill(0xab);
     IdfPushTransportResult transport;
     assert(idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                      nullptr, fake_modem_post, transport));
@@ -71,6 +73,8 @@ int main() {
     assert(captured_request.headerValue == "sms-forwarder");
     assert(captured_request.apn == "internet");
     assert(captured_request.dataEnabled);
+    assert(captured_request.rootCertificateDer == request.rootCertificateDer);
+    assert(captured_request.rootCertificateSha256 == request.rootCertificateSha256);
     assert(transport.httpStatus == 204);
     assert(transport.ok);
 
@@ -103,6 +107,14 @@ int main() {
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(modem_calls == calls_before_get);
+
+    request.method = "POST";
+    request.rootCertificateDer.clear();
+    const int calls_before_missing_ca = modem_calls;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(modem_calls == calls_before_missing_ca);
+    assert(transport.message == "Cellular CA is not provisioned");
 }
 '''
     with tempfile.TemporaryDirectory() as temp_dir:

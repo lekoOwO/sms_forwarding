@@ -88,7 +88,7 @@ function verify(encrypted, passphrase) {
     const payloadLength = plaintext.readUInt32LE(12);
     if (
         !plaintext.subarray(0, 4).equals(CFG2_MAGIC) ||
-        schema !== 6 || plaintext.readUInt16LE(6) !== 0 || generation !== 0 ||
+        (schema !== 6 && schema !== 7) || plaintext.readUInt16LE(6) !== 0 || generation !== 0 ||
         payloadLength !== plaintext.length - CFG2_HEADER_BYTES ||
         plaintext.readUInt32LE(16) !== crc32(plaintext.subarray(CFG2_HEADER_BYTES))
     ) {

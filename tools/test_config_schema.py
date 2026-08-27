@@ -15,13 +15,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = ROOT / "dev_doc/config-schema"
 
-# The v1-v5 files are immutable wire-format compatibility fixtures.
+# Published schema files are immutable wire-format compatibility fixtures.
 IMMUTABLE_SCHEMA_SHA256 = {
     1: "80b341a31713f61f14f8373bf7ecfdfc06b755efd7d701688f9967d25d08f448",
     2: "acfbfae7c5e6691e8c445d4d5d13125ee70b0eb1b6775e00e146ca3f7f3d6a18",
     3: "f83c9413623b8d0a99665a078993ed98aff6b0c1d40cc97e2597b751a8f96aa6",
     4: "51ebce31de035cc853d5b9e55a7c46233724121369c543839bed258c8a1d4984",
     5: "01318a093657a2e166b65dd6cd31650a5dcb79a70860fb068a6b9cc392b9de58",
+    6: "ae57a2b7f9bd53250c07f145f79c3e5a6c3af5435955f2f8b2f3fc22bd331dbb",
 }
 
 
@@ -38,11 +39,21 @@ class ConfigSchemaTest(unittest.TestCase):
             path = SCHEMA_DIR / manifest["versions"][str(version)]
             self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
 
-    def test_v6_covers_keepalive_traffic_and_legacy_migration(self) -> None:
+    def test_v7_adds_bounded_sensitive_cellular_channel_settings(self) -> None:
         manifest = json.loads((SCHEMA_DIR / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["currentVersion"], 6)
-        schema = json.loads((SCHEMA_DIR / manifest["versions"]["6"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["currentVersion"], 7)
+        schema = json.loads((SCHEMA_DIR / manifest["versions"]["7"]).read_text(encoding="utf-8"))
         config = schema["properties"]["config"]["properties"]
+        channel = config["pushChannels"]["items"]
+        self.assertIn("cellularEnabled", channel["required"])
+        self.assertIn("cellularUrl", channel["required"])
+        self.assertEqual(channel["properties"]["cellularEnabled"]["default"], True)
+        self.assertEqual(channel["properties"]["cellularEnabled"]["x-codecOrder"], 9)
+        self.assertEqual(channel["properties"]["cellularUrl"]["default"], "")
+        self.assertEqual(channel["properties"]["cellularUrl"]["maxLength"], 512)
+        self.assertEqual(channel["properties"]["cellularUrl"]["x-maxUtf8Bytes"], 512)
+        self.assertEqual(channel["properties"]["cellularUrl"]["x-codecOrder"], 10)
+        self.assertTrue(channel["properties"]["cellularUrl"]["x-sensitive"])
         self.assertNotIn("wifiFromFallback", config)
         for field in (
             "deviceName", "notificationLocale", "wifiProfiles", "networkMode", "heartbeatEnable",
@@ -162,14 +173,14 @@ class ConfigSchemaTest(unittest.TestCase):
 
     def test_worst_case_wire_size_is_bounded(self) -> None:
         manifest = json.loads((SCHEMA_DIR / "manifest.json").read_text(encoding="utf-8"))
-        schema = json.loads((SCHEMA_DIR / manifest["versions"]["6"]).read_text(encoding="utf-8"))
+        schema = json.loads((SCHEMA_DIR / manifest["versions"]["7"]).read_text(encoding="utf-8"))
         wire = schema["x-wireCodec"]
         self.assertEqual(wire["headerBytes"], 20)
         self.assertEqual(wire["stringLengthPrefixBytes"], 2)
         self.assertEqual(wire["arrayCountBytes"], 1)
         self.assertEqual(wire["scalarBytes"], {"boolean": 1, "integer": 4})
-        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 26756)
-        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 26736)
+        self.assertEqual(schema["x-wireWorstCase"]["binaryBytes"], 29331)
+        self.assertEqual(schema["x-wireWorstCase"]["payloadBytes"], 29311)
         self.assertEqual(
             schema["x-wireWorstCase"]["headroomBytes"],
             manifest["maxBinaryBytes"] - schema["x-wireWorstCase"]["binaryBytes"],
@@ -185,13 +196,14 @@ class ConfigSchemaTest(unittest.TestCase):
         header = (ROOT / "components/idf_config/include/config_schema_generated.h").read_text(
             encoding="utf-8"
         )
-        self.assertIn("CONFIG_SCHEMA_VERSION = 6", header)
+        self.assertIn("CONFIG_SCHEMA_VERSION = 7", header)
         self.assertIn("MAX_SIM_CREDENTIALS 5", header)
         self.assertIn("PUSH_TYPE_NTFY = 12", header)
         self.assertNotIn("MAX_WEB_USER_BYTES", header)
         self.assertNotIn("MAX_WEB_PASS_BYTES", header)
-        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 26756", header)
-        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 6012", header)
+        self.assertIn("MAX_PUSH_CELLULAR_URL_BYTES = 512", header)
+        self.assertIn("CONFIG_WORST_CASE_BINARY_BYTES = 29331", header)
+        self.assertIn("CONFIG_BINARY_HEADROOM_BYTES = 3437", header)
         self.assertNotIn("MAX_MDNS_HOST_BYTES", header)
 
     def test_generated_web_schema_has_no_drift(self) -> None:

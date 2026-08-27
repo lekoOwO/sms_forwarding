@@ -48,7 +48,7 @@
 	},
 	"x-configSchema": {
 	  "source": "config-schema/manifest.json",
-	  "currentVersion": 6,
+	  "currentVersion": 7,
 	  "mimeType": "application/vnd.sms-forwarding.config",
 	  "maxEncryptedBytes": 32828
 	},
@@ -417,6 +417,68 @@
         }
       }
     },
+    "/api/push/ca/probe": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Probe the saved channel TLS chain over WiFi",
+        "description": "Runs a strict bundle-authenticated TLS handshake with SNI and hostname verification. channel is the only query key, the request body must be empty, and any Transfer-Encoding header is rejected. It sends no HTTP request. The terminal GET /api/jobs result contains only a one-time 128-bit nonce and bounded leaf-first certificate hashes, issuer Name DER, and authority-key identifiers.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "description": "The channel or empty-body contract is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "WiFi is unavailable or the channel already has an active CA job." },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "429": { "description": "The bounded job queue is full." }
+        }
+      }
+    },
+    "/api/push/ca/install": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Validate and install one candidate cellular root CA",
+        "description": "Consumes the nonce on the first attempt. channel and nonce are the only query keys. The request requires exact Content-Type application/pkix-cert, an explicit decimal Content-Length matching the body, and no Transfer-Encoding header. The device requires the candidate DER hash in its build-time ESP-IDF bundle allowlist, BasicConstraints CA=true, keyCertSign when a KeyUsage extension is present, a current self-signed certificate, an unchanged channel generation, and a complete hostname-valid path for the retained peer chain.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "name": "nonce", "in": "query", "required": true, "schema": { "type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$" } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "requestBody": { "required": true, "content": { "application/pkix-cert": { "schema": { "type": "string", "contentEncoding": "binary", "minLength": 1, "maxLength": 8192 } } } },
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "description": "The channel, nonce, or body is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "The channel already has an active CA job." },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "415": { "description": "Content-Type is not exactly application/pkix-cert." },
+          "429": { "description": "The bounded job queue is full." }
+        }
+      }
+    },
+    "/api/push/ca/status": {
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Get non-secret cellular CA status for one channel",
+        "description": "channel is the only query key, the request body must be empty, and any Transfer-Encoding header is rejected.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } }
+        ],
+        "responses": {
+          "200": { "description": "Configured state and SHA-256 only; no certificate DER or origin is returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "description": "The channel is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/api/config/export": {
       "post": {
         "tags": ["Configuration"],
@@ -620,6 +682,13 @@
 			  "ACTION_ESIM_FAILED",
 			  "ACTION_ESIM_BUSY",
 			  "ACTION_ESIM_HANDLE_STALE",
+			  "PUSH_CA_PROBE_READY",
+			  "PUSH_CA_PROBE_FAILED",
+			  "PUSH_CA_INSTALLED",
+			  "PUSH_CA_STALE",
+			  "PUSH_CA_REJECTED",
+			  "PUSH_CA_STORE_FAILED",
+			  "PUSH_CA_STATUS",
 			  "ACTION_CONFIG_EXPORT_READY",
               "ACTION_CONFIG_RESTORED",
               "ACTION_OTA_UPLOAD_STARTED",
@@ -702,7 +771,26 @@
 		  "uploadId": { "type": "integer" },
 		  "exportId": { "type": "integer" },
 		  "chunkSize": { "type": "integer", "maximum": 8192 },
-		  "nextOffset": { "type": "integer" }
+		  "nextOffset": { "type": "integer" },
+          "nonce": { "type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$" },
+          "expiresInMs": { "type": "integer", "minimum": 1, "maximum": 120000 },
+          "chain": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["certSha256", "issuerDer", "aki"],
+              "properties": {
+                "certSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "issuerDer": { "type": "string", "contentEncoding": "base64", "maxLength": 216 },
+                "aki": { "type": "string", "pattern": "^(?:[0-9a-f]{2}){0,32}$" }
+              }
+            }
+          },
+          "configured": { "type": "boolean" },
+          "sha256": { "type": "string", "pattern": "^(?:|[0-9a-f]{64})$" }
         }
       },
       "EsimAction": {
@@ -811,7 +899,7 @@
 	  },
       "PushChannel": {
         "type": "object",
-		"required": ["enabled", "type", "name", "url", "urlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"],
+		"required": ["enabled", "type", "name", "url", "urlSet", "cellularEnabled", "cellularUrlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"],
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean" },
@@ -819,6 +907,8 @@
           "name": { "type": "string" },
           "url": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
 		  "urlSet": { "type": "boolean", "description": "True when a URL is stored for the current provider type." },
+		  "cellularEnabled": { "type": "boolean", "description": "False permanently blocks this channel from cellular delivery." },
+		  "cellularUrlSet": { "type": "boolean", "description": "True when a sensitive cellular URL override is stored. The URL itself is never returned." },
 		  "key1": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
 		  "key1Set": { "type": "boolean", "description": "True when key1 is stored for the current provider type." },
 		  "key2": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
@@ -881,7 +971,7 @@
 				"maxItems": 5,
 				"items": { "$ref": "#/components/schemas/WifiProfile" }
 			  },
-			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback when available. The preference is stored, but all cellular delivery currently fails closed until CA provisioning is available. ML307Y cellular transport is disabled, GET and ntfy channels are WiFi-only, and roaming always fails closed." },
+			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback. Cellular delivery requires an enabled per-channel cellular target and an installed device-validated CA. ML307Y cellular transport is disabled, GET channels are WiFi-only, and roaming fails closed." },
 			  "heartbeatEnable": { "type": "boolean" },
 			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
 			  "kaEnabled": { "type": "boolean" },
@@ -900,7 +990,7 @@
       "ConfigUpdate": {
         "type": "object",
         "minProperties": 1,
-		"maxProperties": 51,
+		"maxProperties": 66,
         "additionalProperties": false,
         "properties": {
 		  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
@@ -932,7 +1022,10 @@
           "^push[0-4]en$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
           "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 12, "x-maxUtf8Bytes": 32 },
           "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
-          "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Blank or omitted retains the stored URL when the provider type is unchanged." },
+		  "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Blank or omitted retains the stored URL when the provider type is unchanged." },
+		  "^push[0-4]cellularEnabled$": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
+		  "^push[0-4]cellularUrl$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Sensitive override. Blank or omitted preserves the stored value." },
+		  "^push[0-4]cellularUrlClear$": { "type": "string", "enum": ["1"], "x-maxUtf8Bytes": 32, "description": "Explicitly clears the stored override. It is invalid with a nonempty cellularUrl in the same request." },
 		  "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256, "description": "Blank or omitted retains the stored key when the provider type is unchanged." },
 		  "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Blank or omitted retains the stored custom body when the provider type is unchanged." },
 		  "^push[0-4]title$": { "type": "string", "x-maxUtf8Bytes": 256 },
