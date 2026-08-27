@@ -116,7 +116,7 @@ IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
     if (fail(OwnerTransportFixture::FailureStage::create) &&
         command == idf_modem_https_create_command("push.example.test")) return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::timeout) &&
-        command == "AT+MHTTPCFG=\"timeout\",7,30000") return IdfModemHttpsCommandResult::failed;
+        command == "AT+MHTTPCFG=\"timeout\",7,30") return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::ssl) &&
         command == "AT+MHTTPCFG=\"ssl\",7,1,1") return IdfModemHttpsCommandResult::failed;
     if (cleanup && command == "AT+MHTTPTERM=7" && fixture.first_cleanup_timeout) {
@@ -174,7 +174,7 @@ static std::vector<std::string> expected_writes()
         "AT+MSSLCFG=\"ignoreverify\",1,0",
         "AT+MHTTPCREATE=\"https://push.example.test\"",
         "AT+MHTTPCFG=\"ssl\",7,1,1",
-        "AT+MHTTPCFG=\"timeout\",7,30000",
+        "AT+MHTTPCFG=\"timeout\",7,30",
         "AT+MHTTPCFG=\"header\",7,1",
         "AT+MHTTPHEADER=7,1,30,\"Content-Type: application/json\"",
         "AT+MHTTPHEADER=7,0,19,\"X-Device: forwarder\"",
@@ -240,6 +240,10 @@ int main()
     assert(owner.prompt_seen);
     assert(owner.raw_body == request.body);
     assert(owner.raw_body.find('\x1a') == std::string::npos);
+    assert(idf_modem_https_timeout_command(7, 1001) ==
+           "AT+MHTTPCFG=\"timeout\",7,2");
+    assert(idf_modem_https_timeout_command(7, IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS) ==
+           "AT+MHTTPCFG=\"timeout\",7,90");
 
     const std::pair<OwnerTransportFixture::FailureStage, const char*> tls_failures[] = {
         {OwnerTransportFixture::FailureStage::auth, "HTTPS TLS auth failed"},

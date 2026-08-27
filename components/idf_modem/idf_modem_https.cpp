@@ -507,8 +507,9 @@ std::string idf_modem_https_ssl_command(uint8_t httpId)
 
 std::string idf_modem_https_timeout_command(uint8_t httpId, uint32_t timeoutMs)
 {
+    const uint32_t timeoutSeconds = timeoutMs / 1000U + (timeoutMs % 1000U != 0U ? 1U : 0U);
     return "AT+MHTTPCFG=\"timeout\"," + std::to_string(httpId) + "," +
-           std::to_string(timeoutMs);
+           std::to_string(timeoutSeconds);
 }
 
 std::string idf_modem_https_header_config_command(uint8_t httpId)
