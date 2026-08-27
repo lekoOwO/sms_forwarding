@@ -92,8 +92,12 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     IdfModemHttpsPostResult cellular_result;
     result.error = cellular_post(cellular_request, cellular_result);
     result.httpStatus = cellular_result.httpStatus;
+    result.mhttpError = cellular_result.mhttpError;
     result.message.assign(cellular_result.message.data(),
                           std::min(cellular_result.message.size(), IdfPushTransportResult::MAX_MESSAGE));
+    if (result.message == "HTTPS modem request failed" && result.mhttpError >= 0) {
+        result.message += " (code " + std::to_string(result.mhttpError) + ")";
+    }
     result.ok = result.error == 0 && cellular_result.ok &&
                 result.httpStatus >= 200 && result.httpStatus < 300;
     return result.ok;

@@ -19,6 +19,7 @@ def main() -> None:
 static IdfModemHttpsPostRequest captured_request;
 static int modem_calls = 0;
 static int modem_status = 204;
+static int modem_error = -1;
 static bool modem_ok = true;
 static std::string modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
 
@@ -27,6 +28,7 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     captured_request = request;
     ++modem_calls;
     result.httpStatus = modem_status;
+    result.mhttpError = modem_error;
     result.ok = modem_ok;
     result.message = modem_message;
     return 0;
@@ -73,9 +75,18 @@ int main() {
     assert(transport.ok);
 
     modem_status = 503;
+    modem_error = 4;
+    modem_message = "HTTPS modem request failed";
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(!transport.ok);
+    assert(transport.mhttpError == 4);
+    assert(transport.message == "HTTPS modem request failed (code 4)");
+    modem_error = -1;
+    modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.mhttpError == -1);
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
     modem_message.assign(200, 'x');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,

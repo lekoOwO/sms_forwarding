@@ -20,6 +20,7 @@ struct IdfPushTransportResult {
     static constexpr size_t MAX_MESSAGE = 96;
     int error = -1;
     int httpStatus = -1;
+    int mhttpError = -1;
     bool ok = false;
     std::string message;
 };
