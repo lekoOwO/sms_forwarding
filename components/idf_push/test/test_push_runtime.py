@@ -50,10 +50,10 @@ int main() {
 
     assert(idf_push_select_network(NETWORK_MODE_WIFI_ONLY, true) == IdfPushNetworkDecision::Wifi);
     assert(idf_push_select_network(NETWORK_MODE_WIFI_ONLY, false) == IdfPushNetworkDecision::Defer);
-    assert(idf_push_select_network(NETWORK_MODE_4G_ONLY, true) == IdfPushNetworkDecision::Unsupported);
-    assert(idf_push_select_network(NETWORK_MODE_4G_ONLY, false) == IdfPushNetworkDecision::Unsupported);
+    assert(idf_push_select_network(NETWORK_MODE_4G_ONLY, true) == IdfPushNetworkDecision::Cellular);
+    assert(idf_push_select_network(NETWORK_MODE_4G_ONLY, false) == IdfPushNetworkDecision::Cellular);
     assert(idf_push_select_network(NETWORK_MODE_MIX, true) == IdfPushNetworkDecision::Wifi);
-    assert(idf_push_select_network(NETWORK_MODE_MIX, false) == IdfPushNetworkDecision::Defer);
+    assert(idf_push_select_network(NETWORK_MODE_MIX, false) == IdfPushNetworkDecision::Cellular);
 }
 '''
     with tempfile.TemporaryDirectory() as temp_dir:

@@ -7,6 +7,7 @@
 
 #include "esp_err.h"
 #include "idf_config.h"
+#include "idf_modem_https.h"
 
 #ifndef SMS_USB_RECOVERY
 #define SMS_USB_RECOVERY 0
@@ -104,6 +105,8 @@ esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response,
                               uint8_t* busy_reason = nullptr);
 #endif
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
+esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
+                               IdfModemHttpsPostResult& result);
 esp_err_t idf_modem_request_reset(bool hard_reset);
 // Ask the modem task to recheck the SIM lock. allow_puk permits one user-confirmed PUK attempt.
 esp_err_t idf_modem_request_sim_unlock(bool allow_puk);

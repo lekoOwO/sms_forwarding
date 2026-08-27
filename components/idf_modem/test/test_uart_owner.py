@@ -348,7 +348,7 @@ class UartOwnerContractTest(unittest.TestCase):
             else:
                 self.assertIn("submit_owner_command", body)
 
-        send_at = function_body(source, "owner_send_at")
+        send_at = function_body(source, "owner_send_at_deadline")
         send_until = function_body(source, "owner_send_at_until")
         send_pdu = function_body(source, "owner_send_pdu")
         self.assertIn("MAX_RESPONSE = 8192", send_at)
@@ -383,15 +383,6 @@ class UartOwnerContractTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, unsupported)
 
-    def test_cellular_http_owner_and_mhttp_implementation_are_removed(self):
-        source = SOURCE.read_text()
-        for forbidden in (
-            "OwnerCommandKind::cellular_http", "owner_cellular_http_get",
-            "CELLULAR_HTTP_CALL_TIMEOUT_MS", "MHTTPCREATE", "MHTTPREQUEST",
-            "MHTTPHEADER", "MHTTPURC",
-        ):
-            self.assertNotIn(forbidden, source)
-
     def test_cellular_http_has_no_unapproved_production_callers_repo_wide(self):
         # The public shape remains for a future secure implementation, but no
         # production caller is currently allowed to reach this unsupported API.
@@ -404,6 +395,43 @@ class UartOwnerContractTest(unittest.TestCase):
             "new cellular HTTP production caller requires an explicit terminal allowlist entry: "
             + ", ".join(unexpected),
         )
+
+    def test_https_post_wire_fixture_is_executable(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the host HTTPS fixture requires g++")
+        fixture = SOURCE.parent / "test" / "https_post_fixture.cpp"
+        implementation = SOURCE.parent / "idf_modem_https.cpp"
+        self.assertTrue(fixture.exists(), "missing executable HTTPS POST fixture")
+        self.assertTrue(implementation.exists(), "missing HTTPS POST protocol implementation")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "https_post_fixture"
+            compile_result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                 "-I", str(SOURCE.parent / "include"), str(implementation),
+                 str(fixture), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            run_result = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
+
+    def test_https_queue_wait_covers_both_cleanup_attempts_and_propagates_deadline(self):
+        source = SOURCE.read_text()
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("wait_margin_ms += 2UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
+        self.assertIn("operation_deadline(deadline.start", submit)
+        self.assertIn("slot.request.deadline_start = operation_deadline.start", submit)
+        self.assertIn("slot.request.deadline_span = operation_deadline.span", submit)
+        adapter = function_body(source, "owner_https_send_command")
+        self.assertIn("cleanup", adapter)
+        self.assertIn("TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS)", adapter)
+
+    def test_https_owner_trims_apn_before_cgdc_cont(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        runner = function_body(source, "idf_modem_https_run_post")
+        trim = runner.index("const std::string apn = trim_spaces(request.apn);")
+        cgdc_cont = runner.index('"AT+CGDCONT=1')
+        self.assertLess(trim, cgdc_cont)
 
 
 if __name__ == "__main__":

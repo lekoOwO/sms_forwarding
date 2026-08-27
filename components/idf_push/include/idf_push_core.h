@@ -21,6 +21,7 @@ struct IdfPushTemplateValues {
 enum class IdfPushNetworkDecision : uint8_t {
     Wifi,
     Defer,
+    Cellular,
     Unsupported,
 };
 

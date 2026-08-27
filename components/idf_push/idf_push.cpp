@@ -1,5 +1,6 @@
 #include "idf_push.h"
 #include "idf_push_core.h"
+#include "idf_push_transport.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -575,6 +576,20 @@ static esp_err_t http_request(const std::string& url, const char* method,
     return err;
 }
 
+static int push_wifi_request(const IdfPushHttpRequest& request, int& status_code)
+{
+    return static_cast<int>(http_request(request.url, request.method.c_str(),
+                                         request.contentType.empty() ? nullptr : request.contentType.c_str(),
+                                         request.headerName.empty() ? nullptr : request.headerName.c_str(),
+                                         request.headerValue, request.body, status_code));
+}
+
+static int push_cellular_post(const IdfModemHttpsPostRequest& request,
+                              IdfModemHttpsPostResult& result)
+{
+    return static_cast<int>(idf_modem_https_post(request, result));
+}
+
 static std::string base64_encode_string(const std::string& value)
 {
     if (value.empty()) return {};
@@ -1086,6 +1101,7 @@ static void replace_all(std::string& value, const char* from, const char* to)
 static bool send_to_channel(const IdfPushChannel& channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
                             const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
+                            IdfPushNetworkDecision network,
                             bool notify = false)
 {
     if (!channel_valid(channel)) return false;
@@ -1118,7 +1134,7 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     std::string url;
     std::string body;
     const char* content_type = "application/json";
-    const char* method = "POST";
+    std::string method = "POST";
     const char* extra_header_name = nullptr;
     std::string extra_header_value;
 
@@ -1209,11 +1225,12 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
             break;
         }
         case PUSH_TYPE_GOTIFY:
-            url = channel.url;
-            if (!url.empty() && url.back() != '/') url += "/";
-            url += "message?token=" + url_encode(channel.key1);
-            body = "{\"title\":\"" + title_json + "\",\"message\":\"" +
-                   notification_body_json + "\",\"priority\":5}";
+            {
+                IdfPushHttpRequest gotify;
+                if (!idf_push_build_gotify_request(channel, title, notification_body, gotify)) return false;
+                url = gotify.url;
+                body = gotify.body;
+            }
             break;
         case PUSH_TYPE_TELEGRAM: {
             std::string base = channel.url.empty() ? "https://api.telegram.org" : channel.url;
@@ -1246,10 +1263,23 @@ static bool send_to_channel(const IdfPushChannel& channel, const char* sender_ra
     }
 
     std::string name = channel.name.empty() ? ("Channel " + std::to_string(channel.type)) : channel.name;
-    int code = 0;
-    esp_err_t err = http_request(url, method, content_type, extra_header_name,
-                                 extra_header_value, body, code);
-    bool ok = (err == ESP_OK && code >= 200 && code < 300);
+    IdfPushHttpRequest request;
+    request.url = url;
+    request.method = method;
+    request.contentType = content_type ? content_type : "";
+    request.headerName = extra_header_name ? extra_header_name : "";
+    request.headerValue = extra_header_name ? extra_header_value : "";
+    request.body = body;
+    const IdfConfigStatusView modem_config = network == IdfPushNetworkDecision::Cellular
+                                                  ? idf_config_get_status_view()
+                                                  : IdfConfigStatusView();
+    IdfPushTransportResult transport;
+    const bool dispatched = idf_push_dispatch_request(request, network, modem_config,
+                                                       push_wifi_request, push_cellular_post,
+                                                       transport);
+    const esp_err_t err = static_cast<esp_err_t>(transport.error);
+    const int code = transport.httpStatus;
+    const bool ok = dispatched && transport.ok;
     // Combine the send and response lines. Keep the channel name and result in one concise log entry.
     if (err == ESP_OK) idf_logf("%s push %s (HTTP %d)", name.c_str(), ok ? "succeeded" : "failed", code);
     else idf_logf("%s push failed: %s", name.c_str(), esp_err_to_name(err));
@@ -1602,16 +1632,12 @@ static bool process_push_one()
         return false;
     }
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
-        if (!s_push_jobs[i].used ||
-            (network == IdfPushNetworkDecision::Wifi && s_push_jobs[i].nextUs > now)) continue;
-        if (network == IdfPushNetworkDecision::Wifi &&
-            channel_cooling(s_push_jobs[i].channel, now)) continue;
-        if (network == IdfPushNetworkDecision::Wifi) {
-            const IdfPushChannel& channel = cfg.pushChannels[s_push_jobs[i].channel];
-            if (channel_valid(channel) && channel_waits_for_time(channel)) {
-                s_push_jobs[i].nextUs = now + 5000000LL;
-                continue;
-            }
+        if (!s_push_jobs[i].used || s_push_jobs[i].nextUs > now) continue;
+        if (channel_cooling(s_push_jobs[i].channel, now)) continue;
+        const IdfPushChannel& channel = cfg.pushChannels[s_push_jobs[i].channel];
+        if (channel_valid(channel) && channel_waits_for_time(channel)) {
+            s_push_jobs[i].nextUs = now + 5000000LL;
+            continue;
         }
         picked = static_cast<int>(i);
         job = s_push_jobs[i];
@@ -1636,9 +1662,14 @@ static bool process_push_one()
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
+    if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
+        fail_push_job_without_retry(job, "GET-only provider is not supported over cellular; task stopped");
+        s_busy.store(false, std::memory_order_relaxed);
+        return true;
+    }
 
     bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
-                              job.timestamp.c_str(), cfg, wifi, job.notify);
+                              job.timestamp.c_str(), cfg, wifi, network, job.notify);
     note_channel_result(job.channel, ok);
     if (ok) {
         note_forward_target_success(job.completionId);
@@ -1800,7 +1831,7 @@ static bool process_test_one()
         return fail_pending_tests("Cellular push is not supported; test stopped");
     }
     if (network == IdfPushNetworkDecision::Defer) return false;
-    if (low_heap_defer()) return false;
+    if (network == IdfPushNetworkDecision::Wifi && low_heap_defer()) return false;
     int picked = -1;
     IdfPushChannel channel;
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
@@ -1829,11 +1860,14 @@ static bool process_test_one()
     std::string result;
     if (!channel_valid(channel)) {
         result = "Channel configuration changed or is disabled; test canceled";
+    } else if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
+        result = "GET-only provider is not supported over cellular; test canceled";
     } else {
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "Test", "This is a test push from SMS Forwarder",
-                             ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi);
+                             ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi,
+                             network);
         s_busy.store(false, std::memory_order_relaxed);
         result = ok ? "Test push sent" : "Test push failed; see the log";
     }
@@ -1992,7 +2026,10 @@ bool idf_push_heartbeat_tick(void)
     s_last_heartbeat_us = now;
 
     const IdfWifiStatus wifi = idf_wifi_get_status();
-    if (!idf_push_network_uses_wifi(static_cast<NetworkMode>(cfg.networkMode), wifi.staConnected)) return false;
+    const IdfPushNetworkDecision network = idf_push_select_network(
+        static_cast<NetworkMode>(cfg.networkMode), wifi.staConnected);
+    if (network == IdfPushNetworkDecision::Unsupported ||
+        network == IdfPushNetworkDecision::Defer) return false;
     std::string title;
     std::string body;
     const std::string event_time = format_utc_time(epoch);
@@ -2094,6 +2131,11 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
     }
     if (network == IdfPushNetworkDecision::Defer) {
         message = "WiFi is disconnected; test push is unavailable";
+        return false;
+    }
+    if (network == IdfPushNetworkDecision::Cellular &&
+        cfg.pushChannels[channel].type == PUSH_TYPE_GET) {
+        message = "GET-only provider is not supported over cellular; test was not queued";
         return false;
     }
     bool valid = channel_valid(cfg.pushChannels[channel]);

@@ -40,6 +40,7 @@ static constexpr int MODEM_POWERUP_MIN_MS = 1500;
 static constexpr int MODEM_POWERUP_MAX_MS = 6000;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
+static constexpr uint32_t HTTPS_CLEANUP_TIMEOUT_MS = 10000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // Sample display identity and signal data only after an explicit overview refresh.
 // at_channel_idle prevents sampling from competing for the AT channel.
@@ -50,7 +51,7 @@ static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 static constexpr size_t OWNER_COMMAND_SLOTS = 4;
 
-enum class OwnerCommandKind : uint8_t { at, until, pdu };
+enum class OwnerCommandKind : uint8_t { at, until, pdu, https_post };
 enum class OwnerCommandState : uint8_t { free, queued, running, done, abandoned };
 
 struct OwnerCommand {
@@ -58,7 +59,10 @@ struct OwnerCommand {
     std::string command;
     std::string token;
     std::string pdu;
+    IdfModemHttpsPostRequest https_post_request;
     uint32_t timeout_ms = 0;
+    TickType_t deadline_start = 0;
+    TickType_t deadline_span = 0;
     bool filter_urcs = false;
     std::string response_prefix;
 };
@@ -67,6 +71,7 @@ struct OwnerCommandSlot {
     OwnerCommandState state = OwnerCommandState::free;
     OwnerCommand request;
     std::string response;
+    IdfModemHttpsPostResult https_post_result;
     esp_err_t result = ESP_FAIL;
     SemaphoreHandle_t completed = nullptr;
 };
@@ -121,15 +126,20 @@ static std::atomic<bool> s_health_reset_claimed{false};
 
 void idf_modem_signal_event(void);
 
+struct TickDeadline;
+
 static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
                                bool filter_urcs = false, const char* response_prefix = nullptr);
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
                                      uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
                                 uint32_t timeout_ms, std::string& response);
+static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
+                                  IdfModemHttpsPostResult& result, TickDeadline& deadline);
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
                                       bool priority,
-                                      uint8_t* query_busy_reason = nullptr);
+                                      uint8_t* query_busy_reason = nullptr,
+                                      IdfModemHttpsPostResult* https_result = nullptr);
 static bool owner_process_one_command(bool priority);
 static void owner_drain_priority_commands();
 static void wake_owner_task();
@@ -243,6 +253,8 @@ struct TickDeadline {
     TickType_t start;
     TickType_t span;
     explicit TickDeadline(uint32_t ms) : start(xTaskGetTickCount()), span(timeout_ticks_ceil(ms)) {}
+    TickDeadline(TickType_t start_tick, TickType_t span_ticks)
+        : start(start_tick), span(span_ticks) {}
     TickType_t remaining_ticks() const
     {
         const TickType_t elapsed = static_cast<TickType_t>(xTaskGetTickCount() - start);
@@ -699,22 +711,27 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
     out.append(reinterpret_cast<const char*>(data), len);
 }
 
-static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
-                               bool filter_urcs, const char* response_prefix)
+static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& deadline,
+                                        std::string& response, bool filter_urcs,
+                                        const char* response_prefix,
+                                        bool* modem_error = nullptr)
 {
     assert_owner_task();
+    if (modem_error) *modem_error = false;
+    if (deadline.expired()) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
     std::string wire = cmd;
     wire += "\r\n";
-    owner_uart_write(wire.data(), wire.size());
+    if (owner_uart_write(wire.data(), wire.size()) != static_cast<int>(wire.size())) {
+        return ESP_FAIL;
+    }
 
     response.clear();
     response.reserve(512);
     // Limit responses to 8 KB because AT+CMGL can exceed 10 KB with full storage.
     // Detect a truncated OK or ERROR in the overlap window. Later polling recovers omitted SMS.
     constexpr size_t MAX_RESPONSE = 8192;
-    TickDeadline deadline(timeout_ms);
     uint8_t buf[128];
     std::string scan;  // Overlap window for truncated or split final result codes
     IdfModemQueryResponseFilter query_filter(
@@ -756,12 +773,20 @@ static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std:
                     s_uart_wait_cmt_pdu = query_filter.waiting_for_pdu();
                 }
                 ret = final_code > 0 ? ESP_OK : ESP_FAIL;
+                if (final_code < 0 && modem_error) *modem_error = true;
                 break;
             }
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
     return ret;
+}
+
+static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
+                               bool filter_urcs, const char* response_prefix)
+{
+    TickDeadline deadline(timeout_ms);
+    return owner_send_at_deadline(cmd, deadline, response, filter_urcs, response_prefix, nullptr);
 }
 
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
@@ -1028,6 +1053,7 @@ static void reset_owner_slot(OwnerCommandSlot& slot)
 {
     slot.request = OwnerCommand();
     slot.response.clear();
+    slot.https_post_result = IdfModemHttpsPostResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::free;
 }
@@ -1035,7 +1061,12 @@ static void reset_owner_slot(OwnerCommandSlot& slot)
 static bool owner_request_bounded(const OwnerCommand& request)
 {
     return request.command.size() <= 4096 && request.pdu.size() <= 4096 &&
-           request.token.size() <= 256;
+           request.token.size() <= 256 && request.https_post_request.url.size() <= IDF_MODEM_HTTPS_POST_MAX_URL &&
+           request.https_post_request.body.size() <= IDF_MODEM_HTTPS_POST_MAX_BODY &&
+           request.https_post_request.contentType.size() <= IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE &&
+           request.https_post_request.headerName.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME &&
+           request.https_post_request.headerValue.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE &&
+           request.https_post_request.apn.size() <= 96;
 }
 
 static void wake_owner_task()
@@ -1049,7 +1080,8 @@ static void wake_owner_task()
 
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
                                       bool priority,
-                                      uint8_t* query_busy_reason)
+                                      uint8_t* query_busy_reason,
+                                      IdfModemHttpsPostResult* https_result)
 {
     if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
         return ESP_ERR_INVALID_STATE;
@@ -1063,8 +1095,12 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
 
     bool session_held = false;
     uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
+    if (request.kind == OwnerCommandKind::https_post) {
+        wait_margin_ms += 2UL * HTTPS_CLEANUP_TIMEOUT_MS;
+    }
     uint32_t wait_ms = request.timeout_ms + wait_margin_ms;
     TickDeadline deadline(wait_ms);
+    TickDeadline operation_deadline(deadline.start, timeout_ticks_ceil(request.timeout_ms));
     if (!priority) {
         if (!s_session_mutex ||
             xSemaphoreTakeRecursive(s_session_mutex, deadline.remaining_ticks()) != pdTRUE) {
@@ -1106,7 +1142,12 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     OwnerCommandSlot& slot = s_command_slots[slot_index];
     while (xSemaphoreTake(slot.completed, 0) == pdTRUE) {}
     slot.request = request;
+    if (request.kind == OwnerCommandKind::https_post) {
+        slot.request.deadline_start = operation_deadline.start;
+        slot.request.deadline_span = operation_deadline.span;
+    }
     slot.response.clear();
+    slot.https_post_result = IdfModemHttpsPostResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::queued;
     QueueHandle_t queue = priority ? s_priority_command_queue : s_command_queue;
@@ -1132,11 +1173,13 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
             result = slot.result;
             if (response) *response = slot.response;
+            if (https_result) *https_result = slot.https_post_result;
             reset_owner_slot(slot);
         } else if (slot.state == OwnerCommandState::done) {
             // Prefer completion if its signal arrives with the caller timeout.
             result = slot.result;
             if (response) *response = slot.response;
+            if (https_result) *https_result = slot.https_post_result;
             reset_owner_slot(slot);
             xSemaphoreTake(slot.completed, 0);
         } else {
@@ -1718,6 +1761,198 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
     return ESP_ERR_NOT_SUPPORTED;
 }
 
+static esp_err_t owner_send_raw_prompt_payload(const std::string& command,
+                                               std::string_view payload,
+                                               TickDeadline& deadline)
+{
+    assert_owner_task();
+    if (deadline.expired()) return ESP_ERR_TIMEOUT;
+    std::string wire = command;
+    wire += "\r\n";
+    capture_pending_uart_locked(30);
+    if (owner_uart_write(wire.data(), wire.size()) != static_cast<int>(wire.size())) {
+        return ESP_FAIL;
+    }
+
+    uint8_t buf[128];
+    std::string scan;
+    while (!deadline.expired()) {
+        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
+        if (got <= 0) continue;
+        preserve_uart_urcs(buf, static_cast<size_t>(got));
+        scan.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+        if (scan.find('>') != std::string::npos) break;
+        if (at_final_result(scan) < 0) return ESP_FAIL;
+        if (scan.size() > 64) scan.erase(0, scan.size() - 64);
+    }
+    if (scan.find('>') == std::string::npos) return ESP_ERR_TIMEOUT;
+
+    if (!payload.empty() &&
+        owner_uart_write(payload.data(), payload.size()) != static_cast<int>(payload.size())) {
+        return ESP_FAIL;
+    }
+
+    scan.clear();
+    while (!deadline.expired()) {
+        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(100));
+        if (got <= 0) continue;
+        preserve_uart_urcs(buf, static_cast<size_t>(got));
+        scan.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+        const int final_code = at_final_result(scan);
+        if (final_code != 0) return final_code > 0 ? ESP_OK : ESP_FAIL;
+        if (scan.size() > 64) scan.erase(0, scan.size() - 64);
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t owner_wait_https_response(uint8_t http_id, TickDeadline& deadline,
+                                           IdfModemHttpsPostResult& result)
+{
+    assert_owner_task();
+    IdfModemHttpsUrcParser parser(http_id);
+    size_t copied_urcs = 0;
+    uint8_t buf[128];
+    while (!deadline.expired() && !parser.complete()) {
+        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(120));
+        if (got <= 0) continue;
+        parser.feed(std::string_view(reinterpret_cast<const char*>(buf), static_cast<size_t>(got)));
+        result = parser.result();
+        const std::string& urcs = parser.urcs();
+        if (urcs.size() > copied_urcs) {
+            append_urc_text(urcs.substr(copied_urcs));
+            copied_urcs = urcs.size();
+        }
+    }
+    result = parser.result();
+    const std::string& urcs = parser.urcs();
+    if (urcs.size() > copied_urcs) append_urc_text(urcs.substr(copied_urcs));
+    if (!parser.complete()) {
+        result.message = "HTTPS POST timed out";
+        return ESP_ERR_TIMEOUT;
+    }
+    if (parser.failed()) {
+        if (result.message.empty()) result.message = "HTTPS POST modem error";
+        return ESP_FAIL;
+    }
+    if (!idf_modem_https_status_success(result.httpStatus)) {
+        result.message = "HTTPS POST returned a non-2xx status";
+        return ESP_FAIL;
+    }
+    result.ok = true;
+    result.message = "HTTPS POST succeeded";
+    return ESP_OK;
+}
+
+struct OwnerHttpsCallbackContext {
+    TickDeadline& deadline;
+};
+
+static IdfModemHttpsCommandResult owner_https_send_command(
+    void* opaque, std::string_view command, std::string& response,
+    std::string_view raw_payload, bool cleanup, bool tolerate_modem_error)
+{
+    auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
+    const std::string command_text(command);
+    if (command.rfind("AT+MHTTPCONTENT=", 0) == 0) {
+        response.clear();
+        const esp_err_t err = owner_send_raw_prompt_payload(command_text, raw_payload,
+                                                            context.deadline);
+        if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
+        if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
+        return IdfModemHttpsCommandResult::failed;
+    }
+
+    bool modem_error = false;
+    if (cleanup) {
+        TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS);
+        const esp_err_t err = owner_send_at_deadline(command_text, cleanup_deadline, response, false,
+                                                     nullptr, &modem_error);
+        if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
+        if (modem_error && tolerate_modem_error) return IdfModemHttpsCommandResult::modem_error;
+        if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
+        return IdfModemHttpsCommandResult::failed;
+    }
+    const esp_err_t err = owner_send_at_deadline(command_text, context.deadline, response, false,
+                                                 nullptr, &modem_error);
+    if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
+    if (modem_error && tolerate_modem_error) return IdfModemHttpsCommandResult::modem_error;
+    if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
+    return IdfModemHttpsCommandResult::failed;
+}
+
+static IdfModemHttpsCommandResult owner_https_wait_response(
+    void* opaque, uint8_t http_id, IdfModemHttpsPostResult& result)
+{
+    auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
+    const esp_err_t err = owner_wait_https_response(http_id, context.deadline, result);
+    if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
+    if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
+    return IdfModemHttpsCommandResult::failed;
+}
+
+static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
+                                  IdfModemHttpsPostResult& result, TickDeadline& deadline)
+{
+    assert_owner_task();
+    result = IdfModemHttpsPostResult();
+    const IdfModemStatus status = idf_modem_get_status();
+    if (!status.atReady) {
+        result.message = "Modem AT is not ready";
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!idf_modem_https_model_allowed(status.model)) {
+        result.message = "Cellular HTTPS requires an ML307A modem";
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!idf_modem_data_activation_allowed(status.ceregStat)) {
+        result.message = "Cellular HTTPS requires home registration";
+        return ESP_ERR_INVALID_STATE;
+    }
+    OwnerHttpsCallbackContext context{deadline};
+    const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command,
+                                           &owner_https_wait_response};
+    const IdfModemHttpsRunResult run_result =
+        idf_modem_https_run_post(request, callbacks, result);
+    switch (run_result) {
+        case IdfModemHttpsRunResult::ok:
+            return ESP_OK;
+        case IdfModemHttpsRunResult::invalid_request:
+            return ESP_ERR_INVALID_ARG;
+        case IdfModemHttpsRunResult::timed_out:
+            return ESP_ERR_TIMEOUT;
+        case IdfModemHttpsRunResult::command_failed:
+        case IdfModemHttpsRunResult::response_failed:
+        case IdfModemHttpsRunResult::cleanup_failed:
+            return ESP_FAIL;
+    }
+    return ESP_FAIL;
+}
+
+esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
+                               IdfModemHttpsPostResult& result)
+{
+    result = IdfModemHttpsPostResult();
+    std::string error;
+    if (!idf_modem_https_validate_request(request, error)) {
+        result.message = error;
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    OwnerCommand owner_request;
+    owner_request.kind = OwnerCommandKind::https_post;
+    owner_request.https_post_request = request;
+    owner_request.timeout_ms = request.timeoutMs;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        TickDeadline deadline(request.timeoutMs);
+        return owner_https_post(request, result, deadline);
+    }
+    const esp_err_t err = submit_owner_command(owner_request, nullptr, false, nullptr, &result);
+    if (err == IDF_MODEM_ERR_BUSY) result.message = "Modem command queue is full";
+    else if (err == ESP_ERR_TIMEOUT) result.message = "Modem HTTPS POST timed out";
+    else if (err == ESP_ERR_INVALID_STATE && result.message.empty()) result.message = "Modem is not started";
+    return err;
+}
+
 static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
 {
     assert_owner_task();
@@ -1734,6 +1969,11 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
         case OwnerCommandKind::pdu:
             return owner_send_pdu(slot.request.command, slot.request.pdu.c_str(),
                                   slot.request.timeout_ms, slot.response);
+        case OwnerCommandKind::https_post: {
+            TickDeadline deadline(slot.request.deadline_start, slot.request.deadline_span);
+            return owner_https_post(slot.request.https_post_request, slot.https_post_result,
+                                    deadline);
+        }
     }
     return ESP_ERR_INVALID_ARG;
 }

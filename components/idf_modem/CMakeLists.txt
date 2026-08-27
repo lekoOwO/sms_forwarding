@@ -1,5 +1,5 @@
 idf_component_register(
-  SRCS "idf_modem.cpp"
+  SRCS "idf_modem.cpp" "idf_modem_https.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
     driver

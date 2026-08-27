@@ -120,9 +120,12 @@ bool idf_push_network_uses_wifi(NetworkMode mode, bool wifi_connected)
 
 IdfPushNetworkDecision idf_push_select_network(NetworkMode mode, bool wifi_connected)
 {
-    if (mode == NETWORK_MODE_4G_ONLY) return IdfPushNetworkDecision::Unsupported;
-    if (mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_MIX) {
+    if (mode == NETWORK_MODE_4G_ONLY) return IdfPushNetworkDecision::Cellular;
+    if (mode == NETWORK_MODE_WIFI_ONLY) {
         return wifi_connected ? IdfPushNetworkDecision::Wifi : IdfPushNetworkDecision::Defer;
+    }
+    if (mode == NETWORK_MODE_MIX) {
+        return wifi_connected ? IdfPushNetworkDecision::Wifi : IdfPushNetworkDecision::Cellular;
     }
     return IdfPushNetworkDecision::Unsupported;
 }
