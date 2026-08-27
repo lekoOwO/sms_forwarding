@@ -371,6 +371,10 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
     auto finish = [&](IdfModemHttpsRunResult outcome) {
         bool cleanup_ok = true;
         if (http_id >= 0) {
+            const auto terminate_result = callbacks.sendCommand(
+                callbacks.context, "AT+MHTTPTERM=" + std::to_string(http_id), response, {}, true,
+                false);
+            if (terminate_result != IdfModemHttpsCommandResult::ok) cleanup_ok = false;
             const auto cleanup_result = callbacks.sendCommand(
                 callbacks.context, "AT+MHTTPDEL=" + std::to_string(http_id), response, {}, true,
                 false);

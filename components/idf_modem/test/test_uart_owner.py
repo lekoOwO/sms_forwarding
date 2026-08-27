@@ -418,7 +418,7 @@ class UartOwnerContractTest(unittest.TestCase):
     def test_https_queue_wait_covers_both_cleanup_attempts_and_propagates_deadline(self):
         source = SOURCE.read_text()
         submit = function_body(source, "submit_owner_command")
-        self.assertIn("wait_margin_ms += 2UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
+        self.assertIn("wait_margin_ms += 3UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
         self.assertIn("operation_deadline(deadline.start", submit)
         self.assertIn("slot.request.deadline_start = operation_deadline.start", submit)
         self.assertIn("slot.request.deadline_span = operation_deadline.span", submit)

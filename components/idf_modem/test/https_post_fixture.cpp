@@ -41,6 +41,7 @@ struct OwnerTransportFixture {
     bool abandoned = false;
     bool request_expired = false;
     bool first_cleanup_timeout = false;
+    bool second_cleanup_timeout = false;
     StaleFailure stale_failure = StaleFailure::none;
     bool short_setup_write = false;
     bool non_2xx_response = false;
@@ -118,7 +119,10 @@ IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
         command == "AT+MHTTPCFG=\"timeout\",7,30000") return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::ssl) &&
         command == "AT+MHTTPCFG=\"ssl\",7,1,1") return IdfModemHttpsCommandResult::failed;
-    if (cleanup && command == "AT+MHTTPDEL=7" && fixture.first_cleanup_timeout) {
+    if (cleanup && command == "AT+MHTTPTERM=7" && fixture.first_cleanup_timeout) {
+        return IdfModemHttpsCommandResult::timeout;
+    }
+    if (cleanup && command == "AT+MHTTPDEL=7" && fixture.second_cleanup_timeout) {
         return IdfModemHttpsCommandResult::timeout;
     }
     if (cleanup && !fixture.cleanup_ok) return IdfModemHttpsCommandResult::failed;
@@ -176,6 +180,7 @@ static std::vector<std::string> expected_writes()
         "AT+MHTTPHEADER=7,0,19,\"X-Device: forwarder\"",
         "AT+MHTTPCONTENT=7,22",
         "AT+MHTTPREQUEST=7,2,0,2F6170692F6E6F746966793F736F757263653D736D73",
+        "AT+MHTTPTERM=7",
         "AT+MHTTPDEL=7",
         "AT+CGACT=0,1",
     };
@@ -270,7 +275,19 @@ int main()
     cleanup_timeout.request_expired = true;
     cleanup_timeout.first_cleanup_timeout = true;
     assert(!cleanup_timeout.run(request, "ML307A", 1, cert_response));
+    assert(cleanup_timeout.writes[cleanup_timeout.writes.size() - 3] == "AT+MHTTPTERM=7");
+    assert(cleanup_timeout.writes[cleanup_timeout.writes.size() - 2] == "AT+MHTTPDEL=7");
     assert(cleanup_timeout.writes.back() == "AT+CGACT=0,1");
+
+    OwnerTransportFixture second_cleanup_timeout;
+    second_cleanup_timeout.request_expired = true;
+    second_cleanup_timeout.second_cleanup_timeout = true;
+    assert(!second_cleanup_timeout.run(request, "ML307A", 1, cert_response));
+    assert(second_cleanup_timeout.writes[second_cleanup_timeout.writes.size() - 3] ==
+           "AT+MHTTPTERM=7");
+    assert(second_cleanup_timeout.writes[second_cleanup_timeout.writes.size() - 2] ==
+           "AT+MHTTPDEL=7");
+    assert(second_cleanup_timeout.writes.back() == "AT+CGACT=0,1");
 
     OwnerTransportFixture stale_error;
     stale_error.stale_failure = OwnerTransportFixture::StaleFailure::modem_error;

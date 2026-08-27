@@ -1096,7 +1096,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     bool session_held = false;
     uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
     if (request.kind == OwnerCommandKind::https_post) {
-        wait_margin_ms += 2UL * HTTPS_CLEANUP_TIMEOUT_MS;
+        wait_margin_ms += 3UL * HTTPS_CLEANUP_TIMEOUT_MS;
     }
     uint32_t wait_ms = request.timeout_ms + wait_margin_ms;
     TickDeadline deadline(wait_ms);
