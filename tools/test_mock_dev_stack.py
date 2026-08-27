@@ -48,8 +48,11 @@ class MockDevStackTests(unittest.TestCase):
         self.assertEqual(dev["cap_drop"], ["ALL"])
         self.assertEqual(dev["network_mode"], "none")
         self.assertEqual(dev["security_opt"], ["no-new-privileges:true"])
-        self.assertEqual(dev["tmpfs"], ["/tmp:rw,nosuid,nodev,noexec,size=64m"])
-        self.assertEqual(dev.get("environment"), {"CCACHE_DIR": "/tmp/ccache"})
+        self.assertEqual(dev["tmpfs"], ["/tmp:rw,nosuid,nodev,noexec,size=256m"])
+        self.assertEqual(dev.get("environment"), {
+            "CCACHE_DIR": "/tmp/ccache",
+            "CCACHE_MAXSIZE": "128M",
+        })
         self.assertNotIn("devices", dev)
         self.assertFalse(dev.get("privileged", False))
         self.assertNotIn("secrets", dev)

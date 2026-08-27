@@ -11,13 +11,14 @@ services:
     working_dir: /workspace
     environment:
       CCACHE_DIR: /tmp/ccache
+      CCACHE_MAXSIZE: 128M
     read_only: true
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=64m
+      - /tmp:rw,nosuid,nodev,noexec,size=256m
     volumes:
       - type: bind
         source: .
