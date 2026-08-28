@@ -87,6 +87,13 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 GET 與 ntfy 僅支援 WiFi，漫遊傳送與資料啟用維持 fail closed。
 現有實機證據沒有證明 4G data delivery 可用。
 
+`idf_modem_https` 依 OneMO ML307A 的 SSL context 語意使用 context 1。每次建立 MHTTP
+instance 前，先刪除殘留的 `MHTTP` instance，再完成憑證、auth、version 等設定，並在
+`AT+MHTTPCREATE` 前依序送出：`AT+MSSLCFG="ciphersuite",1,0`（使用全部支援的
+cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache）。這讓
+共用 context 1 在不同 host 間不沿用未明載的設定。這是 OneMO 指令語意與 host transcript
+所證明的 wire 設定，不是 provider push 成功證據。
+
 心跳間隔可設定為 1 至 240 小時。時間未完成 NTP 同步時，scheduler 不會開始心跳計時。
 
 ## 實機證據

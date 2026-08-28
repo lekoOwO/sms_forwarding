@@ -462,6 +462,13 @@ CI compile 不會證明 UART 時序、SIM、PDU、SMTP、推送服務或 OTA rol
 此次操作沒有使用 write AT、manual `COPS`，也沒有執行 `CFUN`、`CGATT`、`CGACT` 或 PDP 狀態變更。
 這份紀錄不證明 Internet、TLS 或 provider delivery 可用。4G push 維持 fail closed。
 
+`idf_modem_https` 依 OneMO ML307A 的 SSL context 語意使用 context 1。每次建立 MHTTP
+instance 前，先刪除殘留的 `MHTTP` instance，再完成憑證、auth、version 等設定，並在
+`AT+MHTTPCREATE` 前依序送出：`AT+MSSLCFG="ciphersuite",1,0`（使用全部支援的
+cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache）。這讓
+共用 context 1 在不同 host 間不沿用未明載的設定。這是 OneMO 指令語意與 host transcript
+所證明的 wire 設定，不是 provider push 成功證據。
+
 ### 2026-08-22 ML307A 未註冊歷史紀錄
 
 這是較早的單次去識別化硬體紀錄，不是通用的 modem protocol fact：

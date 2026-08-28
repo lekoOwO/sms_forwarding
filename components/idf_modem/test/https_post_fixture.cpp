@@ -53,6 +53,8 @@ struct OwnerTransportFixture {
         version,
         ignorestamp,
         ignoreverify,
+        ciphersuite,
+        session,
         create,
         timeout,
         ssl,
@@ -192,6 +194,10 @@ IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
         command == "AT+MSSLCFG=\"ignorestamp\",1,0") return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::ignoreverify) &&
         command == "AT+MSSLCFG=\"ignoreverify\",1,0") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::ciphersuite) &&
+        command == "AT+MSSLCFG=\"ciphersuite\",1,0") return IdfModemHttpsCommandResult::failed;
+    if (fail(OwnerTransportFixture::FailureStage::session) &&
+        command == "AT+MSSLCFG=\"session\",1,0") return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::create) &&
         command == idf_modem_https_create_command("push.example.test")) return IdfModemHttpsCommandResult::failed;
     if (fail(OwnerTransportFixture::FailureStage::timeout) &&
@@ -269,6 +275,8 @@ static std::vector<std::string> expected_writes()
         "AT+MSSLCFG=\"version\",1,3",
         "AT+MSSLCFG=\"ignorestamp\",1,0",
         "AT+MSSLCFG=\"ignoreverify\",1,0",
+        "AT+MSSLCFG=\"ciphersuite\",1,0",
+        "AT+MSSLCFG=\"session\",1,0",
         "AT+MHTTPCREATE=\"https://push.example.test\"",
         "AT+MHTTPCFG=\"ssl\",7,1,1",
         "AT+MHTTPCFG=\"timeout\",7,30",
@@ -360,6 +368,10 @@ int main()
     OwnerTransportFixture owner;
     assert(owner.run(request, "ML307A", 1));
     assert(owner.writes == expected_writes());
+    assert(std::count(owner.writes.begin(), owner.writes.end(),
+                      "AT+MSSLCFG=\"ciphersuite\",1,0") == 1);
+    assert(std::count(owner.writes.begin(), owner.writes.end(),
+                      "AT+MSSLCFG=\"session\",1,0") == 1);
     assert(!owner.cert_prompt_seen);
     assert(owner.body_prompt_seen);
     assert(owner.raw_body == request.body);
@@ -393,6 +405,8 @@ int main()
         {OwnerTransportFixture::FailureStage::version, "HTTPS TLS version failed"},
         {OwnerTransportFixture::FailureStage::ignorestamp, "HTTPS TLS timestamp check failed"},
         {OwnerTransportFixture::FailureStage::ignoreverify, "HTTPS TLS certificate verification failed"},
+        {OwnerTransportFixture::FailureStage::ciphersuite, "HTTPS TLS cipher suite failed"},
+        {OwnerTransportFixture::FailureStage::session, "HTTPS TLS session reset failed"},
         {OwnerTransportFixture::FailureStage::create, "HTTPS connection creation failed"},
         {OwnerTransportFixture::FailureStage::timeout, "HTTPS HTTP timeout configuration failed"},
         {OwnerTransportFixture::FailureStage::ssl, "HTTPS SSL binding failed"},

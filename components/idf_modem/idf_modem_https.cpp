@@ -186,6 +186,8 @@ const char* pre_create_failure_message(size_t index)
         "HTTPS TLS version failed",
         "HTTPS TLS timestamp check failed",
         "HTTPS TLS certificate verification failed",
+        "HTTPS TLS cipher suite failed",
+        "HTTPS TLS session reset failed",
         "HTTPS connection creation failed",
     };
     return index < std::size(messages) ? messages[index] : "HTTPS TLS setup failed";
@@ -539,6 +541,8 @@ bool idf_modem_https_build_post_wire(const IdfModemHttpsPostRequest& request,
         {false, "AT+MSSLCFG=\"version\",1,3"},
         {false, "AT+MSSLCFG=\"ignorestamp\",1,0"},
         {false, "AT+MSSLCFG=\"ignoreverify\",1,0"},
+        {false, "AT+MSSLCFG=\"ciphersuite\",1,0"},
+        {false, "AT+MSSLCFG=\"session\",1,0"},
         {false, idf_modem_https_create_command(target.host)},
     };
 
