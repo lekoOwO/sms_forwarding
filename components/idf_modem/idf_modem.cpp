@@ -68,12 +68,14 @@ struct OwnerCommand {
     bool filter_urcs = false;
     std::string response_prefix;
     size_t response_limit = OWNER_AT_RESPONSE_LIMIT;
+    bool capture_other_line = false;
 };
 
 struct OwnerCommandSlot {
     OwnerCommandState state = OwnerCommandState::free;
     OwnerCommand request;
     std::string response;
+    bool other_line_present = false;
     IdfModemHttpsPostResult https_post_result;
     esp_err_t result = ESP_FAIL;
     SemaphoreHandle_t completed = nullptr;
@@ -133,7 +135,8 @@ struct TickDeadline;
 
 static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
                                bool filter_urcs = false, const char* response_prefix = nullptr,
-                               size_t response_limit = OWNER_AT_RESPONSE_LIMIT);
+                               size_t response_limit = OWNER_AT_RESPONSE_LIMIT,
+                               bool* other_line_present = nullptr);
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
                                      uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
@@ -143,7 +146,8 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
                                       bool priority,
                                       uint8_t* query_busy_reason = nullptr,
-                                      IdfModemHttpsPostResult* https_result = nullptr);
+                                      IdfModemHttpsPostResult* https_result = nullptr,
+                                      bool* other_line_present = nullptr);
 static bool owner_process_one_command(bool priority);
 static void owner_drain_priority_commands();
 static void wake_owner_task();
@@ -719,10 +723,12 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
                                         std::string& response, bool filter_urcs,
                                         const char* response_prefix,
                                         bool* modem_error = nullptr,
-                                        size_t response_limit = OWNER_AT_RESPONSE_LIMIT)
+                                        size_t response_limit = OWNER_AT_RESPONSE_LIMIT,
+                                        bool* other_line_present = nullptr)
 {
     assert_owner_task();
     if (modem_error) *modem_error = false;
+    if (other_line_present) *other_line_present = false;
     if (deadline.expired()) return ESP_ERR_TIMEOUT;
 
     capture_pending_uart_locked(30);
@@ -755,6 +761,9 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
                 response = query_filter.response();
                 s_uart_line_carry = query_filter.carry();
                 s_uart_wait_cmt_pdu = query_filter.waiting_for_pdu();
+                if (other_line_present) {
+                    *other_line_present = query_filter.other_line_present();
+                }
                 scan = response;
                 if (!query_filter.carry().empty()) {
                     scan += "\r\n";
@@ -777,6 +786,9 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
                     response = query_filter.response();
                     s_uart_line_carry = query_filter.carry();
                     s_uart_wait_cmt_pdu = query_filter.waiting_for_pdu();
+                    if (other_line_present) {
+                        *other_line_present = query_filter.other_line_present();
+                    }
                 }
                 ret = final_code > 0 ? ESP_OK : ESP_FAIL;
                 if (final_code < 0 && modem_error) *modem_error = true;
@@ -785,16 +797,17 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
             if (scan.size() > 32) scan.erase(0, scan.size() - 32);
         }
     }
+    if (other_line_present) *other_line_present = query_filter.other_line_present();
     return ret;
 }
 
 static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
                                bool filter_urcs, const char* response_prefix,
-                               size_t response_limit)
+                               size_t response_limit, bool* other_line_present)
 {
     TickDeadline deadline(timeout_ms);
     return owner_send_at_deadline(cmd, deadline, response, filter_urcs, response_prefix, nullptr,
-                                  response_limit);
+                                  response_limit, other_line_present);
 }
 
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
@@ -979,9 +992,11 @@ static const char* usb_query_response_prefix(uint8_t query_id)
     }
 }
 
-esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* busy_reason)
+esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* busy_reason,
+                              bool* other_line_present)
 {
     response.clear();
+    if (other_line_present) *other_line_present = false;
     const char* command = usb_query_command(query_id);
     if (!command) return ESP_ERR_INVALID_ARG;
     const bool queue_ready = s_runtime_queue_ready.load(std::memory_order_acquire);
@@ -1013,12 +1028,15 @@ esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* 
     request.filter_urcs = true;
     request.response_prefix = usb_query_response_prefix(query_id);
     request.response_limit = response_limit;
+    request.capture_other_line = query_id == IDF_MODEM_USB_QUERY_MSSLCIPHER;
     esp_err_t err;
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
         err = owner_send_at(command, timeout_ms, response, true,
-                            request.response_prefix.c_str(), request.response_limit);
+                            request.response_prefix.c_str(), request.response_limit,
+                            other_line_present);
     } else {
-        err = submit_owner_command(request, &response, false, busy_reason);
+        err = submit_owner_command(request, &response, false, busy_reason, nullptr,
+                                   other_line_present);
     }
     if (err == ESP_OK && query_id == IDF_MODEM_USB_QUERY_CPOL) {
         response = idf_modem_cpol_compact_summary(response);
@@ -1070,6 +1088,7 @@ static void reset_owner_slot(OwnerCommandSlot& slot)
 {
     slot.request = OwnerCommand();
     slot.response.clear();
+    slot.other_line_present = false;
     slot.https_post_result = IdfModemHttpsPostResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::free;
@@ -1099,7 +1118,8 @@ static void wake_owner_task()
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
                                       bool priority,
                                       uint8_t* query_busy_reason,
-                                      IdfModemHttpsPostResult* https_result)
+                                      IdfModemHttpsPostResult* https_result,
+                                      bool* other_line_present)
 {
     if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
         return ESP_ERR_INVALID_STATE;
@@ -1165,6 +1185,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         slot.request.deadline_span = operation_deadline.span;
     }
     slot.response.clear();
+    slot.other_line_present = false;
     slot.https_post_result = IdfModemHttpsPostResult();
     slot.result = ESP_FAIL;
     slot.state = OwnerCommandState::queued;
@@ -1191,12 +1212,14 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
             result = slot.result;
             if (response) *response = slot.response;
+            if (other_line_present) *other_line_present = slot.other_line_present;
             if (https_result) *https_result = slot.https_post_result;
             reset_owner_slot(slot);
         } else if (slot.state == OwnerCommandState::done) {
             // Prefer completion if its signal arrives with the caller timeout.
             result = slot.result;
             if (response) *response = slot.response;
+            if (other_line_present) *other_line_present = slot.other_line_present;
             if (https_result) *https_result = slot.https_post_result;
             reset_owner_slot(slot);
             xSemaphoreTake(slot.completed, 0);
@@ -1988,7 +2011,8 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
                                  slot.request.response_prefix.empty()
                                      ? nullptr
                                      : slot.request.response_prefix.c_str(),
-                                 slot.request.response_limit);
+                                 slot.request.response_limit,
+                                 slot.request.capture_other_line ? &slot.other_line_present : nullptr);
         case OwnerCommandKind::until:
             return owner_send_at_until(slot.request.command, slot.request.token.c_str(),
                                        slot.request.timeout_ms, slot.response);

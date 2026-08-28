@@ -55,10 +55,12 @@ constexpr size_t kMaxLegacyPayload = 100;
 constexpr size_t kMaxAsyncPayload = 104;
 constexpr size_t kMaxQueryRequestPayload = 1;
 constexpr size_t kMaxQueryResponsePayload = IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE;
+constexpr size_t kMsslcipherTelemetryPayload = 1;
 constexpr uint8_t kMaxModemQueryId = 0x12;
 constexpr size_t kMaxPayload =
-    kMaxAsyncPayload > (1 + kMaxQueryResponsePayload) ? kMaxAsyncPayload
-                                                       : (1 + kMaxQueryResponsePayload);
+    kMaxAsyncPayload > (1 + kMsslcipherTelemetryPayload + kMaxQueryResponsePayload)
+        ? kMaxAsyncPayload
+        : (1 + kMsslcipherTelemetryPayload + kMaxQueryResponsePayload);
 constexpr size_t kMaxFrame = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr size_t kParserCapacity = kMaxFrame * 2;
 constexpr TickType_t kIoTimeout = pdMS_TO_TICKS(2000);
@@ -454,7 +456,9 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
     }
     std::string response;
     uint8_t busy_reason = 0;
-    const esp_err_t err = idf_modem_usb_query(frame.payload[0], response, &busy_reason);
+    bool other_line_present = false;
+    const esp_err_t err = idf_modem_usb_query(
+        frame.payload[0], response, &busy_reason, &other_line_present);
     if (err != ESP_OK) {
         if (err == IDF_MODEM_ERR_BUSY) {
             output[0] = busy_reason;
@@ -463,8 +467,14 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
         return map_query_error(err);
     }
     if (response.size() > kMaxQueryResponsePayload) return Status::InvalidArg;
-    memcpy(output, response.data(), response.size());
-    *output_length = 1 + response.size();
+    if (frame.payload[0] == IDF_MODEM_USB_QUERY_MSSLCIPHER) {
+        output[0] = other_line_present ? 1 : 0;
+        memcpy(output + 1, response.data(), response.size());
+        *output_length = 2 + response.size();
+    } else {
+        memcpy(output, response.data(), response.size());
+        *output_length = 1 + response.size();
+    }
     return Status::Ok;
 }
 

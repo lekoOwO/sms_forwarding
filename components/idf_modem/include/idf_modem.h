@@ -105,7 +105,8 @@ esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uin
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 #if SMS_USB_RECOVERY
 esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response,
-                              uint8_t* busy_reason = nullptr);
+                              uint8_t* busy_reason = nullptr,
+                              bool* other_line_present = nullptr);
 #endif
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,

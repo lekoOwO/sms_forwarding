@@ -55,6 +55,7 @@ public:
           waiting_for_pdu_(waiting_for_pdu),
           allow_multiple_response_lines_(command == "AT+CPOL?" || command == "AT+CGDCONT?" ||
                                          (command == "AT+CCLK?" && response_prefix == "+CCLK:")),
+          track_other_line_(command == "AT+MSSLCIPHER=?"),
           response_limit_(response_limit)
     {
     }
@@ -69,6 +70,7 @@ public:
             } else if (carry_.size() < 768) {
                 carry_ += ch;
             } else {
+                if (track_other_line_) other_line_present_ = true;
                 carry_.clear();
                 waiting_for_pdu_ = false;
             }
@@ -79,6 +81,7 @@ public:
     const std::string& urcs() const { return urcs_; }
     const std::string& carry() const { return carry_; }
     bool waiting_for_pdu() const { return waiting_for_pdu_; }
+    bool other_line_present() const { return other_line_present_; }
 
     void flush_pending() { flush_line(); }
     void clear_urcs() { urcs_.clear(); }
@@ -162,6 +165,8 @@ private:
             solicited = true;
         }
 
+        if (track_other_line_ && (!solicited || pdu)) other_line_present_ = true;
+
         if (solicited && !pdu) {
             append_response(line);
         } else {
@@ -184,5 +189,7 @@ private:
     bool waiting_for_pdu_ = false;
     bool allow_multiple_response_lines_ = false;
     bool expected_line_seen_ = false;
+    bool track_other_line_ = false;
+    bool other_line_present_ = false;
     size_t response_limit_ = 0;
 };

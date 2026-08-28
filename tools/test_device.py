@@ -775,6 +775,7 @@ class DeviceCommandTest(unittest.TestCase):
                     "query_id": query_id, "valid": True,
                     "supported": {"c02b": True, "c02c": False, "c02f": True, "c030": True},
                     "count": 3, "count_bucket": "1-4", "unknown_present": False,
+                    "other_line_present": False,
                 }
             elif name == "iccid":
                 result = {

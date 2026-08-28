@@ -132,7 +132,7 @@ _BATCH_ALLOWED_KEYS = frozenset((
     "attached", "active", "rssi", "ber", "rxlev", "rscp", "ecn0", "rsrq", "rsrp",
     "unknown", "last_error", "address_count", "ipv4", "ipv6", "0", "1", "2", "3",
     "supported", "c02b", "c02c", "c02f", "c030", "count", "count_bucket",
-    "unknown_present",
+    "unknown_present", "other_line_present",
 ))
 
 
@@ -1318,7 +1318,7 @@ def _container_recovery(
     *, caller_timeout: float | None = None, deadline: float | None = None,
     command: int = usb_recovery.COMMAND_STATE,
     legacy_ota_state: bool = False,
-) -> bytes | dict[str, object]:
+) -> bytes | dict[str, object] | usb_recovery.Frame:
     if deadline is not None and caller_timeout is None:
         caller_timeout = _remaining(deadline)
     if caller_timeout is not None:
@@ -1367,6 +1367,12 @@ def _container_recovery(
         payload = output if isinstance(output, bytes) else output.encode() if isinstance(output, str) else b""
         if not payload.strip():
             raise usb_recovery.DeviceError("USB recovery returned empty query response")
+        query_id = usb_recovery.QUERY_COMMANDS[query][0]
+        payload, other_line_present = usb_recovery._decode_query_payload(query_id, payload)
+        if query_id == usb_recovery.QUERY_MSSLCIPHER:
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_MODEM_QUERY, 0, payload, other_line_present
+            )
         return payload
     try:
         output = result.stdout.decode("utf-8") if isinstance(result.stdout, bytes) else result.stdout
@@ -1416,6 +1422,14 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
     if result.get("query_id") != query_id or not _safe_batch_value(result):
         return False
     if result.get("valid") is False:
+        if name == "msslcipher":
+            if result.get("error") == "unavailable":
+                return set(result) == common | {"error"}
+            return (
+                set(result) == common | {"error", "other_line_present"}
+                and result.get("error") in {"invalid-response", "unavailable"}
+                and isinstance(result["other_line_present"], bool)
+            )
         return (
             set(result) == common | {"error"}
             and result.get("error") in {"invalid-response", "unavailable"}
@@ -1633,7 +1647,7 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
         )
     if name == "msslcipher":
         if set(result) != common | {
-            "supported", "count", "count_bucket", "unknown_present",
+            "supported", "count", "count_bucket", "unknown_present", "other_line_present",
         }:
             return False
         supported = result["supported"]
@@ -1648,6 +1662,7 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             and result["count_bucket"] == usb_recovery.msslcipher_count_bucket(count)
             and result["count_bucket"] in usb_recovery.MSSLCIPHER_COUNT_BUCKETS
             and isinstance(result["unknown_present"], bool)
+            and isinstance(result["other_line_present"], bool)
         )
     if name == "cgdcont":
         if set(result) != common | {"entry_count", "entries"}:
@@ -1990,7 +2005,9 @@ def _reset_state_after_boot(
         time.sleep(min(0.05, remaining))
 
 
-def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes:
+def _diag_query(
+    device: SerialDevice, query_name: str, deadline: float,
+) -> bytes | usb_recovery.Frame:
     payload = usb_recovery.encode_modem_query(query_name)
     busy_retries = 0
     while True:
@@ -2006,7 +2023,7 @@ def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes
                 raise usb_recovery.DeviceError("device operation timed out")
             if not response.payload.strip():
                 raise usb_recovery.DeviceError("empty modem query response")
-            return response.payload
+            return response if query_name == "msslcipher" else response.payload
         except usb_recovery.CommandError as exc:
             if exc.status != usb_recovery.STATUS_BUSY or busy_retries >= BUSY_RETRIES:
                 raise
@@ -2022,7 +2039,7 @@ def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes
                 remaining = _remaining(deadline)
                 return _container_recovery(
                     device, timeout, query_name, caller_timeout=remaining, deadline=deadline
-                )  # type: ignore[return-value]
+                )
             except usb_recovery.CommandError as container_error:
                 if (
                     container_error.status != usb_recovery.STATUS_BUSY
@@ -2034,6 +2051,15 @@ def _diag_query(device: SerialDevice, query_name: str, deadline: float) -> bytes
                 if remaining <= BUSY_DELAY:
                     raise usb_recovery.DeviceError("device operation timed out") from None
                 time.sleep(BUSY_DELAY)
+
+
+def _sanitize_diag_frame(query_id: int, response: usb_recovery.Frame) -> dict[str, object]:
+    if query_id == usb_recovery.QUERY_MSSLCIPHER and response.other_line_present is not None:
+        return usb_recovery.sanitize_query_response(
+            query_id, response.payload,
+            other_line_present=response.other_line_present,
+        )
+    return usb_recovery.sanitize_query_response(query_id, response.payload)
 
 
 def _write_raw(payload: bytes) -> None:
@@ -2062,14 +2088,18 @@ def _diag_command(args: argparse.Namespace) -> int:
         previous_fallback = _ALLOW_DIAG_CONTAINER_FALLBACK
         _ALLOW_DIAG_CONTAINER_FALLBACK = False
         results: dict[str, object] = {}
-        raw_payloads: list[bytes] = []
+        raw_payloads: list[usb_recovery.Frame] = []
         completed = 0
         try:
             while completed < len(names):
                 name = names[completed]
                 query_id = usb_recovery.QUERY_COMMANDS[name][0]
                 try:
-                    payload = _diag_query(device, name, deadline)
+                    response = _diag_query(device, name, deadline)
+                    if not isinstance(response, usb_recovery.Frame):
+                        response = usb_recovery.Frame(
+                            usb_recovery.RESPONSE_MODEM_QUERY, 0, response,
+                        )
                 except usb_recovery.CommandError:
                     if args.raw:
                         raise
@@ -2078,21 +2108,21 @@ def _diag_command(args: argparse.Namespace) -> int:
                     continue
                 if args.raw:
                     if query_id == usb_recovery.QUERY_CPOL:
-                        safe = usb_recovery.sanitize_query_response(query_id, payload)
+                        safe = _sanitize_diag_frame(query_id, response)
                         if not safe["valid"]:
                             raise usb_recovery.DeviceError("CPOL response is not a safe summary")
-                    raw_payloads.append(payload)
+                    raw_payloads.append(response)
                 else:
-                    results[name] = usb_recovery.sanitize_query_response(query_id, payload)
+                    results[name] = _sanitize_diag_frame(query_id, response)
                 completed += 1
         except (usb_recovery.DeviceError, OSError, ImportError) as error:
             if not _host_transport_unavailable(error):
                 raise
             batch_results = _container_recovery_batch(device, names[completed:], deadline=deadline)
             if args.raw:
-                for name, payload in zip(names[:completed], raw_payloads, strict=True):
-                    results[name] = usb_recovery.sanitize_query_response(
-                        usb_recovery.QUERY_COMMANDS[name][0], payload,
+                for name, response in zip(names[:completed], raw_payloads, strict=True):
+                    results[name] = _sanitize_diag_frame(
+                        usb_recovery.QUERY_COMMANDS[name][0], response,
                     )
                 results.update(batch_results)
                 print(json.dumps(results, sort_keys=True))
@@ -2102,24 +2132,28 @@ def _diag_command(args: argparse.Namespace) -> int:
             _ALLOW_DIAG_CONTAINER_FALLBACK = previous_fallback
 
         if args.raw:
-            for payload in raw_payloads:
-                _write_raw(payload)
+            for response in raw_payloads:
+                _write_raw(response.payload)
         else:
             print(json.dumps(results, sort_keys=True))
         return 0
 
     results: dict[str, object] = {}
     name = names[0]
-    payload = _diag_query(device, name, deadline)
+    response = _diag_query(device, name, deadline)
+    if not isinstance(response, usb_recovery.Frame):
+        response = usb_recovery.Frame(
+            usb_recovery.RESPONSE_MODEM_QUERY, 0, response,
+        )
     query_id = usb_recovery.QUERY_COMMANDS[name][0]
     if args.raw:
         if query_id == usb_recovery.QUERY_CPOL:
-            safe = usb_recovery.sanitize_query_response(query_id, payload)
+            safe = _sanitize_diag_frame(query_id, response)
             if not safe["valid"]:
                 raise usb_recovery.DeviceError("CPOL response is not a safe summary")
-        _write_raw(payload)
+        _write_raw(response.payload)
     else:
-        results[name] = usb_recovery.sanitize_query_response(query_id, payload)
+        results[name] = _sanitize_diag_frame(query_id, response)
     if not args.raw:
         print(json.dumps(results[name], sort_keys=True))
     return 0

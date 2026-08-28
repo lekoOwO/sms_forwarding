@@ -142,7 +142,7 @@ response and USB frame budget, so its maximum is 24 IDs and its top count bucket
 The host parser accepts one bounded response line with unique four-digit hexadecimal IDs.
 Malformed, duplicate, out-of-range, and control-character input fails closed.
 The JSON result contains `c02b`, `c02c`, `c02f`, and `c030` support booleans, a bounded `count`, and `count_bucket`.
-It contains `unknown_present`, but it does not contain raw response text or unknown IDs.
+It contains `unknown_present` and `other_line_present`. `other_line_present` is `false` when the owner filter sees no extra line and `true` when it sees a non-final line rejected or moved by the exact response-prefix filter. It does not contain raw response text or unknown IDs.
 This change adds the command and schema only. It does not claim a live hardware result.
 
 Web 設定備份與簽章 OTA 也使用同一個入口。密碼只從 `SMS_WEB_PASSWORD` 或 mode 0600

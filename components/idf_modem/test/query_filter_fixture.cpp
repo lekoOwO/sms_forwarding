@@ -610,6 +610,20 @@ int main()
     assert(msslcipher.response().find("duplicate") == std::string::npos);
     assert(msslcipher.urcs().find("+OTHER: unsolicited") != std::string::npos);
     assert(msslcipher.urcs().find("+MSSLCIPHER: duplicate") != std::string::npos);
+    assert(msslcipher.other_line_present());
+
+    IdfModemQueryResponseFilter msslcipher_bare(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_bare_input = "AT+MSSLCIPHER=?\r\nOK\r\n";
+    msslcipher_bare.feed(msslcipher_bare_input.data(), msslcipher_bare_input.size());
+    assert(!msslcipher_bare.other_line_present());
+
+    IdfModemQueryResponseFilter msslcipher_other(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_other_input =
+        "AT+MSSLCIPHER=?\r\n+UNEXPECTED: value\r\nOK\r\n";
+    msslcipher_other.feed(msslcipher_other_input.data(), msslcipher_other_input.size());
+    assert(msslcipher_other.other_line_present());
 
     IdfModemQueryResponseFilter cereg_filter("AT+CEREG?", "+CEREG:", "", false);
     const std::string cereg_interleaved =

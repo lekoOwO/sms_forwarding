@@ -60,6 +60,8 @@ QUERY_CIMI = 0x0F
 QUERY_CPOL = 0x10
 QUERY_CGDCONT = 0x11
 QUERY_MSSLCIPHER = 0x12
+MSSLCIPHER_TELEMETRY_SIZE = 1
+MSSLCIPHER_TELEMETRY_MASK = 0x01
 QUERY_COMMANDS = {
     "ati": (QUERY_ATI, "ATI"),
     "cpin": (QUERY_CPIN, "AT+CPIN?"),
@@ -160,7 +162,10 @@ OTA_STATE_EXTENDED_PAYLOAD_SIZE = OTA_STATE_PAYLOAD_SIZE + OTA_STATE_PUBLIC_KEY_
 HEADER = struct.Struct("<2sBBHB")
 HEADER_SIZE = HEADER.size
 CRC_SIZE = 2
-MAX_FRAME = HEADER_SIZE + max(MAX_ASYNC_PROVISION_PAYLOAD, 1 + MSSLCIPHER_MAX_RESPONSE) + CRC_SIZE
+MAX_FRAME = HEADER_SIZE + max(
+    MAX_ASYNC_PROVISION_PAYLOAD,
+    1 + MSSLCIPHER_TELEMETRY_SIZE + MSSLCIPHER_MAX_RESPONSE,
+) + CRC_SIZE
 PARSER_BUFFER_SIZE = MAX_FRAME * 2
 PARSER_IDLE_TIMEOUT = 1.0
 STATE_TIMEOUT = 5.0
@@ -239,6 +244,7 @@ class Frame:
     command: int
     sequence: int
     payload: bytes
+    other_line_present: bool | None = None
 
 
 def crc16(data: bytes) -> int:
@@ -261,7 +267,7 @@ def _max_payload(command: int) -> int:
     if command == COMMAND_MODEM_QUERY:
         return MAX_QUERY_PAYLOAD
     if command == RESPONSE_MODEM_QUERY:
-        return 1 + MSSLCIPHER_MAX_RESPONSE
+        return 1 + MSSLCIPHER_TELEMETRY_SIZE + MSSLCIPHER_MAX_RESPONSE
     if command == COMMAND_OTA_STATE:
         return 1
     if command == COMMAND_OTA_MIGRATION_RECOVER:
@@ -280,6 +286,23 @@ def build_frame(command: int, payload: bytes, sequence: int) -> bytes:
     if not 0 <= sequence <= 0xFF:
         raise ValueError("sequence is out of range")
     return _build_unchecked_frame(command, payload, sequence)
+
+
+def _encode_query_payload(query_id: int, payload: bytes,
+                          other_line_present: bool | None) -> bytes:
+    if query_id != QUERY_MSSLCIPHER:
+        return payload
+    if not isinstance(other_line_present, bool):
+        raise DeviceError("missing msslcipher telemetry")
+    return bytes((1 if other_line_present else 0,)) + payload
+
+
+def _decode_query_payload(query_id: int, payload: bytes) -> tuple[bytes, bool | None]:
+    if query_id != QUERY_MSSLCIPHER:
+        return payload, None
+    if not payload or payload[0] & ~MSSLCIPHER_TELEMETRY_MASK:
+        raise DeviceError("malformed msslcipher response")
+    return payload[1:], bool(payload[0])
 
 
 class FrameParser:
@@ -503,6 +526,13 @@ def parse_ati_summary(payload: bytes) -> dict[str, str | None]:
 
 def _invalid_query_response(query_id: int) -> dict[str, object]:
     return {"query_id": query_id, "valid": False, "error": "invalid-response"}
+
+
+def _invalid_msslcipher_response(other_line_present: bool) -> dict[str, object]:
+    return {
+        **_invalid_query_response(QUERY_MSSLCIPHER),
+        "other_line_present": other_line_present,
+    }
 
 
 def _unavailable_query_response(query_id: int) -> dict[str, object]:
@@ -984,14 +1014,16 @@ def _sanitize_cpol(payload: bytes) -> dict[str, object]:
     return result
 
 
-def _sanitize_msslcipher(payload: bytes) -> dict[str, object]:
+def _sanitize_msslcipher(payload: bytes,
+                          other_line_present: bool | None = None) -> dict[str, object]:
     query_id = QUERY_MSSLCIPHER
+    telemetry = other_line_present is True
     data = _query_data_lines(payload, MSSLCIPHER_MAX_RESPONSE)
     if data is None or len(data) != 1:
-        return _invalid_query_response(query_id)
+        return _invalid_msslcipher_response(telemetry)
     match = _MSSLCIPHER.fullmatch(data[0])
     if match is None:
-        return _invalid_query_response(query_id)
+        return _invalid_msslcipher_response(telemetry)
     tokens = [] if not match.group("ids") else match.group("ids").split(",")
     ids: list[int] = []
     for token in tokens:
@@ -1000,10 +1032,10 @@ def _sanitize_msslcipher(payload: bytes) -> dict[str, object]:
             token = token[2:]
         value = int(token, 16)
         if value in ids:
-            return _invalid_query_response(query_id)
+            return _invalid_msslcipher_response(telemetry)
         ids.append(value)
     if len(ids) > MSSLCIPHER_MAX_IDS:
-        return _invalid_query_response(query_id)
+        return _invalid_msslcipher_response(telemetry)
     return {
         "query_id": query_id,
         "valid": True,
@@ -1013,6 +1045,7 @@ def _sanitize_msslcipher(payload: bytes) -> dict[str, object]:
         "count": len(ids),
         "count_bucket": msslcipher_count_bucket(len(ids)),
         "unknown_present": any(value not in _MSSLCIPHER_KNOWN_IDS.values() for value in ids),
+        "other_line_present": telemetry,
     }
 
 
@@ -1130,7 +1163,8 @@ def _sanitize_cereg(payload: bytes) -> dict[str, object]:
     }
 
 
-def sanitize_query_response(query_id: int, payload: bytes) -> dict[str, object]:
+def sanitize_query_response(query_id: int, payload: bytes, *,
+                            other_line_present: bool | None = None) -> dict[str, object]:
     if query_id not in {item[0] for item in QUERY_COMMANDS.values()}:
         return _invalid_query_response(query_id)
     if query_id == QUERY_CIMI:
@@ -1140,7 +1174,7 @@ def sanitize_query_response(query_id: int, payload: bytes) -> dict[str, object]:
     if query_id == QUERY_CPOL:
         return _sanitize_cpol(payload)
     if query_id == QUERY_MSSLCIPHER:
-        return _sanitize_msslcipher(payload)
+        return _sanitize_msslcipher(payload, other_line_present)
     if query_id == QUERY_CGDCONT:
         return _sanitize_cgdcont(payload)
     if query_id == QUERY_CEREG:
@@ -1528,7 +1562,14 @@ class Device:
                         raise DeviceError("malformed USB response")
                     if frame.payload[0] != STATUS_OK:
                         raise CommandError(frame.payload[0], frame.payload[1:])
-                    return Frame(frame.command, frame.sequence, frame.payload[1:])
+                    response_payload = frame.payload[1:]
+                    query_id = payload[0] if command == COMMAND_MODEM_QUERY and len(payload) == 1 else 0
+                    response_payload, other_line_present = _decode_query_payload(
+                        query_id, response_payload
+                    )
+                    return Frame(
+                        frame.command, frame.sequence, response_payload, other_line_present
+                    )
 
 
 def run_transaction(
@@ -1627,9 +1668,19 @@ def _query_command(args: argparse.Namespace) -> int:
     if args.raw:
         if query_id == QUERY_CPOL and not sanitize_query_response(query_id, response.payload)["valid"]:
             raise DeviceError("CPOL response is not a safe summary")
-        sys.stdout.buffer.write(response.payload)
+        output = response.payload
+        if query_id == QUERY_MSSLCIPHER and getattr(args, "internal_container", False):
+            output = _encode_query_payload(query_id, output, response.other_line_present)
+        sys.stdout.buffer.write(output)
         return 0
-    print(json.dumps(sanitize_query_response(query_id, response.payload), sort_keys=True))
+    if query_id == QUERY_MSSLCIPHER and response.other_line_present is not None:
+        safe = sanitize_query_response(
+            query_id, response.payload,
+            other_line_present=response.other_line_present,
+        )
+    else:
+        safe = sanitize_query_response(query_id, response.payload)
+    print(json.dumps(safe, sort_keys=True))
     return 0
 
 
@@ -1675,9 +1726,18 @@ def _diag_batch_command(args: argparse.Namespace) -> int:
                     raise DeviceError("USB device timed out")
                 if not response.payload or not response.payload.strip():
                     raise DeviceError("empty modem query response")
-                safe = sanitize_query_response(query_id, response.payload)
+                if query_id == QUERY_MSSLCIPHER and response.other_line_present is not None:
+                    safe = sanitize_query_response(
+                        query_id, response.payload,
+                        other_line_present=response.other_line_present,
+                    )
+                else:
+                    safe = sanitize_query_response(query_id, response.payload)
                 if safe.get("valid") is not True:
-                    results[name] = _invalid_query_response(query_id)
+                    results[name] = (
+                        safe if query_id == QUERY_MSSLCIPHER
+                        else _invalid_query_response(query_id)
+                    )
                     break
                 results[name] = safe
                 break

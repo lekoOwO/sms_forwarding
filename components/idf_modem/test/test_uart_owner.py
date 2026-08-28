@@ -108,6 +108,8 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE = 192", header)
         self.assertIn("IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE", body)
         self.assertIn("request.response_limit", body)
+        self.assertIn("request.capture_other_line = query_id == IDF_MODEM_USB_QUERY_MSSLCIPHER", body)
+        self.assertIn("slot.request.capture_other_line ? &slot.other_line_present", source)
         self.assertIn("response_limit", function_body(source, "owner_send_at"))
         self.assertIn("response_limit", function_body(source, "execute_owner_command"))
 

@@ -85,7 +85,8 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             usb_recovery.MAX_FRAME,
             usb_recovery.HEADER_SIZE
             + max(usb_recovery.MAX_ASYNC_PROVISION_PAYLOAD,
-                  1 + usb_recovery.MSSLCIPHER_MAX_RESPONSE)
+                  1 + usb_recovery.MSSLCIPHER_TELEMETRY_SIZE
+                  + usb_recovery.MSSLCIPHER_MAX_RESPONSE)
             + usb_recovery.CRC_SIZE,
         )
         ids = ",".join(f"0x{value:04X}" for value in range(0xC02B, 0xC02B + 24))
@@ -93,11 +94,28 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         self.assertTrue(usb_recovery.sanitize_query_response(
             usb_recovery.QUERY_MSSLCIPHER, valid)["valid"])
         response = usb_recovery._build_unchecked_frame(
-            usb_recovery.RESPONSE_MODEM_QUERY, b"\x00" + valid, sequence=4
+            usb_recovery.RESPONSE_MODEM_QUERY, b"\x00\x00" + valid, sequence=4
         )
         parsed = usb_recovery.FrameParser(usb_recovery.RESPONSE_COMMANDS).feed(response)
         self.assertEqual(len(parsed), 1)
-        self.assertEqual(parsed[0].payload, b"\x00" + valid)
+        self.assertEqual(parsed[0].payload, b"\x00\x00" + valid)
+        self.assertEqual(
+            usb_recovery._decode_query_payload(
+                usb_recovery.QUERY_MSSLCIPHER, parsed[0].payload[1:]
+            ),
+            (valid, False),
+        )
+        max_response = usb_recovery.build_frame(
+            usb_recovery.RESPONSE_MODEM_QUERY,
+            bytes((usb_recovery.STATUS_OK, 0))
+            + b"x" * usb_recovery.MSSLCIPHER_MAX_RESPONSE,
+            sequence=5,
+        )
+        self.assertEqual(
+            usb_recovery.FrameParser(usb_recovery.RESPONSE_COMMANDS).feed(max_response)[0].payload,
+            bytes((usb_recovery.STATUS_OK, 0))
+            + b"x" * usb_recovery.MSSLCIPHER_MAX_RESPONSE,
+        )
         too_many = ",".join(f"{value:04X}" for value in range(0xC02B, 0xC02B + 25))
         invalid = (f"+MSSLCIPHER: ({too_many})\r\nOK\r\n").encode()
         self.assertFalse(usb_recovery.sanitize_query_response(
@@ -557,6 +575,7 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             "count": 5,
             "count_bucket": "5-8",
             "unknown_present": True,
+            "other_line_present": False,
         })
         encoded = json.dumps(safe, sort_keys=True)
         for value in ("0xC02B", "0xC02C", "0xC02F", "0xC030", "0x1301"):
@@ -575,6 +594,7 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             "query_id": MSSLCIPHER_QUERY_ID,
             "valid": False,
             "error": "invalid-response",
+            "other_line_present": False,
         }
         for raw in cases:
             with self.subTest(raw=raw):
@@ -582,6 +602,30 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
                     usb_recovery.sanitize_query_response(MSSLCIPHER_QUERY_ID, raw),
                     expected,
                 )
+
+    def test_msslcipher_summary_reports_filter_telemetry_without_relaxing_validation(self):
+        bare = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID, b"OK\r\n", other_line_present=False,
+        )
+        self.assertEqual(bare, {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": False,
+            "error": "invalid-response",
+            "other_line_present": False,
+        })
+        other = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID, b"OK\r\n", other_line_present=True,
+        )
+        self.assertEqual(other["other_line_present"], True)
+        self.assertFalse(other["valid"])
+
+        valid = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: (C02B)\r\nOK\r\n",
+            other_line_present=True,
+        )
+        self.assertTrue(valid["valid"])
+        self.assertTrue(valid["other_line_present"])
 
     def test_cimi_sanitizer_keeps_only_safe_identity_metadata(self):
         raw = b"460011234567890\r\nOK\r\n"
@@ -1656,6 +1700,32 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         )
         self.assertTrue(payload["results"]["csq"]["valid"])
 
+    def test_internal_diag_batch_keeps_msslcipher_filter_telemetry_on_invalid(self):
+        args = type("Args", (), {
+            "device": usb_recovery.INTERNAL_DEVICE_PATH,
+            "timeout": 12.0,
+            "query_names": ["msslcipher"],
+            "internal_container": True,
+        })()
+
+        def fake_transaction(*_args, **_kwargs):
+            return usb_recovery.Frame(
+                usb_recovery.RESPONSE_MODEM_QUERY, 0, b"OK\r\n", True,
+            )
+
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, {"SMS_DEVICE_IN_CONTAINER": "1"}), \
+                mock.patch.object(usb_recovery, "run_transaction", side_effect=fake_transaction), \
+                redirect_stdout(output):
+            self.assertEqual(usb_recovery._diag_batch_command(args), 0)
+
+        self.assertEqual(json.loads(output.getvalue())["results"]["msslcipher"], {
+            "query_id": usb_recovery.QUERY_MSSLCIPHER,
+            "valid": False,
+            "error": "invalid-response",
+            "other_line_present": True,
+        })
+
     def test_internal_diag_batch_keeps_unavailable_result_and_continues(self):
         calls = []
         args = type("Args", (), {
@@ -2083,7 +2153,7 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
         self.assertIn("#if SMS_USB_RECOVERY", source)
         self.assertIn("kCommandModemQuery", source)
         self.assertIn("frame.payload_length != 1", source)
-        self.assertIn("idf_modem_usb_query(frame.payload[0]", source)
+        self.assertIn("idf_modem_usb_query(", source)
         self.assertIn("Status::NotReady", source)
         self.assertNotIn("frame.payload", modem[modem.find("idf_modem_usb_query"):])
 
@@ -2105,9 +2175,11 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
             "kMaxQueryResponsePayload = IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE",
             source,
         )
-        self.assertIn("1 + kMaxQueryResponsePayload", source)
+        self.assertIn("kMsslcipherTelemetryPayload", source)
         self.assertIn("frame.payload[0] > kMaxModemQueryId", modem_query)
-        self.assertIn("idf_modem_usb_query(frame.payload[0], response, &busy_reason)", modem_query)
+        self.assertIn("idf_modem_usb_query(", modem_query)
+        self.assertIn("&busy_reason", modem_query)
+        self.assertIn("&other_line_present", modem_query)
         self.assertIn("*output_length = 2", modem_query)
 
     def test_recovery_starts_after_config_and_before_wifi(self):
