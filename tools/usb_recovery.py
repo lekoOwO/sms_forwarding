@@ -61,7 +61,14 @@ QUERY_CPOL = 0x10
 QUERY_CGDCONT = 0x11
 QUERY_MSSLCIPHER = 0x12
 MSSLCIPHER_TELEMETRY_SIZE = 1
-MSSLCIPHER_TELEMETRY_MASK = 0x01
+MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT = 0x01
+MSSLCIPHER_TELEMETRY_LINE_OVERFLOW = 0x02
+MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN = 0x04
+MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE = 0x08
+MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX = 0x10
+MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT = 0x20
+MSSLCIPHER_TELEMETRY_COMMA_PRESENT = 0x40
+MSSLCIPHER_TELEMETRY_MASK = 0x7F
 QUERY_COMMANDS = {
     "ati": (QUERY_ATI, "ATI"),
     "cpin": (QUERY_CPIN, "AT+CPIN?"),
@@ -245,6 +252,7 @@ class Frame:
     sequence: int
     payload: bytes
     other_line_present: bool | None = None
+    msslcipher_telemetry: int | None = None
 
 
 def crc16(data: bytes) -> int:
@@ -289,20 +297,26 @@ def build_frame(command: int, payload: bytes, sequence: int) -> bytes:
 
 
 def _encode_query_payload(query_id: int, payload: bytes,
-                          other_line_present: bool | None) -> bytes:
+                          msslcipher_telemetry: int | bool | None) -> bytes:
     if query_id != QUERY_MSSLCIPHER:
         return payload
-    if not isinstance(other_line_present, bool):
+    if isinstance(msslcipher_telemetry, bool):
+        msslcipher_telemetry = int(msslcipher_telemetry)
+    if (
+        not isinstance(msslcipher_telemetry, int)
+        or not 0 <= msslcipher_telemetry <= 0xFF
+        or msslcipher_telemetry & ~MSSLCIPHER_TELEMETRY_MASK
+    ):
         raise DeviceError("missing msslcipher telemetry")
-    return bytes((1 if other_line_present else 0,)) + payload
+    return bytes((msslcipher_telemetry,)) + payload
 
 
-def _decode_query_payload(query_id: int, payload: bytes) -> tuple[bytes, bool | None]:
+def _decode_query_payload(query_id: int, payload: bytes) -> tuple[bytes, int | None]:
     if query_id != QUERY_MSSLCIPHER:
         return payload, None
     if not payload or payload[0] & ~MSSLCIPHER_TELEMETRY_MASK:
         raise DeviceError("malformed msslcipher response")
-    return payload[1:], bool(payload[0])
+    return payload[1:], payload[0]
 
 
 class FrameParser:
@@ -528,11 +542,45 @@ def _invalid_query_response(query_id: int) -> dict[str, object]:
     return {"query_id": query_id, "valid": False, "error": "invalid-response"}
 
 
-def _invalid_msslcipher_response(other_line_present: bool) -> dict[str, object]:
-    return {
-        **_invalid_query_response(QUERY_MSSLCIPHER),
-        "other_line_present": other_line_present,
-    }
+_MSSLCIPHER_TELEMETRY_FIELDS = (
+    ("other_line_present", MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT),
+    ("line_overflow", MSSLCIPHER_TELEMETRY_LINE_OVERFLOW),
+    ("contains_msslcipher_token", MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN),
+    ("contains_exact_official_prefix_anywhere",
+     MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE),
+    ("leading_whitespace_before_prefix",
+     MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX),
+    ("parentheses_present", MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT),
+    ("comma_present", MSSLCIPHER_TELEMETRY_COMMA_PRESENT),
+)
+
+
+def _msslcipher_telemetry_fields(
+    telemetry: int | None, other_line_present: bool | None,
+) -> dict[str, bool]:
+    if telemetry is None:
+        if other_line_present is None:
+            return {"other_line_present": False}
+        return {"other_line_present": other_line_present is True}
+    if isinstance(telemetry, bool):
+        telemetry = int(telemetry)
+    if (
+        not isinstance(telemetry, int)
+        or telemetry < 0
+        or telemetry & ~MSSLCIPHER_TELEMETRY_MASK
+    ):
+        telemetry = 0
+    if other_line_present is True:
+        telemetry |= MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT
+    return {name: bool(telemetry & bit) for name, bit in _MSSLCIPHER_TELEMETRY_FIELDS}
+
+
+def _invalid_msslcipher_response(
+    other_line_present: bool | None = None, msslcipher_telemetry: int | None = None,
+) -> dict[str, object]:
+    result = _invalid_query_response(QUERY_MSSLCIPHER)
+    result.update(_msslcipher_telemetry_fields(msslcipher_telemetry, other_line_present))
+    return result
 
 
 def _unavailable_query_response(query_id: int) -> dict[str, object]:
@@ -1015,15 +1063,15 @@ def _sanitize_cpol(payload: bytes) -> dict[str, object]:
 
 
 def _sanitize_msslcipher(payload: bytes,
-                          other_line_present: bool | None = None) -> dict[str, object]:
+                          other_line_present: bool | None = None,
+                          msslcipher_telemetry: int | None = None) -> dict[str, object]:
     query_id = QUERY_MSSLCIPHER
-    telemetry = other_line_present is True
     data = _query_data_lines(payload, MSSLCIPHER_MAX_RESPONSE)
     if data is None or len(data) != 1:
-        return _invalid_msslcipher_response(telemetry)
+        return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
     match = _MSSLCIPHER.fullmatch(data[0])
     if match is None:
-        return _invalid_msslcipher_response(telemetry)
+        return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
     tokens = [] if not match.group("ids") else match.group("ids").split(",")
     ids: list[int] = []
     for token in tokens:
@@ -1032,11 +1080,11 @@ def _sanitize_msslcipher(payload: bytes,
             token = token[2:]
         value = int(token, 16)
         if value in ids:
-            return _invalid_msslcipher_response(telemetry)
+            return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
         ids.append(value)
     if len(ids) > MSSLCIPHER_MAX_IDS:
-        return _invalid_msslcipher_response(telemetry)
-    return {
+        return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
+    result = {
         "query_id": query_id,
         "valid": True,
         "supported": {
@@ -1045,8 +1093,9 @@ def _sanitize_msslcipher(payload: bytes,
         "count": len(ids),
         "count_bucket": msslcipher_count_bucket(len(ids)),
         "unknown_present": any(value not in _MSSLCIPHER_KNOWN_IDS.values() for value in ids),
-        "other_line_present": telemetry,
     }
+    result.update(_msslcipher_telemetry_fields(msslcipher_telemetry, other_line_present))
+    return result
 
 
 def _sanitize_cgdcont(payload: bytes) -> dict[str, object]:
@@ -1164,7 +1213,8 @@ def _sanitize_cereg(payload: bytes) -> dict[str, object]:
 
 
 def sanitize_query_response(query_id: int, payload: bytes, *,
-                            other_line_present: bool | None = None) -> dict[str, object]:
+                            other_line_present: bool | None = None,
+                            msslcipher_telemetry: int | None = None) -> dict[str, object]:
     if query_id not in {item[0] for item in QUERY_COMMANDS.values()}:
         return _invalid_query_response(query_id)
     if query_id == QUERY_CIMI:
@@ -1174,7 +1224,7 @@ def sanitize_query_response(query_id: int, payload: bytes, *,
     if query_id == QUERY_CPOL:
         return _sanitize_cpol(payload)
     if query_id == QUERY_MSSLCIPHER:
-        return _sanitize_msslcipher(payload, other_line_present)
+        return _sanitize_msslcipher(payload, other_line_present, msslcipher_telemetry)
     if query_id == QUERY_CGDCONT:
         return _sanitize_cgdcont(payload)
     if query_id == QUERY_CEREG:
@@ -1564,11 +1614,18 @@ class Device:
                         raise CommandError(frame.payload[0], frame.payload[1:])
                     response_payload = frame.payload[1:]
                     query_id = payload[0] if command == COMMAND_MODEM_QUERY and len(payload) == 1 else 0
-                    response_payload, other_line_present = _decode_query_payload(
+                    response_payload, msslcipher_telemetry = _decode_query_payload(
                         query_id, response_payload
                     )
                     return Frame(
-                        frame.command, frame.sequence, response_payload, other_line_present
+                        frame.command,
+                        frame.sequence,
+                        response_payload,
+                        (
+                            bool(msslcipher_telemetry & MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT)
+                            if msslcipher_telemetry is not None else None
+                        ),
+                        msslcipher_telemetry,
                     )
 
 
@@ -1670,13 +1727,17 @@ def _query_command(args: argparse.Namespace) -> int:
             raise DeviceError("CPOL response is not a safe summary")
         output = response.payload
         if query_id == QUERY_MSSLCIPHER and getattr(args, "internal_container", False):
-            output = _encode_query_payload(query_id, output, response.other_line_present)
+            telemetry = response.msslcipher_telemetry
+            if telemetry is None:
+                telemetry = response.other_line_present
+            output = _encode_query_payload(query_id, output, telemetry)
         sys.stdout.buffer.write(output)
         return 0
     if query_id == QUERY_MSSLCIPHER and response.other_line_present is not None:
         safe = sanitize_query_response(
             query_id, response.payload,
             other_line_present=response.other_line_present,
+            msslcipher_telemetry=response.msslcipher_telemetry,
         )
     else:
         safe = sanitize_query_response(query_id, response.payload)
@@ -1730,6 +1791,7 @@ def _diag_batch_command(args: argparse.Namespace) -> int:
                     safe = sanitize_query_response(
                         query_id, response.payload,
                         other_line_present=response.other_line_present,
+                        msslcipher_telemetry=response.msslcipher_telemetry,
                     )
                 else:
                     safe = sanitize_query_response(query_id, response.payload)

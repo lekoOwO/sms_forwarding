@@ -1112,6 +1112,22 @@ class DeviceCommandTest(unittest.TestCase):
             with self.subTest(mutation=mutation):
                 self.assertFalse(device._safe_batch_result("msslcipher", mutation))
 
+    def test_msslcipher_batch_schema_accepts_named_filter_telemetry_only(self):
+        result = {
+            "query_id": usb_recovery.QUERY_MSSLCIPHER,
+            "valid": False,
+            "error": "invalid-response",
+            "other_line_present": True,
+            "line_overflow": True,
+            "contains_msslcipher_token": True,
+            "contains_exact_official_prefix_anywhere": True,
+            "leading_whitespace_before_prefix": True,
+            "parentheses_present": True,
+            "comma_present": True,
+        }
+        self.assertTrue(device._safe_batch_result("msslcipher", result))
+        self.assertFalse(device._safe_batch_result("msslcipher", {**result, "raw": "C02B"}))
+
     def test_reset_is_dry_run_by_default(self):
         with mock.patch.object(device.subprocess, "run") as run:
             result, output = self.run_main(["--device", DEVICE, "reset"])

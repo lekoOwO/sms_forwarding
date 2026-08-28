@@ -457,8 +457,9 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
     std::string response;
     uint8_t busy_reason = 0;
     bool other_line_present = false;
+    uint8_t msslcipher_telemetry = 0;
     const esp_err_t err = idf_modem_usb_query(
-        frame.payload[0], response, &busy_reason, &other_line_present);
+        frame.payload[0], response, &busy_reason, &other_line_present, &msslcipher_telemetry);
     if (err != ESP_OK) {
         if (err == IDF_MODEM_ERR_BUSY) {
             output[0] = busy_reason;
@@ -468,7 +469,7 @@ static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_le
     }
     if (response.size() > kMaxQueryResponsePayload) return Status::InvalidArg;
     if (frame.payload[0] == IDF_MODEM_USB_QUERY_MSSLCIPHER) {
-        output[0] = other_line_present ? 1 : 0;
+        output[0] = msslcipher_telemetry;
         memcpy(output + 1, response.data(), response.size());
         *output_length = 2 + response.size();
     } else {

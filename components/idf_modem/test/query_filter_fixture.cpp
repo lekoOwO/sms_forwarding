@@ -617,6 +617,68 @@ int main()
     const std::string msslcipher_bare_input = "AT+MSSLCIPHER=?\r\nOK\r\n";
     msslcipher_bare.feed(msslcipher_bare_input.data(), msslcipher_bare_input.size());
     assert(!msslcipher_bare.other_line_present());
+    assert(msslcipher_bare.msslcipher_telemetry() == 0);
+
+    IdfModemQueryResponseFilter msslcipher_leading(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_leading_input =
+        "AT+MSSLCIPHER=?\r\n"
+        "  +MSSLCIPHER: (C02B,C02C)\r\n"
+        "OK\r\n";
+    msslcipher_leading.feed(msslcipher_leading_input.data(), msslcipher_leading_input.size());
+    assert(!msslcipher_leading.other_line_present());
+    assert(msslcipher_leading.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN);
+    assert(msslcipher_leading.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE);
+    assert(msslcipher_leading.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX);
+    assert(msslcipher_leading.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT);
+    assert(msslcipher_leading.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_COMMA_PRESENT);
+
+    IdfModemQueryResponseFilter msslcipher_rejected(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_rejected_input =
+        "AT+MSSLCIPHER=?\r\n"
+        "junk MSSLCIPHER (C02B,C02C)\r\n"
+        "OK\r\n";
+    msslcipher_rejected.feed(msslcipher_rejected_input.data(), msslcipher_rejected_input.size());
+    assert(msslcipher_rejected.other_line_present());
+    assert(msslcipher_rejected.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT);
+    assert(msslcipher_rejected.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN);
+    assert(!(msslcipher_rejected.msslcipher_telemetry() &
+             IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE));
+    assert(msslcipher_rejected.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT);
+    assert(msslcipher_rejected.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_COMMA_PRESENT);
+
+    IdfModemQueryResponseFilter msslcipher_overflow(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_overflow_line =
+        std::string(780, ' ') + "+MSSLCIPHER: (C02B,C02C)";
+    const std::string msslcipher_overflow_input =
+        "AT+MSSLCIPHER=?\r\n" + msslcipher_overflow_line + "\r\nOK\r\n";
+    msslcipher_overflow.feed(msslcipher_overflow_input.data(), msslcipher_overflow_input.size());
+    assert(msslcipher_overflow.other_line_present());
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT);
+    assert(msslcipher_overflow.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_COMMA_PRESENT);
 
     IdfModemQueryResponseFilter msslcipher_other(
         "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);

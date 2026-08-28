@@ -132,7 +132,9 @@ _BATCH_ALLOWED_KEYS = frozenset((
     "attached", "active", "rssi", "ber", "rxlev", "rscp", "ecn0", "rsrq", "rsrp",
     "unknown", "last_error", "address_count", "ipv4", "ipv6", "0", "1", "2", "3",
     "supported", "c02b", "c02c", "c02f", "c030", "count", "count_bucket",
-    "unknown_present", "other_line_present",
+    "unknown_present", "other_line_present", "line_overflow",
+    "contains_msslcipher_token", "contains_exact_official_prefix_anywhere",
+    "leading_whitespace_before_prefix", "parentheses_present", "comma_present",
 ))
 
 
@@ -1368,10 +1370,14 @@ def _container_recovery(
         if not payload.strip():
             raise usb_recovery.DeviceError("USB recovery returned empty query response")
         query_id = usb_recovery.QUERY_COMMANDS[query][0]
-        payload, other_line_present = usb_recovery._decode_query_payload(query_id, payload)
+        payload, msslcipher_telemetry = usb_recovery._decode_query_payload(query_id, payload)
         if query_id == usb_recovery.QUERY_MSSLCIPHER:
             return usb_recovery.Frame(
-                usb_recovery.RESPONSE_MODEM_QUERY, 0, payload, other_line_present
+                usb_recovery.RESPONSE_MODEM_QUERY,
+                0,
+                payload,
+                bool(msslcipher_telemetry & usb_recovery.MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT),
+                msslcipher_telemetry,
             )
         return payload
     try:
@@ -1425,10 +1431,22 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
         if name == "msslcipher":
             if result.get("error") == "unavailable":
                 return set(result) == common | {"error"}
+            telemetry = {
+                "other_line_present", "line_overflow", "contains_msslcipher_token",
+                "contains_exact_official_prefix_anywhere",
+                "leading_whitespace_before_prefix", "parentheses_present", "comma_present",
+            }
+            old_shape = common | {"error", "other_line_present"}
+            new_shape = common | {"error"} | telemetry
+            if set(result) == old_shape:
+                return (
+                    result.get("error") in {"invalid-response", "unavailable"}
+                    and isinstance(result["other_line_present"], bool)
+                )
             return (
-                set(result) == common | {"error", "other_line_present"}
+                set(result) == new_shape
                 and result.get("error") in {"invalid-response", "unavailable"}
-                and isinstance(result["other_line_present"], bool)
+                and all(isinstance(result[key], bool) for key in telemetry)
             )
         return (
             set(result) == common | {"error"}
@@ -1646,13 +1664,19 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
                     for value in result["rat_counts"].values())
         )
     if name == "msslcipher":
-        if set(result) != common | {
+        base = common | {
             "supported", "count", "count_bucket", "unknown_present", "other_line_present",
-        }:
+        }
+        telemetry = {
+            "line_overflow", "contains_msslcipher_token",
+            "contains_exact_official_prefix_anywhere",
+            "leading_whitespace_before_prefix", "parentheses_present", "comma_present",
+        }
+        if set(result) != base and set(result) != base | telemetry:
             return False
         supported = result["supported"]
         count = result["count"]
-        return (
+        valid = (
             isinstance(supported, dict)
             and set(supported) == {"c02b", "c02c", "c02f", "c030"}
             and all(isinstance(value, bool) for value in supported.values())
@@ -1663,6 +1687,10 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             and result["count_bucket"] in usb_recovery.MSSLCIPHER_COUNT_BUCKETS
             and isinstance(result["unknown_present"], bool)
             and isinstance(result["other_line_present"], bool)
+        )
+        return valid and (
+            set(result) == base
+            or all(isinstance(result[key], bool) for key in telemetry)
         )
     if name == "cgdcont":
         if set(result) != common | {"entry_count", "entries"}:
@@ -2058,6 +2086,7 @@ def _sanitize_diag_frame(query_id: int, response: usb_recovery.Frame) -> dict[st
         return usb_recovery.sanitize_query_response(
             query_id, response.payload,
             other_line_present=response.other_line_present,
+            msslcipher_telemetry=response.msslcipher_telemetry,
         )
     return usb_recovery.sanitize_query_response(query_id, response.payload)
 

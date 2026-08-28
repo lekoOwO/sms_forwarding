@@ -657,6 +657,50 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         self.assertTrue(valid["valid"])
         self.assertTrue(valid["other_line_present"])
 
+    def test_msslcipher_telemetry_exposes_named_flags_without_raw_metadata(self):
+        telemetry = 0x7F
+        flags = {
+            "other_line_present": True,
+            "line_overflow": True,
+            "contains_msslcipher_token": True,
+            "contains_exact_official_prefix_anywhere": True,
+            "leading_whitespace_before_prefix": True,
+            "parentheses_present": True,
+            "comma_present": True,
+        }
+        bare = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID, b"OK\r\n", msslcipher_telemetry=telemetry,
+        )
+        self.assertEqual(bare, {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": False,
+            "error": "invalid-response",
+            **flags,
+        })
+        valid = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: (C02B)\r\nOK\r\n",
+            msslcipher_telemetry=telemetry,
+        )
+        self.assertTrue(valid["valid"])
+        self.assertEqual({key: valid[key] for key in flags}, flags)
+        encoded = json.dumps(valid, sort_keys=True)
+        for forbidden in ("C02B", "raw", "sha256", "length", "ids"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_msslcipher_telemetry_bitmask_round_trips_and_rejects_reserved_bit(self):
+        payload = b"OK\r\n"
+        self.assertEqual(
+            usb_recovery._decode_query_payload(
+                MSSLCIPHER_QUERY_ID, bytes((0x7F,)) + payload,
+            ),
+            (payload, 0x7F),
+        )
+        with self.assertRaises(usb_recovery.DeviceError):
+            usb_recovery._decode_query_payload(
+                MSSLCIPHER_QUERY_ID, bytes((0x80,)) + payload,
+            )
+
     def test_cimi_sanitizer_keeps_only_safe_identity_metadata(self):
         raw = b"460011234567890\r\nOK\r\n"
         safe = usb_recovery.sanitize_query_response(usb_recovery.QUERY_CIMI, raw)

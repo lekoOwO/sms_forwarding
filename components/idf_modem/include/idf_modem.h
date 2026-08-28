@@ -8,6 +8,7 @@
 #include "esp_err.h"
 #include "idf_config.h"
 #include "idf_modem_https.h"
+#include "idf_modem_msslcipher_telemetry.h"
 
 #ifndef SMS_USB_RECOVERY
 #define SMS_USB_RECOVERY 0
@@ -106,7 +107,8 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint3
 #if SMS_USB_RECOVERY
 esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response,
                               uint8_t* busy_reason = nullptr,
-                              bool* other_line_present = nullptr);
+                              bool* other_line_present = nullptr,
+                              uint8_t* msslcipher_telemetry = nullptr);
 #endif
 esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result);
 esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,

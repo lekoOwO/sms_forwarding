@@ -6,6 +6,7 @@
 #include <string>
 #include <string_view>
 
+#include "idf_modem_msslcipher_telemetry.h"
 #include "idf_modem_registration.h"
 
 enum class IdfModemUsbQueryAdmission {
@@ -67,12 +68,20 @@ public:
             char ch = data[i];
             if (ch == '\r' || ch == '\n') {
                 flush_line();
-            } else if (carry_.size() < 768) {
-                carry_ += ch;
             } else {
-                if (track_other_line_) other_line_present_ = true;
-                carry_.clear();
-                waiting_for_pdu_ = false;
+                if (track_other_line_) observe_msslcipher_char(ch);
+                if (carry_.size() < 768) {
+                    carry_ += ch;
+                } else {
+                    if (track_other_line_) {
+                        other_line_present_ = true;
+                        msslcipher_telemetry_ |=
+                            IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT |
+                            IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW;
+                    }
+                    carry_.clear();
+                    waiting_for_pdu_ = false;
+                }
             }
         }
     }
@@ -82,6 +91,7 @@ public:
     const std::string& carry() const { return carry_; }
     bool waiting_for_pdu() const { return waiting_for_pdu_; }
     bool other_line_present() const { return other_line_present_; }
+    uint8_t msslcipher_telemetry() const { return msslcipher_telemetry_; }
 
     void flush_pending() { flush_line(); }
     void clear_urcs() { urcs_.clear(); }
@@ -125,6 +135,59 @@ private:
                line == "BUSY" || line == "NO ANSWER" || line == "NORMAL POWER DOWN";
     }
 
+    void observe_msslcipher_char(char ch)
+    {
+        constexpr std::string_view token = "MSSLCIPHER";
+        constexpr std::string_view prefix = "+MSSLCIPHER:";
+        if (ch == '(' || ch == ')') {
+            line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT;
+        } else if (ch == ',') {
+            line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_COMMA_PRESENT;
+        }
+
+        const bool starts_prefix = prefix_match_ == 0 && ch == prefix.front();
+        if (starts_prefix) {
+            prefix_leading_whitespace_ = line_has_data_ && line_only_whitespace_;
+        }
+        if (prefix_match_ < prefix.size() && ch == prefix[prefix_match_]) {
+            ++prefix_match_;
+        } else {
+            prefix_match_ = starts_prefix ? 1 : 0;
+        }
+        if (prefix_match_ == prefix.size()) {
+            line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE;
+            if (prefix_leading_whitespace_) {
+                line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX;
+            }
+            prefix_match_ = 0;
+            prefix_leading_whitespace_ = false;
+        }
+
+        if (token_match_ < token.size() && ch == token[token_match_]) {
+            ++token_match_;
+        } else {
+            token_match_ = ch == token.front() ? 1 : 0;
+        }
+        if (token_match_ == token.size()) {
+            line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN;
+            token_match_ = 0;
+        }
+
+        line_has_data_ = true;
+        if (!std::isspace(static_cast<unsigned char>(ch))) line_only_whitespace_ = false;
+    }
+
+    void finish_msslcipher_line(bool echo)
+    {
+        if (!echo) msslcipher_telemetry_ |= line_telemetry_;
+        line_telemetry_ = 0;
+        line_has_data_ = false;
+        line_only_whitespace_ = true;
+        prefix_match_ = 0;
+        token_match_ = 0;
+        prefix_leading_whitespace_ = false;
+    }
+
     void append_response(const std::string& line)
     {
         if (response_limit_ == 0 || response_.size() >= response_limit_) return;
@@ -135,14 +198,16 @@ private:
 
     void flush_line()
     {
-        if (carry_.empty()) return;
+        if (carry_.empty() && !(track_other_line_ && line_has_data_)) return;
         std::string line = trim(carry_, response_prefix_ == "+CEREG:");
         carry_.clear();
+        const bool echo = line == command_;
+        if (track_other_line_) finish_msslcipher_line(echo);
         if (line.empty()) return;
 
         // Echo is transport noise, not a solicited query result. In particular,
         // do not let an echoed fixed command become the response payload.
-        if (line == command_) return;
+        if (echo) return;
 
         bool cmt = starts_with(line, "+CMT:");
         bool pdu = waiting_for_pdu_ && looks_like_pdu(line);
@@ -165,7 +230,10 @@ private:
             solicited = true;
         }
 
-        if (track_other_line_ && (!solicited || pdu)) other_line_present_ = true;
+        if (track_other_line_ && (!solicited || pdu)) {
+            other_line_present_ = true;
+            msslcipher_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT;
+        }
 
         if (solicited && !pdu) {
             append_response(line);
@@ -191,5 +259,12 @@ private:
     bool expected_line_seen_ = false;
     bool track_other_line_ = false;
     bool other_line_present_ = false;
+    uint8_t msslcipher_telemetry_ = 0;
+    uint8_t line_telemetry_ = 0;
+    size_t prefix_match_ = 0;
+    size_t token_match_ = 0;
+    bool prefix_leading_whitespace_ = false;
+    bool line_has_data_ = false;
+    bool line_only_whitespace_ = true;
     size_t response_limit_ = 0;
 };
