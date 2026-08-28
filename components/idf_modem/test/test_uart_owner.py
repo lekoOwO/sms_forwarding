@@ -58,9 +58,17 @@ class UartOwnerContractTest(unittest.TestCase):
             '"AT+CGATT?"', '"AT+CGACT?"', '"AT+CGPADDR"', '"AT+ICCID"',
             '"AT+CSQ"', '"AT+CESQ"', '"AT+CFUN?"', '"AT+CREG?"',
             '"AT+CGREG?"', '"AT+CEER"', '"AT+CIMI"', '"AT+CPOL?"',
-            '"AT+CGDCONT?"',
+            '"AT+CGDCONT?"', '"AT+MSSLCIPHER=?"',
         ):
             self.assertEqual(query_map.count(command), 1, command)
+        header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
+        self.assertIn("IDF_MODEM_USB_QUERY_MSSLCIPHER = 0x12", header)
+        self.assertIn("case IDF_MODEM_USB_QUERY_MSSLCIPHER", query_map)
+        response_map = function_body(source, "usb_query_response_prefix")
+        self.assertIn(
+            'case IDF_MODEM_USB_QUERY_MSSLCIPHER: return "+MSSLCIPHER:";',
+            response_map,
+        )
         self.assertIn("IDF_MODEM_ERR_BUSY", body)
         self.assertIn("IDF_MODEM_USB_QUERY_TIMEOUT_MS", body)
         self.assertIn("s_runtime_queue_ready", body)
@@ -92,6 +100,17 @@ class UartOwnerContractTest(unittest.TestCase):
                 f"IdfModemUsbQueryBusyReason::{reason}", submit
             )
 
+    def test_msslcipher_has_a_bounded_extended_response_without_changing_legacy_limit(self):
+        source = SOURCE.read_text()
+        header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
+        body = function_body(source, "idf_modem_usb_query")
+        self.assertIn("IDF_MODEM_USB_QUERY_MAX_RESPONSE = 96", header)
+        self.assertIn("IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE = 192", header)
+        self.assertIn("IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE", body)
+        self.assertIn("request.response_limit", body)
+        self.assertIn("response_limit", function_body(source, "owner_send_at"))
+        self.assertIn("response_limit", function_body(source, "execute_owner_command"))
+
     def test_cpol_has_only_a_bounded_longer_owner_timeout(self):
         source = SOURCE.read_text()
         header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
@@ -108,7 +127,7 @@ class UartOwnerContractTest(unittest.TestCase):
     def test_oversized_dev_query_logs_only_bounded_metadata_before_clearing(self):
         source = SOURCE.read_text()
         body = function_body(source, "idf_modem_usb_query")
-        oversize = body[body.index("response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE"):]
+        oversize = body[body.index("response.size() > output_limit"):]
         log = oversize[:oversize.index("response.clear()")]
         self.assertIn("idf_logf", log)
         self.assertIn("query_id", log)
@@ -117,7 +136,7 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertNotIn("bounded_actual_length", log)
         self.assertNotIn("std::min", log)
         self.assertNotIn("IDF_MODEM_USB_QUERY_MAX_RESPONSE + 1", log)
-        self.assertIn("IDF_MODEM_USB_QUERY_MAX_RESPONSE", log)
+        self.assertIn("output_limit", log)
         self.assertNotIn("response.c_str()", log)
         self.assertNotIn("response.data()", log)
         for forbidden in ("command", "operator", "apn", "plmn"):
@@ -127,7 +146,7 @@ class UartOwnerContractTest(unittest.TestCase):
         source = SOURCE.read_text()
         body = function_body(source, "idf_modem_usb_query")
         summary = body.index("idf_modem_cpol_compact_summary")
-        generic_limit = body.index("response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE")
+        generic_limit = body.index("response.size() > output_limit")
         self.assertIn("query_id == IDF_MODEM_USB_QUERY_CPOL", body[:summary])
         self.assertLess(summary, generic_limit)
         self.assertIn("response = idf_modem_cpol_compact_summary(response)", body)

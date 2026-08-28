@@ -67,6 +67,7 @@ IDF_PATH=/path/to/esp-idf-v5.5.4 python3 tools/device.py build --usb-dev
 python3 tools/test_usb_recovery.py
 python3 tools/device.py --device /dev/serial/by-id/usb-... state
 python3 tools/device.py --device /dev/serial/by-id/usb-... diag all
+python3 tools/device.py --device /dev/serial/by-id/usb-... diag msslcipher
 python3 tools/usb_recovery.py --device /dev/serial/by-id/usb-... wifi-provision --ssid 'network-name'
 ```
 
@@ -129,11 +130,20 @@ USB 恢復是開發功能；`FIRMWARE_IS_RELEASE=1 SMS_USB_RECOVERY=1` 會在 CM
 設定載入成功後，USB recovery 立即啟動，並在 WiFi 啟動前提供服務。WiFi 啟動後，
 韌體會自動選擇並重連已保存的 WiFi 設定檔。一般 USB console 輸出不等於 recovery endpoint。
 
-`device.py diag` 只接受固定 17 個唯讀 symbolic query ID：`ati`、`cpin`、`cereg`、
+`device.py diag` 只接受固定 18 個唯讀 symbolic query ID：`ati`、`cpin`、`cereg`、
 `cops`、`cgatt`、`cgact`、`cgpaddr`、`iccid`、`csq`、`cesq`、`cfun`、`creg`、
-`cgreg`、`ceer`、`cimi`、`cpol` 與 `cgdcont`，或使用 `all`。不接受 COPS test、
+`cgreg`、`ceer`、`cimi`、`cpol`、`cgdcont` 與 `msslcipher`，或使用 `all`。不接受 COPS test、
 CRSM 或任意 AT 文字。
 USB recovery 不接受任意 AT 命令。正式版不編譯 `main/usb_recovery.cpp`。
+
+The `msslcipher` query sends ID `0x12` and the exact command `AT+MSSLCIPHER=?`.
+The 17 older queries keep their 96-byte response limit. `msslcipher` has a separate 192-byte
+response and USB frame budget, so its maximum is 24 IDs and its top count bucket is `17-24`.
+The host parser accepts one bounded response line with unique four-digit hexadecimal IDs.
+Malformed, duplicate, out-of-range, and control-character input fails closed.
+The JSON result contains `c02b`, `c02c`, `c02f`, and `c030` support booleans, a bounded `count`, and `count_bucket`.
+It contains `unknown_present`, but it does not contain raw response text or unknown IDs.
+This change adds the command and schema only. It does not claim a live hardware result.
 
 Web 設定備份與簽章 OTA 也使用同一個入口。密碼只從 `SMS_WEB_PASSWORD` 或 mode 0600
 的 `--password-file` 讀取；備份 passphrase 只從 `SMS_CONFIG_PASSPHRASE` 或 mode 0600

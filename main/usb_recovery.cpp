@@ -54,8 +54,11 @@ constexpr size_t kCrcSize = 2;
 constexpr size_t kMaxLegacyPayload = 100;
 constexpr size_t kMaxAsyncPayload = 104;
 constexpr size_t kMaxQueryRequestPayload = 1;
-constexpr size_t kMaxQueryResponsePayload = IDF_MODEM_USB_QUERY_MAX_RESPONSE;
-constexpr size_t kMaxPayload = kMaxAsyncPayload;
+constexpr size_t kMaxQueryResponsePayload = IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE;
+constexpr uint8_t kMaxModemQueryId = 0x12;
+constexpr size_t kMaxPayload =
+    kMaxAsyncPayload > (1 + kMaxQueryResponsePayload) ? kMaxAsyncPayload
+                                                       : (1 + kMaxQueryResponsePayload);
 constexpr size_t kMaxFrame = kHeaderSize + kMaxPayload + kCrcSize;
 constexpr size_t kParserCapacity = kMaxFrame * 2;
 constexpr TickType_t kIoTimeout = pdMS_TO_TICKS(2000);
@@ -445,7 +448,10 @@ static Status provision_wifi_status(const Frame& frame, uint8_t* output, size_t*
 
 static Status modem_query(const Frame& frame, uint8_t* output, size_t* output_length)
 {
-    if (frame.payload_length != 1) return Status::InvalidArg;
+    if (frame.payload_length != 1 || frame.payload[0] == 0 ||
+        frame.payload[0] > kMaxModemQueryId) {
+        return Status::InvalidArg;
+    }
     std::string response;
     uint8_t busy_reason = 0;
     const esp_err_t err = idf_modem_usb_query(frame.payload[0], response, &busy_reason);

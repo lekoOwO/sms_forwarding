@@ -91,7 +91,10 @@ static constexpr uint8_t IDF_MODEM_USB_QUERY_CEER = 0x0E;
 static constexpr uint8_t IDF_MODEM_USB_QUERY_CIMI = 0x0F;
 static constexpr uint8_t IDF_MODEM_USB_QUERY_CPOL = 0x10;
 static constexpr uint8_t IDF_MODEM_USB_QUERY_CGDCONT = 0x11;
+static constexpr uint8_t IDF_MODEM_USB_QUERY_MSSLCIPHER = 0x12;
 static constexpr size_t IDF_MODEM_USB_QUERY_MAX_RESPONSE = 96;
+// MSSLCIPHER returns a bounded capability list that does not fit the legacy query response.
+static constexpr size_t IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE = 192;
 static constexpr uint32_t IDF_MODEM_USB_QUERY_TIMEOUT_MS = 1500;
 static constexpr uint32_t IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS = 5000;
 #endif

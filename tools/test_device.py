@@ -770,6 +770,12 @@ class DeviceCommandTest(unittest.TestCase):
                 }
             elif name == "ceer":
                 result = {"query_id": query_id, "valid": True, "last_error": {"present": False}}
+            elif name == "msslcipher":
+                result = {
+                    "query_id": query_id, "valid": True,
+                    "supported": {"c02b": True, "c02c": False, "c02f": True, "c030": True},
+                    "count": 3, "count_bucket": "1-4", "unknown_present": False,
+                }
             elif name == "iccid":
                 result = {
                     "query_id": query_id, "valid": True, "present": True, "length": 20,
@@ -856,6 +862,7 @@ class DeviceCommandTest(unittest.TestCase):
             "creg": b"+CREG: 0,11\r\nOK\r\n",
             "cgreg": b"+CGREG: 0,0\r\nOK\r\n",
             "ceer": b"OK\n",
+            "msslcipher": b"+MSSLCIPHER: (C02B,C02F,C030)\r\nOK\r\n",
         }
         for name, raw in cases.items():
             with self.subTest(name=name):
@@ -1079,7 +1086,7 @@ class DeviceCommandTest(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_diag_rejects_arbitrary_at_text(self):
-        self.assertEqual(len(device.QUERY_NAMES), 17)
+        self.assertEqual(len(device.QUERY_NAMES), 18)
         self.assertEqual(set(device.QUERY_NAMES), set(usb_recovery.QUERY_COMMANDS))
         with self.assertRaises(SystemExit):
             device.build_parser().parse_args(["--device", DEVICE, "diag", "AT+CGACT=1,1"])
@@ -1087,6 +1094,22 @@ class DeviceCommandTest(unittest.TestCase):
             device.build_parser().parse_args(["--device", DEVICE, "diag", "cops", "test"])
         with self.assertRaises(SystemExit):
             device.build_parser().parse_args(["--device", DEVICE, "diag", "crsm"])
+
+    def test_msslcipher_batch_schema_accepts_sanitized_capability_only(self):
+        raw = b"+MSSLCIPHER: (C02B,C02C,C02F,C030,1301)\r\nOK\r\n"
+        result = usb_recovery.sanitize_query_response(
+            usb_recovery.QUERY_MSSLCIPHER, raw,
+        )
+        self.assertTrue(device._safe_batch_result("msslcipher", result))
+        self.assertNotIn("1301", json.dumps(result, sort_keys=True))
+        for mutation in (
+            {**result, "count": 4},
+            {**result, "count_bucket": "9-16"},
+            {**result, "supported": {**result["supported"], "c02d": True}},
+            {**result, "raw": "C02B"},
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertFalse(device._safe_batch_result("msslcipher", mutation))
 
     def test_reset_is_dry_run_by_default(self):
         with mock.patch.object(device.subprocess, "run") as run:

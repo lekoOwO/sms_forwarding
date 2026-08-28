@@ -59,6 +59,7 @@ QUERY_CEER = 0x0E
 QUERY_CIMI = 0x0F
 QUERY_CPOL = 0x10
 QUERY_CGDCONT = 0x11
+QUERY_MSSLCIPHER = 0x12
 QUERY_COMMANDS = {
     "ati": (QUERY_ATI, "ATI"),
     "cpin": (QUERY_CPIN, "AT+CPIN?"),
@@ -77,6 +78,7 @@ QUERY_COMMANDS = {
     "cimi": (QUERY_CIMI, "AT+CIMI"),
     "cpol": (QUERY_CPOL, "AT+CPOL?"),
     "cgdcont": (QUERY_CGDCONT, "AT+CGDCONT?"),
+    "msslcipher": (QUERY_MSSLCIPHER, "AT+MSSLCIPHER=?"),
 }
 REQUEST_COMMANDS = frozenset((
     COMMAND_STATE,
@@ -140,6 +142,7 @@ MAX_PAYLOAD = 100
 MAX_ASYNC_PROVISION_PAYLOAD = 104
 MAX_QUERY_PAYLOAD = 1
 MAX_QUERY_RESPONSE = 96
+MSSLCIPHER_MAX_RESPONSE = 192
 APP0_OFFSET = 0x10000
 APP1_OFFSET = 0x1F0000
 OTA_IMAGE_STATE_OTHER = 0
@@ -157,7 +160,7 @@ OTA_STATE_EXTENDED_PAYLOAD_SIZE = OTA_STATE_PAYLOAD_SIZE + OTA_STATE_PUBLIC_KEY_
 HEADER = struct.Struct("<2sBBHB")
 HEADER_SIZE = HEADER.size
 CRC_SIZE = 2
-MAX_FRAME = HEADER_SIZE + MAX_ASYNC_PROVISION_PAYLOAD + CRC_SIZE
+MAX_FRAME = HEADER_SIZE + max(MAX_ASYNC_PROVISION_PAYLOAD, 1 + MSSLCIPHER_MAX_RESPONSE) + CRC_SIZE
 PARSER_BUFFER_SIZE = MAX_FRAME * 2
 PARSER_IDLE_TIMEOUT = 1.0
 STATE_TIMEOUT = 5.0
@@ -257,6 +260,8 @@ def _max_payload(command: int) -> int:
         return MAX_ASYNC_PROVISION_PAYLOAD
     if command == COMMAND_MODEM_QUERY:
         return MAX_QUERY_PAYLOAD
+    if command == RESPONSE_MODEM_QUERY:
+        return 1 + MSSLCIPHER_MAX_RESPONSE
     if command == COMMAND_OTA_STATE:
         return 1
     if command == COMMAND_OTA_MIGRATION_RECOVER:
@@ -397,6 +402,12 @@ _CGDCONT = re.compile(
     r'^\+CGDCONT:\s*([0-9]{1,3})\s*,\s*"([^",]*)"\s*,\s*"([^",]*)"'
     r'(?:\s*,\s*"([^",]*)")?$'
 )
+_MSSLCIPHER_ID = r"(?:0[xX])?[0-9A-Fa-f]{4}"
+_MSSLCIPHER = re.compile(
+    r"^\+MSSLCIPHER:[ ]*\([ ]*(?P<ids>"
+    rf"{_MSSLCIPHER_ID}(?:[ ]*,[ ]*{_MSSLCIPHER_ID}){{0,23}}"
+    r")?[ ]*\)$"
+)
 _PDP_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,15}")
 _CEREG_STATUS = re.compile(
     r"^\+CEREG:[ ]*([0-5])[ ]*,[ ]*(0|[1-5]|11)$"
@@ -460,6 +471,26 @@ _MAX_COPS_OPERATOR_BYTES = 32
 _CSQ_RANGES = ((0, 31, 99), (0, 7, 99))
 _CESQ_RANGES = ((0, 63, 99), (0, 7, 99), (0, 96, 255),
                 (0, 49, 255), (0, 34, 255), (0, 97, 255))
+_MSSLCIPHER_KNOWN_IDS = {
+    "c02b": 0xC02B,
+    "c02c": 0xC02C,
+    "c02f": 0xC02F,
+    "c030": 0xC030,
+}
+MSSLCIPHER_MAX_IDS = 24
+MSSLCIPHER_COUNT_BUCKETS = ("0", "1-4", "5-8", "9-16", "17-24")
+
+
+def msslcipher_count_bucket(count: int) -> str:
+    if count == 0:
+        return "0"
+    if count <= 4:
+        return "1-4"
+    if count <= 8:
+        return "5-8"
+    if count <= 16:
+        return "9-16"
+    return "17-24"
 
 
 def parse_ati_summary(payload: bytes) -> dict[str, str | None]:
@@ -485,8 +516,8 @@ def _has_forbidden_controls(text: str) -> bool:
     )
 
 
-def _query_data_lines(payload: bytes) -> list[str] | None:
-    if len(payload) > MAX_QUERY_RESPONSE:
+def _query_data_lines(payload: bytes, maximum: int = MAX_QUERY_RESPONSE) -> list[str] | None:
+    if len(payload) > maximum:
         return None
     try:
         text = payload.decode("utf-8")
@@ -953,6 +984,38 @@ def _sanitize_cpol(payload: bytes) -> dict[str, object]:
     return result
 
 
+def _sanitize_msslcipher(payload: bytes) -> dict[str, object]:
+    query_id = QUERY_MSSLCIPHER
+    data = _query_data_lines(payload, MSSLCIPHER_MAX_RESPONSE)
+    if data is None or len(data) != 1:
+        return _invalid_query_response(query_id)
+    match = _MSSLCIPHER.fullmatch(data[0])
+    if match is None:
+        return _invalid_query_response(query_id)
+    tokens = [] if not match.group("ids") else match.group("ids").split(",")
+    ids: list[int] = []
+    for token in tokens:
+        token = token.strip(" ")
+        if token[:2].lower() == "0x":
+            token = token[2:]
+        value = int(token, 16)
+        if value in ids:
+            return _invalid_query_response(query_id)
+        ids.append(value)
+    if len(ids) > MSSLCIPHER_MAX_IDS:
+        return _invalid_query_response(query_id)
+    return {
+        "query_id": query_id,
+        "valid": True,
+        "supported": {
+            name: value in ids for name, value in _MSSLCIPHER_KNOWN_IDS.items()
+        },
+        "count": len(ids),
+        "count_bucket": msslcipher_count_bucket(len(ids)),
+        "unknown_present": any(value not in _MSSLCIPHER_KNOWN_IDS.values() for value in ids),
+    }
+
+
 def _sanitize_cgdcont(payload: bytes) -> dict[str, object]:
     query_id = QUERY_CGDCONT
     data = _query_data_lines(payload)
@@ -1076,6 +1139,8 @@ def sanitize_query_response(query_id: int, payload: bytes) -> dict[str, object]:
         return _sanitize_ati(payload)
     if query_id == QUERY_CPOL:
         return _sanitize_cpol(payload)
+    if query_id == QUERY_MSSLCIPHER:
+        return _sanitize_msslcipher(payload)
     if query_id == QUERY_CGDCONT:
         return _sanitize_cgdcont(payload)
     if query_id == QUERY_CEREG:

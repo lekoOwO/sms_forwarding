@@ -19,8 +19,17 @@ main/app_main.cpp
 
 開發版可選擇啟用 `main/usb_recovery.cpp`。設定載入成功後、WiFi 啟動前，韌體立即啟動
 USB recovery。它是 USB Serial/JTAG 的唯一管理資料 owner，只提供狀態、WiFi 配網與
-固定 17 個唯讀 modem query ID（`0x01` 至 `0x11`）；不接受任意 AT 命令。正式版不編譯
+固定 18 個唯讀 modem query ID（`0x01` 至 `0x12`）。名稱依序為 `ati`、`cpin`、`cereg`、
+`cops`、`cgatt`、`cgact`、`cgpaddr`、`iccid`、`csq`、`cesq`、`cfun`、`creg`、`cgreg`、
+`ceer`、`cimi`、`cpol`、`cgdcont` 與 `msslcipher`。不接受任意 AT 命令。正式版不編譯
 此來源。一般 USB console 輸出不等於 recovery endpoint。
+
+The `msslcipher` query uses ID `0x12` and sends the exact command `AT+MSSLCIPHER=?`.
+The 17 older queries keep their 96-byte response limit. `msslcipher` uses a separate 192-byte
+response and frame budget. With the accepted four-digit ID syntax, this permits at most 24 IDs.
+The host accepts one bounded `+MSSLCIPHER: (...)` response line with unique hexadecimal IDs.
+The result reports fixed support booleans, a bounded count, a `17-24` top count bucket, and `unknown_present`.
+The result does not contain raw response text or unknown IDs. This change records no live hardware result.
 
 `idf_modem` 是 UART1 的唯一 owner。其他元件透過有界 command queue 執行 AT 操作。
 

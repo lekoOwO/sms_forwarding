@@ -594,6 +594,23 @@ int main()
         assert(shaped.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
     }
 
+    IdfModemQueryResponseFilter msslcipher(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string msslcipher_input =
+        "AT+MSSLCIPHER=?\r\n"
+        "+MSSLCIPHER: (C02B,C02C,C02F,C030,1301)\r\n"
+        "+OTHER: unsolicited\r\n"
+        "+MSSLCIPHER: duplicate\r\n"
+        "OK\r\n";
+    msslcipher.feed(msslcipher_input.data(), msslcipher_input.size());
+    assert(msslcipher.response().find("+MSSLCIPHER: (C02B,C02C,C02F,C030,1301)") !=
+           std::string::npos);
+    assert(msslcipher.response().find("OK") != std::string::npos);
+    assert(msslcipher.response().find("+OTHER:") == std::string::npos);
+    assert(msslcipher.response().find("duplicate") == std::string::npos);
+    assert(msslcipher.urcs().find("+OTHER: unsolicited") != std::string::npos);
+    assert(msslcipher.urcs().find("+MSSLCIPHER: duplicate") != std::string::npos);
+
     IdfModemQueryResponseFilter cereg_filter("AT+CEREG?", "+CEREG:", "", false);
     const std::string cereg_interleaved =
         "AT+CEREG?\r\n+CEREG: 5\r\n"

@@ -113,11 +113,11 @@ FLASH_OPERATION_MAX_TIMEOUT = 300.0
 EXPECTED_QUERY_NAMES = frozenset((
     "ati", "cpin", "cereg", "cops", "cgatt", "cgact", "cgpaddr",
     "iccid", "csq", "cesq", "cfun", "creg", "cgreg", "ceer",
-    "cimi", "cpol", "cgdcont",
+    "cimi", "cpol", "cgdcont", "msslcipher",
 ))
 QUERY_NAMES = tuple(usb_recovery.QUERY_COMMANDS)
-if frozenset(QUERY_NAMES) != EXPECTED_QUERY_NAMES or len(QUERY_NAMES) != 17:
-    raise RuntimeError("USB diagnostic query allowlist must contain exactly 17 IDs")
+if frozenset(QUERY_NAMES) != EXPECTED_QUERY_NAMES or len(QUERY_NAMES) != 18:
+    raise RuntimeError("USB diagnostic query allowlist must contain exactly 18 IDs")
 
 _ALLOW_DIAG_CONTAINER_FALLBACK = True
 _MAX_BATCH_NESTING = 32
@@ -131,6 +131,8 @@ _BATCH_ALLOWED_KEYS = frozenset((
     "registered", "location", "fields", "error", "state", "format", "operator",
     "attached", "active", "rssi", "ber", "rxlev", "rscp", "ecn0", "rsrq", "rsrp",
     "unknown", "last_error", "address_count", "ipv4", "ipv6", "0", "1", "2", "3",
+    "supported", "c02b", "c02c", "c02f", "c030", "count", "count_bucket",
+    "unknown_present",
 ))
 
 
@@ -1629,6 +1631,24 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             and all(isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 8192
                     for value in result["rat_counts"].values())
         )
+    if name == "msslcipher":
+        if set(result) != common | {
+            "supported", "count", "count_bucket", "unknown_present",
+        }:
+            return False
+        supported = result["supported"]
+        count = result["count"]
+        return (
+            isinstance(supported, dict)
+            and set(supported) == {"c02b", "c02c", "c02f", "c030"}
+            and all(isinstance(value, bool) for value in supported.values())
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and 0 <= count <= usb_recovery.MSSLCIPHER_MAX_IDS
+            and result["count_bucket"] == usb_recovery.msslcipher_count_bucket(count)
+            and result["count_bucket"] in usb_recovery.MSSLCIPHER_COUNT_BUCKETS
+            and isinstance(result["unknown_present"], bool)
+        )
     if name == "cgdcont":
         if set(result) != common | {"entry_count", "entries"}:
             return False
@@ -2932,7 +2952,7 @@ def build_parser() -> argparse.ArgumentParser:
     diag = commands.add_parser("diag", help="run fixed read-only modem diagnostics")
     diag.add_argument("query_name", nargs="?", choices=(*QUERY_NAMES, "all"))
     diag.add_argument("--id", dest="query_option", choices=(*QUERY_NAMES, "all"))
-    diag.add_argument("--all", action="store_true", help="run all 17 fixed queries")
+    diag.add_argument("--all", action="store_true", help="run all 18 fixed queries")
     diag.add_argument("--raw", action="store_true", help="write raw response to stdout only")
 
     reset = commands.add_parser("reset", help="reset and probe one exact device")

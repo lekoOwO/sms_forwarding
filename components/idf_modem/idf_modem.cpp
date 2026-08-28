@@ -51,6 +51,7 @@ static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM hot-swap poll
 static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 static constexpr size_t OWNER_COMMAND_SLOTS = 4;
+static constexpr size_t OWNER_AT_RESPONSE_LIMIT = 8192;
 
 enum class OwnerCommandKind : uint8_t { at, until, pdu, https_post };
 enum class OwnerCommandState : uint8_t { free, queued, running, done, abandoned };
@@ -66,6 +67,7 @@ struct OwnerCommand {
     TickType_t deadline_span = 0;
     bool filter_urcs = false;
     std::string response_prefix;
+    size_t response_limit = OWNER_AT_RESPONSE_LIMIT;
 };
 
 struct OwnerCommandSlot {
@@ -130,7 +132,8 @@ void idf_modem_signal_event(void);
 struct TickDeadline;
 
 static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
-                               bool filter_urcs = false, const char* response_prefix = nullptr);
+                               bool filter_urcs = false, const char* response_prefix = nullptr,
+                               size_t response_limit = OWNER_AT_RESPONSE_LIMIT);
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
                                      uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
@@ -715,7 +718,8 @@ static void append_capped(std::string& out, const uint8_t* data, size_t len, siz
 static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& deadline,
                                         std::string& response, bool filter_urcs,
                                         const char* response_prefix,
-                                        bool* modem_error = nullptr)
+                                        bool* modem_error = nullptr,
+                                        size_t response_limit = OWNER_AT_RESPONSE_LIMIT)
 {
     assert_owner_task();
     if (modem_error) *modem_error = false;
@@ -736,7 +740,8 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
     uint8_t buf[128];
     std::string scan;  // Overlap window for truncated or split final result codes
     IdfModemQueryResponseFilter query_filter(
-        cmd, response_prefix ? response_prefix : "", s_uart_line_carry, s_uart_wait_cmt_pdu);
+        cmd, response_prefix ? response_prefix : "", s_uart_line_carry, s_uart_wait_cmt_pdu,
+        std::min(response_limit, OWNER_AT_RESPONSE_LIMIT));
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
         int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
@@ -784,10 +789,12 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
 }
 
 static esp_err_t owner_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response,
-                               bool filter_urcs, const char* response_prefix)
+                               bool filter_urcs, const char* response_prefix,
+                               size_t response_limit)
 {
     TickDeadline deadline(timeout_ms);
-    return owner_send_at_deadline(cmd, deadline, response, filter_urcs, response_prefix, nullptr);
+    return owner_send_at_deadline(cmd, deadline, response, filter_urcs, response_prefix, nullptr,
+                                  response_limit);
 }
 
 static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
@@ -942,6 +949,7 @@ static const char* usb_query_command(uint8_t query_id)
         case IDF_MODEM_USB_QUERY_CIMI: return "AT+CIMI";
         case IDF_MODEM_USB_QUERY_CPOL: return "AT+CPOL?";
         case IDF_MODEM_USB_QUERY_CGDCONT: return "AT+CGDCONT?";
+        case IDF_MODEM_USB_QUERY_MSSLCIPHER: return "AT+MSSLCIPHER=?";
         default: return nullptr;
     }
 }
@@ -964,6 +972,7 @@ static const char* usb_query_response_prefix(uint8_t query_id)
         case IDF_MODEM_USB_QUERY_CEER: return "+CEER:";
         case IDF_MODEM_USB_QUERY_CPOL: return "+CPOL:";
         case IDF_MODEM_USB_QUERY_CGDCONT: return "+CGDCONT:";
+        case IDF_MODEM_USB_QUERY_MSSLCIPHER: return "+MSSLCIPHER:";
         case IDF_MODEM_USB_QUERY_ATI: return "";
         case IDF_MODEM_USB_QUERY_CIMI: return "";
         default: return nullptr;
@@ -992,15 +1001,22 @@ esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* 
     const uint32_t timeout_ms = query_id == IDF_MODEM_USB_QUERY_CPOL
                                     ? IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS
                                     : IDF_MODEM_USB_QUERY_TIMEOUT_MS;
+    const size_t response_limit = query_id == IDF_MODEM_USB_QUERY_MSSLCIPHER
+                                      ? IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE
+                                      : OWNER_AT_RESPONSE_LIMIT;
+    const size_t output_limit = query_id == IDF_MODEM_USB_QUERY_MSSLCIPHER
+                                    ? IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE
+                                    : IDF_MODEM_USB_QUERY_MAX_RESPONSE;
     request.kind = OwnerCommandKind::at;
     request.command = command;
     request.timeout_ms = timeout_ms;
     request.filter_urcs = true;
     request.response_prefix = usb_query_response_prefix(query_id);
+    request.response_limit = response_limit;
     esp_err_t err;
     if (xTaskGetCurrentTaskHandle() == s_owner_task) {
         err = owner_send_at(command, timeout_ms, response, true,
-                            request.response_prefix.c_str());
+                            request.response_prefix.c_str(), request.response_limit);
     } else {
         err = submit_owner_command(request, &response, false, busy_reason);
     }
@@ -1008,11 +1024,11 @@ esp_err_t idf_modem_usb_query(uint8_t query_id, std::string& response, uint8_t* 
         response = idf_modem_cpol_compact_summary(response);
         return ESP_OK;
     }
-    if (err == ESP_OK && response.size() > IDF_MODEM_USB_QUERY_MAX_RESPONSE) {
+    if (err == ESP_OK && response.size() > output_limit) {
         idf_logf("USB modem query response too large: id=0x%02X length=%u limit=%u",
                  static_cast<unsigned>(query_id),
                  static_cast<unsigned>(response.size()),
-                 static_cast<unsigned>(IDF_MODEM_USB_QUERY_MAX_RESPONSE));
+                 static_cast<unsigned>(output_limit));
         response.clear();
         return ESP_ERR_INVALID_SIZE;
     }
@@ -1067,6 +1083,7 @@ static bool owner_request_bounded(const OwnerCommand& request)
            request.https_post_request.contentType.size() <= IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE &&
            request.https_post_request.headerName.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME &&
            request.https_post_request.headerValue.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE &&
+           request.response_limit <= OWNER_AT_RESPONSE_LIMIT &&
            request.https_post_request.apn.size() <= 96;
 }
 
@@ -1970,7 +1987,8 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
                                  slot.request.filter_urcs,
                                  slot.request.response_prefix.empty()
                                      ? nullptr
-                                     : slot.request.response_prefix.c_str());
+                                     : slot.request.response_prefix.c_str(),
+                                 slot.request.response_limit);
         case OwnerCommandKind::until:
             return owner_send_at_until(slot.request.command, slot.request.token.c_str(),
                                        slot.request.timeout_ms, slot.response);

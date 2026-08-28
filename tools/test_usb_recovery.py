@@ -53,6 +53,9 @@ sys.path.insert(0, str(MODULE_PATH.parent))
 import usb_recovery  # noqa: E402
 
 
+MSSLCIPHER_QUERY_ID = 0x12
+
+
 def function_body(source: str, name: str) -> str:
     match = re.search(rf"\b{name}\s*\([^;]*?\)\s*\{{", source, re.S)
     if not match:
@@ -73,6 +76,32 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
     def test_cpol_query_transport_timeout_is_longer_but_bounded(self):
         self.assertEqual(usb_recovery.QUERY_TIMEOUT, 3.0)
         self.assertEqual(usb_recovery.CPOL_QUERY_TIMEOUT, 8.0)
+
+    def test_msslcipher_extended_response_matches_transport_capacity(self):
+        self.assertEqual(usb_recovery.MAX_QUERY_RESPONSE, 96)
+        self.assertEqual(usb_recovery.MSSLCIPHER_MAX_RESPONSE, 192)
+        self.assertEqual(usb_recovery.MSSLCIPHER_MAX_IDS, 24)
+        self.assertEqual(
+            usb_recovery.MAX_FRAME,
+            usb_recovery.HEADER_SIZE
+            + max(usb_recovery.MAX_ASYNC_PROVISION_PAYLOAD,
+                  1 + usb_recovery.MSSLCIPHER_MAX_RESPONSE)
+            + usb_recovery.CRC_SIZE,
+        )
+        ids = ",".join(f"0x{value:04X}" for value in range(0xC02B, 0xC02B + 24))
+        valid = (f"+MSSLCIPHER: ({ids})\r\nOK\r\n").encode()
+        self.assertTrue(usb_recovery.sanitize_query_response(
+            usb_recovery.QUERY_MSSLCIPHER, valid)["valid"])
+        response = usb_recovery._build_unchecked_frame(
+            usb_recovery.RESPONSE_MODEM_QUERY, b"\x00" + valid, sequence=4
+        )
+        parsed = usb_recovery.FrameParser(usb_recovery.RESPONSE_COMMANDS).feed(response)
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0].payload, b"\x00" + valid)
+        too_many = ",".join(f"{value:04X}" for value in range(0xC02B, 0xC02B + 25))
+        invalid = (f"+MSSLCIPHER: ({too_many})\r\nOK\r\n").encode()
+        self.assertFalse(usb_recovery.sanitize_query_response(
+            usb_recovery.QUERY_MSSLCIPHER, invalid)["valid"])
 
     def test_transaction_timeout_must_be_finite_positive_and_bounded(self):
         for timeout in (0.0, -1.0, float("nan"), float("inf"), 91.0):
@@ -502,6 +531,7 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             "cimi": (usb_recovery.QUERY_CIMI, "AT+CIMI"),
             "cpol": (usb_recovery.QUERY_CPOL, "AT+CPOL?"),
             "cgdcont": (usb_recovery.QUERY_CGDCONT, "AT+CGDCONT?"),
+            "msslcipher": (MSSLCIPHER_QUERY_ID, "AT+MSSLCIPHER=?"),
         }
         self.assertEqual(usb_recovery.QUERY_COMMANDS, expected)
         for name, (query_id, _command) in expected.items():
@@ -510,9 +540,48 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 usb_recovery.encode_modem_query(mutation)
         with self.assertRaises(ValueError):
-            usb_recovery.encode_modem_query(0x12)
+            usb_recovery.encode_modem_query(0x13)
         with self.assertRaises(ValueError):
             usb_recovery.build_frame(usb_recovery.COMMAND_MODEM_QUERY, b"AT+CGACT=1,1", 0)
+
+    def test_msslcipher_sanitizer_returns_only_known_flags_and_bounded_counts(self):
+        raw = (
+            b"+MSSLCIPHER: (0xC02B,0xC02C,0xC02F,0xC030,0x1301)\r\n"
+            b"OK\r\n"
+        )
+        safe = usb_recovery.sanitize_query_response(MSSLCIPHER_QUERY_ID, raw)
+        self.assertEqual(safe, {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": True,
+            "supported": {"c02b": True, "c02c": True, "c02f": True, "c030": True},
+            "count": 5,
+            "count_bucket": "5-8",
+            "unknown_present": True,
+        })
+        encoded = json.dumps(safe, sort_keys=True)
+        for value in ("0xC02B", "0xC02C", "0xC02F", "0xC030", "0x1301"):
+            self.assertNotIn(value, encoded)
+
+    def test_msslcipher_sanitizer_rejects_malformed_duplicate_range_and_control(self):
+        cases = (
+            b"+MSSLCIPHER: (C02B,C02C,C02F)\r\nERROR\r\n",
+            b"+MSSLCIPHER: (C02B,C02B)\r\nOK\r\n",
+            b"+MSSLCIPHER: (C02B,10000)\r\nOK\r\n",
+            b"+MSSLCIPHER: (C02B,G02C)\r\nOK\r\n",
+            b"+MSSLCIPHER: (C02B,\x1bC02C)\r\nOK\r\n",
+            b"+MSSLCIPHER: (C02B)\r\n+MSSLCIPHER: (C02C)\r\nOK\r\n",
+        )
+        expected = {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": False,
+            "error": "invalid-response",
+        }
+        for raw in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    usb_recovery.sanitize_query_response(MSSLCIPHER_QUERY_ID, raw),
+                    expected,
+                )
 
     def test_cimi_sanitizer_keeps_only_safe_identity_metadata(self):
         raw = b"460011234567890\r\nOK\r\n"
@@ -2031,6 +2100,13 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
     def test_modem_query_passes_busy_reason_and_fixed_output_length(self):
         source = (ROOT / "main" / "usb_recovery.cpp").read_text(encoding="utf-8")
         modem_query = function_body(source, "modem_query")
+        self.assertIn("kMaxModemQueryId = 0x12", source)
+        self.assertIn(
+            "kMaxQueryResponsePayload = IDF_MODEM_USB_QUERY_MSSLCIPHER_MAX_RESPONSE",
+            source,
+        )
+        self.assertIn("1 + kMaxQueryResponsePayload", source)
+        self.assertIn("frame.payload[0] > kMaxModemQueryId", modem_query)
         self.assertIn("idf_modem_usb_query(frame.payload[0], response, &busy_reason)", modem_query)
         self.assertIn("*output_length = 2", modem_query)
 
