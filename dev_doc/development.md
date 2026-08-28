@@ -138,14 +138,21 @@ USB recovery 不接受任意 AT 命令。正式版不編譯 `main/usb_recovery.c
 
 The `msslcipher` query sends ID `0x12` and the exact command `AT+MSSLCIPHER=?`.
 The 17 older queries keep their 96-byte response limit. `msslcipher` has a separate 192-byte
-response and USB frame budget, so its maximum is 24 IDs and its top count bucket is `17-24`.
-The host parser accepts one bounded response line with unique one-to-four-digit hexadecimal IDs.
-Malformed, duplicate, out-of-range, and control-character input fails closed.
+response and USB frame budget. The owner parses the capability line incrementally, including a line
+longer than its 768-byte carry, then emits only the bounded canonical summary
+`+MSSLCIPHER: SUMMARY;v=1;known=0xNN;count=N;unknown=0|1` followed by `OK`.
+The input grammar accepts one-to-four-digit hexadecimal IDs with an optional `0x` prefix, optional
+ASCII spaces, and optional parentheses. Malformed, empty, duplicate known, out-of-range, control,
+inconsistent-parenthesis, trailing-junk, and `uint16_t` count-overflow input fails closed. Unknown
+duplicates are counted without retaining a raw ID set. The host keeps the legacy bounded response
+parser for compatibility/tests and accepts summary counts through `0xFFFF`, with `25+` as the top
+count bucket.
 The JSON result contains `c02b`, `c02c`, `c02f`, and `c030` support booleans, a bounded `count`, and `count_bucket`.
 It contains `unknown_present` and named filter telemetry booleans: `other_line_present`, `line_overflow`,
 `contains_msslcipher_token`, `contains_exact_official_prefix_anywhere`,
 `leading_whitespace_before_prefix`, `parentheses_present`, and `comma_present`.
 `other_line_present` is `false` when the owner filter sees no extra line and `true` when it sees a non-final line rejected or moved by the exact response-prefix filter. The remaining fields contain only bounded line-shape observations; the result does not contain raw response text or unknown IDs.
+An accepted overlong capability line can set `line_overflow` while leaving `other_line_present` false.
 This change adds the command and schema only. It does not claim a live hardware result.
 
 Web 設定備份與簽章 OTA 也使用同一個入口。密碼只從 `SMS_WEB_PASSWORD` 或 mode 0600

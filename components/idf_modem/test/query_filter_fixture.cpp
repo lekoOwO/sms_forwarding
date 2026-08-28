@@ -2,6 +2,7 @@
 #include "idf_modem_cpol_summary.h"
 #include "idf_modem_registration.h"
 
+#include <algorithm>
 #include <cassert>
 #include <condition_variable>
 #include <cstdint>
@@ -600,16 +601,16 @@ int main()
         "AT+MSSLCIPHER=?\r\n"
         "+MSSLCIPHER: (C02B,C02C,C02F,C030,1301)\r\n"
         "+OTHER: unsolicited\r\n"
-        "+MSSLCIPHER: duplicate\r\n"
         "OK\r\n";
     msslcipher.feed(msslcipher_input.data(), msslcipher_input.size());
-    assert(msslcipher.response().find("+MSSLCIPHER: (C02B,C02C,C02F,C030,1301)") !=
+    assert(msslcipher.response().find(
+               "+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=5;unknown=1") !=
            std::string::npos);
+    assert(msslcipher.response().find("C02B") == std::string::npos);
     assert(msslcipher.response().find("OK") != std::string::npos);
     assert(msslcipher.response().find("+OTHER:") == std::string::npos);
-    assert(msslcipher.response().find("duplicate") == std::string::npos);
+    assert(msslcipher.urcs().find("C02B") == std::string::npos);
     assert(msslcipher.urcs().find("+OTHER: unsolicited") != std::string::npos);
-    assert(msslcipher.urcs().find("+MSSLCIPHER: duplicate") != std::string::npos);
     assert(msslcipher.other_line_present());
 
     IdfModemQueryResponseFilter msslcipher_bare(
@@ -664,9 +665,10 @@ int main()
     const std::string msslcipher_overflow_input =
         "AT+MSSLCIPHER=?\r\n" + msslcipher_overflow_line + "\r\nOK\r\n";
     msslcipher_overflow.feed(msslcipher_overflow_input.data(), msslcipher_overflow_input.size());
-    assert(msslcipher_overflow.other_line_present());
-    assert(msslcipher_overflow.msslcipher_telemetry() &
-           IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT);
+    assert(!msslcipher_overflow.other_line_present());
+    assert(msslcipher_overflow.response().find(
+               "+MSSLCIPHER: SUMMARY;v=1;known=0x03;count=2;unknown=0") !=
+           std::string::npos);
     assert(msslcipher_overflow.msslcipher_telemetry() &
            IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW);
     assert(msslcipher_overflow.msslcipher_telemetry() &
@@ -686,6 +688,72 @@ int main()
         "AT+MSSLCIPHER=?\r\n+UNEXPECTED: value\r\nOK\r\n";
     msslcipher_other.feed(msslcipher_other_input.data(), msslcipher_other_input.size());
     assert(msslcipher_other.other_line_present());
+
+    IdfModemQueryResponseFilter msslcipher_long(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    std::string msslcipher_long_line =
+        "+MSSLCIPHER: 1,0x16,03D,C02B,0xC02C,C02F,0xc030";
+    for (int i = 0; i < 260; ++i) msslcipher_long_line += ",16";
+    assert(msslcipher_long_line.size() > 768);
+    const std::string msslcipher_long_input =
+        "AT+MSSLCIPHER=?\r\n" + msslcipher_long_line + "\r\nOK\r\n";
+    for (size_t offset = 0; offset < msslcipher_long_input.size(); offset += 17) {
+        const size_t length = std::min<size_t>(17, msslcipher_long_input.size() - offset);
+        msslcipher_long.feed(msslcipher_long_input.data() + offset, length);
+    }
+    assert(msslcipher_long.response().find(
+               "+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=267;unknown=1") !=
+           std::string::npos);
+    assert(msslcipher_long.response().find("C02B") == std::string::npos);
+    assert(msslcipher_long.response().find("OK") != std::string::npos);
+    assert(msslcipher_long.urcs().find("C02B") == std::string::npos);
+    assert(!msslcipher_long.other_line_present());
+    assert(!(msslcipher_long.msslcipher_telemetry() &
+             IDF_MODEM_MSSLCIPHER_TELEMETRY_PARENTHESES_PRESENT));
+    assert(msslcipher_long.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW);
+    assert(msslcipher_long.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN);
+    assert(msslcipher_long.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE);
+    assert(msslcipher_long.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_COMMA_PRESENT);
+
+    for (const std::string malformed : {
+             "+MSSLCIPHER: C02B,\tC02C\r\nOK\r\n",
+             "+MSSLCIPHER: C02B,C02B\r\nOK\r\n",
+             "+MSSLCIPHER: C02B,10000\r\nOK\r\n",
+             "+MSSLCIPHER: C02B,\r\nOK\r\n",
+             "+MSSLCIPHER: (C02B\r\nOK\r\n",
+             "+MSSLCIPHER: C02B)\r\nOK\r\n",
+             "+MSSLCIPHER: C02B\x01\r\nOK\r\n",
+         }) {
+        IdfModemQueryResponseFilter invalid(
+            "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+        invalid.feed(malformed.data(), malformed.size());
+        assert(invalid.other_line_present());
+        assert(invalid.response().find("SUMMARY") == std::string::npos);
+        assert(invalid.response().find("C02B") == std::string::npos);
+    }
+
+    std::string count_overflow = "+MSSLCIPHER: 1";
+    for (int i = 1; i < 65536; ++i) count_overflow += ",1";
+    count_overflow += "\r\nOK\r\n";
+    IdfModemQueryResponseFilter overflow_count(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    overflow_count.feed(count_overflow.data(), count_overflow.size());
+    assert(overflow_count.other_line_present());
+    assert(overflow_count.msslcipher_telemetry() &
+           IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW);
+    assert(overflow_count.response().find("SUMMARY") == std::string::npos);
+
+    IdfModemQueryResponseFilter final_error(
+        "AT+MSSLCIPHER=?", "+MSSLCIPHER:", "", false);
+    const std::string final_error_input =
+        "AT+MSSLCIPHER=?\r\n+MSSLCIPHER: C02B\r\nERROR\r\n";
+    final_error.feed(final_error_input.data(), final_error_input.size());
+    assert(final_error.response().find("SUMMARY") == std::string::npos);
+    assert(final_error.response().find("ERROR") != std::string::npos);
 
     IdfModemQueryResponseFilter cereg_filter("AT+CEREG?", "+CEREG:", "", false);
     const std::string cereg_interleaved =

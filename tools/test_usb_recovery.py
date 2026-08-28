@@ -607,6 +607,48 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         self.assertEqual(mixed["count_bucket"], "5-8")
         self.assertTrue(mixed["unknown_present"])
 
+    def test_msslcipher_sanitizer_accepts_bounded_firmware_summary(self):
+        summary = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=267;unknown=1\r\nOK\r\n",
+        )
+        self.assertEqual(summary, {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": True,
+            "supported": {"c02b": True, "c02c": True, "c02f": True, "c030": True},
+            "count": 267,
+            "count_bucket": "25+",
+            "unknown_present": True,
+            "other_line_present": False,
+        })
+        encoded = json.dumps(summary, sort_keys=True)
+        for value in ("C02B", "C02C", "C02F", "C030", "raw", "ids"):
+            self.assertNotIn(value, encoded)
+        streamed = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=267;unknown=1\r\nOK\r\n",
+            msslcipher_telemetry=(
+                usb_recovery.MSSLCIPHER_TELEMETRY_LINE_OVERFLOW
+                | usb_recovery.MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN
+                | usb_recovery.MSSLCIPHER_TELEMETRY_CONTAINS_EXACT_OFFICIAL_PREFIX_ANYWHERE
+                | usb_recovery.MSSLCIPHER_TELEMETRY_COMMA_PRESENT
+            ),
+        )
+        self.assertTrue(streamed["valid"])
+        self.assertTrue(streamed["line_overflow"])
+        self.assertFalse(streamed["other_line_present"])
+
+        for malformed in (
+            b"+MSSLCIPHER: SUMMARY;v=2;known=0x0F;count=267;unknown=1\r\nOK\r\n",
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x10;count=267;unknown=1\r\nOK\r\n",
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=0;unknown=1\r\nOK\r\n",
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=65536;unknown=1\r\nOK\r\n",
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertFalse(
+                    usb_recovery.sanitize_query_response(MSSLCIPHER_QUERY_ID, malformed)["valid"]
+                )
+
     def test_msslcipher_sanitizer_rejects_malformed_duplicate_range_and_control(self):
         cases = (
             b"+MSSLCIPHER: (C02B,C02C,C02F)\r\nERROR\r\n",

@@ -1682,7 +1682,7 @@ def _safe_batch_result(name: str, result: dict[str, object]) -> bool:
             and all(isinstance(value, bool) for value in supported.values())
             and isinstance(count, int)
             and not isinstance(count, bool)
-            and 0 <= count <= usb_recovery.MSSLCIPHER_MAX_IDS
+            and 0 < count <= usb_recovery.MSSLCIPHER_SUMMARY_MAX_COUNT
             and result["count_bucket"] == usb_recovery.msslcipher_count_bucket(count)
             and result["count_bucket"] in usb_recovery.MSSLCIPHER_COUNT_BUCKETS
             and isinstance(result["unknown_present"], bool)

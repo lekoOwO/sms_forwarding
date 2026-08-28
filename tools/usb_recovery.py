@@ -445,6 +445,10 @@ _MSSLCIPHER = re.compile(
     rf"{_MSSLCIPHER_ID}(?:[ ]*,[ ]*{_MSSLCIPHER_ID}){{0,23}}"
     r")?[ ]*\)$"
 )
+_MSSLCIPHER_SUMMARY = re.compile(
+    r"^\+MSSLCIPHER: SUMMARY;v=1;known=0x(?P<known>[0-9A-Fa-f]{2});"
+    r"count=(?P<count>[0-9]{1,5});unknown=(?P<unknown>[01])$"
+)
 _PDP_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,15}")
 _CEREG_STATUS = re.compile(
     r"^\+CEREG:[ ]*([0-5])[ ]*,[ ]*(0|[1-5]|11)$"
@@ -515,7 +519,9 @@ _MSSLCIPHER_KNOWN_IDS = {
     "c030": 0xC030,
 }
 MSSLCIPHER_MAX_IDS = 24
-MSSLCIPHER_COUNT_BUCKETS = ("0", "1-4", "5-8", "9-16", "17-24")
+MSSLCIPHER_SUMMARY_MAX_COUNT = 0xFFFF
+MSSLCIPHER_SUMMARY_KNOWN_MASK = 0x0F
+MSSLCIPHER_COUNT_BUCKETS = ("0", "1-4", "5-8", "9-16", "17-24", "25+")
 
 
 def msslcipher_count_bucket(count: int) -> str:
@@ -527,7 +533,9 @@ def msslcipher_count_bucket(count: int) -> str:
         return "5-8"
     if count <= 16:
         return "9-16"
-    return "17-24"
+    if count <= MSSLCIPHER_MAX_IDS:
+        return "17-24"
+    return "25+"
 
 
 def parse_ati_summary(payload: bytes) -> dict[str, str | None]:
@@ -1069,11 +1077,34 @@ def _sanitize_msslcipher(payload: bytes,
     data = _query_data_lines(payload, MSSLCIPHER_MAX_RESPONSE)
     if data is None or len(data) != 1:
         return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
+    summary_match = _MSSLCIPHER_SUMMARY.fullmatch(data[0])
+    if summary_match is not None:
+        known_bits = int(summary_match.group("known"), 16)
+        count = int(summary_match.group("count"))
+        if (known_bits & ~MSSLCIPHER_SUMMARY_KNOWN_MASK) or not 0 < count <= MSSLCIPHER_SUMMARY_MAX_COUNT:
+            return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
+        result = {
+            "query_id": query_id,
+            "valid": True,
+            "supported": {
+                "c02b": bool(known_bits & 0x01),
+                "c02c": bool(known_bits & 0x02),
+                "c02f": bool(known_bits & 0x04),
+                "c030": bool(known_bits & 0x08),
+            },
+            "count": count,
+            "count_bucket": msslcipher_count_bucket(count),
+            "unknown_present": summary_match.group("unknown") == "1",
+        }
+        result.update(_msslcipher_telemetry_fields(msslcipher_telemetry, other_line_present))
+        return result
     match = _MSSLCIPHER.fullmatch(data[0])
     if match is None:
         return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
     tokens = [] if not match.group("ids") else match.group("ids").split(",")
     ids: list[int] = []
+    if not tokens:
+        return _invalid_msslcipher_response(other_line_present, msslcipher_telemetry)
     for token in tokens:
         token = token.strip(" ")
         if token[:2].lower() == "0x":

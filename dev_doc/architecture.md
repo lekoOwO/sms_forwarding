@@ -26,13 +26,20 @@ USB recovery。它是 USB Serial/JTAG 的唯一管理資料 owner，只提供狀
 
 The `msslcipher` query uses ID `0x12` and sends the exact command `AT+MSSLCIPHER=?`.
 The 17 older queries keep their 96-byte response limit. `msslcipher` uses a separate 192-byte
-response and frame budget. With the accepted one-to-four-digit ID syntax, this permits at most 24 IDs.
-The host accepts one bounded `+MSSLCIPHER: (...)` response line with unique hexadecimal IDs.
-The result reports fixed support booleans, a bounded count, a `17-24` top count bucket, and `unknown_present`.
+response and frame budget. The owner parses the capability line incrementally, including lines longer
+than its 768-byte carry, and emits only the bounded canonical summary
+`+MSSLCIPHER: SUMMARY;v=1;known=0xNN;count=N;unknown=0|1` followed by `OK`.
+The input grammar accepts one-to-four-digit hexadecimal IDs with an optional `0x` prefix, optional
+ASCII spaces, and optional parentheses. The four known IDs are reported as bits; unknown duplicate
+IDs are counted without retaining an ID set, while a token after `0xFFFF` IDs is rejected.
+The host keeps the legacy bounded `+MSSLCIPHER: (...)` parser for compatibility/tests and accepts
+the firmware summary with a `25+` top count bucket.
+The result reports fixed support booleans, a bounded count, and `unknown_present`.
 It also reports named filter telemetry booleans: `other_line_present`, `line_overflow`,
 `contains_msslcipher_token`, `contains_exact_official_prefix_anywhere`,
 `leading_whitespace_before_prefix`, `parentheses_present`, and `comma_present`.
 `other_line_present` is `true` when the owner filter saw at least one non-final line rejected or moved by the exact response-prefix filter; the remaining fields describe only bounded line-shape observations.
+An accepted overlong capability line can set `line_overflow` while leaving `other_line_present` false.
 The result does not contain raw response text or unknown IDs. This change records no live hardware result.
 
 `idf_modem` 是 UART1 的唯一 owner。其他元件透過有界 command queue 執行 AT 操作。

@@ -1128,6 +1128,16 @@ class DeviceCommandTest(unittest.TestCase):
         self.assertTrue(device._safe_batch_result("msslcipher", result))
         self.assertFalse(device._safe_batch_result("msslcipher", {**result, "raw": "C02B"}))
 
+    def test_msslcipher_batch_schema_accepts_streamed_summary_count(self):
+        result = usb_recovery.sanitize_query_response(
+            usb_recovery.QUERY_MSSLCIPHER,
+            b"+MSSLCIPHER: SUMMARY;v=1;known=0x0F;count=267;unknown=1\r\nOK\r\n",
+        )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["count"], 267)
+        self.assertEqual(result["count_bucket"], "25+")
+        self.assertTrue(device._safe_batch_result("msslcipher", result))
+
     def test_reset_is_dry_run_by_default(self):
         with mock.patch.object(device.subprocess, "run") as run:
             result, output = self.run_main(["--device", DEVICE, "reset"])

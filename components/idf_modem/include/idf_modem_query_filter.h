@@ -74,10 +74,8 @@ public:
                     carry_ += ch;
                 } else {
                     if (track_other_line_) {
-                        other_line_present_ = true;
-                        msslcipher_telemetry_ |=
-                            IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT |
-                            IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW;
+                        msslcipher_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_LINE_OVERFLOW;
+                        msslcipher_line_overflowed_ = true;
                     }
                     carry_.clear();
                     waiting_for_pdu_ = false;
@@ -159,6 +157,7 @@ private:
             if (prefix_leading_whitespace_) {
                 line_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_LEADING_WHITESPACE_BEFORE_PREFIX;
             }
+            msslcipher_summary_line_candidate_ = true;
             prefix_match_ = 0;
             prefix_leading_whitespace_ = false;
         }
@@ -173,19 +172,273 @@ private:
             token_match_ = 0;
         }
 
+        observe_msslcipher_summary_char(ch);
         line_has_data_ = true;
         if (!std::isspace(static_cast<unsigned char>(ch))) line_only_whitespace_ = false;
     }
 
-    void finish_msslcipher_line(bool echo)
+    enum class MsslcipherSummaryState : uint8_t {
+        leading,
+        prefix,
+        after_prefix,
+        token_start,
+        token,
+        after_token,
+        closed,
+        invalid,
+    };
+
+    static bool is_hex_digit(char ch)
     {
-        if (!echo) msslcipher_telemetry_ |= line_telemetry_;
+        return std::isxdigit(static_cast<unsigned char>(ch));
+    }
+
+    static uint8_t hex_digit_value(char ch)
+    {
+        if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
+        if (ch >= 'A' && ch <= 'F') return static_cast<uint8_t>(ch - 'A' + 10);
+        return static_cast<uint8_t>(ch - 'a' + 10);
+    }
+
+    static uint8_t msslcipher_known_bit(uint16_t value)
+    {
+        switch (value) {
+            case 0xC02B: return IDF_MODEM_MSSLCIPHER_SUMMARY_C02B;
+            case 0xC02C: return IDF_MODEM_MSSLCIPHER_SUMMARY_C02C;
+            case 0xC02F: return IDF_MODEM_MSSLCIPHER_SUMMARY_C02F;
+            case 0xC030: return IDF_MODEM_MSSLCIPHER_SUMMARY_C030;
+            default: return 0;
+        }
+    }
+
+    void invalidate_msslcipher_summary_line()
+    {
+        msslcipher_summary_state_ = MsslcipherSummaryState::invalid;
+    }
+
+    bool append_msslcipher_summary_digit(char ch)
+    {
+        if (!is_hex_digit(ch) || msslcipher_summary_token_digits_ >= 4) return false;
+        msslcipher_summary_token_value_ = static_cast<uint16_t>(
+            (msslcipher_summary_token_value_ << 4) | hex_digit_value(ch));
+        ++msslcipher_summary_token_digits_;
+        return true;
+    }
+
+    bool finish_msslcipher_summary_token()
+    {
+        if (msslcipher_summary_token_zero_pending_) {
+            if (!append_msslcipher_summary_digit('0')) return false;
+            msslcipher_summary_token_zero_pending_ = false;
+        }
+        if (msslcipher_summary_token_digits_ == 0 ||
+            msslcipher_line_count_ == IDF_MODEM_MSSLCIPHER_SUMMARY_MAX_COUNT) {
+            return false;
+        }
+        ++msslcipher_line_count_;
+        const uint8_t known_bit = msslcipher_known_bit(msslcipher_summary_token_value_);
+        if (known_bit != 0) {
+            if ((msslcipher_line_known_bits_ & known_bit) != 0) return false;
+            msslcipher_line_known_bits_ |= known_bit;
+        } else {
+            // ponytail: accept unknown duplicates without an ID set; add bounded duplicate tracking
+            // only if the modem contract later requires it.
+            msslcipher_line_unknown_present_ = true;
+        }
+        msslcipher_summary_token_digits_ = 0;
+        msslcipher_summary_token_value_ = 0;
+        return true;
+    }
+
+    void start_msslcipher_summary_token(char ch)
+    {
+        msslcipher_summary_token_digits_ = 0;
+        msslcipher_summary_token_value_ = 0;
+        msslcipher_summary_token_zero_pending_ = ch == '0';
+        msslcipher_summary_state_ = MsslcipherSummaryState::token;
+        if (!msslcipher_summary_token_zero_pending_ && !append_msslcipher_summary_digit(ch)) {
+            invalidate_msslcipher_summary_line();
+        }
+    }
+
+    void consume_msslcipher_summary_after_token(char ch)
+    {
+        if (ch == ' ') {
+            msslcipher_summary_state_ = MsslcipherSummaryState::after_token;
+        } else if (ch == ',') {
+            msslcipher_summary_state_ = MsslcipherSummaryState::token_start;
+        } else if (ch == ')' && msslcipher_summary_open_paren_) {
+            msslcipher_summary_state_ = MsslcipherSummaryState::closed;
+        } else {
+            invalidate_msslcipher_summary_line();
+        }
+    }
+
+    void consume_msslcipher_summary_token(char ch)
+    {
+        if (msslcipher_summary_token_zero_pending_) {
+            if (ch == 'x' || ch == 'X') {
+                msslcipher_summary_token_zero_pending_ = false;
+                return;
+            }
+            if (!append_msslcipher_summary_digit('0')) {
+                invalidate_msslcipher_summary_line();
+                return;
+            }
+            msslcipher_summary_token_zero_pending_ = false;
+        }
+        if (is_hex_digit(ch)) {
+            if (!append_msslcipher_summary_digit(ch)) invalidate_msslcipher_summary_line();
+            return;
+        }
+        if (ch == ' ' || ch == ',' || ch == ')') {
+            if (!finish_msslcipher_summary_token()) {
+                invalidate_msslcipher_summary_line();
+                return;
+            }
+            consume_msslcipher_summary_after_token(ch);
+            return;
+        }
+        invalidate_msslcipher_summary_line();
+    }
+
+    void observe_msslcipher_summary_char(char ch)
+    {
+        constexpr std::string_view prefix = "+MSSLCIPHER:";
+        if (msslcipher_summary_state_ == MsslcipherSummaryState::invalid) return;
+        switch (msslcipher_summary_state_) {
+            case MsslcipherSummaryState::leading:
+                if (ch == ' ') return;
+                if (ch != '+') {
+                    invalidate_msslcipher_summary_line();
+                    return;
+                }
+                msslcipher_summary_prefix_index_ = 1;
+                msslcipher_summary_state_ = MsslcipherSummaryState::prefix;
+                return;
+            case MsslcipherSummaryState::prefix:
+                if (msslcipher_summary_prefix_index_ >= prefix.size() ||
+                    ch != prefix[msslcipher_summary_prefix_index_]) {
+                    invalidate_msslcipher_summary_line();
+                    return;
+                }
+                ++msslcipher_summary_prefix_index_;
+                if (msslcipher_summary_prefix_index_ == prefix.size()) {
+                    msslcipher_summary_line_candidate_ = true;
+                    msslcipher_summary_state_ = MsslcipherSummaryState::after_prefix;
+                }
+                return;
+            case MsslcipherSummaryState::after_prefix:
+                if (ch == ' ') return;
+                if (ch == '(' && !msslcipher_summary_open_paren_) {
+                    msslcipher_summary_open_paren_ = true;
+                    msslcipher_summary_state_ = MsslcipherSummaryState::token_start;
+                    return;
+                }
+                if (is_hex_digit(ch)) {
+                    start_msslcipher_summary_token(ch);
+                    return;
+                }
+                invalidate_msslcipher_summary_line();
+                return;
+            case MsslcipherSummaryState::token_start:
+                if (ch == ' ') return;
+                if (is_hex_digit(ch)) {
+                    start_msslcipher_summary_token(ch);
+                    return;
+                }
+                invalidate_msslcipher_summary_line();
+                return;
+            case MsslcipherSummaryState::token:
+                consume_msslcipher_summary_token(ch);
+                return;
+            case MsslcipherSummaryState::after_token:
+                consume_msslcipher_summary_after_token(ch);
+                return;
+            case MsslcipherSummaryState::closed:
+                if (ch != ' ') invalidate_msslcipher_summary_line();
+                return;
+            case MsslcipherSummaryState::invalid:
+                return;
+        }
+    }
+
+    bool finish_msslcipher_summary_line()
+    {
+        if (msslcipher_summary_state_ == MsslcipherSummaryState::token) {
+            if (!finish_msslcipher_summary_token()) {
+                invalidate_msslcipher_summary_line();
+            } else {
+                msslcipher_summary_state_ = MsslcipherSummaryState::after_token;
+            }
+        }
+        if (!msslcipher_summary_line_candidate_ ||
+            msslcipher_summary_state_ == MsslcipherSummaryState::invalid ||
+            msslcipher_line_count_ == 0 ||
+            (msslcipher_summary_open_paren_
+                 ? msslcipher_summary_state_ != MsslcipherSummaryState::closed
+                 : msslcipher_summary_state_ != MsslcipherSummaryState::after_token)) {
+            return false;
+        }
+        return true;
+    }
+
+    bool finish_msslcipher_line(bool echo)
+    {
+        const bool has_token = (line_telemetry_ &
+                                IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN) != 0;
+        const bool partial_prefix = prefix_match_ != 0;
+        const bool candidate = msslcipher_summary_line_candidate_;
+        bool accepted = false;
+        if (!echo) {
+            msslcipher_telemetry_ |= line_telemetry_;
+            const bool valid = finish_msslcipher_summary_line();
+            if (candidate || has_token || partial_prefix) {
+                if (candidate && valid && !msslcipher_summary_seen_ &&
+                    !msslcipher_summary_invalid_) {
+                    msslcipher_summary_seen_ = true;
+                    msslcipher_summary_known_bits_ = msslcipher_line_known_bits_;
+                    msslcipher_summary_total_count_ = msslcipher_line_count_;
+                    msslcipher_summary_total_unknown_present_ = msslcipher_line_unknown_present_;
+                    accepted = true;
+                } else {
+                    msslcipher_summary_invalid_ = true;
+                }
+            }
+        }
         line_telemetry_ = 0;
         line_has_data_ = false;
         line_only_whitespace_ = true;
         prefix_match_ = 0;
         token_match_ = 0;
         prefix_leading_whitespace_ = false;
+        msslcipher_summary_state_ = MsslcipherSummaryState::leading;
+        msslcipher_summary_prefix_index_ = 0;
+        msslcipher_summary_line_candidate_ = false;
+        msslcipher_line_overflowed_ = false;
+        msslcipher_summary_open_paren_ = false;
+        msslcipher_summary_token_zero_pending_ = false;
+        msslcipher_summary_token_digits_ = 0;
+        msslcipher_summary_token_value_ = 0;
+        msslcipher_line_known_bits_ = 0;
+        msslcipher_line_count_ = 0;
+        msslcipher_line_unknown_present_ = false;
+        return accepted;
+    }
+
+    std::string msslcipher_summary_response() const
+    {
+        static constexpr char hex[] = "0123456789ABCDEF";
+        std::string line = "+MSSLCIPHER: SUMMARY;v=";
+        line += std::to_string(IDF_MODEM_MSSLCIPHER_SUMMARY_VERSION);
+        line += ";known=0x";
+        line += hex[(msslcipher_summary_known_bits_ >> 4) & 0x0F];
+        line += hex[msslcipher_summary_known_bits_ & 0x0F];
+        line += ";count=";
+        line += std::to_string(msslcipher_summary_total_count_);
+        line += ";unknown=";
+        line += msslcipher_summary_total_unknown_present_ ? "1" : "0";
+        return line;
     }
 
     void append_response(const std::string& line)
@@ -202,7 +455,23 @@ private:
         std::string line = trim(carry_, response_prefix_ == "+CEREG:");
         carry_.clear();
         const bool echo = line == command_;
-        if (track_other_line_) finish_msslcipher_line(echo);
+        bool msslcipher_line = false;
+        bool msslcipher_line_accepted = false;
+        if (track_other_line_) {
+            msslcipher_line = msslcipher_summary_line_candidate_ ||
+                              prefix_match_ != 0 ||
+                              msslcipher_line_overflowed_ ||
+                              (line_telemetry_ &
+                               IDF_MODEM_MSSLCIPHER_TELEMETRY_CONTAINS_MSSLCIPHER_TOKEN);
+            msslcipher_line_accepted = finish_msslcipher_line(echo);
+        }
+        if (msslcipher_line) {
+            if (!echo && !msslcipher_line_accepted) {
+                other_line_present_ = true;
+                msslcipher_telemetry_ |= IDF_MODEM_MSSLCIPHER_TELEMETRY_OTHER_LINE_PRESENT;
+            }
+            return;
+        }
         if (line.empty()) return;
 
         // Echo is transport noise, not a solicited query result. In particular,
@@ -236,6 +505,11 @@ private:
         }
 
         if (solicited && !pdu) {
+            if (track_other_line_ && line == "OK" && msslcipher_summary_seen_ &&
+                !msslcipher_summary_invalid_ && !msslcipher_summary_emitted_) {
+                append_response(msslcipher_summary_response());
+                msslcipher_summary_emitted_ = true;
+            }
             append_response(line);
         } else {
             urcs_ += line;
@@ -266,5 +540,22 @@ private:
     bool prefix_leading_whitespace_ = false;
     bool line_has_data_ = false;
     bool line_only_whitespace_ = true;
+    MsslcipherSummaryState msslcipher_summary_state_ = MsslcipherSummaryState::leading;
+    size_t msslcipher_summary_prefix_index_ = 0;
+    bool msslcipher_summary_line_candidate_ = false;
+    bool msslcipher_line_overflowed_ = false;
+    bool msslcipher_summary_open_paren_ = false;
+    bool msslcipher_summary_token_zero_pending_ = false;
+    uint8_t msslcipher_summary_token_digits_ = 0;
+    uint16_t msslcipher_summary_token_value_ = 0;
+    uint8_t msslcipher_line_known_bits_ = 0;
+    uint16_t msslcipher_line_count_ = 0;
+    bool msslcipher_line_unknown_present_ = false;
+    bool msslcipher_summary_seen_ = false;
+    bool msslcipher_summary_invalid_ = false;
+    bool msslcipher_summary_emitted_ = false;
+    uint8_t msslcipher_summary_known_bits_ = 0;
+    uint16_t msslcipher_summary_total_count_ = 0;
+    bool msslcipher_summary_total_unknown_present_ = false;
     size_t response_limit_ = 0;
 };
