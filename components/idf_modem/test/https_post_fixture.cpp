@@ -1,4 +1,5 @@
 #include "idf_modem_https.h"
+#include "idf_modem_query_filter.h"
 #include "idf_modem_registration.h"
 
 #include <algorithm>
@@ -26,6 +27,11 @@ static const std::string certificate_name =
     "ca_abababababababababababababababababababababababababababab.pem";
 static const std::string certificate_pem =
     "-----BEGIN CERTIFICATE-----\nREVS\n-----END CERTIFICATE-----\n";
+static constexpr int64_t fixture_epoch = 1704067200;
+static const std::string clock_set_command =
+    "AT+CCLK=\"24/01/01,00:00:00+00\"";
+static constexpr std::string_view clock_error =
+    "HTTPS modem clock synchronization failed";
 static_assert(3 + 56 + 4 <= IDF_MODEM_HTTPS_CERT_NAME_MAX);
 
 struct OwnerTransportFixture {
@@ -36,6 +42,10 @@ struct OwnerTransportFixture {
         cert_write,
         cert_prompt,
         cert_read,
+        clock_set,
+        clock_set_timeout,
+        clock_readback,
+        clock_readback_timeout,
         auth,
         cert_bind,
         encoding,
@@ -59,6 +69,10 @@ struct OwnerTransportFixture {
     bool cleanup_ok = true;
     bool abandoned = false;
     bool request_expired = false;
+    bool omit_clock_callback = false;
+    int64_t epoch = fixture_epoch;
+    std::string clock_readback = "+CCLK: \"24/01/01,00:00:00+00\"\r\nOK\r\n";
+    bool clock_set_seen = false;
     bool first_cleanup_timeout = false;
     bool second_cleanup_timeout = false;
     StaleFailure stale_failure = StaleFailure::none;
@@ -74,6 +88,7 @@ struct OwnerTransportFixture {
         std::string_view raw_payload, bool cleanup, bool tolerate_modem_error);
     static IdfModemHttpsCommandResult wait_response(
         void* context, uint8_t http_id, IdfModemHttpsPostResult& result);
+    static int64_t current_epoch(void* context);
 
     bool run(const IdfModemHttpsPostRequest& request, std::string_view model,
              int cereg_stat)
@@ -83,7 +98,8 @@ struct OwnerTransportFixture {
             return false;
         }
         pinned_certificate = certificate_pem;
-        IdfModemHttpsCallbacks callbacks{this, &send_command, &wait_response};
+        const IdfModemHttpsGetEpoch clock = omit_clock_callback ? nullptr : &current_epoch;
+        IdfModemHttpsCallbacks callbacks{this, &send_command, &wait_response, clock};
         IdfModemHttpsPostResult result;
         last_run_result = idf_modem_https_run_post(request, callbacks, result);
         const bool ok = last_run_result == IdfModemHttpsRunResult::ok;
@@ -91,6 +107,11 @@ struct OwnerTransportFixture {
         return ok;
     }
 };
+
+int64_t OwnerTransportFixture::current_epoch(void* context)
+{
+    return static_cast<OwnerTransportFixture*>(context)->epoch;
+}
 
 IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
     void* context, std::string_view command, std::string& response,
@@ -135,6 +156,25 @@ IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
     if (fail(OwnerTransportFixture::FailureStage::cert_read) &&
         command == "AT+MSSLCERTRD=\"" + certificate_name + "\"") {
         return IdfModemHttpsCommandResult::failed;
+    }
+    if (command.rfind("AT+CCLK=\"", 0) == 0) {
+        fixture.clock_set_seen = true;
+        if (fail(OwnerTransportFixture::FailureStage::clock_set)) {
+            return IdfModemHttpsCommandResult::failed;
+        }
+        if (fail(OwnerTransportFixture::FailureStage::clock_set_timeout)) {
+            return IdfModemHttpsCommandResult::timeout;
+        }
+        response = "OK\r\n";
+    }
+    if (command == "AT+CCLK?") {
+        if (fail(OwnerTransportFixture::FailureStage::clock_readback)) {
+            return IdfModemHttpsCommandResult::failed;
+        }
+        if (fail(OwnerTransportFixture::FailureStage::clock_readback_timeout)) {
+            return IdfModemHttpsCommandResult::timeout;
+        }
+        response = fixture.clock_readback;
     }
     if (fail(OwnerTransportFixture::FailureStage::auth) &&
         command == "AT+MSSLCFG=\"auth\",1,1") return IdfModemHttpsCommandResult::failed;
@@ -212,6 +252,8 @@ IdfModemHttpsCommandResult OwnerTransportFixture::wait_response(
 static std::vector<std::string> expected_writes()
 {
     return {
+        clock_set_command,
+        "AT+CCLK?",
         "AT+MSSLLIST=1",
         "AT+MSSLCERTRD=\"" + certificate_name + "\"",
         "AT+CGDCONT=1,\"IP\",\"internet\"",
@@ -291,6 +333,24 @@ static void feed_fragmented_success()
     assert(!timeout.complete());
 }
 
+static void filter_interleaved_clock_response()
+{
+    IdfModemQueryResponseFilter filter("AT+CCLK?", "+CCLK:", "", false);
+    const std::string input =
+        "+CEREG: 1,1\r\n+CMT: \"+886900000\",145\r\n"
+        "00112233445566778899AABBCCDDEEFF\r\n"
+        "+CCLK: \"24/01/01,00:00:00+00\"\r\n"
+        "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n";
+    filter.feed(input.data(), input.size());
+    filter.flush_pending();
+    assert(filter.response() ==
+           "+CCLK: \"24/01/01,00:00:00+00\"\r\n"
+           "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n");
+    assert(filter.urcs().find("+CEREG:") != std::string::npos);
+    assert(filter.urcs().find("+CMT:") != std::string::npos);
+    assert(filter.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
+}
+
 int main()
 {
     const IdfModemHttpsPostRequest request = request_fixture();
@@ -304,6 +364,7 @@ int main()
     assert(owner.body_prompt_seen);
     assert(owner.raw_body == request.body);
     assert(owner.raw_body.find('\x1a') == std::string::npos);
+    assert(owner.clock_set_seen);
     assert(idf_modem_https_content_command(7, IDF_MODEM_HTTPS_POST_MAX_BODY) ==
            "AT+MHTTPCONTENT=7,0,4096");
 
@@ -354,6 +415,87 @@ int main()
     assert(!expired.run(request, "ML307A", 1));
     assert(expired.writes.back() == "AT+CGACT=0,1");
 
+    for (const int64_t invalid_epoch : {int64_t(-1), int64_t(0), int64_t(2145916800)}) {
+        OwnerTransportFixture invalid_time;
+        invalid_time.epoch = invalid_epoch;
+        assert(!invalid_time.run(request, "ML307A", 1));
+        assert(invalid_time.writes.empty());
+        assert(invalid_time.last_result.message == clock_error);
+    }
+
+    for (const std::string_view invalid_readback : {
+             std::string_view("+CCLK: \"24/01/02,00:00:00+00\"\r\nOK\r\n"),
+             std::string_view("+CCLK: \"24/01/01,00:00:00+08\"\r\nOK\r\n"),
+             std::string_view("+CCLK: \"24/01/01,00:00:00+00\"\r\n"),
+             std::string_view("+CCLK: \"24/01/01,00:00:00+00\"\r\n"
+                              "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n"),
+             std::string_view("+CCLK: \"24/02/30,00:00:00+00\"\r\nOK\r\n"),
+         }) {
+        OwnerTransportFixture invalid_clock;
+        invalid_clock.clock_readback = invalid_readback;
+        assert(!invalid_clock.run(request, "ML307A", 1));
+        assert(invalid_clock.writes ==
+               std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
+        assert(invalid_clock.last_result.message == clock_error);
+    }
+
+    OwnerTransportFixture clock_set_failure;
+    clock_set_failure.fail_stage = OwnerTransportFixture::FailureStage::clock_set;
+    assert(!clock_set_failure.run(request, "ML307A", 1));
+    assert(clock_set_failure.writes == std::vector<std::string>({clock_set_command}));
+    assert(clock_set_failure.last_run_result == IdfModemHttpsRunResult::command_failed);
+    assert(clock_set_failure.last_result.message == clock_error);
+
+    OwnerTransportFixture clock_set_timeout;
+    clock_set_timeout.fail_stage = OwnerTransportFixture::FailureStage::clock_set_timeout;
+    assert(!clock_set_timeout.run(request, "ML307A", 1));
+    assert(clock_set_timeout.writes == std::vector<std::string>({clock_set_command}));
+    assert(clock_set_timeout.last_run_result == IdfModemHttpsRunResult::timed_out);
+    assert(clock_set_timeout.last_result.message == clock_error);
+
+    OwnerTransportFixture clock_readback_failure;
+    clock_readback_failure.fail_stage = OwnerTransportFixture::FailureStage::clock_readback;
+    assert(!clock_readback_failure.run(request, "ML307A", 1));
+    assert(clock_readback_failure.writes ==
+           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
+    assert(clock_readback_failure.last_run_result == IdfModemHttpsRunResult::command_failed);
+    assert(clock_readback_failure.last_result.message == clock_error);
+
+    OwnerTransportFixture clock_readback_timeout;
+    clock_readback_timeout.fail_stage = OwnerTransportFixture::FailureStage::clock_readback_timeout;
+    assert(!clock_readback_timeout.run(request, "ML307A", 1));
+    assert(clock_readback_timeout.writes ==
+           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
+    assert(clock_readback_timeout.last_run_result == IdfModemHttpsRunResult::timed_out);
+    assert(clock_readback_timeout.last_result.message == clock_error);
+
+    for (const std::string_view drift : {
+             std::string_view("+CCLK: \"23/12/31,23:59:55+00\"\r\nOK\r\n"),
+             std::string_view("+CCLK: \"24/01/01,00:00:05+00\"\r\nOK\r\n"),
+         }) {
+        OwnerTransportFixture accepted_drift;
+        accepted_drift.clock_readback = drift;
+        assert(accepted_drift.run(request, "ML307A", 1));
+    }
+    OwnerTransportFixture rejected_drift;
+    rejected_drift.clock_readback = "+CCLK: \"24/01/01,00:00:06+00\"\r\nOK\r\n";
+    assert(!rejected_drift.run(request, "ML307A", 1));
+    assert(rejected_drift.writes ==
+           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
+    assert(rejected_drift.last_result.message == clock_error);
+
+    OwnerTransportFixture last_cclk_second;
+    last_cclk_second.epoch = 2145916799;
+    last_cclk_second.clock_readback = "+CCLK: \"37/12/31,23:59:59+00\"\r\nOK\r\n";
+    assert(last_cclk_second.run(request, "ML307A", 1));
+    assert(last_cclk_second.writes[0] == "AT+CCLK=\"37/12/31,23:59:59+00\"");
+
+    OwnerTransportFixture null_clock;
+    null_clock.omit_clock_callback = true;
+    assert(!null_clock.run(request, "ML307A", 1));
+    assert(null_clock.writes.empty());
+    assert(null_clock.last_run_result == IdfModemHttpsRunResult::invalid_request);
+
     OwnerTransportFixture cleanup_timeout;
     cleanup_timeout.request_expired = true;
     cleanup_timeout.first_cleanup_timeout = true;
@@ -399,11 +541,11 @@ int main()
     OwnerTransportFixture no_certificate;
     no_certificate.cert_present = false;
     assert(no_certificate.run(request, "ML307A", 1));
-    assert(no_certificate.writes[0] == "AT+MSSLLIST=1");
-    assert(no_certificate.writes[1] ==
+    assert(no_certificate.writes[2] == "AT+MSSLLIST=1");
+    assert(no_certificate.writes[3] ==
            "AT+MSSLCERTWR=\"" + certificate_name + "\",0," +
                std::to_string(certificate_pem.size()));
-    assert(no_certificate.writes[2] ==
+    assert(no_certificate.writes[4] ==
            "AT+MSSLCERTRD=\"" + certificate_name + "\"");
     assert(no_certificate.cert_prompt_seen);
     assert(no_certificate.raw_certificate == certificate_pem);
@@ -472,5 +614,6 @@ int main()
     assert(!idf_modem_https_validate_request(oversized, error));
 
     feed_fragmented_success();
+    filter_interleaved_clock_response();
     return 0;
 }

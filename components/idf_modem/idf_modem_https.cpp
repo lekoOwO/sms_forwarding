@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <ctime>
 #include <utility>
 
 #include "idf_modem_query_filter.h"
@@ -12,6 +13,166 @@ namespace {
 constexpr std::string_view kHttpsPrefix = "https://";
 constexpr size_t kMaxLine = 768;
 constexpr size_t kMaxPinnedCertificate = 8192;
+constexpr int kMinimumTrustedYear = 2023;
+constexpr int64_t kMinimumTrustedEpoch = 1700000000;
+constexpr int64_t kLastCclkEpoch = 2145916799;
+constexpr int64_t kClockReadbackToleranceSeconds = 5;
+constexpr std::string_view kClockSynchronizationError =
+    "HTTPS modem clock synchronization failed";
+// Application trust floor is 2023-11-14 (1700000000); ML307A CCLK ends at 2037-12-31.
+
+bool starts_with(std::string_view value, std::string_view prefix);
+
+bool parse_two_digits(std::string_view value, size_t offset, int& output)
+{
+    if (offset + 2 > value.size() || value[offset] < '0' || value[offset] > '9' ||
+        value[offset + 1] < '0' || value[offset + 1] > '9') {
+        return false;
+    }
+    output = static_cast<int>(value[offset] - '0') * 10 +
+             static_cast<int>(value[offset + 1] - '0');
+    return true;
+}
+
+bool leap_year(int year)
+{
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+}
+
+bool valid_civil_date(int year, int month, int day)
+{
+    constexpr int days_per_month[] = {31, 28, 31, 30, 31, 30,
+                                       31, 31, 30, 31, 30, 31};
+    if (year < kMinimumTrustedYear || year > 2037 || month < 1 || month > 12) return false;
+    const int maximum = days_per_month[month - 1] +
+                        (month == 2 && leap_year(year) ? 1 : 0);
+    return day >= 1 && day <= maximum;
+}
+
+// Convert civil UTC fields without depending on the device timezone.
+int64_t days_from_civil(int year, int month, int day)
+{
+    const int adjusted_year = year - (month <= 2 ? 1 : 0);
+    const int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    const int year_of_era = adjusted_year - era * 400;
+    const int month_of_year = month + (month > 2 ? -3 : 9);
+    const int day_of_year = (153 * month_of_year + 2) / 5 + day - 1;
+    const int day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 +
+                           day_of_year;
+    return static_cast<int64_t>(era) * 146097 + day_of_era - 719468;
+}
+
+int64_t cclk_epoch(int year, int month, int day, int hour, int minute, int second)
+{
+    return days_from_civil(year, month, day) * 86400LL +
+           static_cast<int64_t>(hour) * 3600LL +
+           static_cast<int64_t>(minute) * 60LL + second;
+}
+
+void append_two_digits(std::string& output, int value)
+{
+    if (value < 10) output += '0';
+    output += std::to_string(value);
+}
+
+bool cclk_command_from_epoch(int64_t epoch, std::string& command)
+{
+    if (epoch < kMinimumTrustedEpoch || epoch > kLastCclkEpoch) return false;
+    const time_t timestamp = static_cast<time_t>(epoch);
+    if (static_cast<int64_t>(timestamp) != epoch) return false;
+    struct tm utc = {};
+    if (::gmtime_r(&timestamp, &utc) == nullptr) return false;
+    const int year = utc.tm_year + 1900;
+    if (!valid_civil_date(year, utc.tm_mon + 1, utc.tm_mday) || utc.tm_hour < 0 ||
+        utc.tm_hour > 23 || utc.tm_min < 0 || utc.tm_min > 59 || utc.tm_sec < 0 ||
+        utc.tm_sec > 59) {
+        return false;
+    }
+
+    command = "AT+CCLK=\"";
+    append_two_digits(command, year % 100);
+    command += '/';
+    append_two_digits(command, utc.tm_mon + 1);
+    command += '/';
+    append_two_digits(command, utc.tm_mday);
+    command += ',';
+    append_two_digits(command, utc.tm_hour);
+    command += ':';
+    append_two_digits(command, utc.tm_min);
+    command += ':';
+    append_two_digits(command, utc.tm_sec);
+    command += "+00\"";
+    return true;
+}
+
+bool parse_cclk_readback(std::string_view response, int64_t& epoch)
+{
+    // Parse only the modem's UTC +00 representation; local-time offsets and
+    // Pre-2023 dates are outside the application trust floor and are rejected.
+    constexpr std::string_view prefix = "+CCLK: \"";
+    constexpr size_t payload_length = 20;
+    bool clock_seen = false;
+    bool ok_seen = false;
+    size_t start = 0;
+    while (start < response.size()) {
+        const size_t end = response.find_first_of("\r\n", start);
+        const std::string_view line = response.substr(
+            start, end == std::string_view::npos ? response.size() - start : end - start);
+        if (!line.empty()) {
+            if (line == "OK") {
+                if (ok_seen) return false;
+                ok_seen = true;
+            } else {
+                if (clock_seen || ok_seen || !starts_with(line, prefix) ||
+                    line.size() != prefix.size() + payload_length + 1 || line.back() != '"') {
+                    return false;
+                }
+                const std::string_view payload = line.substr(prefix.size(), payload_length);
+                if (payload[2] != '/' || payload[5] != '/' || payload[8] != ',' ||
+                    payload[11] != ':' || payload[14] != ':' || payload[17] != '+' ||
+                    payload.substr(18) != "00") {
+                    return false;
+                }
+                int year_suffix = 0;
+                int month = 0;
+                int day = 0;
+                int hour = 0;
+                int minute = 0;
+                int second = 0;
+                if (!parse_two_digits(payload, 0, year_suffix) ||
+                    !parse_two_digits(payload, 3, month) || !parse_two_digits(payload, 6, day) ||
+                    !parse_two_digits(payload, 9, hour) ||
+                    !parse_two_digits(payload, 12, minute) ||
+                    !parse_two_digits(payload, 15, second)) {
+                    return false;
+                }
+                const int year = 2000 + year_suffix;
+                if (!valid_civil_date(year, month, day) || hour > 23 || minute > 59 ||
+                    second > 59) {
+                    return false;
+                }
+                epoch = cclk_epoch(year, month, day, hour, minute, second);
+                clock_seen = true;
+            }
+        }
+        if (end == std::string_view::npos) break;
+        start = end + 1;
+        while (start < response.size() &&
+               (response[start] == '\r' || response[start] == '\n')) {
+            ++start;
+        }
+    }
+    return clock_seen && ok_seen;
+}
+
+bool cclk_readback_matches(std::string_view response, int64_t requested_epoch)
+{
+    int64_t readback_epoch = 0;
+    if (!parse_cclk_readback(response, readback_epoch)) return false;
+    const int64_t difference = readback_epoch - requested_epoch;
+    return difference >= -kClockReadbackToleranceSeconds &&
+           difference <= kClockReadbackToleranceSeconds;
+}
 
 enum class PinnedCertificateListResult { missing, present, invalid };
 
@@ -410,7 +571,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         result.message = error;
         return IdfModemHttpsRunResult::invalid_request;
     }
-    if (!callbacks.sendCommand || !callbacks.waitResponse) {
+    if (!callbacks.sendCommand || !callbacks.waitResponse || !callbacks.getEpoch) {
         result.message = "HTTPS callbacks unavailable";
         return IdfModemHttpsRunResult::invalid_request;
     }
@@ -457,6 +618,24 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         return callbacks.sendCommand(callbacks.context, command, response, raw_payload, false,
                                      false);
     };
+
+    const int64_t requested_epoch = callbacks.getEpoch(callbacks.context);
+    std::string clock_command;
+    if (!cclk_command_from_epoch(requested_epoch, clock_command)) {
+        result.message.assign(kClockSynchronizationError.data(), kClockSynchronizationError.size());
+        return finish(IdfModemHttpsRunResult::command_failed);
+    }
+    auto clock_result = send(clock_command);
+    if (clock_result != IdfModemHttpsCommandResult::ok) {
+        result.message.assign(kClockSynchronizationError.data(), kClockSynchronizationError.size());
+        return finish(command_failure(clock_result));
+    }
+    clock_result = send("AT+CCLK?");
+    if (clock_result != IdfModemHttpsCommandResult::ok ||
+        !cclk_readback_matches(response, requested_epoch)) {
+        result.message.assign(kClockSynchronizationError.data(), kClockSynchronizationError.size());
+        return finish(command_failure(clock_result));
+    }
 
     auto cert_result = send("AT+MSSLLIST=1");
     if (cert_result != IdfModemHttpsCommandResult::ok) {

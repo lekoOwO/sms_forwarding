@@ -429,6 +429,13 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("owner_uart_write(payload.data(), payload.size())", prompt)
         self.assertIn("!= static_cast<int>(payload.size())", prompt)
 
+    def test_https_clock_query_uses_owner_urc_filter_with_clock_prefix(self):
+        source = SOURCE.read_text()
+        adapter = function_body(source, "owner_https_send_command")
+        self.assertIn('const bool filter_urcs = command == "AT+CCLK?";', adapter)
+        self.assertIn('const char* response_prefix = filter_urcs ? "+CCLK:" : nullptr;', adapter)
+        self.assertIn("filter_urcs, response_prefix, &modem_error", adapter)
+
     def test_https_queue_wait_covers_both_cleanup_attempts_and_propagates_deadline(self):
         source = SOURCE.read_text()
         submit = function_body(source, "submit_owner_command")

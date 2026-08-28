@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
@@ -1847,6 +1848,11 @@ struct OwnerHttpsCallbackContext {
     TickDeadline& deadline;
 };
 
+static int64_t owner_https_get_epoch(void*)
+{
+    return static_cast<int64_t>(time(nullptr));
+}
+
 static IdfModemHttpsCommandResult owner_https_send_command(
     void* opaque, std::string_view command, std::string& response,
     std::string_view raw_payload, bool cleanup, bool tolerate_modem_error)
@@ -1863,6 +1869,8 @@ static IdfModemHttpsCommandResult owner_https_send_command(
     }
 
     bool modem_error = false;
+    const bool filter_urcs = command == "AT+CCLK?";
+    const char* response_prefix = filter_urcs ? "+CCLK:" : nullptr;
     if (cleanup) {
         TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS);
         const esp_err_t err = owner_send_at_deadline(command_text, cleanup_deadline, response, false,
@@ -1872,8 +1880,8 @@ static IdfModemHttpsCommandResult owner_https_send_command(
         if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
         return IdfModemHttpsCommandResult::failed;
     }
-    const esp_err_t err = owner_send_at_deadline(command_text, context.deadline, response, false,
-                                                 nullptr, &modem_error);
+    const esp_err_t err = owner_send_at_deadline(command_text, context.deadline, response,
+                                                 filter_urcs, response_prefix, &modem_error);
     if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
     if (modem_error && tolerate_modem_error) return IdfModemHttpsCommandResult::modem_error;
     if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
@@ -1910,7 +1918,7 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
     }
     OwnerHttpsCallbackContext context{deadline};
     const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command,
-                                           &owner_https_wait_response};
+                                           &owner_https_wait_response, &owner_https_get_epoch};
     const IdfModemHttpsRunResult run_result =
         idf_modem_https_run_post(request, callbacks, result);
     switch (run_result) {

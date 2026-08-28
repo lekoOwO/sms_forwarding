@@ -77,10 +77,13 @@ using IdfModemHttpsSendCommand = IdfModemHttpsCommandResult (*)(
 using IdfModemHttpsWaitResponse = IdfModemHttpsCommandResult (*)(
     void* context, uint8_t httpId, IdfModemHttpsPostResult& result);
 
+using IdfModemHttpsGetEpoch = int64_t (*)(void* context);
+
 struct IdfModemHttpsCallbacks {
     void* context = nullptr;
     IdfModemHttpsSendCommand sendCommand = nullptr;
     IdfModemHttpsWaitResponse waitResponse = nullptr;
+    IdfModemHttpsGetEpoch getEpoch = nullptr;
 };
 
 bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,

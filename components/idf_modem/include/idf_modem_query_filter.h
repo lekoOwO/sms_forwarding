@@ -53,7 +53,8 @@ public:
                                 size_t response_limit = 8192)
         : command_(command), response_prefix_(response_prefix), carry_(initial_carry),
           waiting_for_pdu_(waiting_for_pdu),
-          allow_multiple_response_lines_(command == "AT+CPOL?" || command == "AT+CGDCONT?"),
+          allow_multiple_response_lines_(command == "AT+CPOL?" || command == "AT+CGDCONT?" ||
+                                         (command == "AT+CCLK?" && response_prefix == "+CCLK:")),
           response_limit_(response_limit)
     {
     }
