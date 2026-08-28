@@ -139,7 +139,7 @@ USB recovery 不接受任意 AT 命令。正式版不編譯 `main/usb_recovery.c
 The `msslcipher` query sends ID `0x12` and the exact command `AT+MSSLCIPHER=?`.
 The 17 older queries keep their 96-byte response limit. `msslcipher` has a separate 192-byte
 response and USB frame budget, so its maximum is 24 IDs and its top count bucket is `17-24`.
-The host parser accepts one bounded response line with unique four-digit hexadecimal IDs.
+The host parser accepts one bounded response line with unique one-to-four-digit hexadecimal IDs.
 Malformed, duplicate, out-of-range, and control-character input fails closed.
 The JSON result contains `c02b`, `c02c`, `c02f`, and `c030` support booleans, a bounded `count`, and `count_bucket`.
 It contains `unknown_present` and `other_line_present`. `other_line_present` is `false` when the owner filter sees no extra line and `true` when it sees a non-final line rejected or moved by the exact response-prefix filter. It does not contain raw response text or unknown IDs.

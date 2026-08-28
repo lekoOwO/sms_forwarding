@@ -425,7 +425,7 @@ _CGDCONT = re.compile(
     r'^\+CGDCONT:\s*([0-9]{1,3})\s*,\s*"([^",]*)"\s*,\s*"([^",]*)"'
     r'(?:\s*,\s*"([^",]*)")?$'
 )
-_MSSLCIPHER_ID = r"(?:0[xX])?[0-9A-Fa-f]{4}"
+_MSSLCIPHER_ID = r"(?:0[xX])?[0-9A-Fa-f]{1,4}"
 _MSSLCIPHER = re.compile(
     r"^\+MSSLCIPHER:[ ]*\([ ]*(?P<ids>"
     rf"{_MSSLCIPHER_ID}(?:[ ]*,[ ]*{_MSSLCIPHER_ID}){{0,23}}"

@@ -581,14 +581,44 @@ class UsbRecoveryProtocolTest(unittest.TestCase):
         for value in ("0xC02B", "0xC02C", "0xC02F", "0xC030", "0x1301"):
             self.assertNotIn(value, encoded)
 
+    def test_msslcipher_sanitizer_accepts_official_short_and_mixed_width_ids(self):
+        official = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: (0x01,0x16,0x3D)\r\nOK\r\n",
+        )
+        self.assertEqual(official, {
+            "query_id": MSSLCIPHER_QUERY_ID,
+            "valid": True,
+            "supported": {"c02b": False, "c02c": False, "c02f": False, "c030": False},
+            "count": 3,
+            "count_bucket": "1-4",
+            "unknown_present": True,
+            "other_line_present": False,
+        })
+
+        mixed = usb_recovery.sanitize_query_response(
+            MSSLCIPHER_QUERY_ID,
+            b"+MSSLCIPHER: (1,0x16,03D,C02B,0xC02C,C02F,0xc030)\r\nOK\r\n",
+        )
+        self.assertEqual(mixed["supported"], {
+            "c02b": True, "c02c": True, "c02f": True, "c030": True,
+        })
+        self.assertEqual(mixed["count"], 7)
+        self.assertEqual(mixed["count_bucket"], "5-8")
+        self.assertTrue(mixed["unknown_present"])
+
     def test_msslcipher_sanitizer_rejects_malformed_duplicate_range_and_control(self):
         cases = (
             b"+MSSLCIPHER: (C02B,C02C,C02F)\r\nERROR\r\n",
             b"+MSSLCIPHER: (C02B,C02B)\r\nOK\r\n",
             b"+MSSLCIPHER: (C02B,10000)\r\nOK\r\n",
+            b"+MSSLCIPHER: (0x)\r\nOK\r\n",
+            b"+MSSLCIPHER: (0x10000)\r\nOK\r\n",
+            b"+MSSLCIPHER: (0x01,0001)\r\nOK\r\n",
             b"+MSSLCIPHER: (C02B,G02C)\r\nOK\r\n",
             b"+MSSLCIPHER: (C02B,\x1bC02C)\r\nOK\r\n",
             b"+MSSLCIPHER: (C02B)\r\n+MSSLCIPHER: (C02C)\r\nOK\r\n",
+            b"+MSSLCIPHER: (C02B) trailing\r\nOK\r\n",
         )
         expected = {
             "query_id": MSSLCIPHER_QUERY_ID,
