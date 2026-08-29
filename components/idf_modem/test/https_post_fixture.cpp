@@ -193,33 +193,42 @@ int main()
     assert(value == request.size());
     phases.emplace_back("SEND");
 
-    std::string http_wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Transcript: ";
-    assert(http_wire.size() + 4U < 269U);
-    http_wire.append(269U - http_wire.size() - 4U, 'a');
-    http_wire += "\r\n\r\n";
-    assert(http_wire.size() == 269U);
-    const std::string http_hex = idf_modem_https_wire::hex_encode(
-        reinterpret_cast<const uint8_t*>(http_wire.data()), http_wire.size());
-    const std::string read_response = frame(
-        read_command, "+CEREG: 1,1\r\n+MIPRD: 0,0,269," + http_hex);
+    const std::string http_body(1536U, 'b');
+    const std::string http_headers =
+        "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(http_body.size()) +
+        "\r\nX-Transcript: fragmented\r\n\r\n";
+    const std::string http_wire = http_headers + http_body;
+    assert(http_wire.size() > 1024U);
+    const std::vector<size_t> read_ends = {
+        http_headers.size() - 1U,
+        http_headers.size() - 1U + 1024U,
+        http_wire.size(),
+    };
     uint32_t unread = 0;
     std::vector<uint8_t> read_data;
-    assert(parse_read(read_response, read_command, 0, unread, read_data));
-    assert(unread == 0 && read_data.size() == http_wire.size());
-    phases.emplace_back("READ");
-
     HttpResponse http;
     IdfModemHttpsPostResult result;
-    for (size_t offset = 0; offset < read_data.size();) {
-        const size_t chunk = std::min(read_data.size() - offset, (offset % 11U) + 1U);
-        assert(http.feed(read_data.data() + offset, chunk, result));
-        offset += chunk;
+    size_t offset = 0;
+    for (const size_t end : read_ends) {
+        const size_t chunk = end - offset;
+        assert(chunk <= 1024U);
+        const std::string http_hex = idf_modem_https_wire::hex_encode(
+            reinterpret_cast<const uint8_t*>(http_wire.data() + offset), chunk);
+        const std::string read_response = frame(
+            read_command, "+CEREG: 1,1\r\n+MIPRD: 0," +
+                              std::to_string(http_wire.size() - end) + "," +
+                              std::to_string(chunk) + "," + http_hex);
+        assert(parse_read(read_response, read_command, 0, unread, read_data));
+        assert(unread == http_wire.size() - end && read_data.size() == chunk);
+        assert(http.feed(read_data.data(), read_data.size(), result));
+        offset = end;
     }
+    phases.emplace_back("READ");
     assert(http.complete());
     assert(result.httpStatus == 200);
-    assert(result.expectedResponseBytes == 0);
-    assert(result.responseBytes == 269);
-    assert(http.header_bytes() == 269);
+    assert(result.expectedResponseBytes == http_body.size());
+    assert(result.responseBytes == http_wire.size());
+    assert(http.header_bytes() == http_headers.size());
     phases.emplace_back("HTTP200");
 
     const std::string close_response = frame(close_command, "+MIPCLOSE: 0,0");

@@ -244,8 +244,9 @@ public:
 
     bool read_http(IdfModemHttpsPostResult& result)
     {
+        constexpr size_t kTlsPlaintextReadBytes = 1024;
         HttpResponse parser;
-        std::array<uint8_t, kReadMax> bytes{};
+        std::array<uint8_t, kTlsPlaintextReadBytes> bytes{};
         while (!deadline_.expired() && !parser.complete()) {
             const int received = mbedtls_ssl_read(ssl_.get(), bytes.data(), bytes.size());
             if (received > 0) {

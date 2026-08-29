@@ -602,6 +602,19 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("transfer_encoding", implementation)
         self.assertIn("complete_ = false", implementation)
 
+    def test_https_tls_plaintext_scratch_stays_within_task_stack_budget(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        read_http = function_body(source, "read_http")
+        scratch = re.search(
+            r"constexpr\s+size_t\s+([A-Za-z_]\w*)\s*=\s*(\d+)\s*;", read_http
+        )
+        self.assertIsNotNone(scratch, "read_http needs an explicit local scratch budget")
+        name, size = scratch.groups()
+        self.assertGreater(int(size), 0)
+        self.assertLessEqual(int(size), 1024)
+        self.assertIn(f"std::array<uint8_t, {name}> bytes{{}};", read_http)
+        self.assertNotIn("kReadMax", read_http)
+
     def test_https_post_uses_private_mip_runner_and_wire_seam(self):
         source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
         runner = function_body(source, "idf_modem_https_run_post")
