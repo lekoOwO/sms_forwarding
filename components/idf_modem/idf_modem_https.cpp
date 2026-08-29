@@ -267,6 +267,7 @@ public:
     }
 
     bool timed_out() const { return timed_out_; }
+    bool remote_closed() const { return remote_closed_; }
 
 private:
     friend int mip_bio_send(void*, const unsigned char*, size_t);
@@ -299,15 +300,18 @@ private:
             received = count;
             return true;
         }
+        if (remote_closed()) return true;
         if (length == 0) return true;
         const std::string command = "AT+MIPRD=0,4096";
         std::string response;
         if (!send_command(command, response, false)) return false;
         uint32_t unread = 0;
         std::vector<uint8_t> data;
-        if (!parse_read(response, command, 0, unread, data)) {
+        bool remote_closed = false;
+        if (!parse_read(response, command, 0, unread, data, remote_closed)) {
             return false;
         }
+        if (remote_closed) remote_closed_ = true;
         pending_ = std::move(data);
         if (pending_.empty()) return true;
         const size_t count = std::min(length, pending_.size());
@@ -346,6 +350,7 @@ private:
     bool drbg_initialized_ = false;
     bool entropy_initialized_ = false;
     bool timed_out_ = false;
+    bool remote_closed_ = false;
 };
 
 int mip_bio_send(void* context, const unsigned char* bytes, size_t length)
@@ -365,7 +370,9 @@ int mip_bio_recv(void* context, unsigned char* bytes, size_t length)
     if (!session->receive_mip_bytes(bytes, length, received)) {
         return session->timed_out() ? MBEDTLS_ERR_SSL_TIMEOUT : MBEDTLS_ERR_NET_RECV_FAILED;
     }
-    return received == 0 ? MBEDTLS_ERR_SSL_WANT_READ : static_cast<int>(received);
+    if (received != 0) return static_cast<int>(received);
+    if (session->remote_closed()) return 0;
+    return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 class MipPostSession {
@@ -381,7 +388,7 @@ public:
 
     IdfModemHttpsRunResult run()
     {
-        if (!query_state("INITIAL")) return fail();
+        if (!ensure_initial_state()) return fail();
         if (!snapshot_config()) return fail();
         if (!prepare_pdp()) return fail();
         if (!apply_runtime_config()) return fail();
@@ -453,6 +460,27 @@ private:
         uint8_t cid = 0;
         return command(command_text, response) && parse_mip_state(response, command_text, expected, cid) &&
                cid == 0;
+    }
+
+    bool ensure_initial_state()
+    {
+        const std::string state_command = "AT+MIPSTATE=0";
+        std::string response;
+        if (!command(state_command, response)) return false;
+        const MipStateDisposition disposition = classify_mip_state(response, state_command, 0);
+        if (disposition == MipStateDisposition::invalid) return false;
+        if (disposition == MipStateDisposition::initial) return true;
+        if (disposition != MipStateDisposition::connected &&
+            disposition != MipStateDisposition::closed) {
+            return false;
+        }
+        const std::string close = "AT+MIPCLOSE=0";
+        uint32_t result = 0;
+        if (!command(close, response, true) ||
+            !parse_result(response, close, "+MIPCLOSE:", 0, result) || result != 0) {
+            return false;
+        }
+        return query_state("INITIAL");
     }
 
     bool query_config(std::string_view parameter, uint8_t& first, uint8_t& second,

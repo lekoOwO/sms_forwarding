@@ -10,9 +10,11 @@
 namespace {
 
 using idf_modem_https_wire::HttpResponse;
+using idf_modem_https_wire::MipStateDisposition;
 using idf_modem_https_wire::parse_cgact;
 using idf_modem_https_wire::parse_cgdccont;
 using idf_modem_https_wire::parse_cfg_response;
+using idf_modem_https_wire::classify_mip_state;
 using idf_modem_https_wire::parse_mip_state;
 using idf_modem_https_wire::parse_mip_open;
 using idf_modem_https_wire::parse_mip_urc;
@@ -38,10 +40,339 @@ bool is_upper_hex(std::string_view value)
     });
 }
 
+enum class InitialStateMode {
+    initial,
+    connected_then_initial,
+    closed_then_initial,
+    state_failed,
+    state_timeout,
+    malformed_state,
+    ambiguous_state,
+    unknown_state,
+    wrong_cid,
+    close_failed,
+    close_ambiguous,
+    connected_after_close,
+};
+
+struct InitialStateTranscript {
+    explicit InitialStateTranscript(InitialStateMode selected) : mode(selected) {}
+
+    InitialStateMode mode;
+    size_t state_queries = 0;
+    std::vector<std::string> commands;
+    std::vector<bool> cleanup;
+
+    static IdfModemHttpsCommandResult send(void* context, std::string_view command,
+                                           std::string& response, bool cleanup)
+    {
+        auto& transcript = *static_cast<InitialStateTranscript*>(context);
+        transcript.commands.emplace_back(command);
+        transcript.cleanup.push_back(cleanup);
+        if (command == "AT+MIPSTATE=0") {
+            ++transcript.state_queries;
+            const bool initial = transcript.mode == InitialStateMode::initial ||
+                                 ((transcript.mode == InitialStateMode::connected_then_initial ||
+                                   transcript.mode == InitialStateMode::closed_then_initial) &&
+                                  transcript.state_queries == 2);
+            if (transcript.mode == InitialStateMode::state_failed) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (transcript.mode == InitialStateMode::state_timeout) {
+                return IdfModemHttpsCommandResult::timeout;
+            }
+            if (transcript.mode == InitialStateMode::malformed_state) {
+                response = frame(command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",\"CONNECTED\"");
+            } else if (transcript.mode == InitialStateMode::ambiguous_state) {
+                response = frame(command, "+MIPSTATE: 0,,,,\"INITIAL\"\r\n"
+                                          "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"");
+            } else if (transcript.mode == InitialStateMode::unknown_state) {
+                response = frame(command, "+MIPSTATE: 0,,,,\"OTHER\"");
+            } else if (transcript.mode == InitialStateMode::wrong_cid) {
+                response = frame(command,
+                                 "+MIPSTATE: 1,\"TCP\",\"fixture.example\",443,\"CONNECTED\"");
+            } else {
+                const std::string_view state =
+                    initial ? "+MIPSTATE: 0,,,,\"INITIAL\""
+                    : transcript.mode == InitialStateMode::closed_then_initial
+                        ? "+MIPSTATE: 0,,,,\"CLOSED\""
+                        : "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
+                response = frame(command, state);
+            }
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCLOSE=0") {
+            if (transcript.mode == InitialStateMode::close_failed) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            response = frame(command, transcript.mode == InitialStateMode::close_ambiguous
+                                          ? "+MIPCLOSE: 0,1"
+                                          : "+MIPCLOSE: 0,0");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        return IdfModemHttpsCommandResult::failed;
+    }
+};
+
+IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& transcript)
+{
+    IdfModemHttpsPostRequest request;
+    request.url = "https://fixture.example/notify";
+    request.body = "{}";
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    request.rootCertificateSha256.fill(0xab);
+    IdfModemHttpsCallbacks callbacks{&transcript, &InitialStateTranscript::send};
+    IdfModemHttpsPostResult result;
+    return idf_modem_https_run_post(request, callbacks, result);
+}
+
+void check_initial_state_transcripts()
+{
+    InitialStateTranscript initial{InitialStateMode::initial};
+    assert(run_initial_state_transcript(initial) == IdfModemHttpsRunResult::command_failed);
+    assert((initial.commands == std::vector<std::string>{
+                                    "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
+    assert(std::count(initial.commands.begin(), initial.commands.end(), "AT+MIPCLOSE=0") == 0);
+
+    InitialStateTranscript recovered{InitialStateMode::connected_then_initial};
+    assert(run_initial_state_transcript(recovered) == IdfModemHttpsRunResult::command_failed);
+    assert((recovered.commands == std::vector<std::string>{
+                                      "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
+                                      "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
+    assert((recovered.cleanup == std::vector<bool>{false, true, false, false}));
+
+    InitialStateTranscript closed{InitialStateMode::closed_then_initial};
+    assert(run_initial_state_transcript(closed) == IdfModemHttpsRunResult::command_failed);
+    assert((closed.commands == std::vector<std::string>{
+                                   "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
+                                   "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
+    assert((closed.cleanup == std::vector<bool>{false, true, false, false}));
+
+    for (const InitialStateMode mode : {InitialStateMode::state_failed,
+                                        InitialStateMode::state_timeout,
+                                        InitialStateMode::malformed_state,
+                                        InitialStateMode::ambiguous_state,
+                                        InitialStateMode::unknown_state,
+                                        InitialStateMode::wrong_cid}) {
+        InitialStateTranscript rejected{mode};
+        const IdfModemHttpsRunResult expected = mode == InitialStateMode::state_timeout
+                                                    ? IdfModemHttpsRunResult::timed_out
+                                                    : IdfModemHttpsRunResult::command_failed;
+        assert(run_initial_state_transcript(rejected) == expected);
+        assert((rejected.commands == std::vector<std::string>{"AT+MIPSTATE=0"}));
+        assert(std::count(rejected.commands.begin(), rejected.commands.end(),
+                          "AT+MIPCLOSE=0") == 0);
+    }
+
+    for (const InitialStateMode mode : {InitialStateMode::close_failed,
+                                        InitialStateMode::close_ambiguous}) {
+        InitialStateTranscript rejected{mode};
+        assert(run_initial_state_transcript(rejected) == IdfModemHttpsRunResult::command_failed);
+        assert((rejected.commands == std::vector<std::string>{
+                                         "AT+MIPSTATE=0", "AT+MIPCLOSE=0"}));
+    }
+
+    InitialStateTranscript still_connected{InitialStateMode::connected_after_close};
+    assert(run_initial_state_transcript(still_connected) == IdfModemHttpsRunResult::command_failed);
+    assert((still_connected.commands == std::vector<std::string>{
+                                         "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
+                                         "AT+MIPSTATE=0"}));
+}
+
+enum class RemoteCloseMode {
+    data_then_disconnect,
+    disconnect_only,
+    unread_data,
+    duplicate_disconnect,
+    post_open_closed,
+};
+
+bool parse_decimal(std::string_view value, size_t& parsed)
+{
+    if (value.empty()) return false;
+    parsed = 0;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') return false;
+        parsed = parsed * 10U + static_cast<size_t>(ch - '0');
+    }
+    return true;
+}
+
+struct RemoteCloseTranscript {
+    explicit RemoteCloseTranscript(RemoteCloseMode selected) : mode(selected) {}
+
+    RemoteCloseMode mode;
+    size_t state_queries = 0;
+    size_t send_commands = 0;
+    size_t read_commands = 0;
+    size_t close_commands = 0;
+    bool close_was_cleanup = false;
+    uint8_t encoding_send = 0;
+    uint8_t encoding_receive = 0;
+    uint8_t autofree = 0;
+
+    static IdfModemHttpsCommandResult send(void* context, std::string_view command,
+                                           std::string& response, bool cleanup)
+    {
+        auto& transcript = *static_cast<RemoteCloseTranscript*>(context);
+        if (command == "AT+MIPSTATE=0") {
+            ++transcript.state_queries;
+            const std::string_view state =
+                transcript.state_queries == 1
+                    ? "+MIPSTATE: 0,,,,\"INITIAL\""
+                : transcript.mode == RemoteCloseMode::post_open_closed
+                    ? "+MIPSTATE: 0,,,,\"CLOSED\""
+                    : "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
+            response = frame(command, state);
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"cid\",0") {
+            response = frame(command, "+MIPCFG: \"cid\",0,1");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"encoding\",0") {
+            response = frame(command, "+MIPCFG: \"encoding\",0," +
+                                          std::to_string(transcript.encoding_send) + "," +
+                                          std::to_string(transcript.encoding_receive));
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"autofree\",0") {
+            response = frame(command, "+MIPCFG: \"autofree\",0," +
+                                          std::to_string(transcript.autofree));
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"ssl\",0") {
+            response = frame(command, "+MIPCFG: \"ssl\",0,0,0");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"encoding\",0,1,1" ||
+            command == "AT+MIPCFG=\"encoding\",0,0,0") {
+            transcript.encoding_send = command == "AT+MIPCFG=\"encoding\",0,1,1" ? 1 : 0;
+            transcript.encoding_receive = transcript.encoding_send;
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"autofree\",0,1" ||
+            command == "AT+MIPCFG=\"autofree\",0,0") {
+            transcript.autofree = command == "AT+MIPCFG=\"autofree\",0,1" ? 1 : 0;
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCFG=\"ssl\",0,0,0") {
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGDCONT?") {
+            response = frame(command, "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGACT?") {
+            response = frame(command, "+CGACT: 1,1");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        constexpr std::string_view open_prefix = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",443,";
+        if (command.compare(0, open_prefix.size(), open_prefix) == 0) {
+            response = frame(command, "+MIPOPEN: 0,0");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        constexpr std::string_view send_prefix = "AT+MIPSEND=0,";
+        if (command.compare(0, send_prefix.size(), send_prefix) == 0) {
+            ++transcript.send_commands;
+            const size_t comma = command.find(',', send_prefix.size());
+            size_t sent = 0;
+            if (comma == std::string_view::npos ||
+                !parse_decimal(command.substr(send_prefix.size(), comma - send_prefix.size()), sent)) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            response = frame(command, "+MIPSEND: 0," + std::to_string(sent));
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPRD=0,4096") {
+            ++transcript.read_commands;
+            if (transcript.mode == RemoteCloseMode::disconnect_only) {
+                response = frame(command, "+MIPURC: \"disconn\",0,2");
+            } else if (transcript.mode == RemoteCloseMode::unread_data) {
+                response = frame(command,
+                                 "+MIPRD: 0,1,1,41\r\n+MIPURC: \"disconn\",0,2");
+            } else if (transcript.mode == RemoteCloseMode::duplicate_disconnect) {
+                response = frame(command,
+                                 "+MIPRD: 0,0,1,41\r\n+MIPURC: \"disconn\",0,2\r\n"
+                                 "+MIPURC: \"disconn\",0,2");
+            } else {
+                static constexpr std::string_view http =
+                    "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
+                const std::string hex = idf_modem_https_wire::hex_encode(
+                    reinterpret_cast<const uint8_t*>(http.data()), http.size());
+                response = frame(command, "+MIPRD: 0,0," + std::to_string(http.size()) + "," +
+                                              hex + "\r\n+MIPURC: \"disconn\",0,2");
+            }
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+MIPCLOSE=0") {
+            ++transcript.close_commands;
+            transcript.close_was_cleanup = cleanup;
+            response = frame(command, "+MIPCLOSE: 0,0");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        return IdfModemHttpsCommandResult::failed;
+    }
+};
+
+IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transcript,
+                                                   IdfModemHttpsPostResult& result)
+{
+    IdfModemHttpsPostRequest request;
+    request.url = "https://fixture.example/notify";
+    request.body = "{}";
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    request.rootCertificateSha256.fill(0xab);
+    IdfModemHttpsCallbacks callbacks{&transcript, &RemoteCloseTranscript::send};
+    return idf_modem_https_run_post(request, callbacks, result);
+}
+
+void check_remote_close_transcripts()
+{
+    static constexpr std::string_view http =
+        "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
+    assert(http.size() > 7);
+    RemoteCloseTranscript delivered{RemoteCloseMode::data_then_disconnect};
+    IdfModemHttpsPostResult result;
+    assert(run_remote_close_transcript(delivered, result) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && result.httpStatus == 200 && result.responseBytes == http.size());
+    assert(result.expectedResponseBytes == 0);
+    assert(delivered.read_commands == 1 && delivered.close_commands == 1 &&
+           delivered.close_was_cleanup);
+    assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
+           delivered.autofree == 0);
+
+    for (const RemoteCloseMode mode : {RemoteCloseMode::disconnect_only,
+                                       RemoteCloseMode::unread_data,
+                                       RemoteCloseMode::duplicate_disconnect}) {
+        RemoteCloseTranscript rejected{mode};
+        result = {};
+        assert(run_remote_close_transcript(rejected, result) ==
+               IdfModemHttpsRunResult::response_failed);
+        assert(!result.ok && result.responseBytes == 0 && rejected.read_commands == 1 &&
+               rejected.close_commands == 1 && rejected.close_was_cleanup);
+    }
+
+    RemoteCloseTranscript closed_after_open{RemoteCloseMode::post_open_closed};
+    result = {};
+    assert(run_remote_close_transcript(closed_after_open, result) ==
+           IdfModemHttpsRunResult::command_failed);
+    assert(!result.ok && closed_after_open.send_commands == 0 &&
+           closed_after_open.read_commands == 0 && closed_after_open.close_commands == 1 &&
+           closed_after_open.close_was_cleanup);
+    assert(closed_after_open.encoding_send == 0 && closed_after_open.encoding_receive == 0 &&
+           closed_after_open.autofree == 0);
+}
+
 }  // namespace
 
 int main()
 {
+    check_initial_state_transcripts();
+    check_remote_close_transcripts();
     const uint8_t pdp_cid = 1;
     const std::string open_command = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",80,30,2";
     const std::string state_command = "AT+MIPSTATE=0";
@@ -169,11 +500,26 @@ int main()
 
     const std::string initial_state_response =
         frame(state_command, "+MIPSTATE: 0,,,,\"INITIAL\"");
+    assert(classify_mip_state(initial_state_response, state_command, 0) ==
+           MipStateDisposition::initial);
     uint8_t initial_cid = 0;
     assert(parse_mip_state(initial_state_response, state_command, "INITIAL", initial_cid));
     assert(initial_cid == 0);
     const std::string state_response =
         frame(state_command, "+CSQ: 99,99\r\n+MIPSTATE: 0,\"TCP\",\"fixture.example\",80,\"CONNECTED\"");
+    assert(classify_mip_state(state_response, state_command, 0) ==
+           MipStateDisposition::connected);
+    assert(classify_mip_state(state_response, state_command, 1) ==
+           MipStateDisposition::invalid);
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"OTHER\""),
+                              state_command, 0) == MipStateDisposition::invalid);
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"CLOSED\""),
+                              state_command, 0) == MipStateDisposition::closed);
+    const std::string closed_state_response =
+        frame(state_command, "+MIPSTATE: 0,,,,\"CLOSED\"");
+    uint8_t closed_cid = 0;
+    assert(!parse_mip_state(closed_state_response, state_command, "CONNECTED", closed_cid));
+    assert(!parse_mip_state(closed_state_response, state_command, "INITIAL", closed_cid));
     uint8_t state_cid = 0;
     assert(parse_mip_state(state_response, state_command, "CONNECTED", state_cid));
     assert(state_cid == 0);
@@ -206,6 +552,7 @@ int main()
     };
     uint32_t unread = 0;
     std::vector<uint8_t> read_data;
+    bool remote_closed = false;
     HttpResponse http;
     IdfModemHttpsPostResult result;
     size_t offset = 0;
@@ -218,11 +565,28 @@ int main()
             read_command, "+CEREG: 1,1\r\n+MIPRD: 0," +
                               std::to_string(http_wire.size() - end) + "," +
                               std::to_string(chunk) + "," + http_hex);
-        assert(parse_read(read_response, read_command, 0, unread, read_data));
+        assert(parse_read(read_response, read_command, 0, unread, read_data, remote_closed));
+        assert(!remote_closed);
         assert(unread == http_wire.size() - end && read_data.size() == chunk);
         assert(http.feed(read_data.data(), read_data.size(), result));
         offset = end;
     }
+
+    const std::string remote_close_response = frame(
+        read_command, "+MIPRD: 0,0,3,414243\r\n+MIPURC: \"disconn\",0,2");
+    assert(parse_read(remote_close_response, read_command, 0, unread, read_data, remote_closed));
+    assert(remote_closed);
+    assert(read_data == std::vector<uint8_t>({'A', 'B', 'C'}));
+    assert(parse_read(frame(read_command, "+MIPURC: \"disconn\",0,2"),
+                      read_command, 0, unread, read_data, remote_closed));
+    assert(remote_closed && unread == 0 && read_data.empty());
+    assert(!parse_read(frame(read_command,
+                             "+MIPRD: 0,1,1,41\r\n+MIPURC: \"disconn\",0,2"),
+                       read_command, 0, unread, read_data, remote_closed));
+    assert(!parse_read(frame(read_command, "+MIPURC: \"other\",0,2"),
+                       read_command, 0, unread, read_data, remote_closed));
+    assert(!parse_read(frame(read_command, "+MIPURC: \"disconn\",0,0"),
+                       read_command, 0, unread, read_data, remote_closed));
     phases.emplace_back("READ");
     assert(http.complete());
     assert(result.httpStatus == 200);
@@ -246,11 +610,11 @@ int main()
 
     std::vector<uint8_t> rejected;
     const std::string odd_hex = frame(read_command, "+MIPRD: 0,0,0,A");
-    assert(!parse_read(odd_hex, read_command, 0, unread, rejected));
+    assert(!parse_read(odd_hex, read_command, 0, unread, rejected, remote_closed));
     const std::string declared_mismatch = frame(read_command, "+MIPRD: 0,0,2,AB");
-    assert(!parse_read(declared_mismatch, read_command, 0, unread, rejected));
+    assert(!parse_read(declared_mismatch, read_command, 0, unread, rejected, remote_closed));
     const std::string invalid_hex = frame(read_command, "+MIPRD: 0,0,1,0G");
-    assert(!parse_read(invalid_hex, read_command, 0, unread, rejected));
+    assert(!parse_read(invalid_hex, read_command, 0, unread, rejected, remote_closed));
 
     HttpResponse malformed_status;
     IdfModemHttpsPostResult malformed_result;

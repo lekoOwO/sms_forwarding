@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 import subprocess
@@ -425,16 +426,108 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertTrue(fixture.exists(), "missing executable HTTPS POST fixture")
         self.assertTrue(implementation.exists(), "missing HTTPS POST wire implementation")
         with tempfile.TemporaryDirectory() as directory:
+            stub_root = Path(directory) / "stubs"
+            mbedtls = stub_root / "mbedtls"
+            mbedtls.mkdir(parents=True)
+            (stub_root / "mbedtls_stub.h").write_text(r'''
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+
+struct mbedtls_ctr_drbg_context {};
+struct mbedtls_entropy_context {};
+struct mbedtls_ssl_config {};
+struct mbedtls_ssl_context {
+    void* bio_context = nullptr;
+    int (*bio_send)(void*, const unsigned char*, size_t) = nullptr;
+    int (*bio_recv)(void*, unsigned char*, size_t) = nullptr;
+};
+struct mbedtls_x509_crt {};
+
+inline constexpr int MBEDTLS_ERR_NET_RECV_FAILED = -1;
+inline constexpr int MBEDTLS_ERR_NET_SEND_FAILED = -2;
+inline constexpr int MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY = -3;
+inline constexpr int MBEDTLS_ERR_SSL_TIMEOUT = -4;
+inline constexpr int MBEDTLS_ERR_SSL_WANT_READ = -5;
+inline constexpr int MBEDTLS_ERR_SSL_WANT_WRITE = -6;
+inline constexpr int MBEDTLS_SSL_IS_CLIENT = 0;
+inline constexpr int MBEDTLS_SSL_PRESET_DEFAULT = 0;
+inline constexpr int MBEDTLS_SSL_TRANSPORT_STREAM = 0;
+inline constexpr int MBEDTLS_SSL_VERIFY_REQUIRED = 0;
+inline constexpr int MBEDTLS_SSL_VERSION_TLS1_2 = 0;
+inline constexpr unsigned int MBEDTLS_X509_KU_KEY_CERT_SIGN = 1;
+
+inline void mbedtls_ctr_drbg_init(mbedtls_ctr_drbg_context*) {}
+inline void mbedtls_ctr_drbg_free(mbedtls_ctr_drbg_context*) {}
+inline int mbedtls_ctr_drbg_random(void*, unsigned char*, size_t) { return 0; }
+inline int mbedtls_ctr_drbg_seed(mbedtls_ctr_drbg_context*,
+                                 int (*)(void*, unsigned char*, size_t), void*,
+                                 const unsigned char*, size_t) { return 0; }
+inline void mbedtls_entropy_init(mbedtls_entropy_context*) {}
+inline void mbedtls_entropy_free(mbedtls_entropy_context*) {}
+inline int mbedtls_entropy_func(void*, unsigned char*, size_t) { return 0; }
+inline int mbedtls_sha256(const unsigned char*, size_t, unsigned char* output, int) {
+    std::memset(output, 0xab, 32);
+    return 0;
+}
+inline void mbedtls_ssl_config_init(mbedtls_ssl_config*) {}
+inline void mbedtls_ssl_config_free(mbedtls_ssl_config*) {}
+inline int mbedtls_ssl_config_defaults(mbedtls_ssl_config*, int, int, int) { return 0; }
+inline void mbedtls_ssl_conf_rng(mbedtls_ssl_config*,
+                                 int (*)(void*, unsigned char*, size_t), void*) {}
+inline void mbedtls_ssl_conf_authmode(mbedtls_ssl_config*, int) {}
+inline void mbedtls_ssl_conf_min_tls_version(mbedtls_ssl_config*, int) {}
+inline void mbedtls_ssl_conf_max_tls_version(mbedtls_ssl_config*, int) {}
+inline void mbedtls_ssl_conf_ca_chain(mbedtls_ssl_config*, mbedtls_x509_crt*, void*) {}
+inline void mbedtls_ssl_init(mbedtls_ssl_context*) {}
+inline void mbedtls_ssl_free(mbedtls_ssl_context*) {}
+inline int mbedtls_ssl_setup(mbedtls_ssl_context*, const mbedtls_ssl_config*) { return 0; }
+inline int mbedtls_ssl_set_hostname(mbedtls_ssl_context*, const char*) { return 0; }
+inline void mbedtls_ssl_set_bio(
+    mbedtls_ssl_context* ssl, void* context,
+    int (*send)(void*, const unsigned char*, size_t),
+    int (*recv)(void*, unsigned char*, size_t),
+    int (*)(void*, unsigned char*, size_t, uint32_t)) {
+    ssl->bio_context = context;
+    ssl->bio_send = send;
+    ssl->bio_recv = recv;
+}
+inline int mbedtls_ssl_handshake(mbedtls_ssl_context*) { return 0; }
+inline uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context*) { return 0; }
+inline int mbedtls_ssl_write(mbedtls_ssl_context* ssl, const unsigned char* bytes,
+                             size_t length) {
+    return ssl->bio_send ? ssl->bio_send(ssl->bio_context, bytes, length) : -2;
+}
+inline int mbedtls_ssl_read(mbedtls_ssl_context* ssl, unsigned char* bytes, size_t length) {
+    const size_t bounded = length < 7 ? length : 7;
+    return ssl->bio_recv ? ssl->bio_recv(ssl->bio_context, bytes, bounded) : -1;
+}
+inline void mbedtls_x509_crt_init(mbedtls_x509_crt*) {}
+inline void mbedtls_x509_crt_free(mbedtls_x509_crt*) {}
+inline int mbedtls_x509_crt_parse_der(mbedtls_x509_crt*, const unsigned char*, size_t) { return 0; }
+inline int mbedtls_x509_crt_get_ca_istrue(const mbedtls_x509_crt*) { return 1; }
+inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned int) { return 0; }
+''')
+            for header in (
+                "ctr_drbg.h", "entropy.h", "net_sockets.h", "sha256.h", "ssl.h", "x509_crt.h"
+            ):
+                (mbedtls / header).write_text('#include "../mbedtls_stub.h"\n')
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(
                 [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 "-I", str(SOURCE.parent), "-I", str(SOURCE.parent / "include"),
-                 str(implementation), str(fixture), "-o", str(binary)],
+                 "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                 "-I", str(stub_root), "-I", str(SOURCE.parent),
+                 "-I", str(SOURCE.parent / "include"),
+                 str(implementation), str(SOURCE.parent / "idf_modem_https.cpp"),
+                 str(fixture), "-o", str(binary)],
                 check=False, capture_output=True, text=True,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
             run_result = subprocess.run(
-                [str(binary)], check=False, capture_output=True, text=True
+                [str(binary)], check=False, capture_output=True, text=True,
+                env={**os.environ, "ASAN_OPTIONS": "detect_leaks=1",
+                     "UBSAN_OPTIONS": "halt_on_error=1"},
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
 
@@ -589,6 +682,29 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("if (!certificate_)", init)
         self.assertIn("if (!drbg_)", init)
         self.assertIn("if (!entropy_)", init)
+
+    def test_https_remote_close_keeps_slot_owned_until_explicit_cleanup(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        receive = function_body(source, "receive_mip_bytes")
+        cleanup = function_body(source, "cleanup")
+        self.assertIn("bool remote_closed_ = false;", source)
+        self.assertNotIn("maybe_open_", receive)
+        self.assertIn("if (cleanup_done_) return;", cleanup)
+        self.assertIn("if (maybe_open_)", cleanup)
+        self.assertIn('"AT+MIPCLOSE=0"', cleanup)
+
+    def test_https_stale_slot_cleanup_is_one_shot_before_config_snapshot(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        run = function_body(source, "run")
+        ensure_initial = function_body(source, "ensure_initial_state")
+        self.assertLess(run.index("ensure_initial_state"), run.index("snapshot_config"))
+        self.assertEqual(ensure_initial.count('"AT+MIPCLOSE=0"'), 1)
+        self.assertEqual(ensure_initial.count('query_state("INITIAL")'), 1)
+        self.assertIn("classify_mip_state", ensure_initial)
+        self.assertIn("MipStateDisposition::invalid", ensure_initial)
+        self.assertIn("command(close, response, true)", ensure_initial)
+        self.assertNotIn("while", ensure_initial)
+        self.assertNotIn("MIPOPEN", ensure_initial)
 
     def test_https_http_parser_requires_eof_without_length_and_rejects_chunked(self):
         source = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()

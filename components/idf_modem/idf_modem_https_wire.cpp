@@ -205,6 +205,58 @@ bool consume_nonfatal_mip_urc(std::string_view line)
     return parse_mip_urc(line, received, total, state, disconnected) && !disconnected;
 }
 
+MipStateDisposition parse_mip_state_disposition(std::string_view response,
+                                                std::string_view command,
+                                                uint8_t& cid)
+{
+    std::vector<std::string_view> body;
+    if (!scan_frame(response, command, body)) return MipStateDisposition::invalid;
+    std::string_view state_line;
+    for (std::string_view line : body) {
+        if (starts_with(line, "+MIPURC:")) {
+            if (!consume_nonfatal_mip_urc(line)) return MipStateDisposition::invalid;
+        } else if (state_line.empty()) {
+            state_line = line;
+        } else {
+            return MipStateDisposition::invalid;
+        }
+    }
+    if (state_line.empty() || !starts_with(state_line, "+MIPSTATE:")) {
+        return MipStateDisposition::invalid;
+    }
+    std::array<std::string_view, 8> fields;
+    std::array<bool, 8> quoted{};
+    size_t count = 0;
+    if (!parse_csv(state_line.substr(std::string_view("+MIPSTATE:").size()), fields, quoted,
+                   count) ||
+        count != 5 || quoted[0] || !quoted[4]) {
+        return MipStateDisposition::invalid;
+    }
+    uint32_t connect_id = 0;
+    if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) {
+        return MipStateDisposition::invalid;
+    }
+    if (fields[4] == "INITIAL" || fields[4] == "CLOSED") {
+        if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
+            !fields[2].empty() || !fields[3].empty()) {
+            return MipStateDisposition::invalid;
+        }
+        cid = static_cast<uint8_t>(connect_id);
+        return fields[4] == "INITIAL" ? MipStateDisposition::initial
+                                      : MipStateDisposition::closed;
+    }
+    if (fields[4] == "CONNECTED") {
+        uint32_t port = 0;
+        if (!quoted[1] || fields[1] != "TCP" || !quoted[2] || fields[2].empty() || quoted[3] ||
+            !parse_uint(fields[3], port) || port == 0 || port > UINT16_MAX) {
+            return MipStateDisposition::invalid;
+        }
+        cid = static_cast<uint8_t>(connect_id);
+        return MipStateDisposition::connected;
+    }
+    return MipStateDisposition::invalid;
+}
+
 }  // namespace
 
 bool parse_cfg_response(std::string_view response, std::string_view command,
@@ -249,40 +301,24 @@ bool parse_cfg_response(std::string_view response, std::string_view command,
 bool parse_mip_state(std::string_view response, std::string_view command,
                      std::string_view expected, uint8_t& cid)
 {
-    std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body)) return false;
-    std::string_view state_line;
-    for (std::string_view line : body) {
-        if (starts_with(line, "+MIPURC:")) {
-            if (!consume_nonfatal_mip_urc(line)) return false;
-        } else if (state_line.empty()) {
-            state_line = line;
-        } else {
-            return false;
-        }
-    }
-    if (state_line.empty() || !starts_with(state_line, "+MIPSTATE:")) return false;
-    std::array<std::string_view, 8> fields;
-    std::array<bool, 8> quoted{};
-    size_t count = 0;
-    if (!parse_csv(state_line.substr(std::string_view("+MIPSTATE:").size()), fields, quoted, count) ||
-        count != 5 || quoted[0] || !quoted[4] || fields[4] != expected) return false;
-    uint32_t connect_id = 0;
-    if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) return false;
-    if (expected == "INITIAL") {
-        if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
-            !fields[2].empty() || !fields[3].empty()) return false;
-    } else if (expected == "CONNECTED") {
-        uint32_t port = 0;
-        if (!quoted[1] || fields[1] != "TCP" || !quoted[2] || quoted[3] ||
-            !parse_uint(fields[3], port) || port == 0 || port > UINT16_MAX) {
-            return false;
-        }
-    } else {
-        return false;
-    }
-    cid = static_cast<uint8_t>(connect_id);
-    return true;
+    uint8_t parsed_cid = 0;
+    const MipStateDisposition disposition =
+        parse_mip_state_disposition(response, command, parsed_cid);
+    const bool matches =
+        (expected == "INITIAL" && disposition == MipStateDisposition::initial) ||
+        (expected == "CONNECTED" && disposition == MipStateDisposition::connected);
+    if (matches) cid = parsed_cid;
+    return matches;
+}
+
+MipStateDisposition classify_mip_state(std::string_view response,
+                                       std::string_view command,
+                                       uint8_t expected_cid)
+{
+    uint8_t cid = 0;
+    const MipStateDisposition disposition =
+        parse_mip_state_disposition(response, command, cid);
+    return cid == expected_cid ? disposition : MipStateDisposition::invalid;
 }
 
 bool parse_mip_open(std::string_view response, std::string_view command,
@@ -433,21 +469,32 @@ bool parse_result(std::string_view response, std::string_view command,
 }
 
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
-                uint32_t& unread, std::vector<uint8_t>& data)
+                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed)
 {
+    unread = 0;
+    data.clear();
+    remote_closed = false;
     std::vector<std::string_view> body;
     if (!scan_frame(response, command, body)) return false;
     std::string_view read_line;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
-            if (!consume_nonfatal_mip_urc(line)) return false;
+            uint32_t received = 0;
+            uint32_t total = 0;
+            uint8_t state = 0;
+            bool disconnected = false;
+            if (!parse_mip_urc(line, received, total, state, disconnected) ||
+                (disconnected && remote_closed)) {
+                return false;
+            }
+            remote_closed = remote_closed || disconnected;
         } else if (starts_with(line, "+MIPRD:") && read_line.empty()) {
             read_line = line;
         } else {
             return false;
         }
     }
-    if (read_line.empty()) return false;
+    if (read_line.empty()) return remote_closed;
     std::array<std::string_view, 8> fields;
     std::array<bool, 8> quoted{};
     size_t count = 0;
@@ -458,8 +505,8 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
     if (!parse_uint(fields[0], parsed_cid) || parsed_cid != cid ||
         !parse_uint(fields[1], unread) || unread > UINT16_MAX ||
         !parse_uint(fields[2], length) || length > kReadMax ||
-        fields[3].size() != static_cast<size_t>(length) * 2U) return false;
-    data.clear();
+        fields[3].size() != static_cast<size_t>(length) * 2U ||
+        (remote_closed && unread != 0)) return false;
     data.reserve(length);
     for (size_t i = 0; i < fields[3].size(); i += 2) {
         const auto digit = [](unsigned char ch) -> int {

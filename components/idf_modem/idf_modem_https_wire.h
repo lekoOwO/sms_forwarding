@@ -17,6 +17,13 @@ inline constexpr size_t kReadMax = 4096;
 inline constexpr size_t kHttpHeaderMax = 4096;
 inline constexpr size_t kHttpBodyMax = 65536;
 
+enum class MipStateDisposition : uint8_t {
+    invalid,
+    initial,
+    connected,
+    closed,
+};
+
 bool scan_frame(std::string_view response, std::string_view command,
                 std::vector<std::string_view>& body);
 bool parse_cfg_response(std::string_view response, std::string_view command,
@@ -24,6 +31,9 @@ bool parse_cfg_response(std::string_view response, std::string_view command,
                         bool& has_second);
 bool parse_mip_state(std::string_view response, std::string_view command,
                      std::string_view expected, uint8_t& cid);
+MipStateDisposition classify_mip_state(std::string_view response,
+                                       std::string_view command,
+                                       uint8_t expected_cid);
 bool parse_mip_open(std::string_view response, std::string_view command,
                     uint8_t expected_cid, bool& present);
 bool parse_mip_urc(std::string_view line, uint32_t& received, uint32_t& total,
@@ -36,7 +46,7 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
 bool parse_result(std::string_view response, std::string_view command,
                   std::string_view prefix, uint8_t expected_cid, uint32_t& value);
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
-                uint32_t& unread, std::vector<uint8_t>& data);
+                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed);
 std::string hex_encode(const uint8_t* bytes, size_t length);
 
 class HttpResponse {
