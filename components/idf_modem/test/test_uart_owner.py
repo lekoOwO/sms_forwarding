@@ -421,15 +421,15 @@ class UartOwnerContractTest(unittest.TestCase):
         compiler = shutil.which("g++")
         self.assertIsNotNone(compiler, "the host HTTPS fixture requires g++")
         fixture = SOURCE.parent / "test" / "https_post_fixture.cpp"
-        implementation = SOURCE.parent / "idf_modem_https.cpp"
+        implementation = SOURCE.parent / "idf_modem_https_wire.cpp"
         self.assertTrue(fixture.exists(), "missing executable HTTPS POST fixture")
-        self.assertTrue(implementation.exists(), "missing HTTPS POST protocol implementation")
+        self.assertTrue(implementation.exists(), "missing HTTPS POST wire implementation")
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(
                 [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                 "-I", str(SOURCE.parent / "include"), str(implementation),
-                 str(fixture), "-o", str(binary)],
+                 "-I", str(SOURCE.parent), "-I", str(SOURCE.parent / "include"),
+                 str(implementation), str(fixture), "-o", str(binary)],
                 check=False, capture_output=True, text=True,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
@@ -438,42 +438,201 @@ class UartOwnerContractTest(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
 
-    def test_https_owner_routes_each_nonempty_raw_payload_through_prompt_transport(self):
+    def test_https_owner_routes_mip_commands_through_uart_without_prompt_requeue(self):
         source = SOURCE.read_text()
         adapter = function_body(source, "owner_https_send_command")
-        self.assertIn("if (!raw_payload.empty())", adapter)
-        self.assertNotIn('command.rfind("AT+MHTTPCONTENT=", 0)', adapter)
-        self.assertIn("owner_send_raw_prompt_payload", adapter)
-        prompt = function_body(source, "owner_send_raw_prompt_payload")
-        self.assertIn("scan.find('>') == std::string::npos", prompt)
-        self.assertIn("return ESP_ERR_TIMEOUT", prompt)
-        self.assertIn("owner_uart_write(payload.data(), payload.size())", prompt)
-        self.assertIn("!= static_cast<int>(payload.size())", prompt)
+        self.assertIn("owner_send_mip_deadline", adapter)
+        self.assertIn("TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS)", adapter)
+        self.assertIn("owner_uart_write_all", source)
+        self.assertIn("preserve_uart_urcs", source)
+        self.assertNotIn("submit_owner_command", adapter)
+        self.assertNotIn("raw_payload", adapter)
+        self.assertNotIn("owner_send_raw_prompt_payload", source)
+        self.assertNotIn("MHTTP", (SOURCE.parent / "idf_modem_https.cpp").read_text())
 
-    def test_https_clock_query_uses_owner_urc_filter_with_clock_prefix(self):
+    def test_https_owner_callback_is_concrete_mip_command_adapter(self):
         source = SOURCE.read_text()
         adapter = function_body(source, "owner_https_send_command")
-        self.assertIn('const bool filter_urcs = command == "AT+CCLK?";', adapter)
-        self.assertIn('const char* response_prefix = filter_urcs ? "+CCLK:" : nullptr;', adapter)
-        self.assertIn("filter_urcs, response_prefix, &modem_error", adapter)
+        self.assertIn("const std::string command_text(command)", adapter)
+        self.assertIn("owner_send_mip_deadline", adapter)
+        self.assertIn("cleanup", adapter)
+        self.assertNotIn("CCLK", adapter)
+        self.assertNotIn("filter_urcs", adapter)
 
     def test_https_queue_wait_covers_both_cleanup_attempts_and_propagates_deadline(self):
         source = SOURCE.read_text()
         submit = function_body(source, "submit_owner_command")
-        self.assertIn("wait_margin_ms += 3UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
+        self.assertIn("HTTPS_CLEANUP_WAIT_MARGIN_MS", submit)
+        self.assertIn("HTTPS_CLEANUP_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_CLOSE_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_CONFIGS_MAX * HTTPS_CLEANUP_CONFIG_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_PDP_COMMANDS_MAX", source)
+        self.assertNotIn("3UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
         self.assertIn("operation_deadline(deadline.start", submit)
         self.assertIn("slot.request.deadline_start = operation_deadline.start", submit)
         self.assertIn("slot.request.deadline_span = operation_deadline.span", submit)
         adapter = function_body(source, "owner_https_send_command")
         self.assertIn("cleanup", adapter)
         self.assertIn("TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS)", adapter)
+        self.assertIn("static constexpr size_t OWNER_COMMAND_SLOTS = 4;", source)
+        self.assertIn("slot.state = OwnerCommandState::abandoned", submit)
+        reclaim = function_body(source, "owner_process_one_command")
+        self.assertIn("slot.state == OwnerCommandState::abandoned", reclaim)
+        self.assertIn("reset_owner_slot(slot)", reclaim)
 
-    def test_https_owner_trims_apn_before_cgdc_cont(self):
+    def test_https_der_bound_rejects_before_owner_copy_or_submit(self):
+        source = SOURCE.read_text()
+        submit = function_body(source, "submit_owner_command")
+        bounded = function_body(source, "owner_request_bounded")
+        self.assertIn("if (request.kind != OwnerCommandKind::https_post)", bounded)
+        self.assertIn("return true;", bounded)
+        self.assertIn("rootCertificateDer.empty()", bounded)
+        self.assertIn("rootCertificateDer.size() <= IDF_MODEM_HTTPS_ROOT_DER_MAX", bounded)
+        self.assertIn("rootCertificateSha256.size() == 32", bounded)
+        self.assertLess(submit.index("owner_request_bounded(request)"),
+                        submit.index("slot.request = request"))
+
+        https_source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        validate = function_body(https_source, "idf_modem_https_validate_request")
+        self.assertIn("rootCertificateDer.empty()", validate)
+        self.assertIn("rootCertificateDer.size() > IDF_MODEM_HTTPS_ROOT_DER_MAX", validate)
+        self.assertIn("rootCertificateSha256.size() != 32", validate)
+        post = function_body(source, "idf_modem_https_post")
+        self.assertLess(post.index("idf_modem_https_validate_request"),
+                        post.index("owner_request.https_post_request = request"))
+        self.assertLess(post.index("idf_modem_https_validate_request"),
+                        post.index("submit_owner_command"))
+
+    def test_https_cleanup_budget_includes_apn_restore(self):
+        source = SOURCE.read_text()
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("HTTPS_CLEANUP_PDP_PROFILE_RESTORE_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_CONFIGS_MAX * HTTPS_CLEANUP_CONFIG_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_PDP_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_WAIT_MARGIN_MS", submit)
+        self.assertNotIn("3UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
+
+    def test_https_mip_state_open_close_and_cgact_parsers_are_strict(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        wire = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
+        self.assertIn("parse_mip_open", source)
+        self.assertIn("result != 0", source)
+        self.assertIn("parse_mip_open", wire)
+        self.assertIn("std::array<bool, 256> seen", wire)
+        self.assertIn("return found", wire)
+        self.assertIn('expected == "INITIAL"', wire)
+        self.assertIn('expected == "CONNECTED"', wire)
+
+    def test_https_open_waits_for_async_result_and_parses_mipurc_strictly(self):
+        source = SOURCE.read_text()
+        wire = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
+        fixture = (SOURCE.parent / "test" / "https_post_fixture.cpp").read_text()
+        adapter = function_body(source, "owner_send_mip_deadline")
+        self.assertIn("await_mip_open", adapter)
+        self.assertIn("terminal_seen", adapter)
+        self.assertIn("open_seen", adapter)
+        self.assertIn("line_carry", adapter)
+        self.assertIn("known_mip_urc", adapter)
+        self.assertIn("if (line == command)", adapter)
+        self.assertIn("parse_mip_open", adapter)
+        self.assertIn("owner_send_mip_deadline(command_text, active_deadline, response,", source)
+        self.assertIn("parse_mip_urc", wire)
+        self.assertNotIn('"+MIPURC:"', wire.split("bool is_known_urc", 1)[1].split("}", 1)[0])
+        self.assertIn("open_after_ok_response", fixture)
+        self.assertIn("no_open_present", fixture)
+        self.assertIn("duplicate_open", fixture)
+        self.assertIn("+UNKNOWN: 1", fixture)
+        self.assertIn('\\"disconn\\",0,2', fixture)
+
+    def test_https_uart_drain_uses_operation_deadline_and_bounded_cap(self):
+        source = SOURCE.read_text()
+        drain = function_body(source, "capture_pending_uart_locked")
+        self.assertIn("TickDeadline& deadline", source[source.index("capture_pending_uart_locked"):])
+        self.assertIn("HTTPS_UART_DRAIN_MAX_MS", source)
+        self.assertNotIn("std::max<uint32_t>(max_ms, 1000)", drain)
+        self.assertIn("deadline.expired()", drain)
+        cleanup = function_body(source, "submit_owner_command")
+        self.assertIn("HTTPS_CLEANUP_WAIT_MARGIN_MS", cleanup)
+        self.assertIn("OWNER_SLOT_RECLAIM_MUTEX_TIMEOUT_MS", cleanup)
+
+    def test_https_cgdcont_rejects_duplicate_and_out_of_range_rows(self):
+        wire = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
+        self.assertIn("std::array<bool, 256> seen", wire)
+        self.assertIn("seen[context]", wire)
+        self.assertIn("context == 0 || context > 16", wire)
+
+    def test_https_mip_slot_timeout_path_reclaims_abandoned_slots(self):
+        source = SOURCE.read_text()
+        submit = function_body(source, "submit_owner_command")
+        self.assertIn("slot.state = OwnerCommandState::abandoned", submit)
+        self.assertIn("xSemaphoreTake(s_command_mutex", submit)
+        self.assertIn("caller_abandoned", submit)
+        self.assertIn("OWNER_SLOT_RECLAIM_MUTEX_TIMEOUT_MS", submit)
+        self.assertIn("wake_owner_task()", submit)
+        self.assertIn("owner_reclaim_expired_done_slots", source)
+        self.assertIn("reset_owner_slot(slot)", source)
+        self.assertIn("for (size_t i = 0; i < OWNER_COMMAND_SLOTS; ++i)", source)
+
+    def test_https_mbedtls_contexts_free_only_after_initialization(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        destructor_match = re.search(r"~MipTlsSession\s*\(\)\s*\{", source)
+        self.assertIsNotNone(destructor_match)
+        destructor_start = destructor_match.end()
+        destructor = source[destructor_start:source.index("\n    }", destructor_start)]
+        init = function_body(source, "init")
+        for name in ("ssl", "config", "certificate", "drbg", "entropy"):
+            self.assertIn(f"{name}_initialized_", destructor)
+            self.assertIn(f"{name}_initialized_ = true", init)
+        self.assertIn("if (!ssl_)", init)
+        self.assertIn("if (!config_)", init)
+        self.assertIn("if (!certificate_)", init)
+        self.assertIn("if (!drbg_)", init)
+        self.assertIn("if (!entropy_)", init)
+
+    def test_https_http_parser_requires_eof_without_length_and_rejects_chunked(self):
+        source = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
+        header = (SOURCE.parent / "idf_modem_https_wire.h").read_text()
+        implementation = source + header
+        self.assertIn("finish_eof", source)
+        self.assertIn("finish_eof", header)
+        self.assertIn("Content-Length", implementation)
+        self.assertIn("content_length", implementation)
+        self.assertIn("Transfer-Encoding", implementation)
+        self.assertIn("transfer_encoding", implementation)
+        self.assertIn("complete_ = false", implementation)
+
+    def test_https_post_uses_private_mip_runner_and_wire_seam(self):
         source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
         runner = function_body(source, "idf_modem_https_run_post")
-        trim = runner.index("const std::string apn = trim_spaces(request.apn);")
-        cgdc_cont = runner.index('"AT+CGDCONT=1')
-        self.assertLess(trim, cgdc_cont)
+        self.assertIn("using namespace idf_modem_https_wire;", source)
+        self.assertIn("class MipPostSession", source)
+        self.assertIn("MipPostSession session", runner)
+        self.assertIn("AT+MIPOPEN", source)
+        self.assertIn("AT+MIPSEND", source)
+        self.assertIn("AT+MIPRD", source)
+        self.assertIn("AT+MIPCLOSE", source)
+        self.assertNotIn("MHTTP", source)
+
+    def test_https_apn_is_targeted_validated_verified_before_activation(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        prepare = function_body(source, "prepare_pdp")
+        run = function_body(source, "run")
+        self.assertIn("trim_spaces(request_.apn)", prepare)
+        self.assertIn("build_cgdccont_command", prepare)
+        self.assertIn("requested_apn != current_apn", prepare)
+        self.assertIn("if (active || current_profile.empty()) return false;", prepare)
+        self.assertIn("pdp_profile_changed_ = true", prepare)
+        self.assertIn("configured_apn != requested_apn", prepare)
+        first_query = prepare.index("command(context_query")
+        set_apn = prepare.index("command(configure")
+        verify_query = prepare.index("command(context_query", set_apn)
+        activate = prepare.index("command(activate")
+        self.assertLess(first_query, set_apn)
+        self.assertLess(set_apn, verify_query)
+        self.assertLess(verify_query, activate)
+        self.assertNotIn("MIPOPEN", prepare)
+        self.assertLess(run.index("prepare_pdp"), run.index("open_socket"))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#include "idf_modem_https_wire.h"
 #if SMS_USB_RECOVERY
 #include "idf_modem_cpol_summary.h"
 #endif
@@ -42,6 +43,20 @@ static constexpr int MODEM_POWERUP_MAX_MS = 6000;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000UL;
 static constexpr uint8_t MODEM_DATA_MODE_RETRY_MAX = 3;
 static constexpr uint32_t HTTPS_CLEANUP_TIMEOUT_MS = 10000UL;
+static constexpr uint32_t HTTPS_UART_DRAIN_MAX_MS = 250UL;
+static constexpr uint32_t HTTPS_CLEANUP_CLOSE_COMMANDS_MAX = 1UL;
+static constexpr uint32_t HTTPS_CLEANUP_CONFIGS_MAX = 3UL;  // ssl, autofree, encoding
+static constexpr uint32_t HTTPS_CLEANUP_CONFIG_COMMANDS_MAX = 2UL;  // setter and query
+static constexpr uint32_t HTTPS_CLEANUP_PDP_COMMANDS_MAX = 1UL;
+static constexpr uint32_t HTTPS_CLEANUP_PDP_PROFILE_RESTORE_COMMANDS_MAX = 2UL;
+static constexpr uint32_t OWNER_SLOT_RECLAIM_MUTEX_TIMEOUT_MS = 100UL;
+static constexpr uint32_t HTTPS_CLEANUP_COMMANDS_MAX =
+    HTTPS_CLEANUP_CLOSE_COMMANDS_MAX +
+    HTTPS_CLEANUP_CONFIGS_MAX * HTTPS_CLEANUP_CONFIG_COMMANDS_MAX +
+    HTTPS_CLEANUP_PDP_COMMANDS_MAX +
+    HTTPS_CLEANUP_PDP_PROFILE_RESTORE_COMMANDS_MAX;
+static constexpr uint32_t HTTPS_CLEANUP_WAIT_MARGIN_MS =
+    HTTPS_CLEANUP_COMMANDS_MAX * (HTTPS_CLEANUP_TIMEOUT_MS + HTTPS_UART_DRAIN_MAX_MS) + 1000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
 // Sample display identity and signal data only after an explicit overview refresh.
 // at_channel_idle prevents sampling from competing for the AT channel.
@@ -52,6 +67,7 @@ static constexpr int64_t WEB_POLL_ACTIVE_WINDOW_US = 15LL * 1000LL * 1000LL;
 static constexpr size_t URC_BUFFER_MAX = 8192;
 static constexpr size_t OWNER_COMMAND_SLOTS = 4;
 static constexpr size_t OWNER_AT_RESPONSE_LIMIT = 8192;
+static constexpr size_t OWNER_MIP_RESPONSE_LIMIT = 16384;
 
 enum class OwnerCommandKind : uint8_t { at, until, pdu, https_post };
 enum class OwnerCommandState : uint8_t { free, queued, running, done, abandoned };
@@ -73,6 +89,7 @@ struct OwnerCommand {
 
 struct OwnerCommandSlot {
     OwnerCommandState state = OwnerCommandState::free;
+    std::atomic<bool> caller_abandoned{false};
     OwnerCommand request;
     std::string response;
     bool other_line_present = false;
@@ -81,6 +98,8 @@ struct OwnerCommandSlot {
     esp_err_t result = ESP_FAIL;
     SemaphoreHandle_t completed = nullptr;
 };
+
+static void reset_owner_slot(OwnerCommandSlot& slot);
 
 // session_mutex keeps exclusive eSIM multi-command sessions. Command slots never store caller pointers.
 static SemaphoreHandle_t s_session_mutex = nullptr;
@@ -211,7 +230,8 @@ static void cleanup_start_resources()
     }
     for (auto& slot : s_command_slots) {
         if (slot.completed) vSemaphoreDelete(slot.completed);
-        slot = OwnerCommandSlot();
+        slot.completed = nullptr;
+        reset_owner_slot(slot);
     }
     s_owner_task = nullptr;
     s_runtime_queue_ready.store(false, std::memory_order_release);
@@ -274,6 +294,20 @@ struct TickDeadline {
     bool expired() const { return static_cast<TickType_t>(xTaskGetTickCount() - start) >= span; }
     void restart(uint32_t ms) { start = xTaskGetTickCount(); span = timeout_ticks_ceil(ms); }
 };
+
+static bool owner_uart_write_all(const void* data, size_t size, TickDeadline& deadline)
+{
+    assert_owner_task();
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t written = 0;
+    while (written < size) {
+        if (deadline.expired()) return false;
+        const int count = owner_uart_write(bytes + written, size - written);
+        if (count <= 0 || static_cast<size_t>(count) > size - written) return false;
+        written += static_cast<size_t>(count);
+    }
+    return true;
+}
 
 // Final AT result: 1=OK, -1=ERROR/+CMS ERROR/+CME ERROR, 0=incomplete.
 // Accept a final result without trailing CRLF because a UART block can end at "OK".
@@ -653,7 +687,7 @@ static void preserve_uart_urcs(const uint8_t* data, size_t len)
     }
 }
 
-static void capture_pending_uart_locked(uint32_t max_ms)
+static void capture_pending_uart_locked(TickDeadline& deadline)
 {
     assert_owner_task();
     // Return immediately when RX is empty. This runs before every AT command.
@@ -661,23 +695,34 @@ static void capture_pending_uart_locked(uint32_t max_ms)
     if (uart_get_buffered_data_len(MODEM_UART, &buffered) == ESP_OK && buffered == 0) return;
 
     uint8_t buf[128];
-    // Set a total limit in addition to the renewable quiet window so continuous
-    // modem output cannot retain the AT channel indefinitely.
-    TickDeadline hard_deadline(std::max<uint32_t>(max_ms, 1000));
-    TickDeadline quiet(max_ms);
-    do {
-        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(20));
+    // Bound one pre-command drain without resetting the caller's operation deadline.
+    const TickType_t drain_limit =
+        std::min(deadline.remaining_ticks(), timeout_ticks_ceil(HTTPS_UART_DRAIN_MAX_MS));
+    const TickType_t drain_start = xTaskGetTickCount();
+    const TickType_t quiet_limit = timeout_ticks_ceil(40);
+    TickType_t quiet_start = drain_start;
+    while (!deadline.expired()) {
+        const TickType_t elapsed = static_cast<TickType_t>(xTaskGetTickCount() - drain_start);
+        if (elapsed >= drain_limit) break;
+        const TickType_t quiet_elapsed =
+            static_cast<TickType_t>(xTaskGetTickCount() - quiet_start);
+        if (quiet_elapsed >= quiet_limit) break;
+        TickType_t wait = std::min(pdMS_TO_TICKS(20), drain_limit - elapsed);
+        wait = std::min(wait, quiet_limit - quiet_elapsed);
+        if (wait == 0) break;
+        const int got = owner_uart_read(buf, sizeof(buf), wait);
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
-            quiet.restart(40);
+            quiet_start = xTaskGetTickCount();
         }
-    } while (!quiet.expired() && !hard_deadline.expired());
+    }
 }
 
 static bool poll_unsolicited_uart(uint32_t max_ms)
 {
     assert_owner_task();
-    capture_pending_uart_locked(max_ms);
+    TickDeadline deadline(max_ms);
+    capture_pending_uart_locked(deadline);
     return true;
 }
 
@@ -736,10 +781,10 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
     if (msslcipher_telemetry) *msslcipher_telemetry = 0;
     if (deadline.expired()) return ESP_ERR_TIMEOUT;
 
-    capture_pending_uart_locked(30);
+    capture_pending_uart_locked(deadline);
     std::string wire = cmd;
     wire += "\r\n";
-    if (owner_uart_write(wire.data(), wire.size()) != static_cast<int>(wire.size())) {
+    if (!owner_uart_write_all(wire.data(), wire.size(), deadline)) {
         return ESP_FAIL;
     }
 
@@ -829,7 +874,9 @@ static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
     assert_owner_task();
     if (!token || !*token) return ESP_ERR_INVALID_ARG;
 
-    capture_pending_uart_locked(30);
+    TickDeadline deadline(timeout_ms);
+    if (deadline.expired()) return ESP_ERR_TIMEOUT;
+    capture_pending_uart_locked(deadline);
     std::string wire = cmd;
     wire += "\r\n";
     owner_uart_write(wire.data(), wire.size());
@@ -837,7 +884,6 @@ static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
     response.clear();
     response.reserve(512);
     constexpr size_t MAX_RESPONSE = 4096;
-    TickDeadline deadline(timeout_ms);
     uint8_t buf[128];
     std::string scan;
     esp_err_t ret = ESP_ERR_TIMEOUT;
@@ -867,7 +913,9 @@ static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
     assert_owner_task();
     if (!pdu) return ESP_ERR_INVALID_ARG;
 
-    capture_pending_uart_locked(30);
+    TickDeadline prompt_deadline(5000);
+    if (prompt_deadline.expired()) return ESP_ERR_TIMEOUT;
+    capture_pending_uart_locked(prompt_deadline);
     std::string wire = cmgs_cmd;
     wire += "\r\n";
     owner_uart_write(wire.data(), wire.size());
@@ -876,7 +924,6 @@ static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
     response.reserve(512);
     constexpr size_t MAX_RESPONSE = 4096;
     uint8_t buf[128];
-    TickDeadline prompt_deadline(5000);
     bool got_prompt = false;
     esp_err_t ret = ESP_ERR_TIMEOUT;
     std::string scan;
@@ -1100,6 +1147,7 @@ esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu,
 
 static void reset_owner_slot(OwnerCommandSlot& slot)
 {
+    slot.caller_abandoned.store(false, std::memory_order_release);
     slot.request = OwnerCommand();
     slot.response.clear();
     slot.other_line_present = false;
@@ -1111,13 +1159,22 @@ static void reset_owner_slot(OwnerCommandSlot& slot)
 
 static bool owner_request_bounded(const OwnerCommand& request)
 {
-    return request.command.size() <= 4096 && request.pdu.size() <= 4096 &&
-           request.token.size() <= 256 && request.https_post_request.url.size() <= IDF_MODEM_HTTPS_POST_MAX_URL &&
+    if (request.command.size() > 4096 || request.pdu.size() > 4096 ||
+        request.token.size() > 256 || request.response_limit > OWNER_AT_RESPONSE_LIMIT) {
+        return false;
+    }
+    if (request.kind != OwnerCommandKind::https_post) return true;
+    return request.https_post_request.url.size() <= IDF_MODEM_HTTPS_POST_MAX_URL &&
            request.https_post_request.body.size() <= IDF_MODEM_HTTPS_POST_MAX_BODY &&
            request.https_post_request.contentType.size() <= IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE &&
            request.https_post_request.headerName.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME &&
            request.https_post_request.headerValue.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE &&
-           request.response_limit <= OWNER_AT_RESPONSE_LIMIT &&
+           !request.https_post_request.rootCertificateDer.empty() &&
+           request.https_post_request.rootCertificateDer.size() <= IDF_MODEM_HTTPS_ROOT_DER_MAX &&
+           request.https_post_request.rootCertificateSha256.size() == 32 &&
+           !std::all_of(request.https_post_request.rootCertificateSha256.begin(),
+                        request.https_post_request.rootCertificateSha256.end(),
+                        [](uint8_t byte) { return byte == 0; }) &&
            request.https_post_request.apn.size() <= 96;
 }
 
@@ -1150,7 +1207,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     bool session_held = false;
     uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
     if (request.kind == OwnerCommandKind::https_post) {
-        wait_margin_ms += 3UL * HTTPS_CLEANUP_TIMEOUT_MS;
+        wait_margin_ms = HTTPS_CLEANUP_WAIT_MARGIN_MS;
     }
     uint32_t wait_ms = request.timeout_ms + wait_margin_ms;
     TickDeadline deadline(wait_ms);
@@ -1194,6 +1251,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     }
 
     OwnerCommandSlot& slot = s_command_slots[slot_index];
+    slot.caller_abandoned.store(false, std::memory_order_release);
     while (xSemaphoreTake(slot.completed, 0) == pdTRUE) {}
     slot.request = request;
     if (request.kind == OwnerCommandKind::https_post) {
@@ -1220,12 +1278,20 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
 
     // Reserve one command-mutex window so an expiry can still mark the slot abandoned.
     TickType_t completion_wait = deadline.remaining_ticks();
-    const TickType_t cleanup_wait = timeout_ticks_ceil(100);
+    const TickType_t cleanup_wait = timeout_ticks_ceil(OWNER_SLOT_RECLAIM_MUTEX_TIMEOUT_MS);
     if (completion_wait > cleanup_wait) completion_wait -= cleanup_wait;
     else completion_wait = 0;
     BaseType_t completed = xSemaphoreTake(slot.completed, completion_wait);
     esp_err_t result = ESP_ERR_TIMEOUT;
-    if (xSemaphoreTake(s_command_mutex, deadline.remaining_ticks()) == pdTRUE) {
+    const bool caller_timed_out = completed != pdTRUE;
+    if (caller_timed_out) {
+        // Publish abandonment before the bounded mutex window. If the owner is
+        // between execute() and its final lock, it will reclaim the slot there.
+        slot.caller_abandoned.store(true, std::memory_order_release);
+    }
+    const TickType_t reclaim_wait =
+        std::min(deadline.remaining_ticks(), cleanup_wait);
+    if (xSemaphoreTake(s_command_mutex, reclaim_wait) == pdTRUE) {
         if (completed == pdTRUE && slot.state == OwnerCommandState::done) {
             result = slot.result;
             if (response) *response = slot.response;
@@ -1242,10 +1308,19 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
             if (https_result) *https_result = slot.https_post_result;
             reset_owner_slot(slot);
             xSemaphoreTake(slot.completed, 0);
-        } else {
+        } else if (slot.state == OwnerCommandState::queued ||
+                   slot.state == OwnerCommandState::running) {
             slot.state = OwnerCommandState::abandoned;
+        } else if (slot.state == OwnerCommandState::free) {
+            slot.caller_abandoned.store(false, std::memory_order_release);
         }
         xSemaphoreGive(s_command_mutex);
+    } else {
+        // The owner retries reclamation on its next wake and after command
+        // completion. Never leave a slot owned by a caller that could not
+        // complete the final critical-section handoff.
+        slot.caller_abandoned.store(true, std::memory_order_release);
+        wake_owner_task();
     }
     if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
     return result;
@@ -1821,140 +1896,157 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-static esp_err_t owner_send_raw_prompt_payload(const std::string& command,
-                                               std::string_view payload,
-                                               TickDeadline& deadline)
+struct OwnerHttpsCallbackContext {
+    TickDeadline& deadline;
+};
+
+static esp_err_t owner_send_mip_deadline(const std::string& command, TickDeadline& deadline,
+                                         std::string& response, bool* modem_error = nullptr,
+                                         bool await_mip_open = false)
 {
     assert_owner_task();
+    if (modem_error) *modem_error = false;
     if (deadline.expired()) return ESP_ERR_TIMEOUT;
+
+    capture_pending_uart_locked(deadline);
     std::string wire = command;
     wire += "\r\n";
-    capture_pending_uart_locked(30);
-    if (owner_uart_write(wire.data(), wire.size()) != static_cast<int>(wire.size())) {
-        return ESP_FAIL;
+    if (!owner_uart_write_all(wire.data(), wire.size(), deadline)) {
+        return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_FAIL;
     }
 
-    uint8_t buf[128];
+    response.clear();
+    response.reserve(1024);
     std::string scan;
+    std::string line_carry;
+    bool terminal_seen = false;
+    bool open_seen = false;
+    bool sms_pdu_pending = false;
+    auto known_mip_urc = [](std::string_view line) {
+        static constexpr std::string_view prefixes[] = {
+            "+CMTI:", "+CEREG:", "+CREG:", "+CGREG:", "+CLIP:",
+            "+CSQ:", "+CESQ:", "+MUESTATS:",
+        };
+        return line == "RING" || std::any_of(
+                                  std::begin(prefixes), std::end(prefixes),
+                                  [line](std::string_view prefix) {
+                                      return line.rfind(prefix, 0) == 0;
+                                  });
+    };
+    auto consume_open_line = [&](std::string_view raw_line) -> int {
+        const std::string line = idf_util_trim_copy(std::string(raw_line));
+        if (line.empty()) return 0;
+        if (line == command) return 0;
+        if (line == "OK") {
+            if (terminal_seen) return -1;
+            terminal_seen = true;
+            return 0;
+        }
+        if (line == "ERROR" || line.rfind("+CMS ERROR", 0) == 0 ||
+            line.rfind("+CME ERROR", 0) == 0) {
+            return -1;
+        }
+        if (line.rfind("+MIPURC:", 0) == 0) {
+            uint32_t received = 0;
+            uint32_t total = 0;
+            uint8_t state = 0;
+            bool disconnected = false;
+            if (!idf_modem_https_wire::parse_mip_urc(line, received, total, state,
+                                                      disconnected) || disconnected) {
+                return -1;
+            }
+            return 0;
+        }
+        if (line.rfind("+MIPOPEN:", 0) == 0) {
+            if (open_seen) return -1;
+            // Parse only the sanitized, complete async line. The full response is
+            // retained separately so known SMS/registration URCs are preserved.
+            std::string sanitized_response = "\r\n";
+            sanitized_response += command;
+            sanitized_response += "\r\n";
+            sanitized_response += line;
+            sanitized_response += "\r\nOK\r\n";
+            bool present = false;
+            if (!idf_modem_https_wire::parse_mip_open(sanitized_response, command, 0, present) ||
+                !present) {
+                return -1;
+            }
+            open_seen = true;
+            return 0;
+        }
+        if (line.rfind("+CMT:", 0) == 0) {
+            sms_pdu_pending = true;
+            return 0;
+        }
+        if (sms_pdu_pending && looks_like_pdu_line(line)) {
+            sms_pdu_pending = false;
+            return 0;
+        }
+        if (known_mip_urc(line)) return 0;
+        sms_pdu_pending = false;
+        // A complete line not covered by the observed command/URC grammar is
+        // a protocol error; do not silently pass it to the session parser.
+        return -1;
+    };
+    uint8_t buf[128];
     while (!deadline.expired()) {
-        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
+        const TickType_t wait = std::min(pdMS_TO_TICKS(80), deadline.remaining_ticks());
+        if (wait == 0) break;
+        const int got = owner_uart_read(buf, sizeof(buf), wait);
         if (got <= 0) continue;
         preserve_uart_urcs(buf, static_cast<size_t>(got));
+        if (static_cast<size_t>(got) > OWNER_MIP_RESPONSE_LIMIT - response.size()) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        response.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
         scan.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
-        if (scan.find('>') != std::string::npos) break;
-        if (at_final_result(scan) < 0) return ESP_FAIL;
-        if (scan.size() > 64) scan.erase(0, scan.size() - 64);
-    }
-    if (scan.find('>') == std::string::npos) return ESP_ERR_TIMEOUT;
-
-    if (!payload.empty() &&
-        owner_uart_write(payload.data(), payload.size()) != static_cast<int>(payload.size())) {
-        return ESP_FAIL;
-    }
-
-    scan.clear();
-    while (!deadline.expired()) {
-        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(100));
-        if (got <= 0) continue;
-        preserve_uart_urcs(buf, static_cast<size_t>(got));
-        scan.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+        if (await_mip_open) {
+            line_carry.append(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
+            size_t line_end = std::string::npos;
+            while ((line_end = line_carry.find_first_of("\r\n")) != std::string::npos) {
+                const std::string line = line_carry.substr(0, line_end);
+                size_t consumed = line_end + 1;
+                while (consumed < line_carry.size() &&
+                       (line_carry[consumed] == '\r' || line_carry[consumed] == '\n')) {
+                    ++consumed;
+                }
+                line_carry.erase(0, consumed);
+                if (consume_open_line(line) < 0) {
+                    if (terminal_seen && modem_error) *modem_error = true;
+                    return ESP_FAIL;
+                }
+            }
+            if (terminal_seen && open_seen && line_carry.empty()) return ESP_OK;
+            continue;
+        }
+        // For non-OPEN MIP commands, retain the hardware-evidenced result-before-OK
+        // behavior; only OPEN has the separately observed post-OK async result.
         const int final_code = at_final_result(scan);
-        if (final_code != 0) return final_code > 0 ? ESP_OK : ESP_FAIL;
+        if (final_code != 0) {
+            if (final_code < 0 && modem_error) *modem_error = true;
+            return final_code > 0 ? ESP_OK : ESP_FAIL;
+        }
         if (scan.size() > 64) scan.erase(0, scan.size() - 64);
     }
     return ESP_ERR_TIMEOUT;
 }
 
-static esp_err_t owner_wait_https_response(uint8_t http_id, TickDeadline& deadline,
-                                           IdfModemHttpsPostResult& result)
-{
-    assert_owner_task();
-    IdfModemHttpsUrcParser parser(http_id);
-    size_t copied_urcs = 0;
-    uint8_t buf[128];
-    while (!deadline.expired() && !parser.complete()) {
-        const int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(120));
-        if (got <= 0) continue;
-        parser.feed(std::string_view(reinterpret_cast<const char*>(buf), static_cast<size_t>(got)));
-        result = parser.result();
-        const std::string& urcs = parser.urcs();
-        if (urcs.size() > copied_urcs) {
-            append_urc_text(urcs.substr(copied_urcs));
-            copied_urcs = urcs.size();
-        }
-    }
-    result = parser.result();
-    const std::string& urcs = parser.urcs();
-    if (urcs.size() > copied_urcs) append_urc_text(urcs.substr(copied_urcs));
-    if (!parser.complete()) {
-        result.message = "HTTPS POST timed out";
-        return ESP_ERR_TIMEOUT;
-    }
-    if (parser.failed()) {
-        if (result.message.empty()) result.message = "HTTPS POST modem error";
-        return ESP_FAIL;
-    }
-    if (!idf_modem_https_status_success(result.httpStatus)) {
-        result.message = "HTTPS POST returned a non-2xx status";
-        return ESP_FAIL;
-    }
-    result.ok = true;
-    result.message = "HTTPS POST succeeded";
-    return ESP_OK;
-}
-
-struct OwnerHttpsCallbackContext {
-    TickDeadline& deadline;
-};
-
-static int64_t owner_https_get_epoch(void*)
-{
-    return static_cast<int64_t>(time(nullptr));
-}
-
 static IdfModemHttpsCommandResult owner_https_send_command(
     void* opaque, std::string_view command, std::string& response,
-    std::string_view raw_payload, bool cleanup, bool tolerate_modem_error)
+    bool cleanup)
 {
     auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
     const std::string command_text(command);
-    if (!raw_payload.empty()) {
-        response.clear();
-        const esp_err_t err = owner_send_raw_prompt_payload(command_text, raw_payload,
-                                                            context.deadline);
-        if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
-        if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
-        return IdfModemHttpsCommandResult::failed;
-    }
-
     bool modem_error = false;
-    const bool filter_urcs = command == "AT+CCLK?";
-    const char* response_prefix = filter_urcs ? "+CCLK:" : nullptr;
-    if (cleanup) {
-        TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS);
-        const esp_err_t err = owner_send_at_deadline(command_text, cleanup_deadline, response, false,
-                                                     nullptr, &modem_error);
-        if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
-        if (modem_error && tolerate_modem_error) return IdfModemHttpsCommandResult::modem_error;
-        if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
-        return IdfModemHttpsCommandResult::failed;
-    }
-    const esp_err_t err = owner_send_at_deadline(command_text, context.deadline, response,
-                                                 filter_urcs, response_prefix, &modem_error);
-    if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
-    if (modem_error && tolerate_modem_error) return IdfModemHttpsCommandResult::modem_error;
-    if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
-    return IdfModemHttpsCommandResult::failed;
-}
-
-static IdfModemHttpsCommandResult owner_https_wait_response(
-    void* opaque, uint8_t http_id, IdfModemHttpsPostResult& result)
-{
-    auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
-    const esp_err_t err = owner_wait_https_response(http_id, context.deadline, result);
+    TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS);
+    TickDeadline& active_deadline = cleanup ? cleanup_deadline : context.deadline;
+    const bool await_mip_open = command_text.rfind("AT+MIPOPEN=", 0) == 0;
+    const esp_err_t err = owner_send_mip_deadline(command_text, active_deadline, response,
+                                                  &modem_error, await_mip_open);
     if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
     if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
-    return IdfModemHttpsCommandResult::failed;
+    return modem_error ? IdfModemHttpsCommandResult::modem_error
+                        : IdfModemHttpsCommandResult::failed;
 }
 
 static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
@@ -1976,8 +2068,7 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
         return ESP_ERR_INVALID_STATE;
     }
     OwnerHttpsCallbackContext context{deadline};
-    const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command,
-                                           &owner_https_wait_response, &owner_https_get_epoch};
+    const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command};
     const IdfModemHttpsRunResult run_result =
         idf_modem_https_run_post(request, callbacks, result);
     switch (run_result) {
@@ -2048,9 +2139,31 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
     return ESP_ERR_INVALID_ARG;
 }
 
+static void owner_reclaim_expired_done_slots()
+{
+    assert_owner_task();
+    if (!s_command_mutex || xSemaphoreTake(s_command_mutex, 0) != pdTRUE) return;
+    for (size_t index = 0; index < OWNER_COMMAND_SLOTS; ++index) {
+        OwnerCommandSlot& slot = s_command_slots[index];
+        if (!slot.caller_abandoned.load(std::memory_order_acquire) ||
+            (slot.state != OwnerCommandState::done &&
+             slot.state != OwnerCommandState::free)) {
+            continue;
+        }
+        if (slot.state == OwnerCommandState::done) {
+            while (slot.completed && xSemaphoreTake(slot.completed, 0) == pdTRUE) {}
+            reset_owner_slot(slot);
+        } else {
+            slot.caller_abandoned.store(false, std::memory_order_release);
+        }
+    }
+    xSemaphoreGive(s_command_mutex);
+}
+
 static bool owner_process_one_command(bool priority)
 {
     assert_owner_task();
+    owner_reclaim_expired_done_slots();
     int slot_index = -1;
     QueueHandle_t queue = priority ? s_priority_command_queue : s_command_queue;
     if (!queue || xQueueReceive(queue, &slot_index, 0) != pdTRUE) return false;
@@ -2058,7 +2171,8 @@ static bool owner_process_one_command(bool priority)
 
     if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return true;
     OwnerCommandSlot& slot = s_command_slots[slot_index];
-    if (slot.state == OwnerCommandState::abandoned) {
+    if (slot.state == OwnerCommandState::abandoned ||
+        slot.caller_abandoned.load(std::memory_order_acquire)) {
         reset_owner_slot(slot);
         xSemaphoreGive(s_command_mutex);
         return true;
@@ -2084,7 +2198,8 @@ static bool owner_process_one_command(bool priority)
     esp_err_t result = execute_owner_command(slot);
     if (xSemaphoreTake(s_command_mutex, portMAX_DELAY) != pdTRUE) return true;
     bool signal_completion = false;
-    if (slot.state == OwnerCommandState::abandoned) {
+    if (slot.state == OwnerCommandState::abandoned ||
+        slot.caller_abandoned.load(std::memory_order_acquire)) {
         reset_owner_slot(slot);
     } else {
         slot.result = result;

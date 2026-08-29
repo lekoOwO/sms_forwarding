@@ -1,633 +1,317 @@
-#include "idf_modem_https.h"
-#include "idf_modem_query_filter.h"
-#include "idf_modem_registration.h"
+#include "idf_modem_https_wire.h"
 
 #include <algorithm>
 #include <cassert>
-#include <fstream>
-#include <iterator>
+#include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
-static IdfModemHttpsPostRequest request_fixture()
+namespace {
+
+using idf_modem_https_wire::HttpResponse;
+using idf_modem_https_wire::parse_cgact;
+using idf_modem_https_wire::parse_cgdccont;
+using idf_modem_https_wire::parse_cfg_response;
+using idf_modem_https_wire::parse_mip_state;
+using idf_modem_https_wire::parse_mip_open;
+using idf_modem_https_wire::parse_mip_urc;
+using idf_modem_https_wire::parse_read;
+using idf_modem_https_wire::parse_result;
+using idf_modem_https_wire::scan_frame;
+using idf_modem_https_wire::build_cgdccont_command;
+
+std::string frame(std::string_view command, std::string_view body)
 {
-    IdfModemHttpsPostRequest request;
-    request.url = "https://push.example.test/api/notify?source=sms";
-    request.body = std::string("{\"message\":\"line\n\r\0\x1f\"}", 22);
-    request.contentType = "application/json";
-    request.headerName = "X-Device";
-    request.headerValue = "forwarder";
-    request.apn = "  internet  ";
-    request.rootCertificateDer = {'D', 'E', 'R'};
-    request.rootCertificateSha256.fill(0xab);
-    return request;
+    std::string response = "\r\n";
+    response.append(command.data(), command.size());
+    response += "\r\n";
+    response.append(body.data(), body.size());
+    response += "\r\nOK\r\n";
+    return response;
 }
 
-static const std::string certificate_name =
-    "ca_abababababababababababababababababababababababababababab.pem";
-static const std::string certificate_pem =
-    "-----BEGIN CERTIFICATE-----\nREVS\n-----END CERTIFICATE-----\n";
-static constexpr int64_t fixture_epoch = 1704067200;
-static const std::string clock_set_command =
-    "AT+CCLK=\"24/01/01,00:00:00+00\"";
-static constexpr std::string_view clock_error =
-    "HTTPS modem clock synchronization failed";
-static_assert(3 + 56 + 4 <= IDF_MODEM_HTTPS_CERT_NAME_MAX);
-
-struct OwnerTransportFixture {
-    enum class StaleFailure { none, modem_error, transport_failure };
-    enum class FailureStage {
-        none,
-        cert_list,
-        cert_write,
-        cert_prompt,
-        cert_read,
-        clock_set,
-        clock_set_timeout,
-        clock_readback,
-        clock_readback_timeout,
-        auth,
-        cert_bind,
-        encoding,
-        negotime,
-        version,
-        ignorestamp,
-        ignoreverify,
-        ciphersuite,
-        session,
-        create,
-        timeout,
-        ssl,
-    };
-
-    std::vector<std::string> writes;
-    std::string raw_body;
-    std::string raw_certificate;
-    bool body_prompt_seen = false;
-    bool cert_prompt_seen = false;
-    bool cert_present = true;
-    bool cert_length_mismatch = false;
-    bool cert_readback_mismatch = false;
-    bool cleanup_ok = true;
-    bool abandoned = false;
-    bool request_expired = false;
-    bool omit_clock_callback = false;
-    int64_t epoch = fixture_epoch;
-    std::string clock_readback = "+CCLK: \"24/01/01,00:00:00+00\"\r\nOK\r\n";
-    bool clock_set_seen = false;
-    bool first_cleanup_timeout = false;
-    bool second_cleanup_timeout = false;
-    StaleFailure stale_failure = StaleFailure::none;
-    bool short_setup_write = false;
-    bool non_2xx_response = false;
-    std::string pinned_certificate;
-    FailureStage fail_stage = FailureStage::none;
-    IdfModemHttpsRunResult last_run_result = IdfModemHttpsRunResult::invalid_request;
-    IdfModemHttpsPostResult last_result;
-
-    static IdfModemHttpsCommandResult send_command(
-        void* context, std::string_view command, std::string& response,
-        std::string_view raw_payload, bool cleanup, bool tolerate_modem_error);
-    static IdfModemHttpsCommandResult wait_response(
-        void* context, uint8_t http_id, IdfModemHttpsPostResult& result);
-    static int64_t current_epoch(void* context);
-
-    bool run(const IdfModemHttpsPostRequest& request, std::string_view model,
-             int cereg_stat)
-    {
-        if (abandoned || !idf_modem_https_model_allowed(model) ||
-            !idf_modem_data_activation_allowed(cereg_stat)) {
-            return false;
-        }
-        pinned_certificate = certificate_pem;
-        const IdfModemHttpsGetEpoch clock = omit_clock_callback ? nullptr : &current_epoch;
-        IdfModemHttpsCallbacks callbacks{this, &send_command, &wait_response, clock};
-        IdfModemHttpsPostResult result;
-        last_run_result = idf_modem_https_run_post(request, callbacks, result);
-        const bool ok = last_run_result == IdfModemHttpsRunResult::ok;
-        last_result = result;
-        return ok;
-    }
-};
-
-int64_t OwnerTransportFixture::current_epoch(void* context)
+bool is_upper_hex(std::string_view value)
 {
-    return static_cast<OwnerTransportFixture*>(context)->epoch;
+    return std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F');
+    });
 }
 
-IdfModemHttpsCommandResult OwnerTransportFixture::send_command(
-    void* context, std::string_view command, std::string& response,
-    std::string_view raw_payload, bool cleanup, bool tolerate_modem_error)
-{
-    auto& fixture = *static_cast<OwnerTransportFixture*>(context);
-    response.clear();
-    fixture.writes.emplace_back(command);
-    if (command.rfind("AT+MHTTPCONTENT=", 0) == 0) {
-        fixture.body_prompt_seen = true;
-        fixture.raw_body.assign(raw_payload.data(), raw_payload.size());
-    }
-    const std::string cert_write =
-        "AT+MSSLCERTWR=\"" + certificate_name +
-        "\",0," + std::to_string(fixture.pinned_certificate.size());
-    if (command == cert_write) {
-        fixture.cert_prompt_seen = true;
-        fixture.raw_certificate.assign(raw_payload.data(), raw_payload.size());
-    }
-    if (!cleanup && command == "AT+MHTTPDEL=0") {
-        if (fixture.stale_failure == OwnerTransportFixture::StaleFailure::transport_failure) {
-            return IdfModemHttpsCommandResult::failed;
-        }
-        if (fixture.stale_failure == OwnerTransportFixture::StaleFailure::modem_error) {
-            assert(tolerate_modem_error);
-            return IdfModemHttpsCommandResult::modem_error;
-        }
-    }
-    if (!cleanup && fixture.short_setup_write &&
-        command == "AT+MHTTPCFG=\"ssl\",7,1,1") {
-        return IdfModemHttpsCommandResult::failed;
-    }
-    const auto fail = [&](OwnerTransportFixture::FailureStage stage) {
-        return fixture.fail_stage == stage;
-    };
-    if (fail(OwnerTransportFixture::FailureStage::cert_list) &&
-        command == "AT+MSSLLIST=1") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::cert_write) &&
-        command == cert_write) return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::cert_prompt) &&
-        command == cert_write) return IdfModemHttpsCommandResult::timeout;
-    if (fail(OwnerTransportFixture::FailureStage::cert_read) &&
-        command == "AT+MSSLCERTRD=\"" + certificate_name + "\"") {
-        return IdfModemHttpsCommandResult::failed;
-    }
-    if (command.rfind("AT+CCLK=\"", 0) == 0) {
-        fixture.clock_set_seen = true;
-        if (fail(OwnerTransportFixture::FailureStage::clock_set)) {
-            return IdfModemHttpsCommandResult::failed;
-        }
-        if (fail(OwnerTransportFixture::FailureStage::clock_set_timeout)) {
-            return IdfModemHttpsCommandResult::timeout;
-        }
-        response = "OK\r\n";
-    }
-    if (command == "AT+CCLK?") {
-        if (fail(OwnerTransportFixture::FailureStage::clock_readback)) {
-            return IdfModemHttpsCommandResult::failed;
-        }
-        if (fail(OwnerTransportFixture::FailureStage::clock_readback_timeout)) {
-            return IdfModemHttpsCommandResult::timeout;
-        }
-        response = fixture.clock_readback;
-    }
-    if (fail(OwnerTransportFixture::FailureStage::auth) &&
-        command == "AT+MSSLCFG=\"auth\",1,1") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::cert_bind) &&
-        command == idf_modem_https_cert_bind_command(certificate_name)) {
-        return IdfModemHttpsCommandResult::failed;
-    }
-    if (fail(OwnerTransportFixture::FailureStage::encoding) &&
-        command == "AT+MSSLCFG=\"encoding\",1,2") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::negotime) &&
-        command == "AT+MSSLCFG=\"negotime\",1,60") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::version) &&
-        command == "AT+MSSLCFG=\"version\",1,3") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::ignorestamp) &&
-        command == "AT+MSSLCFG=\"ignorestamp\",1,0") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::ignoreverify) &&
-        command == "AT+MSSLCFG=\"ignoreverify\",1,0") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::ciphersuite) &&
-        command == "AT+MSSLCFG=\"ciphersuite\",1,0") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::session) &&
-        command == "AT+MSSLCFG=\"session\",1,0") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::create) &&
-        command == idf_modem_https_create_command("push.example.test")) return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::timeout) &&
-        command == "AT+MHTTPCFG=\"timeout\",7,30") return IdfModemHttpsCommandResult::failed;
-    if (fail(OwnerTransportFixture::FailureStage::ssl) &&
-        command == "AT+MHTTPCFG=\"ssl\",7,1,1") return IdfModemHttpsCommandResult::failed;
-    if (cleanup && command == "AT+MHTTPTERM=7" && fixture.first_cleanup_timeout) {
-        return IdfModemHttpsCommandResult::timeout;
-    }
-    if (cleanup && command == "AT+MHTTPDEL=7" && fixture.second_cleanup_timeout) {
-        return IdfModemHttpsCommandResult::timeout;
-    }
-    if (cleanup && !fixture.cleanup_ok) return IdfModemHttpsCommandResult::failed;
-    if (command == "AT+MSSLLIST=1") {
-        if (fixture.cert_present) {
-            const size_t listed_length = fixture.pinned_certificate.size() +
-                                         (fixture.cert_length_mismatch ? 1U : 0U);
-            response = "+MSSLLIST: \"" + certificate_name +
-                       "\"," + std::to_string(listed_length) + "\r\nOK\r\n";
-        } else {
-            response = "OK\r\n";
-        }
-    }
-    if (command == "AT+MSSLCERTRD=\"" + certificate_name + "\"") {
-        std::string readback = fixture.pinned_certificate;
-        if (fixture.cert_readback_mismatch && !readback.empty()) readback[0] ^= 1;
-        response = "+MSSLCERTRD: " + std::to_string(readback.size()) + "," + readback +
-                   "\r\nOK\r\n";
-    }
-    if (command == idf_modem_https_create_command("push.example.test")) {
-        response = "+MHTTPCREATE: 7\r\nOK\r\n";
-    }
-    return IdfModemHttpsCommandResult::ok;
-}
-
-IdfModemHttpsCommandResult OwnerTransportFixture::wait_response(
-    void* context, uint8_t http_id, IdfModemHttpsPostResult& result)
-{
-    auto& fixture = *static_cast<OwnerTransportFixture*>(context);
-    if (fixture.request_expired) return IdfModemHttpsCommandResult::timeout;
-    if (fixture.non_2xx_response) {
-        result.httpStatus = 503;
-        result.message = "HTTPS POST returned a non-2xx status";
-        return IdfModemHttpsCommandResult::failed;
-    }
-    IdfModemHttpsUrcParser parser(http_id);
-    for (const std::string_view chunk : {
-             std::string_view("+MHTTPURC: \"header\",7,200,19,X-Test: forward\r\n\r\n"),
-             std::string_view("+MHTTPURC: \"content\",7,5,5,5,hello"),
-         }) {
-        parser.feed(chunk);
-    }
-    result = parser.result();
-    if (!parser.complete() || parser.failed()) return IdfModemHttpsCommandResult::failed;
-    return IdfModemHttpsCommandResult::ok;
-}
-
-static std::vector<std::string> expected_writes()
-{
-    return {
-        clock_set_command,
-        "AT+CCLK?",
-        "AT+MSSLLIST=1",
-        "AT+MSSLCERTRD=\"" + certificate_name + "\"",
-        "AT+CGDCONT=1,\"IP\",\"internet\"",
-        "AT+CGACT=1,1",
-        "AT+MHTTPDEL=0",
-        "AT+MHTTPDEL=1",
-        "AT+MHTTPDEL=2",
-        "AT+MHTTPDEL=3",
-        "AT+MSSLCFG=\"cert\",1,\"" + certificate_name + "\"",
-        "AT+MSSLCFG=\"auth\",1,1",
-        "AT+MSSLCFG=\"encoding\",1,2",
-        "AT+MSSLCFG=\"negotime\",1,60",
-        "AT+MSSLCFG=\"version\",1,3",
-        "AT+MSSLCFG=\"ignorestamp\",1,0",
-        "AT+MSSLCFG=\"ignoreverify\",1,0",
-        "AT+MSSLCFG=\"ciphersuite\",1,0",
-        "AT+MSSLCFG=\"session\",1,0",
-        "AT+MHTTPCREATE=\"https://push.example.test\"",
-        "AT+MHTTPCFG=\"ssl\",7,1,1",
-        "AT+MHTTPCFG=\"timeout\",7,30",
-        "AT+MHTTPHEADER=7,1,30,\"Content-Type: application/json\"",
-        "AT+MHTTPHEADER=7,0,19,\"X-Device: forwarder\"",
-        "AT+MHTTPCONTENT=7,0,22",
-        "AT+MHTTPREQUEST=7,2,0,\"/api/notify?source=sms\"",
-        "AT+MHTTPTERM=7",
-        "AT+MHTTPDEL=7",
-        "AT+CGACT=0,1",
-    };
-}
-
-static void assert_no_network_or_secret_wire(const OwnerTransportFixture& fixture)
-{
-    for (const std::string& write : fixture.writes) {
-        assert(write.rfind("AT+CGACT", 0) != 0);
-        assert(write.rfind("AT+MHTTP", 0) != 0);
-        assert(write.find("forwarder") == std::string::npos);
-    }
-}
-
-static void feed_fragmented_success()
-{
-    IdfModemHttpsUrcParser parser(7);
-    const std::string wire =
-        "+MHTTPURC: \"header\",7,200,19,X-Test: forward\r\n\r\n"
-        "+CMT: \"+886900000\",145\r\n00112233445566778899AABBCCDDEEFF\r\n"
-        "RING\r\n+CLIP: \"+886911111\",145\r\n+CEREG: 1,1\r\n"
-        "+MHTTPURC: \"content\",7,5,2,2,he"
-        "+MHTTPURC: \"content\",7,5,5,3,llo";
-    for (size_t offset = 0, fragment = 1; offset < wire.size(); fragment = fragment % 3 + 1) {
-        const size_t count = std::min(fragment, wire.size() - offset);
-        parser.feed(std::string_view(wire).substr(offset, count));
-        offset += count;
-    }
-    assert(parser.complete());
-    assert(!parser.failed());
-    assert(parser.result().httpStatus == 200);
-    assert(parser.result().expectedResponseBytes == 5);
-    assert(parser.result().responseBytes == 5);
-    assert(parser.urcs().find("+CMT:") != std::string::npos);
-    assert(parser.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
-    assert(parser.urcs().find("RING") != std::string::npos);
-    assert(parser.urcs().find("+CLIP:") != std::string::npos);
-    assert(parser.urcs().find("+CEREG:") != std::string::npos);
-    assert(parser.urcs().find("hello") == std::string::npos);
-
-    IdfModemHttpsUrcParser error_parser(7);
-    error_parser.feed("+MHTTPURC: \"err\",7,4\r\n");
-    assert(error_parser.complete());
-    assert(error_parser.failed());
-    assert(error_parser.result().mhttpError == 4);
-
-    IdfModemHttpsUrcParser non_2xx(7);
-    non_2xx.feed("+MHTTPURC: \"header\",7,503,0,");
-    non_2xx.feed("+MHTTPURC: \"content\",7,0,0,0,");
-    assert(non_2xx.complete());
-    assert(!idf_modem_https_status_success(non_2xx.result().httpStatus));
-
-    IdfModemHttpsUrcParser timeout(7);
-    assert(!timeout.complete());
-}
-
-static void filter_interleaved_clock_response()
-{
-    IdfModemQueryResponseFilter filter("AT+CCLK?", "+CCLK:", "", false);
-    const std::string input =
-        "+CEREG: 1,1\r\n+CMT: \"+886900000\",145\r\n"
-        "00112233445566778899AABBCCDDEEFF\r\n"
-        "+CCLK: \"24/01/01,00:00:00+00\"\r\n"
-        "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n";
-    filter.feed(input.data(), input.size());
-    filter.flush_pending();
-    assert(filter.response() ==
-           "+CCLK: \"24/01/01,00:00:00+00\"\r\n"
-           "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n");
-    assert(filter.urcs().find("+CEREG:") != std::string::npos);
-    assert(filter.urcs().find("+CMT:") != std::string::npos);
-    assert(filter.urcs().find("00112233445566778899AABBCCDDEEFF") != std::string::npos);
-}
+}  // namespace
 
 int main()
 {
-    const IdfModemHttpsPostRequest request = request_fixture();
-    assert(certificate_name.rfind("ca_", 0) == 0);
-    assert(certificate_name.size() == 63);
+    const uint8_t pdp_cid = 1;
+    const std::string open_command = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",80,30,2";
+    const std::string state_command = "AT+MIPSTATE=0";
+    const std::string send_command = "AT+MIPSEND=0,57,\"";
+    const std::string read_command = "AT+MIPRD=0,4096";
+    const std::string close_command = "AT+MIPCLOSE=0";
 
-    OwnerTransportFixture owner;
-    assert(owner.run(request, "ML307A", 1));
-    assert(owner.writes == expected_writes());
-    assert(std::count(owner.writes.begin(), owner.writes.end(),
-                      "AT+MSSLCFG=\"ciphersuite\",1,0") == 1);
-    assert(std::count(owner.writes.begin(), owner.writes.end(),
-                      "AT+MSSLCFG=\"session\",1,0") == 1);
-    assert(!owner.cert_prompt_seen);
-    assert(owner.body_prompt_seen);
-    assert(owner.raw_body == request.body);
-    assert(owner.raw_body.find('\x1a') == std::string::npos);
-    assert(owner.clock_set_seen);
-    assert(idf_modem_https_content_command(7, IDF_MODEM_HTTPS_POST_MAX_BODY) ==
-           "AT+MHTTPCONTENT=7,0,4096");
+    uint8_t first = 0;
+    uint8_t second = 0;
+    bool has_second = false;
+    assert(parse_cfg_response(frame("AT+MIPCFG=\"encoding\",0",
+                                    "+MIPCFG: \"encoding\",0,1,1"),
+                              "AT+MIPCFG=\"encoding\",0", "encoding", first, second,
+                              has_second));
+    assert(first == 1 && second == 1 && has_second);
 
-    IdfModemHttpsPostRequest missing_root = request;
-    missing_root.rootCertificateDer.clear();
-    OwnerTransportFixture no_root;
-    assert(!no_root.run(missing_root, "ML307A", 1));
-    assert(no_root.writes.empty());
-    assert(!no_root.body_prompt_seen);
+    std::string apn;
+    std::string original_profile;
+    assert(parse_cgdccont(
+        frame("AT+CGDCONT?", "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,"),
+        "AT+CGDCONT?", pdp_cid, &apn, &original_profile));
+    assert(apn == "fixture");
+    assert(original_profile == "1,\"IPV4V6\",\"fixture\",,0,0,,,,");
+    bool active = false;
+    assert(parse_cgact(frame("AT+CGACT?", "+CGACT: 1,1"), "AT+CGACT?", pdp_cid, active));
+    assert(active);
+    assert(!parse_cgact(frame("AT+CGACT?", "+CGACT: 1,1\r\n+CGACT: 1,0"),
+                        "AT+CGACT?", pdp_cid, active));
+    assert(!parse_cgact(frame("AT+CGACT?", "+CGACT: 2,0"), "AT+CGACT?", pdp_cid,
+                        active));
 
-    IdfModemHttpsPostRequest empty_body = request;
-    empty_body.body.clear();
-    OwnerTransportFixture empty;
-    assert(!empty.run(empty_body, "ML307A", 1));
-    assert(empty.writes.empty());
-    assert(idf_modem_https_timeout_command(7, 1001) ==
-           "AT+MHTTPCFG=\"timeout\",7,2");
-    assert(idf_modem_https_timeout_command(7, IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS) ==
-           "AT+MHTTPCFG=\"timeout\",7,90");
+    const std::string duplicate_cgdcont = frame(
+        "AT+CGDCONT?", "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,\r\n"
+                       "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,");
+    assert(!parse_cgdccont(duplicate_cgdcont, "AT+CGDCONT?", pdp_cid));
+    const std::string out_of_range_cgdcont = frame(
+        "AT+CGDCONT?", "+CGDCONT: 17,\"IPV4V6\",\"fixture\",,0,0,,,,");
+    assert(!parse_cgdccont(out_of_range_cgdcont, "AT+CGDCONT?", pdp_cid));
 
-    const std::pair<OwnerTransportFixture::FailureStage, const char*> tls_failures[] = {
-        {OwnerTransportFixture::FailureStage::auth, "HTTPS TLS auth failed"},
-        {OwnerTransportFixture::FailureStage::cert_bind, "HTTPS TLS certificate binding failed"},
-        {OwnerTransportFixture::FailureStage::encoding, "HTTPS TLS encoding failed"},
-        {OwnerTransportFixture::FailureStage::negotime, "HTTPS TLS negotiation timeout failed"},
-        {OwnerTransportFixture::FailureStage::version, "HTTPS TLS version failed"},
-        {OwnerTransportFixture::FailureStage::ignorestamp, "HTTPS TLS timestamp check failed"},
-        {OwnerTransportFixture::FailureStage::ignoreverify, "HTTPS TLS certificate verification failed"},
-        {OwnerTransportFixture::FailureStage::ciphersuite, "HTTPS TLS cipher suite failed"},
-        {OwnerTransportFixture::FailureStage::session, "HTTPS TLS session reset failed"},
-        {OwnerTransportFixture::FailureStage::create, "HTTPS connection creation failed"},
-        {OwnerTransportFixture::FailureStage::timeout, "HTTPS HTTP timeout configuration failed"},
-        {OwnerTransportFixture::FailureStage::ssl, "HTTPS SSL binding failed"},
-    };
-    for (const auto& failure : tls_failures) {
-        OwnerTransportFixture failed_tls;
-        failed_tls.fail_stage = failure.first;
-        assert(!failed_tls.run(request, "ML307A", 1));
-        assert(failed_tls.last_result.message == failure.second);
-        assert(failed_tls.writes.back() == "AT+CGACT=0,1");
+    uint32_t urc_received = 0;
+    uint32_t urc_total = 0;
+    uint8_t urc_state = 0;
+    bool urc_disconnected = false;
+    assert(parse_mip_urc("+MIPURC: \"rtcp\",0,1,3", urc_received, urc_total,
+                         urc_state, urc_disconnected));
+    assert(!urc_disconnected && urc_received == 1 && urc_total == 3);
+    assert(parse_mip_urc("+MIPURC: \"disconn\",0,2", urc_received, urc_total,
+                         urc_state, urc_disconnected));
+    assert(urc_disconnected && urc_state == 2);
+    assert(!parse_mip_urc("+MIPURC: \"rtcp\",0,4,3", urc_received, urc_total,
+                          urc_state, urc_disconnected));
+    assert(!parse_mip_urc("+MIPURC: \"disconn\",0,0", urc_received, urc_total,
+                          urc_state, urc_disconnected));
+    assert(!parse_mip_urc("+MIPURC: \"other\",0,1", urc_received, urc_total,
+                          urc_state, urc_disconnected));
+
+    std::string configure_apn;
+    assert(build_cgdccont_command(pdp_cid, "request-apn", configure_apn));
+    assert(configure_apn == "AT+CGDCONT=1,\"IPV4V6\",\"request-apn\"");
+    assert(!build_cgdccont_command(pdp_cid, "bad\"apn", configure_apn));
+    assert(!build_cgdccont_command(pdp_cid, "bad\napn", configure_apn));
+    assert(!build_cgdccont_command(pdp_cid, std::string(97, 'a'), configure_apn));
+
+    const std::vector<std::string> apn_commands = {
+        "AT+CGDCONT?", configure_apn, "AT+CGDCONT?", "AT+CGACT=1,1"};
+    assert(apn_commands[0] == "AT+CGDCONT?");
+    assert(apn_commands[1] == configure_apn);
+    assert(apn_commands[2] == "AT+CGDCONT?");
+    assert(apn_commands[3] == "AT+CGACT=1,1");
+    assert(std::find(apn_commands.begin(), apn_commands.end(), "AT+MIPOPEN=0") ==
+           apn_commands.end());
+
+    const std::string wrong_apn_response = frame(
+        "AT+CGDCONT?", "+CGDCONT: 1,\"IPV4V6\",\"other-apn\",,0,0,,,,");
+    std::string verified_apn;
+    assert(parse_cgdccont(wrong_apn_response, "AT+CGDCONT?", pdp_cid, &verified_apn));
+    assert(verified_apn != "request-apn");
+    const std::vector<std::string> failed_apn_commands = {
+        "AT+CGDCONT?", configure_apn, "AT+CGDCONT?",
+        "AT+CGDCONT=" + original_profile};
+    assert(std::find(failed_apn_commands.begin(), failed_apn_commands.end(),
+                     "AT+MIPOPEN=0") == failed_apn_commands.end());
+    assert(std::find(failed_apn_commands.begin(), failed_apn_commands.end(),
+                     "AT+MIPCLOSE=0") == failed_apn_commands.end());
+    assert(std::find(failed_apn_commands.begin(), failed_apn_commands.end(),
+                     "AT+CGACT=1,1") == failed_apn_commands.end());
+
+    std::vector<std::string> phases;
+    std::vector<std::string_view> body;
+
+    const std::string open_response =
+        frame(open_command, "+CMTI: \"SM\",1\r\n+CEREG: 1,1\r\n"
+                           "+MIPURC: \"rtcp\",0,1,3\r\n+MIPOPEN: 0,0");
+    const std::string open_after_ok_response =
+        "\r\n" + open_command + "\r\nOK\r\n+CEREG: 1,1\r\n"
+        "+MIPURC: \"rtcp\",0,1,3\r\n+MIPOPEN: 0,0\r\n";
+    uint32_t value = 0;
+    assert(scan_frame(open_response, open_command, body));
+    assert(body.size() == 2 && body[0] == "+MIPURC: \"rtcp\",0,1,3" &&
+           body[1] == "+MIPOPEN: 0,0");
+    assert(parse_result(open_response, open_command, "+MIPOPEN:", 0, value));
+    assert(value == 0);
+    phases.emplace_back("OPEN");
+
+    bool open_present = false;
+    assert(parse_mip_open(open_response, open_command, 0, open_present));
+    assert(open_present);
+    assert(parse_mip_open(open_after_ok_response, open_command, 0, open_present));
+    assert(open_present);
+    bool no_open_present = true;
+    assert(parse_mip_open(frame(open_command, "+CEREG: 1,1"), open_command, 0,
+                          no_open_present));
+    assert(!no_open_present);
+    assert(!parse_mip_open(frame(open_command, "+MIPOPEN: 0,4"), open_command, 0,
+                           open_present));
+    assert(!parse_mip_open(frame(open_command, "+MIPOPEN: 1,0"), open_command, 0,
+                           open_present));
+    const std::string duplicate_open = frame(
+        open_command, "+MIPOPEN: 0,0\r\n+MIPOPEN: 0,0");
+    assert(!parse_mip_open(duplicate_open, open_command, 0, open_present));
+    assert(!parse_mip_open(frame(open_command, "+UNKNOWN: 1"), open_command, 0,
+                           open_present));
+    assert(!parse_mip_open(frame(open_command, "+MIPURC: \"disconn\",0,2"),
+                           open_command, 0, open_present));
+
+    const std::string initial_state_response =
+        frame(state_command, "+MIPSTATE: 0,,,,\"INITIAL\"");
+    uint8_t initial_cid = 0;
+    assert(parse_mip_state(initial_state_response, state_command, "INITIAL", initial_cid));
+    assert(initial_cid == 0);
+    const std::string state_response =
+        frame(state_command, "+CSQ: 99,99\r\n+MIPSTATE: 0,\"TCP\",\"fixture.example\",80,\"CONNECTED\"");
+    uint8_t state_cid = 0;
+    assert(parse_mip_state(state_response, state_command, "CONNECTED", state_cid));
+    assert(state_cid == 0);
+    phases.emplace_back("STATE");
+
+    std::vector<uint8_t> request(57);
+    for (size_t index = 0; index < request.size(); ++index) {
+        request[index] = static_cast<uint8_t>(index);
     }
+    const std::string request_hex = idf_modem_https_wire::hex_encode(request.data(), request.size());
+    assert(request_hex.size() == request.size() * 2U);
+    assert(is_upper_hex(request_hex));
+    const std::string send_wire_command = send_command + request_hex + "\"";
+    const std::string send_response =
+        frame(send_wire_command, "+MIPURC: \"rtcp\",0,57,57\r\n+MIPSEND: 0,57");
+    assert(parse_result(send_response, send_wire_command, "+MIPSEND:", 0, value));
+    assert(value == request.size());
+    phases.emplace_back("SEND");
 
-    OwnerTransportFixture cleanup_failure;
-    cleanup_failure.cleanup_ok = false;
-    assert(!cleanup_failure.run(request, "ML307A", 1));
-    assert(cleanup_failure.writes.back() == "AT+CGACT=0,1");
+    std::string http_wire = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Transcript: ";
+    assert(http_wire.size() + 4U < 269U);
+    http_wire.append(269U - http_wire.size() - 4U, 'a');
+    http_wire += "\r\n\r\n";
+    assert(http_wire.size() == 269U);
+    const std::string http_hex = idf_modem_https_wire::hex_encode(
+        reinterpret_cast<const uint8_t*>(http_wire.data()), http_wire.size());
+    const std::string read_response = frame(
+        read_command, "+CEREG: 1,1\r\n+MIPRD: 0,0,269," + http_hex);
+    uint32_t unread = 0;
+    std::vector<uint8_t> read_data;
+    assert(parse_read(read_response, read_command, 0, unread, read_data));
+    assert(unread == 0 && read_data.size() == http_wire.size());
+    phases.emplace_back("READ");
 
-    OwnerTransportFixture expired;
-    expired.request_expired = true;
-    assert(!expired.run(request, "ML307A", 1));
-    assert(expired.writes.back() == "AT+CGACT=0,1");
-
-    for (const int64_t invalid_epoch : {int64_t(-1), int64_t(0), int64_t(2145916800)}) {
-        OwnerTransportFixture invalid_time;
-        invalid_time.epoch = invalid_epoch;
-        assert(!invalid_time.run(request, "ML307A", 1));
-        assert(invalid_time.writes.empty());
-        assert(invalid_time.last_result.message == clock_error);
+    HttpResponse http;
+    IdfModemHttpsPostResult result;
+    for (size_t offset = 0; offset < read_data.size();) {
+        const size_t chunk = std::min(read_data.size() - offset, (offset % 11U) + 1U);
+        assert(http.feed(read_data.data() + offset, chunk, result));
+        offset += chunk;
     }
+    assert(http.complete());
+    assert(result.httpStatus == 200);
+    assert(result.expectedResponseBytes == 0);
+    assert(result.responseBytes == 269);
+    assert(http.header_bytes() == 269);
+    phases.emplace_back("HTTP200");
 
-    for (const std::string_view invalid_readback : {
-             std::string_view("+CCLK: \"24/01/02,00:00:00+00\"\r\nOK\r\n"),
-             std::string_view("+CCLK: \"24/01/01,00:00:00+08\"\r\nOK\r\n"),
-             std::string_view("+CCLK: \"24/01/01,00:00:00+00\"\r\n"),
-             std::string_view("+CCLK: \"24/01/01,00:00:00+00\"\r\n"
-                              "+CCLK: \"24/01/01,00:00:01+00\"\r\nOK\r\n"),
-             std::string_view("+CCLK: \"24/02/30,00:00:00+00\"\r\nOK\r\n"),
-         }) {
-        OwnerTransportFixture invalid_clock;
-        invalid_clock.clock_readback = invalid_readback;
-        assert(!invalid_clock.run(request, "ML307A", 1));
-        assert(invalid_clock.writes ==
-               std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
-        assert(invalid_clock.last_result.message == clock_error);
-    }
+    const std::string close_response = frame(close_command, "+MIPCLOSE: 0,0");
+    assert(parse_result(close_response, close_command, "+MIPCLOSE:", 0, value));
+    assert(value == 0);
+    const std::string close_error = frame(close_command, "+MIPCLOSE: 0,1");
+    assert(parse_result(close_error, close_command, "+MIPCLOSE:", 0, value));
+    assert(value == 1);
+    phases.emplace_back("CLOSE");
 
-    OwnerTransportFixture clock_set_failure;
-    clock_set_failure.fail_stage = OwnerTransportFixture::FailureStage::clock_set;
-    assert(!clock_set_failure.run(request, "ML307A", 1));
-    assert(clock_set_failure.writes == std::vector<std::string>({clock_set_command}));
-    assert(clock_set_failure.last_run_result == IdfModemHttpsRunResult::command_failed);
-    assert(clock_set_failure.last_result.message == clock_error);
+    const std::vector<std::string> expected_phases = {"OPEN", "STATE", "SEND", "READ",
+                                                       "HTTP200", "CLOSE"};
+    assert(phases == expected_phases);
+    assert(std::count(phases.begin(), phases.end(), "CLOSE") == 1);
 
-    OwnerTransportFixture clock_set_timeout;
-    clock_set_timeout.fail_stage = OwnerTransportFixture::FailureStage::clock_set_timeout;
-    assert(!clock_set_timeout.run(request, "ML307A", 1));
-    assert(clock_set_timeout.writes == std::vector<std::string>({clock_set_command}));
-    assert(clock_set_timeout.last_run_result == IdfModemHttpsRunResult::timed_out);
-    assert(clock_set_timeout.last_result.message == clock_error);
+    std::vector<uint8_t> rejected;
+    const std::string odd_hex = frame(read_command, "+MIPRD: 0,0,0,A");
+    assert(!parse_read(odd_hex, read_command, 0, unread, rejected));
+    const std::string declared_mismatch = frame(read_command, "+MIPRD: 0,0,2,AB");
+    assert(!parse_read(declared_mismatch, read_command, 0, unread, rejected));
+    const std::string invalid_hex = frame(read_command, "+MIPRD: 0,0,1,0G");
+    assert(!parse_read(invalid_hex, read_command, 0, unread, rejected));
 
-    OwnerTransportFixture clock_readback_failure;
-    clock_readback_failure.fail_stage = OwnerTransportFixture::FailureStage::clock_readback;
-    assert(!clock_readback_failure.run(request, "ML307A", 1));
-    assert(clock_readback_failure.writes ==
-           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
-    assert(clock_readback_failure.last_run_result == IdfModemHttpsRunResult::command_failed);
-    assert(clock_readback_failure.last_result.message == clock_error);
+    HttpResponse malformed_status;
+    IdfModemHttpsPostResult malformed_result;
+    const std::string bad_status = "HTTP/1.1 20 OK\r\n\r\n";
+    assert(!malformed_status.feed(reinterpret_cast<const uint8_t*>(bad_status.data()),
+                                  bad_status.size(), malformed_result));
 
-    OwnerTransportFixture clock_readback_timeout;
-    clock_readback_timeout.fail_stage = OwnerTransportFixture::FailureStage::clock_readback_timeout;
-    assert(!clock_readback_timeout.run(request, "ML307A", 1));
-    assert(clock_readback_timeout.writes ==
-           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
-    assert(clock_readback_timeout.last_run_result == IdfModemHttpsRunResult::timed_out);
-    assert(clock_readback_timeout.last_result.message == clock_error);
+    HttpResponse body_mismatch;
+    IdfModemHttpsPostResult body_result;
+    const std::string body_prefix = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n";
+    assert(body_mismatch.feed(reinterpret_cast<const uint8_t*>(body_prefix.data()),
+                              body_prefix.size(), body_result));
+    assert(!body_mismatch.complete());
+    const std::string body_partial = "a";
+    assert(body_mismatch.feed(reinterpret_cast<const uint8_t*>(body_partial.data()),
+                              body_partial.size(), body_result));
+    assert(!body_mismatch.complete());
+    const std::string body_overrun = "bc";
+    assert(!body_mismatch.feed(reinterpret_cast<const uint8_t*>(body_overrun.data()),
+                               body_overrun.size(), body_result));
 
-    for (const std::string_view drift : {
-             std::string_view("+CCLK: \"23/12/31,23:59:55+00\"\r\nOK\r\n"),
-             std::string_view("+CCLK: \"24/01/01,00:00:05+00\"\r\nOK\r\n"),
-         }) {
-        OwnerTransportFixture accepted_drift;
-        accepted_drift.clock_readback = drift;
-        assert(accepted_drift.run(request, "ML307A", 1));
-    }
-    OwnerTransportFixture rejected_drift;
-    rejected_drift.clock_readback = "+CCLK: \"24/01/01,00:00:06+00\"\r\nOK\r\n";
-    assert(!rejected_drift.run(request, "ML307A", 1));
-    assert(rejected_drift.writes ==
-           std::vector<std::string>({clock_set_command, "AT+CCLK?"}));
-    assert(rejected_drift.last_result.message == clock_error);
+    HttpResponse exact_body;
+    IdfModemHttpsPostResult exact_result;
+    const std::string exact_wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab";
+    assert(exact_body.feed(reinterpret_cast<const uint8_t*>(exact_wire.data()),
+                           exact_wire.size(), exact_result));
+    assert(exact_body.complete() && exact_result.responseBytes == exact_wire.size());
+    const std::string extra_body = "x";
+    assert(!exact_body.feed(reinterpret_cast<const uint8_t*>(extra_body.data()),
+                            extra_body.size(), exact_result));
 
-    OwnerTransportFixture last_cclk_second;
-    last_cclk_second.epoch = 2145916799;
-    last_cclk_second.clock_readback = "+CCLK: \"37/12/31,23:59:59+00\"\r\nOK\r\n";
-    assert(last_cclk_second.run(request, "ML307A", 1));
-    assert(last_cclk_second.writes[0] == "AT+CCLK=\"37/12/31,23:59:59+00\"");
+    HttpResponse case_insensitive_length;
+    IdfModemHttpsPostResult case_result;
+    const std::string case_wire = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nab";
+    assert(case_insensitive_length.feed(reinterpret_cast<const uint8_t*>(case_wire.data()),
+                                        case_wire.size(), case_result));
+    assert(case_insensitive_length.complete() && case_result.expectedResponseBytes == 2);
 
-    OwnerTransportFixture null_clock;
-    null_clock.omit_clock_callback = true;
-    assert(!null_clock.run(request, "ML307A", 1));
-    assert(null_clock.writes.empty());
-    assert(null_clock.last_run_result == IdfModemHttpsRunResult::invalid_request);
+    HttpResponse no_length;
+    IdfModemHttpsPostResult no_length_result;
+    const std::string no_length_wire = "HTTP/1.1 200 OK\r\nX-Mode: close\r\n\r\nbody";
+    assert(no_length.feed(reinterpret_cast<const uint8_t*>(no_length_wire.data()),
+                          no_length_wire.size(), no_length_result));
+    assert(!no_length.complete());
+    assert(no_length.finish_eof(no_length_result));
+    assert(no_length.complete() && no_length_result.expectedResponseBytes == 0);
 
-    OwnerTransportFixture cleanup_timeout;
-    cleanup_timeout.request_expired = true;
-    cleanup_timeout.first_cleanup_timeout = true;
-    assert(!cleanup_timeout.run(request, "ML307A", 1));
-    assert(cleanup_timeout.writes[cleanup_timeout.writes.size() - 3] == "AT+MHTTPTERM=7");
-    assert(cleanup_timeout.writes[cleanup_timeout.writes.size() - 2] == "AT+MHTTPDEL=7");
-    assert(cleanup_timeout.writes.back() == "AT+CGACT=0,1");
+    HttpResponse chunked;
+    IdfModemHttpsPostResult chunked_result;
+    const std::string chunked_wire =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    assert(!chunked.feed(reinterpret_cast<const uint8_t*>(chunked_wire.data()),
+                         chunked_wire.size(), chunked_result));
 
-    OwnerTransportFixture second_cleanup_timeout;
-    second_cleanup_timeout.request_expired = true;
-    second_cleanup_timeout.second_cleanup_timeout = true;
-    assert(!second_cleanup_timeout.run(request, "ML307A", 1));
-    assert(second_cleanup_timeout.writes[second_cleanup_timeout.writes.size() - 3] ==
-           "AT+MHTTPTERM=7");
-    assert(second_cleanup_timeout.writes[second_cleanup_timeout.writes.size() - 2] ==
-           "AT+MHTTPDEL=7");
-    assert(second_cleanup_timeout.writes.back() == "AT+CGACT=0,1");
+    HttpResponse conflicting_length;
+    IdfModemHttpsPostResult conflicting_result;
+    const std::string conflicting_wire =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\ncontent-length: 2\r\n\r\nab";
+    assert(!conflicting_length.feed(reinterpret_cast<const uint8_t*>(conflicting_wire.data()),
+                                    conflicting_wire.size(), conflicting_result));
 
-    OwnerTransportFixture stale_error;
-    stale_error.stale_failure = OwnerTransportFixture::StaleFailure::modem_error;
-    assert(stale_error.run(request, "ML307A", 1));
-    assert(stale_error.writes.back() == "AT+CGACT=0,1");
+    HttpResponse timeout;
+    IdfModemHttpsPostResult timeout_result;
+    assert(timeout.feed(nullptr, 0, timeout_result));
+    assert(!timeout.complete());
+    const std::string partial_status = "HTTP/1.1 200 OK\r\n";
+    assert(timeout.feed(reinterpret_cast<const uint8_t*>(partial_status.data()),
+                        partial_status.size(), timeout_result));
+    assert(!timeout.complete());
+    // A no-progress poll remains incomplete; the owner deadline classifies it as timeout.
 
-    OwnerTransportFixture stale_transport;
-    stale_transport.stale_failure = OwnerTransportFixture::StaleFailure::transport_failure;
-    assert(!stale_transport.run(request, "ML307A", 1));
-    assert(stale_transport.writes.back() == "AT+CGACT=0,1");
-    assert(std::find(stale_transport.writes.begin(), stale_transport.writes.end(),
-                     "AT+MHTTPCREATE=\"https://push.example.test\"") ==
-           stale_transport.writes.end());
-
-    OwnerTransportFixture short_setup;
-    short_setup.short_setup_write = true;
-    assert(!short_setup.run(request, "ML307A", 1));
-    assert(short_setup.writes.back() == "AT+CGACT=0,1");
-    assert(std::find(short_setup.writes.begin(), short_setup.writes.end(),
-                     "AT+MHTTPCFG=\"ssl\",7,1,1") != short_setup.writes.end());
-    assert(!short_setup.body_prompt_seen);
-    assert(std::find(short_setup.writes.begin(), short_setup.writes.end(),
-                     "AT+MHTTPREQUEST=7,2,0,\"/api/notify?source=sms\"") ==
-           short_setup.writes.end());
-
-    OwnerTransportFixture no_certificate;
-    no_certificate.cert_present = false;
-    assert(no_certificate.run(request, "ML307A", 1));
-    assert(no_certificate.writes[2] == "AT+MSSLLIST=1");
-    assert(no_certificate.writes[3] ==
-           "AT+MSSLCERTWR=\"" + certificate_name + "\",0," +
-               std::to_string(certificate_pem.size()));
-    assert(no_certificate.writes[4] ==
-           "AT+MSSLCERTRD=\"" + certificate_name + "\"");
-    assert(no_certificate.cert_prompt_seen);
-    assert(no_certificate.raw_certificate == certificate_pem);
-    assert(no_certificate.raw_certificate.find('\x1a') == std::string::npos);
-
-    for (const auto failure : {OwnerTransportFixture::FailureStage::cert_list,
-                               OwnerTransportFixture::FailureStage::cert_write,
-                               OwnerTransportFixture::FailureStage::cert_prompt,
-                               OwnerTransportFixture::FailureStage::cert_read}) {
-        OwnerTransportFixture failed_certificate;
-        failed_certificate.cert_present =
-            failure != OwnerTransportFixture::FailureStage::cert_write &&
-            failure != OwnerTransportFixture::FailureStage::cert_prompt;
-        failed_certificate.fail_stage = failure;
-        assert(!failed_certificate.run(request, "ML307A", 1));
-        assert(failed_certificate.last_run_result ==
-               (failure == OwnerTransportFixture::FailureStage::cert_prompt
-                    ? IdfModemHttpsRunResult::timed_out
-                    : IdfModemHttpsRunResult::command_failed));
-        assert_no_network_or_secret_wire(failed_certificate);
-    }
-    OwnerTransportFixture listed_mismatch;
-    listed_mismatch.cert_length_mismatch = true;
-    assert(!listed_mismatch.run(request, "ML307A", 1));
-    assert_no_network_or_secret_wire(listed_mismatch);
-    assert(!listed_mismatch.cert_prompt_seen);
-
-    OwnerTransportFixture readback_mismatch;
-    readback_mismatch.cert_readback_mismatch = true;
-    assert(!readback_mismatch.run(request, "ML307A", 1));
-    assert_no_network_or_secret_wire(readback_mismatch);
-
-    OwnerTransportFixture non_2xx;
-    non_2xx.non_2xx_response = true;
-    assert(!non_2xx.run(request, "ML307A", 1));
-    assert(non_2xx.writes.back() == "AT+CGACT=0,1");
-
-    for (const std::string_view model : {std::string_view(), std::string_view("ML307Y"),
-                                         std::string_view("unknown")}) {
-        OwnerTransportFixture blocked;
-        assert(!blocked.run(request, model, 1));
-        assert(blocked.writes.empty());
-    }
-    for (const int stat : {0, 5, 11, -1}) {
-        OwnerTransportFixture blocked;
-        assert(!blocked.run(request, "ML307A", stat));
-        assert(blocked.writes.empty());
-    }
-    OwnerTransportFixture abandoned;
-    abandoned.abandoned = true;
-    assert(!abandoned.run(request, "ML307A", 1));
-    assert(abandoned.writes.empty());
-
-    IdfModemHttpsPostRequest oversized = request;
-    std::string error;
-    oversized.body.assign(IDF_MODEM_HTTPS_POST_MAX_BODY + 1, 'x');
-    assert(!idf_modem_https_validate_request(oversized, error));
-    oversized = request;
-    oversized.url.assign(IDF_MODEM_HTTPS_POST_MAX_URL + 1, 'x');
-    assert(!idf_modem_https_validate_request(oversized, error));
-    oversized = request;
-    oversized.headerValue.assign(IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE + 1, 'x');
-    assert(!idf_modem_https_validate_request(oversized, error));
-    oversized = request;
-    oversized.url = "https://push.example.test/\xE9\x80\x9A\xE7\x9F\xA5";
-    assert(!idf_modem_https_validate_request(oversized, error));
-
-    feed_fragmented_success();
-    filter_interleaved_clock_response();
     return 0;
 }

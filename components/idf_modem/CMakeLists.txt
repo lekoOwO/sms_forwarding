@@ -1,5 +1,5 @@
 idf_component_register(
-  SRCS "idf_modem.cpp" "idf_modem_https.cpp"
+  SRCS "idf_modem.cpp" "idf_modem_https.cpp" "idf_modem_https_wire.cpp"
   INCLUDE_DIRS "include"
   REQUIRES
     driver
@@ -8,6 +8,7 @@ idf_component_register(
     esp_timer
     idf_config
     idf_logbuf
+    mbedtls
     nvs_flash
 )
 
