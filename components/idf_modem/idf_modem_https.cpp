@@ -21,10 +21,15 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 namespace {
 
 constexpr std::string_view kHttpsPrefix = "https://";
+constexpr uint32_t kConnectedPollWindowMs = 5000;
+constexpr uint32_t kConnectedPollCadenceMs = 250;
+constexpr size_t kConnectedPollMaxQueries = 21;
 using namespace idf_modem_https_wire;
 
 using Clock = std::chrono::steady_clock;
@@ -35,6 +40,7 @@ public:
         : end_(Clock::now() + std::chrono::milliseconds(milliseconds)) {}
 
     bool expired() const { return Clock::now() >= end_; }
+    Clock::time_point end() const { return end_; }
 
 private:
     Clock::time_point end_;
@@ -393,7 +399,7 @@ public:
         if (!prepare_pdp()) return fail();
         if (!apply_runtime_config()) return fail();
         if (!open_socket()) return fail();
-        if (!query_state("CONNECTED")) return fail();
+        if (!wait_for_connected()) return fail();
         {
             MipTlsSession tls(request_, target_, callbacks_, deadline_);
             if (!tls.init()) {
@@ -481,6 +487,34 @@ private:
             return false;
         }
         return query_state("INITIAL");
+    }
+
+    bool wait_for_connected()
+    {
+        const Clock::time_point poll_end = std::min(
+            deadline_.end(), Clock::now() + std::chrono::milliseconds(kConnectedPollWindowMs));
+        const auto cadence = std::chrono::milliseconds(kConnectedPollCadenceMs);
+        const std::string state_command = "AT+MIPSTATE=0";
+        for (size_t query = 0; query < kConnectedPollMaxQueries; ++query) {
+            if (Clock::now() >= poll_end) break;
+            std::string response;
+            if (!command(state_command, response)) return false;
+            const MipStateDisposition disposition =
+                classify_mip_state(response, state_command, 0);
+            if (disposition == MipStateDisposition::connected) {
+                const IdfModemHttpsCommandResult confirmed =
+                    callbacks_.confirmOpen(callbacks_.context);
+                if (confirmed == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
+                return confirmed == IdfModemHttpsCommandResult::ok;
+            }
+            if (disposition != MipStateDisposition::initial) return false;
+            if (query + 1 == kConnectedPollMaxQueries || poll_end - Clock::now() < cadence) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(kConnectedPollCadenceMs));
+        }
+        timed_out_ = true;
+        return false;
     }
 
     bool query_config(std::string_view parameter, uint8_t& first, uint8_t& second,
@@ -595,7 +629,7 @@ private:
         std::string response;
         if (!command(text, response)) return false;
         bool async_result_present = false;
-        return parse_mip_open(response, text, 0, async_result_present) && async_result_present;
+        return parse_mip_open(response, text, 0, async_result_present);
     }
 
     bool restore_config(std::string_view parameter, std::string_view values,
@@ -859,7 +893,7 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         result.message = error;
         return IdfModemHttpsRunResult::invalid_request;
     }
-    if (!callbacks.sendCommand) {
+    if (!callbacks.sendCommand || !callbacks.confirmOpen) {
         result.message = "HTTPS callbacks unavailable";
         return IdfModemHttpsRunResult::invalid_request;
     }

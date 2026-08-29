@@ -49,6 +49,26 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
                 uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed);
 std::string hex_encode(const uint8_t* bytes, size_t length);
 
+class MipOpenLatch {
+public:
+    void begin();
+    bool feed(std::string_view bytes);
+    bool finish();
+    void reset();
+    bool active() const { return active_; }
+    bool connected() const { return connected_; }
+    bool nonfatal() const { return !failed_; }
+
+private:
+    bool consume_line(std::string_view line);
+
+    std::string carry_;
+    bool active_ = false;
+    bool connected_ = false;
+    bool failed_ = false;
+    bool success_seen_ = false;
+};
+
 class HttpResponse {
 public:
     bool feed(const uint8_t* bytes, size_t length, IdfModemHttpsPostResult& result);

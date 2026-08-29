@@ -205,6 +205,22 @@ bool consume_nonfatal_mip_urc(std::string_view line)
     return parse_mip_urc(line, received, total, state, disconnected) && !disconnected;
 }
 
+bool parse_mip_open_line(std::string_view line, uint8_t expected_cid)
+{
+    if (!starts_with(line, "+MIPOPEN:")) return false;
+    std::array<std::string_view, 8> fields;
+    std::array<bool, 8> quoted{};
+    size_t count = 0;
+    if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count) ||
+        count != 2 || quoted[0] || quoted[1]) {
+        return false;
+    }
+    uint32_t cid = 0;
+    uint32_t result = 0;
+    return parse_uint(fields[0], cid) && cid == expected_cid &&
+           parse_uint(fields[1], result) && result == 0;
+}
+
 MipStateDisposition parse_mip_state_disposition(std::string_view response,
                                                 std::string_view command,
                                                 uint8_t& cid)
@@ -212,9 +228,15 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     std::vector<std::string_view> body;
     if (!scan_frame(response, command, body)) return MipStateDisposition::invalid;
     std::string_view state_line;
+    bool open_seen = false;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
             if (!consume_nonfatal_mip_urc(line)) return MipStateDisposition::invalid;
+        } else if (starts_with(line, "+MIPOPEN")) {
+            if (open_seen || !parse_mip_open_line(line, 0)) {
+                return MipStateDisposition::invalid;
+            }
+            open_seen = true;
         } else if (state_line.empty()) {
             state_line = line;
         } else {
@@ -333,18 +355,78 @@ bool parse_mip_open(std::string_view response, std::string_view command,
             continue;
         }
         if (!starts_with(line, "+MIPOPEN:") || present) return false;
-        std::array<std::string_view, 8> fields;
-        std::array<bool, 8> quoted{};
-        size_t count = 0;
-        if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count) ||
-            count != 2 || quoted[0] || quoted[1]) return false;
-        uint32_t cid = 0;
-        uint32_t result = 0;
-        if (!parse_uint(fields[0], cid) || cid != expected_cid ||
-            !parse_uint(fields[1], result) || result != 0) return false;
+        if (!parse_mip_open_line(line, expected_cid)) return false;
         present = true;
     }
     return true;
+}
+
+void MipOpenLatch::begin()
+{
+    reset();
+    active_ = true;
+}
+
+bool MipOpenLatch::consume_line(std::string_view line)
+{
+    line = trim_spaces(line);
+    if (line.empty()) return true;
+    if (starts_with(line, "+MIPOPEN")) {
+        if (success_seen_ || !parse_mip_open_line(line, 0)) return false;
+        success_seen_ = true;
+        return true;
+    }
+    if (starts_with(line, "+MIPURC")) return consume_nonfatal_mip_urc(line);
+    return true;
+}
+
+bool MipOpenLatch::feed(std::string_view bytes)
+{
+    if (!active_) return true;
+    if (failed_) return false;
+    for (const char ch : bytes) {
+        if (ch == '\r' || ch == '\n') {
+            if (!carry_.empty() && !consume_line(carry_)) {
+                failed_ = true;
+                return false;
+            }
+            carry_.clear();
+        } else {
+            if (carry_.size() == kLineMax) {
+                failed_ = true;
+                return false;
+            }
+            carry_.push_back(ch);
+        }
+    }
+    return true;
+}
+
+bool MipOpenLatch::finish()
+{
+    if (!active_ || connected_ || failed_) return false;
+    const std::string_view remaining = trim_spaces(carry_);
+    if (!remaining.empty()) {
+        static constexpr std::string_view targets[] = {"+MIPOPEN", "+MIPURC"};
+        for (const std::string_view target : targets) {
+            if (starts_with(remaining, target) || starts_with(target, remaining)) {
+                failed_ = true;
+                return false;
+            }
+        }
+    }
+    carry_.clear();
+    connected_ = true;
+    return true;
+}
+
+void MipOpenLatch::reset()
+{
+    carry_.clear();
+    active_ = false;
+    connected_ = false;
+    failed_ = false;
+    success_seen_ = false;
 }
 
 bool parse_cgdccont(std::string_view response, std::string_view command, uint8_t cid,

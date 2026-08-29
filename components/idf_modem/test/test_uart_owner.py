@@ -428,7 +428,9 @@ class UartOwnerContractTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             stub_root = Path(directory) / "stubs"
             mbedtls = stub_root / "mbedtls"
+            freertos = stub_root / "freertos"
             mbedtls.mkdir(parents=True)
+            freertos.mkdir(parents=True)
             (stub_root / "mbedtls_stub.h").write_text(r'''
 #pragma once
 #include <cstddef>
@@ -513,6 +515,17 @@ inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned in
                 "ctr_drbg.h", "entropy.h", "net_sockets.h", "sha256.h", "ssl.h", "x509_crt.h"
             ):
                 (mbedtls / header).write_text('#include "../mbedtls_stub.h"\n')
+            (freertos / "FreeRTOS.h").write_text(r'''
+#pragma once
+#include <cstdint>
+using TickType_t = uint32_t;
+#define pdMS_TO_TICKS(milliseconds) static_cast<TickType_t>(milliseconds)
+''')
+            (freertos / "task.h").write_text(r'''
+#pragma once
+#include "FreeRTOS.h"
+inline void vTaskDelay(TickType_t) {}
+''')
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(
                 [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
@@ -617,7 +630,7 @@ inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned in
         self.assertIn('expected == "INITIAL"', wire)
         self.assertIn('expected == "CONNECTED"', wire)
 
-    def test_https_open_waits_for_async_result_and_parses_mipurc_strictly(self):
+    def test_https_open_accepts_terminal_and_parses_optional_result_strictly(self):
         source = SOURCE.read_text()
         wire = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
         fixture = (SOURCE.parent / "test" / "https_post_fixture.cpp").read_text()
@@ -629,7 +642,18 @@ inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned in
         self.assertIn("known_mip_urc", adapter)
         self.assertIn("if (line == command)", adapter)
         self.assertIn("parse_mip_open", adapter)
+        self.assertIn("terminal_seen && line_carry.empty()", adapter)
+        self.assertNotIn("terminal_seen && open_seen &&", adapter)
         self.assertIn("owner_send_mip_deadline(command_text, active_deadline, response,", source)
+        self.assertIn("open_latch->feed", adapter)
+        self.assertIn("open_latch->feed", function_body(source, "capture_pending_uart_locked"))
+        confirm = function_body(source, "owner_https_confirm_open")
+        self.assertIn("capture_pending_uart_locked", confirm)
+        self.assertIn("open_latch.finish()", confirm)
+        self.assertNotIn("open_latch.reset()", confirm)
+        self.assertIn("!open_latch->connected()", adapter)
+        self.assertIn("if (cleanup) context.open_latch.reset()", source)
+        self.assertIn("context.open_latch.reset()", function_body(source, "owner_https_post"))
         self.assertIn("parse_mip_urc", wire)
         self.assertNotIn('"+MIPURC:"', wire.split("bool is_known_urc", 1)[1].split("}", 1)[0])
         self.assertIn("open_after_ok_response", fixture)
@@ -705,6 +729,11 @@ inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned in
         self.assertIn("command(close, response, true)", ensure_initial)
         self.assertNotIn("while", ensure_initial)
         self.assertNotIn("MIPOPEN", ensure_initial)
+        wait_connected = function_body(source, "wait_for_connected")
+        self.assertIn("kConnectedPollWindowMs", wait_connected)
+        self.assertIn("kConnectedPollCadenceMs", wait_connected)
+        self.assertIn("kConnectedPollMaxQueries", wait_connected)
+        self.assertIn("vTaskDelay", wait_connected)
 
     def test_https_http_parser_requires_eof_without_length_and_rejects_chunked(self):
         source = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()

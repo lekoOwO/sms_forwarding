@@ -64,9 +64,11 @@ enum class IdfModemHttpsRunResult : int {
 
 using IdfModemHttpsSendCommand = IdfModemHttpsCommandResult (*)(
     void* context, std::string_view command, std::string& response, bool cleanup);
+using IdfModemHttpsConfirmOpen = IdfModemHttpsCommandResult (*)(void* context);
 struct IdfModemHttpsCallbacks {
     void* context = nullptr;
     IdfModemHttpsSendCommand sendCommand = nullptr;
+    IdfModemHttpsConfirmOpen confirmOpen = nullptr;
 };
 
 bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,

@@ -10,6 +10,7 @@
 namespace {
 
 using idf_modem_https_wire::HttpResponse;
+using idf_modem_https_wire::MipOpenLatch;
 using idf_modem_https_wire::MipStateDisposition;
 using idf_modem_https_wire::parse_cgact;
 using idf_modem_https_wire::parse_cgdccont;
@@ -112,6 +113,11 @@ struct InitialStateTranscript {
         }
         return IdfModemHttpsCommandResult::failed;
     }
+
+    static IdfModemHttpsCommandResult confirm(void*)
+    {
+        return IdfModemHttpsCommandResult::ok;
+    }
 };
 
 IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& transcript)
@@ -121,7 +127,8 @@ IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& tran
     request.body = "{}";
     request.rootCertificateDer = {'D', 'E', 'R'};
     request.rootCertificateSha256.fill(0xab);
-    IdfModemHttpsCallbacks callbacks{&transcript, &InitialStateTranscript::send};
+    IdfModemHttpsCallbacks callbacks{
+        &transcript, &InitialStateTranscript::send, &InitialStateTranscript::confirm};
     IdfModemHttpsPostResult result;
     return idf_modem_https_run_post(request, callbacks, result);
 }
@@ -184,7 +191,37 @@ enum class RemoteCloseMode {
     disconnect_only,
     unread_data,
     duplicate_disconnect,
+    open_ok_connected,
+    open_ok_initial_connected,
+    open_result_failed,
+    open_duplicate,
+    open_wrong_cid,
+    open_disconnect,
+    open_malformed,
+    open_command_timeout,
+    post_open_initial_timeout,
     post_open_closed,
+    post_open_wrong_cid,
+    post_open_invalid,
+};
+
+enum class LateOpenKind {
+    none,
+    success,
+    result_failed,
+    duplicate,
+    wrong_cid,
+    disconnect,
+    malformed,
+};
+
+enum class LateOpenStage {
+    none,
+    before_first_state,
+    between_initial_polls,
+    in_first_state_response,
+    after_connected_before_confirm,
+    after_confirm_before_first_send,
 };
 
 bool parse_decimal(std::string_view value, size_t& parsed)
@@ -199,10 +236,18 @@ bool parse_decimal(std::string_view value, size_t& parsed)
 }
 
 struct RemoteCloseTranscript {
-    explicit RemoteCloseTranscript(RemoteCloseMode selected) : mode(selected) {}
+    explicit RemoteCloseTranscript(RemoteCloseMode selected,
+                                   LateOpenKind late = LateOpenKind::none,
+                                   LateOpenStage stage = LateOpenStage::none)
+        : mode(selected), late_open(late), late_stage(stage) {}
 
     RemoteCloseMode mode;
+    LateOpenKind late_open;
+    LateOpenStage late_stage;
+    bool late_consumed = false;
+    size_t late_feed_calls = 0;
     size_t state_queries = 0;
+    size_t open_commands = 0;
     size_t send_commands = 0;
     size_t read_commands = 0;
     size_t close_commands = 0;
@@ -210,20 +255,90 @@ struct RemoteCloseTranscript {
     uint8_t encoding_send = 0;
     uint8_t encoding_receive = 0;
     uint8_t autofree = 0;
+    MipOpenLatch open_latch;
+
+    std::string late_open_bytes() const
+    {
+        switch (late_open) {
+            case LateOpenKind::success:
+                return "+MIPOPEN: 0,0\r\n";
+            case LateOpenKind::result_failed:
+                return "+MIPOPEN: 0,4\r\n";
+            case LateOpenKind::duplicate:
+                return "+MIPOPEN: 0,0\r\n+MIPOPEN: 0,0\r\n";
+            case LateOpenKind::wrong_cid:
+                return "+MIPOPEN: 1,0\r\n";
+            case LateOpenKind::disconnect:
+                return "+MIPURC: \"disconn\",0,2\r\n";
+            case LateOpenKind::malformed:
+                return "+MIPOPEN: 0\r\n";
+            case LateOpenKind::none:
+                return {};
+        }
+        return {};
+    }
+
+    bool feed_late_open_split()
+    {
+        const std::string bytes = late_open_bytes();
+        assert(bytes.size() > 5);
+        ++late_feed_calls;
+        if (!open_latch.feed(std::string_view(bytes).substr(0, 5))) return false;
+        ++late_feed_calls;
+        return open_latch.feed(std::string_view(bytes).substr(5));
+    }
 
     static IdfModemHttpsCommandResult send(void* context, std::string_view command,
                                            std::string& response, bool cleanup)
     {
         auto& transcript = *static_cast<RemoteCloseTranscript*>(context);
+        if (cleanup) transcript.open_latch.reset();
+        if (!transcript.open_latch.nonfatal()) return IdfModemHttpsCommandResult::failed;
+        if (command.rfind("AT+MIPSEND=0,", 0) == 0 &&
+            transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
+            transcript.late_stage == LateOpenStage::after_confirm_before_first_send) {
+            assert(transcript.open_latch.connected());
+            transcript.late_consumed = true;
+            if (!transcript.feed_late_open_split()) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+        }
         if (command == "AT+MIPSTATE=0") {
+            if (transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
+                ((transcript.late_stage == LateOpenStage::before_first_state &&
+                  transcript.state_queries == 1) ||
+                 (transcript.late_stage == LateOpenStage::between_initial_polls &&
+                  transcript.state_queries == 2))) {
+                transcript.late_consumed = true;
+                if (!transcript.open_latch.feed(transcript.late_open_bytes())) {
+                    return IdfModemHttpsCommandResult::failed;
+                }
+            }
             ++transcript.state_queries;
-            const std::string_view state =
-                transcript.state_queries == 1
-                    ? "+MIPSTATE: 0,,,,\"INITIAL\""
-                : transcript.mode == RemoteCloseMode::post_open_closed
-                    ? "+MIPSTATE: 0,,,,\"CLOSED\""
-                    : "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
-            response = frame(command, state);
+            std::string_view state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
+            if (transcript.state_queries == 1 ||
+                transcript.mode == RemoteCloseMode::post_open_initial_timeout ||
+                (transcript.mode == RemoteCloseMode::open_ok_initial_connected &&
+                 transcript.state_queries == 2)) {
+                state = "+MIPSTATE: 0,,,,\"INITIAL\"";
+            } else if (transcript.mode == RemoteCloseMode::post_open_closed) {
+                state = "+MIPSTATE: 0,,,,\"CLOSED\"";
+            } else if (transcript.mode == RemoteCloseMode::post_open_wrong_cid) {
+                state = "+MIPSTATE: 1,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
+            } else if (transcript.mode == RemoteCloseMode::post_open_invalid) {
+                state = "+MIPSTATE: 0,,,,\"OTHER\"";
+            }
+            std::string state_body(state);
+            if (transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
+                transcript.late_stage == LateOpenStage::in_first_state_response &&
+                transcript.state_queries == 2) {
+                transcript.late_consumed = true;
+                state_body = transcript.late_open_bytes() + state_body;
+            }
+            response = frame(command, state_body);
+            if (!transcript.open_latch.feed(response)) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+MIPCFG=\"cid\",0") {
@@ -272,7 +387,30 @@ struct RemoteCloseTranscript {
         }
         constexpr std::string_view open_prefix = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",443,";
         if (command.compare(0, open_prefix.size(), open_prefix) == 0) {
-            response = frame(command, "+MIPOPEN: 0,0");
+            ++transcript.open_commands;
+            transcript.open_latch.begin();
+            if (transcript.mode == RemoteCloseMode::open_command_timeout) {
+                return IdfModemHttpsCommandResult::timeout;
+            }
+            std::string_view body = "+MIPOPEN: 0,0";
+            if (transcript.mode == RemoteCloseMode::open_ok_connected ||
+                transcript.mode == RemoteCloseMode::open_ok_initial_connected) {
+                body = "";
+            } else if (transcript.mode == RemoteCloseMode::open_result_failed) {
+                body = "+MIPOPEN: 0,4";
+            } else if (transcript.mode == RemoteCloseMode::open_duplicate) {
+                body = "+MIPOPEN: 0,0\r\n+MIPOPEN: 0,0";
+            } else if (transcript.mode == RemoteCloseMode::open_wrong_cid) {
+                body = "+MIPOPEN: 1,0";
+            } else if (transcript.mode == RemoteCloseMode::open_disconnect) {
+                body = "+MIPURC: \"disconn\",0,2";
+            } else if (transcript.mode == RemoteCloseMode::open_malformed) {
+                body = "+MIPOPEN: 0";
+            }
+            response = frame(command, body);
+            if (!transcript.open_latch.feed(response)) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             return IdfModemHttpsCommandResult::ok;
         }
         constexpr std::string_view send_prefix = "AT+MIPSEND=0,";
@@ -316,6 +454,21 @@ struct RemoteCloseTranscript {
         }
         return IdfModemHttpsCommandResult::failed;
     }
+
+    static IdfModemHttpsCommandResult confirm(void* context)
+    {
+        auto& transcript = *static_cast<RemoteCloseTranscript*>(context);
+        if (transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
+            transcript.late_stage == LateOpenStage::after_connected_before_confirm) {
+            assert(!transcript.open_latch.connected());
+            transcript.late_consumed = true;
+            if (!transcript.feed_late_open_split()) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+        }
+        if (!transcript.open_latch.finish()) return IdfModemHttpsCommandResult::failed;
+        return IdfModemHttpsCommandResult::ok;
+    }
 };
 
 IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transcript,
@@ -326,7 +479,8 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
     request.body = "{}";
     request.rootCertificateDer = {'D', 'E', 'R'};
     request.rootCertificateSha256.fill(0xab);
-    IdfModemHttpsCallbacks callbacks{&transcript, &RemoteCloseTranscript::send};
+    IdfModemHttpsCallbacks callbacks{
+        &transcript, &RemoteCloseTranscript::send, &RemoteCloseTranscript::confirm};
     return idf_modem_https_run_post(request, callbacks, result);
 }
 
@@ -356,15 +510,122 @@ void check_remote_close_transcripts()
                rejected.close_commands == 1 && rejected.close_was_cleanup);
     }
 
-    RemoteCloseTranscript closed_after_open{RemoteCloseMode::post_open_closed};
+    for (const RemoteCloseMode mode : {RemoteCloseMode::open_ok_connected,
+                                       RemoteCloseMode::open_ok_initial_connected}) {
+        RemoteCloseTranscript accepted{mode};
+        result = {};
+        assert(run_remote_close_transcript(accepted, result) == IdfModemHttpsRunResult::ok);
+        const size_t expected_state_queries =
+            mode == RemoteCloseMode::open_ok_connected ? 2 : 3;
+        assert(result.ok && accepted.state_queries == expected_state_queries &&
+               accepted.open_commands == 1 && accepted.send_commands == 1 &&
+               accepted.read_commands == 1 && accepted.close_commands == 1 &&
+               accepted.close_was_cleanup);
+    }
+
+    for (const RemoteCloseMode mode : {RemoteCloseMode::open_result_failed,
+                                       RemoteCloseMode::open_duplicate,
+                                       RemoteCloseMode::open_wrong_cid,
+                                       RemoteCloseMode::open_disconnect,
+                                       RemoteCloseMode::open_malformed}) {
+        RemoteCloseTranscript rejected{mode};
+        result = {};
+        assert(run_remote_close_transcript(rejected, result) ==
+               IdfModemHttpsRunResult::command_failed);
+        assert(!result.ok && rejected.state_queries == 1 && rejected.open_commands == 1 &&
+               rejected.send_commands == 0 && rejected.read_commands == 0 &&
+               rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert(!rejected.open_latch.active());
+    }
+
+    RemoteCloseTranscript open_timeout{RemoteCloseMode::open_command_timeout};
     result = {};
-    assert(run_remote_close_transcript(closed_after_open, result) ==
-           IdfModemHttpsRunResult::command_failed);
-    assert(!result.ok && closed_after_open.send_commands == 0 &&
-           closed_after_open.read_commands == 0 && closed_after_open.close_commands == 1 &&
-           closed_after_open.close_was_cleanup);
-    assert(closed_after_open.encoding_send == 0 && closed_after_open.encoding_receive == 0 &&
-           closed_after_open.autofree == 0);
+    assert(run_remote_close_transcript(open_timeout, result) ==
+           IdfModemHttpsRunResult::timed_out);
+    assert(!result.ok && open_timeout.state_queries == 1 && open_timeout.open_commands == 1 &&
+           open_timeout.send_commands == 0 && open_timeout.read_commands == 0 &&
+           open_timeout.close_commands == 1 && open_timeout.close_was_cleanup);
+
+    for (const RemoteCloseMode mode : {RemoteCloseMode::post_open_closed,
+                                       RemoteCloseMode::post_open_wrong_cid,
+                                       RemoteCloseMode::post_open_invalid}) {
+        RemoteCloseTranscript rejected{mode};
+        result = {};
+        assert(run_remote_close_transcript(rejected, result) ==
+               IdfModemHttpsRunResult::command_failed);
+        assert(!result.ok && rejected.state_queries == 2 && rejected.open_commands == 1 &&
+               rejected.send_commands == 0 && rejected.read_commands == 0 &&
+               rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert(rejected.encoding_send == 0 && rejected.encoding_receive == 0 &&
+               rejected.autofree == 0);
+    }
+
+    RemoteCloseTranscript state_timeout{RemoteCloseMode::post_open_initial_timeout};
+    result = {};
+    assert(run_remote_close_transcript(state_timeout, result) ==
+           IdfModemHttpsRunResult::timed_out);
+    assert(!result.ok && state_timeout.state_queries == 22 && state_timeout.open_commands == 1 &&
+           state_timeout.send_commands == 0 && state_timeout.read_commands == 0 &&
+           state_timeout.close_commands == 1 && state_timeout.close_was_cleanup);
+
+    for (const LateOpenStage stage : {LateOpenStage::before_first_state,
+                                      LateOpenStage::between_initial_polls,
+                                      LateOpenStage::in_first_state_response}) {
+        for (const LateOpenKind late : {LateOpenKind::result_failed,
+                                        LateOpenKind::duplicate,
+                                        LateOpenKind::wrong_cid,
+                                        LateOpenKind::disconnect,
+                                        LateOpenKind::malformed}) {
+            const RemoteCloseMode mode = stage == LateOpenStage::before_first_state
+                                             ? RemoteCloseMode::open_ok_connected
+                                             : RemoteCloseMode::open_ok_initial_connected;
+            RemoteCloseTranscript rejected{mode, late, stage};
+            result = {};
+            assert(run_remote_close_transcript(rejected, result) ==
+                   IdfModemHttpsRunResult::command_failed);
+            assert(rejected.late_consumed && rejected.send_commands == 0 &&
+                   rejected.read_commands == 0 && rejected.close_commands == 1 &&
+                   rejected.close_was_cleanup);
+            assert(!rejected.open_latch.active());
+        }
+    }
+
+    for (const LateOpenStage stage : {LateOpenStage::after_connected_before_confirm,
+                                      LateOpenStage::after_confirm_before_first_send}) {
+        for (const LateOpenKind late : {LateOpenKind::result_failed,
+                                        LateOpenKind::duplicate,
+                                        LateOpenKind::wrong_cid,
+                                        LateOpenKind::disconnect,
+                                        LateOpenKind::malformed}) {
+            RemoteCloseTranscript rejected{RemoteCloseMode::open_ok_connected, late, stage};
+            result = {};
+            assert(run_remote_close_transcript(rejected, result) ==
+                   IdfModemHttpsRunResult::command_failed);
+            assert(rejected.late_consumed && rejected.late_feed_calls == 2 &&
+                   rejected.send_commands == 0 && rejected.read_commands == 0 &&
+                   rejected.close_commands == 1 && rejected.close_was_cleanup);
+            assert(!rejected.open_latch.active());
+        }
+    }
+
+    RemoteCloseTranscript late_success{RemoteCloseMode::open_ok_connected,
+                                       LateOpenKind::success,
+                                       LateOpenStage::before_first_state};
+    result = {};
+    assert(run_remote_close_transcript(late_success, result) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && late_success.late_consumed && late_success.send_commands == 1 &&
+           late_success.read_commands == 1 && late_success.close_commands == 1 &&
+           late_success.close_was_cleanup);
+
+    RemoteCloseTranscript response_success{RemoteCloseMode::open_ok_connected,
+                                           LateOpenKind::success,
+                                           LateOpenStage::in_first_state_response};
+    result = {};
+    assert(run_remote_close_transcript(response_success, result) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && response_success.late_consumed && response_success.send_commands == 1 &&
+           response_success.read_commands == 1 && response_success.close_commands == 1 &&
+           response_success.close_was_cleanup);
+    assert(!response_success.open_latch.active());
 }
 
 }  // namespace

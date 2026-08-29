@@ -687,12 +687,15 @@ static void preserve_uart_urcs(const uint8_t* data, size_t len)
     }
 }
 
-static void capture_pending_uart_locked(TickDeadline& deadline)
+static bool capture_pending_uart_locked(
+    TickDeadline& deadline,
+    idf_modem_https_wire::MipOpenLatch* open_latch = nullptr)
 {
     assert_owner_task();
+    if (open_latch && !open_latch->nonfatal()) return false;
     // Return immediately when RX is empty. This runs before every AT command.
     size_t buffered = 0;
-    if (uart_get_buffered_data_len(MODEM_UART, &buffered) == ESP_OK && buffered == 0) return;
+    if (uart_get_buffered_data_len(MODEM_UART, &buffered) == ESP_OK && buffered == 0) return true;
 
     uint8_t buf[128];
     // Bound one pre-command drain without resetting the caller's operation deadline.
@@ -713,9 +716,15 @@ static void capture_pending_uart_locked(TickDeadline& deadline)
         const int got = owner_uart_read(buf, sizeof(buf), wait);
         if (got > 0) {
             preserve_uart_urcs(buf, static_cast<size_t>(got));
+            if (open_latch &&
+                !open_latch->feed(std::string_view(
+                    reinterpret_cast<const char*>(buf), static_cast<size_t>(got)))) {
+                return false;
+            }
             quiet_start = xTaskGetTickCount();
         }
     }
+    return true;
 }
 
 static bool poll_unsolicited_uart(uint32_t max_ms)
@@ -1898,21 +1907,27 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
 
 struct OwnerHttpsCallbackContext {
     TickDeadline& deadline;
+    idf_modem_https_wire::MipOpenLatch open_latch;
 };
 
 static esp_err_t owner_send_mip_deadline(const std::string& command, TickDeadline& deadline,
                                          std::string& response, bool* modem_error = nullptr,
-                                         bool await_mip_open = false)
+                                         bool await_mip_open = false,
+                                         idf_modem_https_wire::MipOpenLatch* open_latch = nullptr)
 {
     assert_owner_task();
     if (modem_error) *modem_error = false;
     if (deadline.expired()) return ESP_ERR_TIMEOUT;
 
-    capture_pending_uart_locked(deadline);
+    if (!capture_pending_uart_locked(deadline, open_latch)) return ESP_FAIL;
     std::string wire = command;
     wire += "\r\n";
     if (!owner_uart_write_all(wire.data(), wire.size(), deadline)) {
         return deadline.expired() ? ESP_ERR_TIMEOUT : ESP_FAIL;
+    }
+    if (await_mip_open) {
+        if (!open_latch) return ESP_FAIL;
+        open_latch->begin();
     }
 
     response.clear();
@@ -1995,6 +2010,11 @@ static esp_err_t owner_send_mip_deadline(const std::string& command, TickDeadlin
         const int got = owner_uart_read(buf, sizeof(buf), wait);
         if (got <= 0) continue;
         preserve_uart_urcs(buf, static_cast<size_t>(got));
+        if (open_latch && !open_latch->connected() &&
+            !open_latch->feed(std::string_view(
+                reinterpret_cast<const char*>(buf), static_cast<size_t>(got)))) {
+            return ESP_FAIL;
+        }
         if (static_cast<size_t>(got) > OWNER_MIP_RESPONSE_LIMIT - response.size()) {
             return ESP_ERR_INVALID_SIZE;
         }
@@ -2016,11 +2036,10 @@ static esp_err_t owner_send_mip_deadline(const std::string& command, TickDeadlin
                     return ESP_FAIL;
                 }
             }
-            if (terminal_seen && open_seen && line_carry.empty()) return ESP_OK;
+            if (terminal_seen && line_carry.empty()) return ESP_OK;
             continue;
         }
-        // For non-OPEN MIP commands, retain the hardware-evidenced result-before-OK
-        // behavior; only OPEN has the separately observed post-OK async result.
+        // For non-OPEN MIP commands, retain the hardware-evidenced result-before-OK behavior.
         const int final_code = at_final_result(scan);
         if (final_code != 0) {
             if (final_code < 0 && modem_error) *modem_error = true;
@@ -2041,12 +2060,27 @@ static IdfModemHttpsCommandResult owner_https_send_command(
     TickDeadline cleanup_deadline(HTTPS_CLEANUP_TIMEOUT_MS);
     TickDeadline& active_deadline = cleanup ? cleanup_deadline : context.deadline;
     const bool await_mip_open = command_text.rfind("AT+MIPOPEN=", 0) == 0;
+    if (cleanup) context.open_latch.reset();
     const esp_err_t err = owner_send_mip_deadline(command_text, active_deadline, response,
-                                                  &modem_error, await_mip_open);
+                                                  &modem_error, await_mip_open,
+                                                  &context.open_latch);
     if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
     if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
     return modem_error ? IdfModemHttpsCommandResult::modem_error
                         : IdfModemHttpsCommandResult::failed;
+}
+
+static IdfModemHttpsCommandResult owner_https_confirm_open(void* opaque)
+{
+    auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
+    if (context.deadline.expired()) return IdfModemHttpsCommandResult::timeout;
+    if (!capture_pending_uart_locked(context.deadline, &context.open_latch)) {
+        return context.deadline.expired() ? IdfModemHttpsCommandResult::timeout
+                                          : IdfModemHttpsCommandResult::failed;
+    }
+    if (context.deadline.expired()) return IdfModemHttpsCommandResult::timeout;
+    if (!context.open_latch.finish()) return IdfModemHttpsCommandResult::failed;
+    return IdfModemHttpsCommandResult::ok;
 }
 
 static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
@@ -2067,10 +2101,12 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
         result.message = "Cellular HTTPS requires home registration";
         return ESP_ERR_INVALID_STATE;
     }
-    OwnerHttpsCallbackContext context{deadline};
-    const IdfModemHttpsCallbacks callbacks{&context, &owner_https_send_command};
+    OwnerHttpsCallbackContext context{deadline, {}};
+    const IdfModemHttpsCallbacks callbacks{
+        &context, &owner_https_send_command, &owner_https_confirm_open};
     const IdfModemHttpsRunResult run_result =
         idf_modem_https_run_post(request, callbacks, result);
+    context.open_latch.reset();
     switch (run_result) {
         case IdfModemHttpsRunResult::ok:
             return ESP_OK;
