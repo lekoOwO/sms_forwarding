@@ -139,16 +139,34 @@ def main() -> None:
     assert push_test["get"]["parameters"][0]["schema"] == {
         "type": "integer", "minimum": 0, "maximum": 4
     }
-    assert push_test["post"]["parameters"][1]["$ref"].endswith("/CsrfToken")
+    for operation in (push_test["get"], push_test["post"]):
+        detail = next(parameter for parameter in operation["parameters"]
+                      if parameter.get("name") == "detail")
+        assert detail["required"] is False
+        assert detail["schema"] == {"type": "string", "enum": ["1"]}
+        assert "cleanupMessage" in detail["description"]
+    assert push_test["post"]["parameters"][2]["$ref"].endswith("/CsrfToken")
     assert "requestBody" not in push_test["post"]
     assert "body must be empty" in push_test["post"]["description"]
+    assert "five-key" in push_test["get"]["description"]
     push_status = SPEC["components"]["schemas"]["PushTestStatus"]
     assert set(push_status["required"]) == {"queued", "running", "done", "success", "message"}
     assert push_status["additionalProperties"] is False
     assert {name: schema["type"] for name, schema in push_status["properties"].items()} == {
         "queued": "boolean", "running": "boolean", "done": "boolean",
-        "success": "boolean", "message": "string",
+        "success": "boolean", "message": "string", "cleanupMessage": "string",
     }
+    cleanup_message = push_status["properties"]["cleanupMessage"]
+    assert "cleanupMessage" not in push_status["required"]
+    assert cleanup_message["maxLength"] == 95
+    assert cleanup_message["enum"] == [
+        "HTTPS cleanup socket close failed",
+        "HTTPS cleanup SSL config restore failed",
+        "HTTPS cleanup autofree config restore failed",
+        "HTTPS cleanup encoding config restore failed",
+        "HTTPS cleanup PDP deactivate failed",
+        "HTTPS cleanup PDP profile restore failed",
+    ]
     assert len(push_status["oneOf"]) == 5
 
     # Provisioning endpoints are firmware-private AP routes. Legacy plaintext

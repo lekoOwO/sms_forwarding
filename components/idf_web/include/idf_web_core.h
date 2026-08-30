@@ -23,6 +23,14 @@ struct IdfWebFormDecodeResult {
 
 IdfWebFormDecodeResult idf_web_decode_form(const std::string& body, size_t max_fields);
 
+struct IdfWebPushTestQuery {
+    uint8_t channel = 0;
+    bool includeCleanup = false;
+};
+
+bool idf_web_parse_push_test_query(const std::string& query, size_t channel_count,
+                                   IdfWebPushTestQuery& output);
+
 struct IdfWebOwnedJobInput {
     std::string type;
     std::string payload;

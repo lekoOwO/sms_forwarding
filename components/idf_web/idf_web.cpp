@@ -3651,6 +3651,17 @@ static esp_err_t send_push_test_failure(httpd_req_t* req, const char* status,
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+static bool push_test_parse_query(httpd_req_t* req, uint8_t& channel, bool& include_cleanup)
+{
+    char query[64] = {};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+    IdfWebPushTestQuery parsed;
+    if (!idf_web_parse_push_test_query(query, IDF_MAX_PUSH_CHANNELS, parsed)) return false;
+    channel = parsed.channel;
+    include_cleanup = parsed.includeCleanup;
+    return true;
+}
+
 static esp_err_t handle_test_push(httpd_req_t* req)
 {
     if (reject_oversized_body(req)) return ESP_OK;
@@ -3663,23 +3674,20 @@ static esp_err_t handle_test_push(httpd_req_t* req)
     if (req->method == HTTP_POST && req->content_len != 0) {
         return send_push_test_failure(req, "400 Bad Request", "Push test request body is not allowed");
     }
-    std::string channel_raw;
-    int channel_value = -1;
-    if (!get_query_param(req, "channel", channel_raw, 64) ||
-        !parse_int_strict(channel_raw, channel_value) ||
-        channel_value < 0 || channel_value >= IDF_MAX_PUSH_CHANNELS) {
+    uint8_t channel = 0;
+    bool include_cleanup = false;
+    if (!push_test_parse_query(req, channel, include_cleanup)) {
         return send_push_test_failure(req, "400 Bad Request", "Invalid channel index");
     }
-    const uint8_t channel = static_cast<uint8_t>(channel_value);
     if (req->method == HTTP_GET) {
         set_json_no_cache(req);
-        const std::string body = idf_push_test_status_json(channel);
+        const std::string body = idf_push_test_status_json(channel, include_cleanup);
         return httpd_resp_send(req, body.c_str(), body.size());
     }
     if (idf_push_test_channel_active(channel)) {
         httpd_resp_set_status(req, "409 Conflict");
         set_json_no_cache(req);
-        const std::string body = idf_push_test_status_json(channel);
+        const std::string body = idf_push_test_status_json(channel, include_cleanup);
         return httpd_resp_send(req, body.c_str(), body.size());
     }
     if (s_push_test_admission_active.exchange(true, std::memory_order_acq_rel)) {
@@ -3708,7 +3716,7 @@ static esp_err_t handle_test_push(httpd_req_t* req)
         httpd_resp_set_status(req, "202 Accepted");
     }
     set_json_no_cache(req);
-    const std::string body = idf_push_test_status_json(channel);
+    const std::string body = idf_push_test_status_json(channel, include_cleanup);
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 

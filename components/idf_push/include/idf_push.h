@@ -21,4 +21,4 @@ bool idf_push_test_active(void);
 bool idf_push_test_channel_active(uint8_t channel);
 
 bool idf_push_enqueue_test(uint8_t channel, std::string& message);
-std::string idf_push_test_status_json(uint8_t channel);
+std::string idf_push_test_status_json(uint8_t channel, bool include_cleanup = false);

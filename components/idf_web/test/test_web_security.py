@@ -610,6 +610,29 @@ int main() {
     const IdfWebFormDecodeResult oversized_config_update = idf_web_decode_form(config_update, 51);
     assert(!oversized_config_update.valid && oversized_config_update.too_many_fields);
 
+    IdfWebPushTestQuery push_query;
+    assert(idf_web_parse_push_test_query("channel=0", 3, push_query));
+    assert(push_query.channel == 0 && !push_query.includeCleanup);
+    assert(idf_web_parse_push_test_query("channel=2&detail=1", 3, push_query));
+    assert(push_query.channel == 2 && push_query.includeCleanup);
+    assert(idf_web_parse_push_test_query("detail=1&channel=1", 3, push_query));
+    assert(push_query.channel == 1 && push_query.includeCleanup);
+    assert(idf_web_parse_push_test_query("channel=+0", 3, push_query));
+    assert(push_query.channel == 0 && !push_query.includeCleanup);
+    assert(idf_web_parse_push_test_query("channel=%2B0", 3, push_query));
+    assert(push_query.channel == 0 && !push_query.includeCleanup);
+    for (const char* invalid : {
+             "", "detail=1", "channel=3", "channel=-1", "channel=0&detail=",
+             "channel=0&detail=0", "channel=0&detail=2", "channel=0&unknown=1",
+             "channel=0&channel=1", "channel=0&detail=1&detail=1",
+             "channel=0&detail=1&unknown=1", "channel=%ZZ", "channel=0&&detail=1",
+             "channel=0&=1",
+         }) {
+        assert(!idf_web_parse_push_test_query(invalid, 3, push_query));
+    }
+    assert(!idf_web_parse_push_test_query("channel=" + std::string(56, ' ') + "0",
+                                          3, push_query));
+
     char request_body[] = "content=before";
     IdfWebOwnedJobInput owned = idf_web_own_job_input("sms", request_body,
                                                        sizeof(request_body) - 1);
@@ -898,6 +921,9 @@ int main() {
     assert push_test.index("req->method != HTTP_GET") < push_test.index("check_csrf(req)")
     assert push_test.index("check_csrf(req)") < push_test.index("req->content_len != 0")
     assert push_test.index("idf_push_test_channel_active") < push_test.index("api_jobs_active()")
+    assert "push_test_parse_query(req, channel, include_cleanup)" in push_test
+    assert push_test.count("idf_push_test_status_json(channel, include_cleanup)") == 3
+    assert "get_query_param(req, \"channel\"" not in push_test
     for guard in (
         "backup_transfer_active()", "ota_active()", "device_restart_pending()",
         "restore_restart_pending()", "api_jobs_active()",

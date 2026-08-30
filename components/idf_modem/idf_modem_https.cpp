@@ -73,6 +73,25 @@ constexpr std::string_view kPostCloseQueryCommandFailure =
     "HTTPS modem post-close query command failed";
 constexpr std::string_view kPostCloseQueryResponseInvalid =
     "HTTPS modem post-close query response invalid";
+constexpr std::string_view kCleanupSocketCloseFailure =
+    "HTTPS cleanup socket close failed";
+constexpr std::string_view kCleanupSslRestoreFailure =
+    "HTTPS cleanup SSL config restore failed";
+constexpr std::string_view kCleanupAutofreeRestoreFailure =
+    "HTTPS cleanup autofree config restore failed";
+constexpr std::string_view kCleanupEncodingRestoreFailure =
+    "HTTPS cleanup encoding config restore failed";
+constexpr std::string_view kCleanupPdpDeactivateFailure =
+    "HTTPS cleanup PDP deactivate failed";
+constexpr std::string_view kCleanupPdpProfileRestoreFailure =
+    "HTTPS cleanup PDP profile restore failed";
+
+static_assert(kCleanupSocketCloseFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
+static_assert(kCleanupSslRestoreFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
+static_assert(kCleanupAutofreeRestoreFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
+static_assert(kCleanupEncodingRestoreFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
+static_assert(kCleanupPdpDeactivateFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
+static_assert(kCleanupPdpProfileRestoreFailure.size() < IdfModemHttpsPostResult::MAX_CLEANUP_MESSAGE);
 
 constexpr std::string_view failure_message(HttpsFailureStage stage)
 {
@@ -523,7 +542,9 @@ private:
         cleanup();
         if (!cleanup_ok_) {
             result_.ok = false;
-            result_.message = failure_message(HttpsFailureStage::cleanup);
+            if (outcome == IdfModemHttpsRunResult::ok || result_.message.empty()) {
+                result_.message = failure_message(HttpsFailureStage::cleanup);
+            }
             return IdfModemHttpsRunResult::cleanup_failed;
         }
         return outcome;
@@ -748,19 +769,20 @@ private:
     }
 
     bool restore_config(std::string_view parameter, std::string_view values,
-                        uint8_t expected, uint8_t expected_second, bool has_second)
+                        uint8_t expected, uint8_t expected_second, bool has_second,
+                        std::string_view cleanup_failure)
     {
         const std::string text = "AT+MIPCFG=\"" + std::string(parameter) + "\",0," +
                                  std::string(values);
         std::string response;
         std::vector<std::string_view> body;
         if (!command(text, response, true) || !scan_frame(response, text, body) || !body.empty()) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(cleanup_failure);
             return false;
         }
         const std::string query = "AT+MIPCFG=\"" + std::string(parameter) + "\",0";
         if (!command(query, response, true)) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(cleanup_failure);
             return false;
         }
         uint8_t first = 0;
@@ -769,7 +791,7 @@ private:
         if (!parse_cfg_response(response, query, parameter, first, second, actual_has_second) ||
             first != expected || actual_has_second != has_second ||
             (has_second && second != expected_second)) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(cleanup_failure);
             return false;
         }
         return true;
@@ -778,7 +800,7 @@ private:
     bool restore_cgdccont()
     {
         if (original_cgdccont_.empty()) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(kCleanupPdpProfileRestoreFailure);
             return false;
         }
         const std::string command_text = "AT+CGDCONT=" + original_cgdccont_;
@@ -786,7 +808,7 @@ private:
         std::vector<std::string_view> body;
         if (!command(command_text, response, true) ||
             !scan_frame(response, command_text, body) || !body.empty()) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(kCleanupPdpProfileRestoreFailure);
             return false;
         }
         const std::string query = "AT+CGDCONT?";
@@ -794,10 +816,16 @@ private:
         if (!command(query, response, true) ||
             !parse_cgdccont(response, query, snapshot_.cid, nullptr, &restored_profile) ||
             restored_profile != original_cgdccont_) {
-            cleanup_ok_ = false;
+            record_cleanup_failure(kCleanupPdpProfileRestoreFailure);
             return false;
         }
         return true;
+    }
+
+    void record_cleanup_failure(std::string_view message)
+    {
+        cleanup_ok_ = false;
+        if (result_.cleanupMessage.empty()) result_.cleanupMessage = message;
     }
 
     void cleanup()
@@ -810,28 +838,32 @@ private:
             uint32_t result = 0;
             if (!command(close, response, true) ||
                 !parse_result(response, close, "+MIPCLOSE:", 0, result) || result != 0) {
-                cleanup_ok_ = false;
+                record_cleanup_failure(kCleanupSocketCloseFailure);
             }
         }
         if (touched_ssl_) {
             const std::string values = std::to_string(snapshot_.ssl) +
                                        (snapshot_.sslIdPresent ? "," + std::to_string(snapshot_.sslId) : "");
-            restore_config("ssl", values, snapshot_.ssl, snapshot_.sslId, snapshot_.sslIdPresent);
+            restore_config("ssl", values, snapshot_.ssl, snapshot_.sslId,
+                           snapshot_.sslIdPresent, kCleanupSslRestoreFailure);
         }
         if (touched_autofree_) {
-            restore_config("autofree", std::to_string(snapshot_.autofree), snapshot_.autofree, 0, false);
+            restore_config("autofree", std::to_string(snapshot_.autofree),
+                           snapshot_.autofree, 0, false, kCleanupAutofreeRestoreFailure);
         }
         if (touched_encoding_) {
             restore_config("encoding", std::to_string(snapshot_.send) + "," +
                                std::to_string(snapshot_.receive), snapshot_.send,
-                               snapshot_.receive, true);
+                               snapshot_.receive, true, kCleanupEncodingRestoreFailure);
         }
         if (pdp_activated_ && !request_.dataEnabled) {
             const std::string deactivate = "AT+CGACT=0," + std::to_string(snapshot_.cid);
-            if (!command(deactivate, response, true)) cleanup_ok_ = false;
+            if (!command(deactivate, response, true)) {
+                record_cleanup_failure(kCleanupPdpDeactivateFailure);
+            }
             std::vector<std::string_view> body;
             if (cleanup_ok_ && (!scan_frame(response, deactivate, body) || !body.empty())) {
-                cleanup_ok_ = false;
+                record_cleanup_failure(kCleanupPdpDeactivateFailure);
             }
         }
         if (pdp_profile_changed_ && !request_.dataEnabled) restore_cgdccont();

@@ -12,6 +12,9 @@ def main() -> None:
     harness = r'''
 #include <cassert>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 
 #include "idf_push_core.h"
 #include "idf_push_transport.h"
@@ -22,6 +25,19 @@ static int modem_status = 204;
 static int modem_error = -1;
 static bool modem_ok = true;
 static std::string modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
+static std::string modem_cleanup_message;
+
+template <typename T, typename = void>
+struct CleanupMessageAccessor {
+    static void set(T&, const std::string&) {}
+    static std::string_view get(const T&) { return {}; }
+};
+
+template <typename T>
+struct CleanupMessageAccessor<T, std::void_t<decltype(std::declval<T&>().cleanupMessage)>> {
+    static void set(T& result, const std::string& message) { result.cleanupMessage = message; }
+    static std::string_view get(const T& result) { return result.cleanupMessage; }
+};
 
 static int fake_modem_post(const IdfModemHttpsPostRequest& request,
                            IdfModemHttpsPostResult& result) {
@@ -31,6 +47,7 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     result.mhttpError = modem_error;
     result.ok = modem_ok;
     result.message = modem_message;
+    CleanupMessageAccessor<IdfModemHttpsPostResult>::set(result, modem_cleanup_message);
     return 0;
 }
 
@@ -77,6 +94,7 @@ int main() {
     assert(captured_request.rootCertificateSha256 == request.rootCertificateSha256);
     assert(transport.httpStatus == 204);
     assert(transport.ok);
+    assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
 
     modem_status = 503;
     modem_error = 4;
@@ -115,9 +133,29 @@ int main() {
     assert(transport.message.size() == IdfPushTransportResult::MAX_MESSAGE);
     modem_status = 200;
     modem_ok = false;
+    modem_message = "HTTPS request write failed";
+    modem_cleanup_message = "HTTPS cleanup socket close failed";
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(!transport.ok);
+    assert(transport.httpStatus == 200);
+    assert(transport.message == "HTTPS request write failed");
+    assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport) ==
+           "HTTPS cleanup socket close failed");
+
+    modem_cleanup_message.assign(200, 'y');
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).size() ==
+           IdfPushTransportResult::MAX_MESSAGE);
+
+    modem_status = 204;
+    modem_ok = true;
+    modem_message = "HTTPS POST succeeded";
+    modem_cleanup_message.clear();
+    assert(idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                     nullptr, fake_modem_post, transport));
+    assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
 
     request.method = "GET";
     const int calls_before_get = modem_calls;
@@ -145,6 +183,8 @@ int main() {
                 f"-I{temp_dir}",
                 f"-I{PUSH / 'include'}", f"-I{ROOT / 'components/idf_config/include'}",
                 f"-I{ROOT / 'components/idf_modem/include'}",
+                f"-I{ROOT / 'components/idf_logbuf/include'}",
+                str(ROOT / "components/idf_logbuf/idf_util.cpp"),
                 str(PUSH / "idf_push_core.cpp"), str(PUSH / "idf_push_transport.cpp"),
                 str(harness_path), "-o", str(binary_path),
             ],

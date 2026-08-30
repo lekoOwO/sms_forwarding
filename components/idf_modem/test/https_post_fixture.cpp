@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -52,6 +53,28 @@ void assert_failure_message(std::string_view actual, std::string_view expected)
     assert(actual != "Test push failed; see the log");
     for (const std::string_view forbidden : {"AT+", "fixture.example", "internet", "DER", "{}",
                                              "INITIAL", "CONNECTED", "CLOSED", "TCP", "\r", "\n"}) {
+        assert(actual.find(forbidden) == std::string_view::npos);
+    }
+}
+
+template <typename T, typename = void>
+struct CleanupMessageAccessor {
+    static std::string_view get(const T&) { return {}; }
+};
+
+template <typename T>
+struct CleanupMessageAccessor<T, std::void_t<decltype(std::declval<const T&>().cleanupMessage)>> {
+    static std::string_view get(const T& result) { return result.cleanupMessage; }
+};
+
+void assert_cleanup_message(const IdfModemHttpsPostResult& result,
+                            std::string_view expected)
+{
+    const std::string_view actual = CleanupMessageAccessor<IdfModemHttpsPostResult>::get(result);
+    assert(actual == expected);
+    assert(!actual.empty() && actual.size() < 96);
+    for (const std::string_view forbidden : {"AT+", "fixture", "request-apn", "CONNECTED",
+                                             "TCP", "\r", "\n"}) {
         assert(actual.find(forbidden) == std::string_view::npos);
     }
 }
@@ -263,7 +286,27 @@ enum class RemoteCloseMode {
     tls_handshake_failure,
     request_write_failure,
     http_non_success,
-    cleanup_failure,
+};
+
+enum class CleanupFailure {
+    none,
+    socket_close,
+    ssl,
+    autofree,
+    encoding,
+    pdp_deactivate,
+    pdp_profile,
+    socket_close_and_ssl,
+};
+
+enum class CleanupFailurePhase {
+    command,
+    malformed_response,
+    nonzero_response,
+    unexpected_response,
+    query_command,
+    verify_mismatch,
+    profile_mismatch,
 };
 
 enum class LateOpenKind {
@@ -299,12 +342,23 @@ bool parse_decimal(std::string_view value, size_t& parsed)
 struct RemoteCloseTranscript {
     explicit RemoteCloseTranscript(RemoteCloseMode selected,
                                    LateOpenKind late = LateOpenKind::none,
-                                   LateOpenStage stage = LateOpenStage::none)
-        : mode(selected), late_open(late), late_stage(stage) {}
+                                   LateOpenStage stage = LateOpenStage::none,
+                                   CleanupFailure cleanup = CleanupFailure::none,
+                                   CleanupFailurePhase phase = CleanupFailurePhase::command)
+        : mode(selected), late_open(late), late_stage(stage), cleanup_failure(cleanup),
+          cleanup_failure_phase(phase)
+    {
+        if (cleanup == CleanupFailure::pdp_deactivate ||
+            cleanup == CleanupFailure::pdp_profile) {
+            pdp_active = false;
+        }
+    }
 
     RemoteCloseMode mode;
     LateOpenKind late_open;
     LateOpenStage late_stage;
+    CleanupFailure cleanup_failure;
+    CleanupFailurePhase cleanup_failure_phase;
     bool late_consumed = false;
     size_t late_feed_calls = 0;
     size_t state_queries = 0;
@@ -316,7 +370,19 @@ struct RemoteCloseTranscript {
     uint8_t encoding_send = 0;
     uint8_t encoding_receive = 0;
     uint8_t autofree = 0;
+    bool pdp_active = true;
+    std::string current_apn = "fixture";
+    std::string current_profile = "1,\"IPV4V6\",\"fixture\",,0,0,,,,";
+    std::vector<std::string> cleanup_commands;
+    std::vector<std::string_view> cleanup_steps;
     MipOpenLatch open_latch;
+
+    bool cleanup_fails(CleanupFailure failure) const
+    {
+        return cleanup_failure == failure ||
+               (cleanup_failure == CleanupFailure::socket_close_and_ssl &&
+                (failure == CleanupFailure::socket_close || failure == CleanupFailure::ssl));
+    }
 
     std::string late_open_bytes() const
     {
@@ -353,7 +419,22 @@ struct RemoteCloseTranscript {
                                            std::string& response, bool cleanup)
     {
         auto& transcript = *static_cast<RemoteCloseTranscript*>(context);
-        if (cleanup) transcript.open_latch.reset();
+        if (cleanup) {
+            transcript.open_latch.reset();
+            transcript.cleanup_commands.emplace_back(command);
+            if (command == "AT+MIPCLOSE=0") transcript.cleanup_steps.emplace_back("socket_close");
+            else if (command == "AT+MIPCFG=\"ssl\",0,0,0") {
+                transcript.cleanup_steps.emplace_back("ssl");
+            } else if (command == "AT+MIPCFG=\"autofree\",0,0") {
+                transcript.cleanup_steps.emplace_back("autofree");
+            } else if (command == "AT+MIPCFG=\"encoding\",0,0,0") {
+                transcript.cleanup_steps.emplace_back("encoding");
+            } else if (command == "AT+CGACT=0,1") {
+                transcript.cleanup_steps.emplace_back("pdp_deactivate");
+            } else if (command == "AT+CGDCONT=1,\"IPV4V6\",\"fixture\",,0,0,,,,") {
+                transcript.cleanup_steps.emplace_back("pdp_profile");
+            }
+        }
         if (!transcript.open_latch.nonfatal()) return IdfModemHttpsCommandResult::open_failed;
         if (command.rfind("AT+MIPSEND=0,", 0) == 0 &&
             transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
@@ -407,17 +488,44 @@ struct RemoteCloseTranscript {
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+MIPCFG=\"encoding\",0") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::encoding) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::query_command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::encoding) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::verify_mismatch) {
+                response = frame(command, "+MIPCFG: \"encoding\",0,1,1");
+                return IdfModemHttpsCommandResult::ok;
+            }
             response = frame(command, "+MIPCFG: \"encoding\",0," +
                                           std::to_string(transcript.encoding_send) + "," +
                                           std::to_string(transcript.encoding_receive));
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+MIPCFG=\"autofree\",0") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::autofree) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::query_command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::autofree) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::verify_mismatch) {
+                response = frame(command, "+MIPCFG: \"autofree\",0,1");
+                return IdfModemHttpsCommandResult::ok;
+            }
             response = frame(command, "+MIPCFG: \"autofree\",0," +
                                           std::to_string(transcript.autofree));
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+MIPCFG=\"ssl\",0") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::ssl) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::query_command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::ssl) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::verify_mismatch) {
+                response = frame(command, "+MIPCFG: \"ssl\",0,1,0");
+                return IdfModemHttpsCommandResult::ok;
+            }
             response = frame(command, "+MIPCFG: \"ssl\",0,0,0");
             return IdfModemHttpsCommandResult::ok;
         }
@@ -427,6 +535,10 @@ struct RemoteCloseTranscript {
                 command == "AT+MIPCFG=\"encoding\",0,1,1") {
                 return IdfModemHttpsCommandResult::failed;
             }
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::encoding) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             transcript.encoding_send = command == "AT+MIPCFG=\"encoding\",0,1,1" ? 1 : 0;
             transcript.encoding_receive = transcript.encoding_send;
             response = frame(command, "");
@@ -434,11 +546,19 @@ struct RemoteCloseTranscript {
         }
         if (command == "AT+MIPCFG=\"autofree\",0,1" ||
             command == "AT+MIPCFG=\"autofree\",0,0") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::autofree) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             transcript.autofree = command == "AT+MIPCFG=\"autofree\",0,1" ? 1 : 0;
             response = frame(command, "");
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+MIPCFG=\"ssl\",0,0,0") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::ssl) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             response = frame(command, "");
             return IdfModemHttpsCommandResult::ok;
         }
@@ -446,11 +566,65 @@ struct RemoteCloseTranscript {
             if (transcript.mode == RemoteCloseMode::pdp_failure) {
                 return IdfModemHttpsCommandResult::failed;
             }
-            response = frame(command, "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,");
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::pdp_profile)) {
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::query_command) {
+                    return IdfModemHttpsCommandResult::failed;
+                }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::verify_mismatch) {
+                    response = frame(command, "+CGDCONT: malformed");
+                    return IdfModemHttpsCommandResult::ok;
+                }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::profile_mismatch) {
+                    response = frame(command,
+                                     "+CGDCONT: 1,\"IPV4V6\",\"other\",,0,0,,,,");
+                    return IdfModemHttpsCommandResult::ok;
+                }
+            }
+            response = frame(command, "+CGDCONT: " + transcript.current_profile);
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+CGACT?") {
-            response = frame(command, "+CGACT: 1,1");
+            response = frame(command, transcript.pdp_active ? "+CGACT: 1,1" : "+CGACT: 1,0");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGDCONT=1,\"IPV4V6\",\"request-apn\"") {
+            transcript.current_apn = "request-apn";
+            transcript.current_profile = "1,\"IPV4V6\",\"request-apn\",,0,0,,,,";
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGDCONT=1,\"IPV4V6\",\"fixture\",,0,0,,,,") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::pdp_profile) &&
+                transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            transcript.current_apn = "fixture";
+            transcript.current_profile = "1,\"IPV4V6\",\"fixture\",,0,0,,,,";
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGACT=1,1") {
+            transcript.pdp_active = true;
+            response = frame(command, "");
+            return IdfModemHttpsCommandResult::ok;
+        }
+        if (command == "AT+CGACT=0,1") {
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::pdp_deactivate)) {
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                    return IdfModemHttpsCommandResult::failed;
+                }
+                transcript.pdp_active = false;
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::malformed_response) {
+                    response = "\r\nAT+CGACT=0,1\r\n";
+                    return IdfModemHttpsCommandResult::ok;
+                }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::unexpected_response) {
+                    response = frame(command, "+CGACT: 1,0");
+                    return IdfModemHttpsCommandResult::ok;
+                }
+            }
+            transcript.pdp_active = false;
+            response = frame(command, "");
             return IdfModemHttpsCommandResult::ok;
         }
         constexpr std::string_view open_prefix = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",443,";
@@ -522,8 +696,18 @@ struct RemoteCloseTranscript {
         if (command == "AT+MIPCLOSE=0") {
             ++transcript.close_commands;
             transcript.close_was_cleanup = cleanup;
-            if (transcript.mode == RemoteCloseMode::cleanup_failure) {
-                return IdfModemHttpsCommandResult::failed;
+            if (cleanup && transcript.cleanup_fails(CleanupFailure::socket_close)) {
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
+                    return IdfModemHttpsCommandResult::failed;
+                }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::malformed_response) {
+                    response = "\r\nAT+MIPCLOSE=0\r\n";
+                    return IdfModemHttpsCommandResult::ok;
+                }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::nonzero_response) {
+                    response = frame(command, "+MIPCLOSE: 0,1");
+                    return IdfModemHttpsCommandResult::ok;
+                }
             }
             response = frame(command, "+MIPCLOSE: 0,0");
             return IdfModemHttpsCommandResult::ok;
@@ -553,6 +737,9 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
     IdfModemHttpsPostRequest request;
     request.url = "https://fixture.example/notify";
     request.body = "{}";
+    if (transcript.cleanup_failure == CleanupFailure::pdp_profile) {
+        request.apn = "request-apn";
+    }
     request.rootCertificateDer = {'D', 'E', 'R'};
     request.rootCertificateSha256.fill(0xab);
     IdfModemHttpsCallbacks callbacks{
@@ -567,6 +754,45 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
     return outcome;
 }
 
+int cleanup_command_rank(const std::string& command)
+{
+    if (command == "AT+MIPCLOSE=0") return 0;
+    if (command.find("MIPCFG=\"ssl\"") != std::string::npos) return 1;
+    if (command.find("MIPCFG=\"autofree\"") != std::string::npos) return 2;
+    if (command.find("MIPCFG=\"encoding\"") != std::string::npos) return 3;
+    if (command == "AT+CGACT=0,1") return 4;
+    if (command.rfind("AT+CGDCONT", 0) == 0) return 5;
+    return -1;
+}
+
+void assert_cleanup_action_order(const RemoteCloseTranscript& transcript)
+{
+    int previous_rank = -1;
+    for (const std::string& command : transcript.cleanup_commands) {
+        const int rank = cleanup_command_rank(command);
+        assert(rank >= previous_rank);
+        previous_rank = rank;
+        assert(std::count(transcript.cleanup_commands.begin(),
+                          transcript.cleanup_commands.end(), command) == 1);
+    }
+    for (const auto& [setter, query] : {
+             std::pair<std::string_view, std::string_view>{
+                 "AT+MIPCFG=\"ssl\",0,0,0", "AT+MIPCFG=\"ssl\",0"},
+             {"AT+MIPCFG=\"autofree\",0,0", "AT+MIPCFG=\"autofree\",0"},
+             {"AT+MIPCFG=\"encoding\",0,0,0", "AT+MIPCFG=\"encoding\",0"},
+             {"AT+CGDCONT=1,\"IPV4V6\",\"fixture\",,0,0,,,,", "AT+CGDCONT?"},
+         }) {
+        const auto setter_at = std::find(transcript.cleanup_commands.begin(),
+                                         transcript.cleanup_commands.end(), setter);
+        const auto query_at = std::find(transcript.cleanup_commands.begin(),
+                                        transcript.cleanup_commands.end(), query);
+        if (setter_at != transcript.cleanup_commands.end() &&
+            query_at != transcript.cleanup_commands.end()) {
+            assert(setter_at < query_at);
+        }
+    }
+}
+
 void check_remote_close_transcripts()
 {
     static constexpr std::string_view http =
@@ -577,6 +803,7 @@ void check_remote_close_transcripts()
     assert(run_remote_close_transcript(delivered, result) == IdfModemHttpsRunResult::ok);
     assert(result.ok && result.httpStatus == 200 && result.responseBytes == http.size());
     assert(result.expectedResponseBytes == 0);
+    assert(CleanupMessageAccessor<IdfModemHttpsPostResult>::get(result).empty());
     assert(delivered.read_commands == 1 && delivered.close_commands == 1 &&
            delivered.close_was_cleanup);
     assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
@@ -722,9 +949,6 @@ void check_remote_close_transcripts()
              FailureCase{RemoteCloseMode::http_non_success,
                          IdfModemHttpsRunResult::response_failed,
                          "HTTPS POST returned a non-2xx status"},
-             FailureCase{RemoteCloseMode::cleanup_failure,
-                         IdfModemHttpsRunResult::cleanup_failed,
-                         "HTTPS cleanup failed"},
          }) {
         RemoteCloseTranscript rejected{failure.mode};
         result = {};
@@ -736,6 +960,137 @@ void check_remote_close_transcripts()
                                       : 1U));
         assert_failure_message(result.message, failure.message);
     }
+
+    struct CleanupFailureCase {
+        CleanupFailure failure;
+        CleanupFailurePhase phase;
+        std::string_view cleanup_message;
+        std::string_view failed_command;
+    };
+    for (const CleanupFailureCase failure : {
+             CleanupFailureCase{CleanupFailure::socket_close,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
+             CleanupFailureCase{CleanupFailure::socket_close,
+                                CleanupFailurePhase::malformed_response,
+                                "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
+             CleanupFailureCase{CleanupFailure::socket_close,
+                                CleanupFailurePhase::nonzero_response,
+                                "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
+             CleanupFailureCase{CleanupFailure::ssl,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup SSL config restore failed",
+                                "AT+MIPCFG=\"ssl\",0,0,0"},
+             CleanupFailureCase{CleanupFailure::ssl,
+                                CleanupFailurePhase::query_command,
+                                "HTTPS cleanup SSL config restore failed",
+                                "AT+MIPCFG=\"ssl\",0"},
+             CleanupFailureCase{CleanupFailure::ssl,
+                                CleanupFailurePhase::verify_mismatch,
+                                "HTTPS cleanup SSL config restore failed",
+                                "AT+MIPCFG=\"ssl\",0"},
+             CleanupFailureCase{CleanupFailure::autofree,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup autofree config restore failed",
+                                "AT+MIPCFG=\"autofree\",0,0"},
+             CleanupFailureCase{CleanupFailure::encoding,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup encoding config restore failed",
+                                "AT+MIPCFG=\"encoding\",0,0,0"},
+             CleanupFailureCase{CleanupFailure::pdp_deactivate,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup PDP deactivate failed", "AT+CGACT=0,1"},
+             CleanupFailureCase{CleanupFailure::pdp_deactivate,
+                                CleanupFailurePhase::malformed_response,
+                                "HTTPS cleanup PDP deactivate failed", "AT+CGACT=0,1"},
+             CleanupFailureCase{CleanupFailure::pdp_deactivate,
+                                CleanupFailurePhase::unexpected_response,
+                                "HTTPS cleanup PDP deactivate failed", "AT+CGACT=0,1"},
+             CleanupFailureCase{CleanupFailure::pdp_profile,
+                                CleanupFailurePhase::command,
+                                "HTTPS cleanup PDP profile restore failed",
+                                "AT+CGDCONT=1,\"IPV4V6\",\"fixture\",,0,0,,,,"},
+             CleanupFailureCase{CleanupFailure::pdp_profile,
+                                CleanupFailurePhase::query_command,
+                                "HTTPS cleanup PDP profile restore failed", "AT+CGDCONT?"},
+             CleanupFailureCase{CleanupFailure::pdp_profile,
+                                CleanupFailurePhase::verify_mismatch,
+                                "HTTPS cleanup PDP profile restore failed", "AT+CGDCONT?"},
+             CleanupFailureCase{CleanupFailure::pdp_profile,
+                                CleanupFailurePhase::profile_mismatch,
+                                "HTTPS cleanup PDP profile restore failed", "AT+CGDCONT?"},
+         }) {
+        RemoteCloseTranscript cleanup_failed{RemoteCloseMode::data_then_disconnect,
+                                              LateOpenKind::none, LateOpenStage::none,
+                                              failure.failure, failure.phase};
+        result = {};
+        assert(run_remote_close_transcript(cleanup_failed, result) ==
+               IdfModemHttpsRunResult::cleanup_failed);
+        assert(!result.ok && result.httpStatus == 200 && result.responseBytes == http.size() &&
+               result.expectedResponseBytes == 0);
+        assert_failure_message(result.message, "HTTPS cleanup failed");
+        assert_cleanup_message(result, failure.cleanup_message);
+        assert(cleanup_failed.close_commands == 1 && cleanup_failed.close_was_cleanup);
+        assert(std::count(cleanup_failed.cleanup_commands.begin(),
+                          cleanup_failed.cleanup_commands.end(), "AT+MIPCLOSE=0") == 1);
+        assert(std::count(cleanup_failed.cleanup_commands.begin(),
+                          cleanup_failed.cleanup_commands.end(), failure.failed_command) == 1);
+        std::vector<std::string_view> expected_steps{
+            "socket_close", "ssl", "autofree", "encoding"};
+        if (failure.failure == CleanupFailure::pdp_deactivate ||
+            failure.failure == CleanupFailure::pdp_profile) {
+            expected_steps.emplace_back("pdp_deactivate");
+        }
+        if (failure.failure == CleanupFailure::pdp_profile) {
+            expected_steps.emplace_back("pdp_profile");
+        }
+        assert(cleanup_failed.cleanup_steps == expected_steps);
+        assert_cleanup_action_order(cleanup_failed);
+        assert(cleanup_failed.encoding_send ==
+               (failure.failure == CleanupFailure::encoding &&
+                        failure.phase == CleanupFailurePhase::command
+                    ? 1
+                    : 0));
+        assert(cleanup_failed.encoding_receive == cleanup_failed.encoding_send);
+        assert(cleanup_failed.autofree ==
+               (failure.failure == CleanupFailure::autofree &&
+                        failure.phase == CleanupFailurePhase::command
+                    ? 1
+                    : 0));
+        if (failure.failure == CleanupFailure::pdp_deactivate &&
+            failure.phase == CleanupFailurePhase::command) {
+            assert(cleanup_failed.pdp_active);
+        }
+        if (failure.failure == CleanupFailure::pdp_profile) {
+            assert(!cleanup_failed.pdp_active);
+            assert(cleanup_failed.current_apn ==
+                   (failure.phase == CleanupFailurePhase::command ? "request-apn" : "fixture"));
+        }
+    }
+
+    RemoteCloseTranscript primary_and_cleanup_failed{
+        RemoteCloseMode::request_write_failure, LateOpenKind::none, LateOpenStage::none,
+        CleanupFailure::socket_close};
+    result = {};
+    assert(run_remote_close_transcript(primary_and_cleanup_failed, result) ==
+           IdfModemHttpsRunResult::cleanup_failed);
+    assert(!result.ok && result.httpStatus == -1 && result.responseBytes == 0 &&
+           result.expectedResponseBytes == 0);
+    assert_failure_message(result.message, "HTTPS request write failed");
+    assert_cleanup_message(result, "HTTPS cleanup socket close failed");
+
+    RemoteCloseTranscript first_cleanup_failure_wins{
+        RemoteCloseMode::data_then_disconnect, LateOpenKind::none, LateOpenStage::none,
+        CleanupFailure::socket_close_and_ssl};
+    result = {};
+    assert(run_remote_close_transcript(first_cleanup_failure_wins, result) ==
+           IdfModemHttpsRunResult::cleanup_failed);
+    assert_failure_message(result.message, "HTTPS cleanup failed");
+    assert_cleanup_message(result, "HTTPS cleanup socket close failed");
+    assert(std::count(first_cleanup_failure_wins.cleanup_commands.begin(),
+                      first_cleanup_failure_wins.cleanup_commands.end(), "AT+MIPCLOSE=0") == 1);
+    assert((first_cleanup_failure_wins.cleanup_steps ==
+            std::vector<std::string_view>{"socket_close", "ssl", "autofree", "encoding"}));
 
     RemoteCloseTranscript late_success{RemoteCloseMode::open_ok_connected,
                                        LateOpenKind::success,

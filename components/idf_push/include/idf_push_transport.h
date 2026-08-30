@@ -28,6 +28,7 @@ struct IdfPushTransportResult {
     int mhttpError = -1;
     bool ok = false;
     std::string message;
+    std::string cleanupMessage;
 };
 
 using IdfPushWifiRequest = int (*)(const IdfPushHttpRequest& request, int& statusCode);

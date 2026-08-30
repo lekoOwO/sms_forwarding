@@ -702,6 +702,23 @@ inline void vTaskDelay(TickType_t) {}
             self.assertLess(len(message.encode("ascii")), 96)
             for forbidden in ("AT+", "INITIAL", "CONNECTED", "CLOSED", "TCP", "fixture"):
                 self.assertNotIn(forbidden, message)
+        for message in (
+            "HTTPS cleanup socket close failed",
+            "HTTPS cleanup SSL config restore failed",
+            "HTTPS cleanup autofree config restore failed",
+            "HTTPS cleanup encoding config restore failed",
+            "HTTPS cleanup PDP deactivate failed",
+            "HTTPS cleanup PDP profile restore failed",
+        ):
+            self.assertEqual(source.count(f'"{message}"'), 1)
+            self.assertLess(len(message.encode("ascii")), 96)
+            for forbidden in ("AT+", "fixture", "request-apn", "INITIAL", "CONNECTED", "TCP"):
+                self.assertNotIn(forbidden, message)
+        result_header = (SOURCE.parent / "include" / "idf_modem_https.h").read_text()
+        self.assertIn("MAX_CLEANUP_MESSAGE = 96", result_header)
+        self.assertIn("std::string cleanupMessage", result_header)
+        submit = function_body(owner, "submit_owner_command")
+        self.assertEqual(submit.count("*https_result = slot.https_post_result"), 2)
         run = function_body(source, "run")
         for stage in (
             "initial_state", "runtime_snapshot", "pdp_apn", "runtime_config",

@@ -1,8 +1,11 @@
 #include "idf_web_core.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
 #include <iterator>
 #include <new>
 #include <vector>
@@ -137,6 +140,45 @@ IdfWebFormDecodeResult idf_web_decode_form(const std::string& body, size_t max_f
     }
     result.valid = true;
     return result;
+}
+
+bool idf_web_parse_push_test_query(const std::string& query, size_t channel_count,
+                                   IdfWebPushTestQuery& output)
+{
+    output = IdfWebPushTestQuery();
+    if (query.empty() || query.size() > 63 || query.front() == '&' || query.back() == '&' ||
+        query.find("&&") != std::string::npos) {
+        return false;
+    }
+    const IdfWebFormDecodeResult decoded = idf_web_decode_form(query, 2);
+    const size_t encoded_fields = 1 + static_cast<size_t>(std::count(query.begin(), query.end(), '&'));
+    if (!decoded.valid || decoded.fields.empty() || decoded.fields.size() > 2 ||
+        decoded.fields.size() != encoded_fields) {
+        return false;
+    }
+    const std::string* channel_raw = nullptr;
+    const std::string* detail_raw = nullptr;
+    for (const auto& field : decoded.fields) {
+        if (field.first == "channel" && !channel_raw) channel_raw = &field.second;
+        else if (field.first == "detail" && !detail_raw) detail_raw = &field.second;
+        else return false;
+    }
+    if (!channel_raw || (detail_raw && *detail_raw != "1")) return false;
+
+    errno = 0;
+    char* end = nullptr;
+    const long parsed = strtol(channel_raw->c_str(), &end, 10);
+    if (end == channel_raw->c_str() || errno == ERANGE || parsed < 0 ||
+        static_cast<size_t>(parsed) >= channel_count) {
+        return false;
+    }
+    while (*end != '\0') {
+        if (!std::isspace(static_cast<unsigned char>(*end))) return false;
+        ++end;
+    }
+    output.channel = static_cast<uint8_t>(parsed);
+    output.includeCleanup = detail_raw != nullptr;
+    return true;
 }
 
 IdfWebOwnedJobInput idf_web_own_job_input(const char* type, const char* payload,

@@ -32,12 +32,14 @@ struct IdfModemHttpsPostRequest {
 };
 
 struct IdfModemHttpsPostResult {
+    static constexpr size_t MAX_CLEANUP_MESSAGE = 96;
     bool ok = false;
     int httpStatus = -1;
     uint32_t responseBytes = 0;
     uint32_t expectedResponseBytes = 0;
     int mhttpError = 0;
     std::string message;
+    std::string cleanupMessage;
 };
 
 struct IdfModemHttpsTarget {

@@ -61,6 +61,62 @@ int main() {
     assert(idf_push_select_network(NETWORK_MODE_4G_ONLY, false) == IdfPushNetworkDecision::Cellular);
     assert(idf_push_select_network(NETWORK_MODE_MIX, true) == IdfPushNetworkDecision::Wifi);
     assert(idf_push_select_network(NETWORK_MODE_MIX, false) == IdfPushNetworkDecision::Cellular);
+
+    IdfPushTestJobState cleanup_only;
+    idf_push_complete_test_job(cleanup_only, false, "HTTPS cleanup failed",
+                               "HTTPS cleanup socket close failed");
+    assert(!cleanup_only.pending && !cleanup_only.running && cleanup_only.done);
+    assert(!cleanup_only.success);
+    assert(cleanup_only.message == "HTTPS cleanup failed");
+    assert(cleanup_only.cleanupMessage == "HTTPS cleanup socket close failed");
+    assert(idf_push_serialize_test_status(cleanup_only, false) ==
+           "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,"
+           "\"message\":\"HTTPS cleanup failed\"}");
+    assert(idf_push_serialize_test_status(cleanup_only, true) ==
+           "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,"
+           "\"message\":\"HTTPS cleanup failed\","
+           "\"cleanupMessage\":\"HTTPS cleanup socket close failed\"}");
+
+    IdfPushTestJobState empty_failure;
+    idf_push_complete_test_job(empty_failure, false, "", "");
+    assert(empty_failure.message == "Test push failed; see the log");
+    assert(empty_failure.cleanupMessage.empty());
+
+    IdfPushTestJobState primary_failure;
+    idf_push_complete_test_job(primary_failure, false, "HTTPS request write failed",
+                               "HTTPS cleanup socket close failed");
+    assert(primary_failure.message == "HTTPS request write failed");
+    assert(primary_failure.cleanupMessage == "HTTPS cleanup socket close failed");
+    assert(idf_push_serialize_test_status(primary_failure, true).find(
+        "\"message\":\"HTTPS request write failed\",\"cleanupMessage\":"
+        "\"HTTPS cleanup socket close failed\"") != std::string::npos);
+
+    IdfPushTestJobState success;
+    idf_push_complete_test_job(success, true, "", "");
+    assert(success.success && success.done && success.message == "Test push sent");
+    assert(success.cleanupMessage.empty());
+    assert(idf_push_serialize_test_status(success, true) ==
+           "{\"queued\":false,\"running\":false,\"done\":true,\"success\":true,"
+           "\"message\":\"Test push sent\"}");
+
+    IdfPushTestJobState pending;
+    pending.pending = true;
+    pending.message = "Test push queued";
+    pending.cleanupMessage = "must not appear before completion";
+    assert(idf_push_serialize_test_status(pending, true) ==
+           "{\"queued\":true,\"running\":false,\"done\":false,\"success\":false,"
+           "\"message\":\"Test push queued\"}");
+
+    IdfPushTestJobState escaped;
+    idf_push_complete_test_job(escaped, false, "", "fixed \\\"label\\\\line\nend");
+    assert(escaped.cleanupMessage == "fixed \\\"label\\\\line\nend");
+    assert(idf_push_serialize_test_status(escaped, true).find(
+        "\"cleanupMessage\":\"fixed \\\\\\\"label\\\\\\\\line\\nend\"") != std::string::npos);
+    IdfPushTestJobState bounded;
+    idf_push_complete_test_job(bounded, false, "", std::string(160, 'x'));
+    assert(bounded.cleanupMessage.size() == IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1);
+    assert(idf_push_serialize_test_status(bounded, true).find(std::string(96, 'x')) ==
+           std::string::npos);
 }
 '''
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -72,6 +128,8 @@ int main() {
                 "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
                 f"-I{PUSH}", f"-I{PUSH / 'include'}",
                 f"-I{ROOT / 'components/idf_config/include'}",
+                f"-I{ROOT / 'components/idf_logbuf/include'}",
+                str(ROOT / "components/idf_logbuf/idf_util.cpp"),
                 str(PUSH / "idf_push_core.cpp"), str(harness_path), "-o", str(binary_path),
             ],
             check=True,
@@ -80,6 +138,9 @@ int main() {
 
     source = (PUSH / "idf_push.cpp").read_text()
     header = (PUSH / "include/idf_push.h").read_text()
+    core_header = (PUSH / "include/idf_push_core.h").read_text()
+    core_source = (PUSH / "idf_push_core.cpp").read_text()
+    transport_header = (PUSH / "include/idf_push_transport.h").read_text()
     assert "idf_modem_cellular_http_get" not in source
     assert "enum : uint8_t" not in source
     discord = source.split("case PUSH_TYPE_DISCORD:", 2)[2].split("case PUSH_TYPE_NTFY:", 1)[0]
@@ -109,9 +170,15 @@ int main() {
         "static bool enqueue_push_job_locked", 1
     )[0]
     assert "std::string* failure_message = nullptr" in send
+    assert "std::string* cleanup_message = nullptr" in send
+    assert "cleanup_message->clear()" in send
     assert "*failure_message = transport.message" in send
     assert send.count("*failure_message = transport.message") == 1
+    assert "*cleanup_message = transport.cleanupMessage" in send
+    assert send.count("*cleanup_message = transport.cleanupMessage") == 1
     assert send.index("*failure_message = transport.message") < send.index("return ok")
+    assert send.index("*cleanup_message = transport.cleanupMessage") < send.index("return ok")
+    assert "std::string cleanupMessage" in transport_header
     locked_selection = push_worker.split(
         "for (size_t i = 0; i < s_push_jobs.size(); ++i)", 1
     )[1].split("xSemaphoreGive(s_mutex)", 1)[0]
@@ -131,11 +198,17 @@ int main() {
     assert "channel_waits_for_time(cfg.pushChannels[i])" in tests
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
     assert "network, false, &result" in tests
-    assert "else if (result.empty()) result = \"Test push failed; see the log\"" in tests
-    assert "job.message = result" in tests
+    assert "std::string cleanup_result" in tests
+    assert "&result, nullptr, &cleanup_result" in tests
+    assert "idf_push_complete_test_job(job, ok, std::move(result)," in tests
+    assert "std::move(cleanup_result))" in tests
+    post_send = tests.split("&result, nullptr, &cleanup_result);", 1)[1]
+    completion_call = post_send.split("idf_push_complete_test_job", 1)[0]
+    assert "cleanup_result.clear" not in completion_call
 
     assert "bool idf_push_test_active(void)" in source
     assert "bool idf_push_test_channel_active(uint8_t channel)" in header
+    assert "idf_push_test_status_json(uint8_t channel, bool include_cleanup = false)" in header
     test_active = source.split("bool idf_push_test_active(void)", 1)[1].split(
         "bool idf_push_test_channel_active", 1
     )[0]
@@ -155,7 +228,7 @@ int main() {
     assert "return false" in duplicate
     assert enqueue_test.index("if (busy)") < enqueue_test.index("idf_push_select_network")
     assert "PUSH_TEST_PENDING_MAX_US" in source
-    assert "int64_t deadlineUs = 0" in source
+    assert "int64_t deadlineUs = 0" in core_header
     assert "job.deadlineUs = esp_timer_get_time() + PUSH_TEST_PENDING_MAX_US" in enqueue_test
     assert enqueue_test.index("if (!s_started)") < enqueue_test.index("job.pending = true")
     assert "expire_test_jobs_locked" in enqueue_test
@@ -164,16 +237,39 @@ int main() {
     )[0]
     assert "expire_test_jobs_locked" in process_test
     assert process_test.index("expire_test_jobs_locked") < process_test.index("IdfPushNetworkDecision::Defer")
-    completion = process_test.split('if (ok) result = "Test push sent";', 1)[1]
+    completion = process_test.split("if (s_mutex &&", 1)[1]
     assert "xSemaphoreTake(s_mutex, portMAX_DELAY)" in completion
-    assert process_test.count('if (ok) result = "Test push sent";') == 1
-    assert completion.index('else if (result.empty()) result = "Test push failed; see the log"') < completion.index(
-        "job.message = result"
-    )
+    assert 'if (ok) result = "Test push sent";' not in process_test
+    assert 'result = "Test push failed; see the log"' not in process_test
+    assert "idf_push_complete_test_job(job, ok, std::move(result)," in completion
     status = source.split("std::string idf_push_test_status_json", 1)[1]
     assert "expire_test_jobs_locked" in status
     assert "Push test status is temporarily unavailable" in status
-    assert 'json_prop(out, "message", msg)' in status
+    assert "return idf_push_serialize_test_status(copy, include_cleanup)" in status
+    before_serialize = status.split("return idf_push_serialize_test_status", 1)[0]
+    assert "copy.cleanupMessage.clear" not in before_serialize
+    assert "include_cleanup && job.done && !job.cleanupMessage.empty()" in core_source
+
+    assert "using TestJob = IdfPushTestJobState" in source
+    fail_pending = source.split("static bool fail_pending_tests", 1)[1].split(
+        "static bool expire_test_jobs_locked", 1
+    )[0]
+    expire_pending = source.split("static bool expire_test_jobs_locked", 1)[1].split(
+        "static bool process_test_one", 1
+    )[0]
+    assert "cleanupMessage.clear()" in fail_pending
+    assert "cleanupMessage.clear()" in expire_pending
+    assert "cleanupMessage.clear()" in enqueue_test
+
+    # The normal retrying push worker does not request or retain cleanup telemetry.
+    assert "cleanup_result" not in push_worker
+
+    # Existing web clients accept extra status members because they validate only
+    # the five required fields and do not enforce an exact key set.
+    web_api = (ROOT / "web/src/lib/api.ts").read_text()
+    validator = web_api.split("function isPushTestStatus", 1)[1].split("function demoResponse", 1)[0]
+    assert "Object.keys" not in validator
+    assert "cleanupMessage" not in validator
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1

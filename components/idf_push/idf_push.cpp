@@ -19,6 +19,7 @@
 #include <atomic>
 #include <array>
 #include <string>
+#include <utility>
 
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
@@ -114,15 +115,7 @@ struct ForwardCompletion {
     uint8_t remaining = 0;
 };
 
-struct TestJob {
-    bool pending = false;
-    bool running = false;
-    bool done = false;
-    bool success = false;
-    int64_t nextUs = 0;
-    int64_t deadlineUs = 0;
-    std::string message;
-};
+using TestJob = IdfPushTestJobState;
 
 struct ForwardDecision {
     bool matched = false;
@@ -386,15 +379,6 @@ static std::string html_escape(const std::string& value)
         }
     }
     return out;
-}
-
-static void json_prop(std::string& out, const char* key, const std::string& value)
-{
-    out += "\"";
-    out += key;
-    out += "\":\"";
-    idf_util_json_escape_append(out, value);
-    out += "\"";
 }
 
 static std::string url_encode(const std::string& value)
@@ -1116,9 +1100,11 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
                             const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
                             IdfPushNetworkDecision network,
                             bool notify = false, std::string* failure_message = nullptr,
-                            bool* permanent_failure = nullptr)
+                            bool* permanent_failure = nullptr,
+                            std::string* cleanup_message = nullptr)
 {
     if (permanent_failure) *permanent_failure = false;
+    if (cleanup_message) cleanup_message->clear();
     if (!channel_valid(input_channel)) return false;
 
     IdfPushCellularTarget cellular_target;
@@ -1322,6 +1308,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
     if (!ok && failure_message && !transport.message.empty()) {
         *failure_message = transport.message;
     }
+    if (cleanup_message) *cleanup_message = transport.cleanupMessage;
     // Combine the send and response lines. Keep the channel name and result in one concise log entry.
     if (err == ESP_OK) idf_logf("%s push %s (HTTP %d)", name.c_str(), ok ? "succeeded" : "failed", code);
     else idf_logf("%s push failed: %s", name.c_str(), esp_err_to_name(err));
@@ -1843,6 +1830,7 @@ static bool fail_pending_tests(const char* message)
         job.nextUs = 0;
         job.deadlineUs = 0;
         job.message = message;
+        job.cleanupMessage.clear();
     }
     xSemaphoreGive(s_mutex);
     return failed;
@@ -1860,6 +1848,7 @@ static bool expire_test_jobs_locked(int64_t now)
         job.nextUs = 0;
         job.deadlineUs = 0;
         job.message = "Test push timed out before it could start";
+        job.cleanupMessage.clear();
     }
     return expired;
 }
@@ -1899,6 +1888,7 @@ static bool process_test_one()
         s_test_jobs[i].nextUs = 0;
         s_test_jobs[i].deadlineUs = 0;
         s_test_jobs[i].message = "Sending test push";
+        s_test_jobs[i].cleanupMessage.clear();
         channel = cfg.pushChannels[i];
         break;
     }
@@ -1907,6 +1897,7 @@ static bool process_test_one()
 
     bool ok = false;
     std::string result;
+    std::string cleanup_result;
     if (!channel_valid(channel)) {
         result = "Channel configuration changed or is disabled; test canceled";
     } else if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
@@ -1916,18 +1907,13 @@ static bool process_test_one()
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "Test", "This is a test push from SMS Forwarder",
                              ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi,
-                             network, false, &result);
+                             network, false, &result, nullptr, &cleanup_result);
         s_busy.store(false, std::memory_order_relaxed);
-        if (ok) result = "Test push sent";
-        else if (result.empty()) result = "Test push failed; see the log";
     }
 
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         TestJob& job = s_test_jobs[picked];
-        job.running = false;
-        job.done = true;
-        job.success = ok;
-        job.message = result;
+        idf_push_complete_test_job(job, ok, std::move(result), std::move(cleanup_result));
         xSemaphoreGive(s_mutex);
     }
     return true;
@@ -2204,6 +2190,7 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         job.nextUs = 0;
         job.deadlineUs = esp_timer_get_time() + PUSH_TEST_PENDING_MAX_US;
         job.message = "Test push queued; you can continue to refresh the page";
+        job.cleanupMessage.clear();
         message = job.message;
     }
     xSemaphoreGive(s_mutex);
@@ -2219,7 +2206,7 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
     return true;
 }
 
-std::string idf_push_test_status_json(uint8_t channel)
+std::string idf_push_test_status_json(uint8_t channel, bool include_cleanup)
 {
     if (channel >= IDF_MAX_PUSH_CHANNELS) {
         return "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,\"message\":\"Channel number is invalid\"}";
@@ -2237,13 +2224,5 @@ std::string idf_push_test_status_json(uint8_t channel)
     expire_test_jobs_locked(esp_timer_get_time());
     copy = s_test_jobs[channel];
     xSemaphoreGive(s_mutex);
-    std::string msg = copy.message.empty() ? "Test not started" : copy.message;
-    std::string out = "{";
-    out += "\"queued\":"; out += copy.pending ? "true" : "false"; out += ",";
-    out += "\"running\":"; out += copy.running ? "true" : "false"; out += ",";
-    out += "\"done\":"; out += copy.done ? "true" : "false"; out += ",";
-    out += "\"success\":"; out += copy.success ? "true" : "false"; out += ",";
-    json_prop(out, "message", msg);
-    out += "}";
-    return out;
+    return idf_push_serialize_test_status(copy, include_cleanup);
 }

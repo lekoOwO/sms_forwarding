@@ -4,6 +4,8 @@
 #include <array>
 #include <utility>
 
+#include "idf_util.h"
+
 static size_t utf8_char_length(const unsigned char* data, size_t remaining)
 {
     if (remaining == 0) return 0;
@@ -141,4 +143,48 @@ size_t idf_push_utf8_codepoint_count(const std::string& value, size_t limit)
         pos += length;
     }
     return count;
+}
+
+void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
+                                std::string message, std::string cleanup_message)
+{
+    if (success) message = "Test push sent";
+    else if (message.empty()) message = "Test push failed; see the log";
+    job.pending = false;
+    job.running = false;
+    job.done = true;
+    job.success = success;
+    job.nextUs = 0;
+    job.deadlineUs = 0;
+    job.message = std::move(message);
+    job.cleanupMessage.assign(
+        cleanup_message.data(),
+        std::min(cleanup_message.size(), IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1));
+}
+
+static void append_json_string(std::string& out, const char* key, const std::string& value)
+{
+    out += "\"";
+    out += key;
+    out += "\":\"";
+    idf_util_json_escape_append(out, value);
+    out += "\"";
+}
+
+std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
+                                           bool include_cleanup)
+{
+    const std::string message = job.message.empty() ? "Test not started" : job.message;
+    std::string out = "{";
+    out += "\"queued\":"; out += job.pending ? "true" : "false"; out += ",";
+    out += "\"running\":"; out += job.running ? "true" : "false"; out += ",";
+    out += "\"done\":"; out += job.done ? "true" : "false"; out += ",";
+    out += "\"success\":"; out += job.success ? "true" : "false"; out += ",";
+    append_json_string(out, "message", message);
+    if (include_cleanup && job.done && !job.cleanupMessage.empty()) {
+        out += ",";
+        append_json_string(out, "cleanupMessage", job.cleanupMessage);
+    }
+    out += "}";
+    return out;
 }
