@@ -130,6 +130,7 @@ int main() {
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
     assert "network, false, &result" in tests
     assert "else if (result.empty()) result = \"Test push failed; see the log\"" in tests
+    assert "job.message = result" in tests
 
     assert "bool idf_push_test_active(void)" in source
     assert "bool idf_push_test_channel_active(uint8_t channel)" in header
@@ -166,6 +167,7 @@ int main() {
     status = source.split("std::string idf_push_test_status_json", 1)[1]
     assert "expire_test_jobs_locked" in status
     assert "Push test status is temporarily unavailable" in status
+    assert 'json_prop(out, "message", msg)' in status
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1

@@ -30,6 +30,42 @@ constexpr std::string_view kHttpsPrefix = "https://";
 constexpr uint32_t kConnectedPollWindowMs = 5000;
 constexpr uint32_t kConnectedPollCadenceMs = 250;
 constexpr size_t kConnectedPollMaxQueries = 21;
+
+enum class HttpsFailureStage : uint8_t {
+    initial_state,
+    runtime_snapshot,
+    pdp_apn,
+    runtime_config,
+    socket_open,
+    connected_state,
+    tls_setup,
+    tls_handshake,
+    request_write,
+    response_read,
+    cleanup,
+    count,
+};
+
+constexpr std::array<std::string_view,
+                     static_cast<size_t>(HttpsFailureStage::count)> kFailureMessages = {
+    "HTTPS modem initial-state check failed",
+    "HTTPS modem runtime snapshot failed",
+    "HTTPS modem PDP/APN setup failed",
+    "HTTPS modem runtime configuration failed",
+    "HTTPS modem socket open failed",
+    "HTTPS modem connected-state poll failed",
+    "HTTPS TLS setup failed",
+    "HTTPS TLS handshake failed",
+    "HTTPS request write failed",
+    "HTTPS response failed",
+    "HTTPS cleanup failed",
+};
+
+constexpr std::string_view failure_message(HttpsFailureStage stage)
+{
+    return kFailureMessages[static_cast<size_t>(stage)];
+}
+
 using namespace idf_modem_https_wire;
 
 using Clock = std::chrono::steady_clock;
@@ -274,6 +310,7 @@ public:
 
     bool timed_out() const { return timed_out_; }
     bool remote_closed() const { return remote_closed_; }
+    bool open_failed() const { return open_failed_; }
 
 private:
     friend int mip_bio_send(void*, const unsigned char*, size_t);
@@ -336,6 +373,7 @@ private:
         const IdfModemHttpsCommandResult result = callbacks_.sendCommand(
             callbacks_.context, command, response, cleanup);
         if (result == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
+        if (result == IdfModemHttpsCommandResult::open_failed) open_failed_ = true;
         if (result != IdfModemHttpsCommandResult::ok) return false;
         return response.size() <= kResponseMax;
     }
@@ -357,6 +395,7 @@ private:
     bool entropy_initialized_ = false;
     bool timed_out_ = false;
     bool remote_closed_ = false;
+    bool open_failed_ = false;
 };
 
 int mip_bio_send(void* context, const unsigned char* bytes, size_t length)
@@ -394,38 +433,62 @@ public:
 
     IdfModemHttpsRunResult run()
     {
-        if (!ensure_initial_state()) return fail();
-        if (!snapshot_config()) return fail();
-        if (!prepare_pdp()) return fail();
-        if (!apply_runtime_config()) return fail();
-        if (!open_socket()) return fail();
-        if (!wait_for_connected()) return fail();
+        if (!ensure_initial_state()) return fail(HttpsFailureStage::initial_state);
+        if (!snapshot_config()) return fail(HttpsFailureStage::runtime_snapshot);
+        if (!prepare_pdp()) return fail(HttpsFailureStage::pdp_apn);
+        if (!apply_runtime_config()) return fail(HttpsFailureStage::runtime_config);
+        if (!open_socket()) return fail(HttpsFailureStage::socket_open);
+        if (!wait_for_connected()) {
+            return fail(open_failed_ ? HttpsFailureStage::socket_open
+                                     : HttpsFailureStage::connected_state);
+        }
         {
             MipTlsSession tls(request_, target_, callbacks_, deadline_);
             if (!tls.init()) {
-                result_.message = "HTTPS TLS setup failed";
-                return fail();
+                result_.message = failure_message(HttpsFailureStage::tls_setup);
+                return fail(HttpsFailureStage::tls_setup);
             }
             if (!tls.handshake()) {
-                result_.message = tls.timed_out() ? "HTTPS TLS handshake timed out"
-                                                  : "HTTPS TLS handshake failed";
-                return tls.timed_out() ? fail(IdfModemHttpsRunResult::timed_out) : fail();
+                result_.message = tls.open_failed()
+                                      ? failure_message(HttpsFailureStage::socket_open)
+                                      : tls.timed_out() ? "HTTPS TLS handshake timed out"
+                                                        : failure_message(
+                                                              HttpsFailureStage::tls_handshake);
+                return tls.timed_out()
+                           ? fail(HttpsFailureStage::tls_handshake,
+                                  IdfModemHttpsRunResult::timed_out)
+                           : fail(tls.open_failed() ? HttpsFailureStage::socket_open
+                                                    : HttpsFailureStage::tls_handshake);
             }
             const std::string request_wire = build_http_request();
             if (!tls.write_all(request_wire)) {
-                result_.message = "HTTPS request write failed";
-                return tls.timed_out() ? fail(IdfModemHttpsRunResult::timed_out) : fail();
+                result_.message = tls.open_failed()
+                                      ? failure_message(HttpsFailureStage::socket_open)
+                                      : failure_message(HttpsFailureStage::request_write);
+                const HttpsFailureStage stage = tls.open_failed()
+                                                    ? HttpsFailureStage::socket_open
+                                                    : HttpsFailureStage::request_write;
+                return tls.timed_out() ? fail(stage, IdfModemHttpsRunResult::timed_out)
+                                       : fail(stage);
             }
             if (!tls.read_http(result_)) {
-                result_.message = tls.timed_out() ? "HTTPS response timed out"
-                                                  : "HTTPS response failed";
-                return tls.timed_out() ? fail(IdfModemHttpsRunResult::timed_out)
-                                       : fail(IdfModemHttpsRunResult::response_failed);
+                result_.message = tls.open_failed()
+                                      ? failure_message(HttpsFailureStage::socket_open)
+                                      : tls.timed_out() ? "HTTPS response timed out"
+                                                        : failure_message(
+                                                              HttpsFailureStage::response_read);
+                const HttpsFailureStage stage = tls.open_failed()
+                                                    ? HttpsFailureStage::socket_open
+                                                    : HttpsFailureStage::response_read;
+                return tls.timed_out()
+                           ? fail(stage, IdfModemHttpsRunResult::timed_out)
+                           : fail(stage, IdfModemHttpsRunResult::response_failed);
             }
         }
         if (!idf_modem_https_status_success(result_.httpStatus)) {
             result_.message = "HTTPS POST returned a non-2xx status";
-            return fail(IdfModemHttpsRunResult::response_failed);
+            return fail(HttpsFailureStage::response_read,
+                        IdfModemHttpsRunResult::response_failed);
         }
         result_.ok = true;
         result_.message = "HTTPS POST succeeded";
@@ -433,8 +496,11 @@ public:
     }
 
 private:
-    IdfModemHttpsRunResult fail(IdfModemHttpsRunResult fallback = IdfModemHttpsRunResult::command_failed)
+    IdfModemHttpsRunResult fail(
+        HttpsFailureStage stage,
+        IdfModemHttpsRunResult fallback = IdfModemHttpsRunResult::command_failed)
     {
+        if (result_.message.empty()) result_.message = failure_message(stage);
         if (timed_out_ || deadline_.expired()) return finish(IdfModemHttpsRunResult::timed_out);
         return finish(fallback);
     }
@@ -444,7 +510,7 @@ private:
         cleanup();
         if (!cleanup_ok_) {
             result_.ok = false;
-            result_.message = "HTTPS cleanup failed";
+            result_.message = failure_message(HttpsFailureStage::cleanup);
             return IdfModemHttpsRunResult::cleanup_failed;
         }
         return outcome;
@@ -456,6 +522,7 @@ private:
         const IdfModemHttpsCommandResult result = callbacks_.sendCommand(
             callbacks_.context, text, response, cleanup);
         if (result == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
+        if (result == IdfModemHttpsCommandResult::open_failed) open_failed_ = true;
         return result == IdfModemHttpsCommandResult::ok && response.size() <= kResponseMax;
     }
 
@@ -505,6 +572,7 @@ private:
                 const IdfModemHttpsCommandResult confirmed =
                     callbacks_.confirmOpen(callbacks_.context);
                 if (confirmed == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
+                if (confirmed == IdfModemHttpsCommandResult::open_failed) open_failed_ = true;
                 return confirmed == IdfModemHttpsCommandResult::ok;
             }
             if (disposition != MipStateDisposition::initial) return false;
@@ -738,6 +806,7 @@ private:
     bool touched_autofree_ = false;
     bool touched_ssl_ = false;
     bool timed_out_ = false;
+    bool open_failed_ = false;
 
     std::string build_http_request() const
     {

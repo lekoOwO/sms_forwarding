@@ -92,6 +92,10 @@ int main() {
                                       nullptr, fake_modem_post, transport));
     assert(transport.mhttpError == -1);
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
+    modem_message = "HTTPS modem connected-state poll failed";
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.message == "HTTPS modem connected-state poll failed");
     modem_message.assign(200, 'x');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));

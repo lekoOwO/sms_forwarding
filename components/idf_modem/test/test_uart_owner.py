@@ -447,6 +447,9 @@ struct mbedtls_ssl_context {
 };
 struct mbedtls_x509_crt {};
 
+extern int fixture_tls_setup_result;
+extern int fixture_tls_handshake_result;
+
 inline constexpr int MBEDTLS_ERR_NET_RECV_FAILED = -1;
 inline constexpr int MBEDTLS_ERR_NET_SEND_FAILED = -2;
 inline constexpr int MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY = -3;
@@ -484,7 +487,9 @@ inline void mbedtls_ssl_conf_max_tls_version(mbedtls_ssl_config*, int) {}
 inline void mbedtls_ssl_conf_ca_chain(mbedtls_ssl_config*, mbedtls_x509_crt*, void*) {}
 inline void mbedtls_ssl_init(mbedtls_ssl_context*) {}
 inline void mbedtls_ssl_free(mbedtls_ssl_context*) {}
-inline int mbedtls_ssl_setup(mbedtls_ssl_context*, const mbedtls_ssl_config*) { return 0; }
+inline int mbedtls_ssl_setup(mbedtls_ssl_context*, const mbedtls_ssl_config*) {
+    return fixture_tls_setup_result;
+}
 inline int mbedtls_ssl_set_hostname(mbedtls_ssl_context*, const char*) { return 0; }
 inline void mbedtls_ssl_set_bio(
     mbedtls_ssl_context* ssl, void* context,
@@ -495,7 +500,9 @@ inline void mbedtls_ssl_set_bio(
     ssl->bio_send = send;
     ssl->bio_recv = recv;
 }
-inline int mbedtls_ssl_handshake(mbedtls_ssl_context*) { return 0; }
+inline int mbedtls_ssl_handshake(mbedtls_ssl_context*) {
+    return fixture_tls_handshake_result;
+}
 inline uint32_t mbedtls_ssl_get_verify_result(const mbedtls_ssl_context*) { return 0; }
 inline int mbedtls_ssl_write(mbedtls_ssl_context* ssl, const unsigned char* bytes,
                              size_t length) {
@@ -662,6 +669,38 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn("+UNKNOWN: 1", fixture)
         self.assertIn('\\"disconn\\",0,2', fixture)
 
+    def test_https_failure_stages_are_fixed_sanitized_messages(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        owner = SOURCE.read_text()
+        self.assertIn("enum class HttpsFailureStage", source)
+        expected = (
+            "HTTPS modem initial-state check failed",
+            "HTTPS modem runtime snapshot failed",
+            "HTTPS modem PDP/APN setup failed",
+            "HTTPS modem runtime configuration failed",
+            "HTTPS modem socket open failed",
+            "HTTPS modem connected-state poll failed",
+            "HTTPS TLS setup failed",
+            "HTTPS TLS handshake failed",
+            "HTTPS request write failed",
+            "HTTPS response failed",
+            "HTTPS cleanup failed",
+        )
+        for message in expected:
+            self.assertEqual(source.count(f'"{message}"'), 1)
+            self.assertNotIn("AT+", message)
+            self.assertNotIn("fixture", message)
+        run = function_body(source, "run")
+        for stage in (
+            "initial_state", "runtime_snapshot", "pdp_apn", "runtime_config",
+            "socket_open", "connected_state", "tls_setup", "tls_handshake",
+            "request_write", "response_read",
+        ):
+            self.assertIn(f"HttpsFailureStage::{stage}", run)
+        post = function_body(owner, "idf_modem_https_post")
+        self.assertIn("err == ESP_ERR_TIMEOUT && result.message.empty()", post)
+        self.assertNotIn("Test push failed; see the log", source)
+
     def test_https_uart_drain_uses_operation_deadline_and_bounded_cap(self):
         source = SOURCE.read_text()
         drain = function_body(source, "capture_pending_uart_locked")
@@ -729,7 +768,9 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn("command(close, response, true)", ensure_initial)
         self.assertNotIn("while", ensure_initial)
         self.assertNotIn("MIPOPEN", ensure_initial)
-        wait_connected = function_body(source, "wait_for_connected")
+        wait_connected = function_body(
+            source[source.index("bool wait_for_connected()"):], "wait_for_connected"
+        )
         self.assertIn("kConnectedPollWindowMs", wait_connected)
         self.assertIn("kConnectedPollCadenceMs", wait_connected)
         self.assertIn("kConnectedPollMaxQueries", wait_connected)

@@ -2065,6 +2065,7 @@ static IdfModemHttpsCommandResult owner_https_send_command(
                                                   &modem_error, await_mip_open,
                                                   &context.open_latch);
     if (err == ESP_OK) return IdfModemHttpsCommandResult::ok;
+    if (!context.open_latch.nonfatal()) return IdfModemHttpsCommandResult::open_failed;
     if (err == ESP_ERR_TIMEOUT) return IdfModemHttpsCommandResult::timeout;
     return modem_error ? IdfModemHttpsCommandResult::modem_error
                         : IdfModemHttpsCommandResult::failed;
@@ -2075,11 +2076,12 @@ static IdfModemHttpsCommandResult owner_https_confirm_open(void* opaque)
     auto& context = *static_cast<OwnerHttpsCallbackContext*>(opaque);
     if (context.deadline.expired()) return IdfModemHttpsCommandResult::timeout;
     if (!capture_pending_uart_locked(context.deadline, &context.open_latch)) {
+        if (!context.open_latch.nonfatal()) return IdfModemHttpsCommandResult::open_failed;
         return context.deadline.expired() ? IdfModemHttpsCommandResult::timeout
                                           : IdfModemHttpsCommandResult::failed;
     }
     if (context.deadline.expired()) return IdfModemHttpsCommandResult::timeout;
-    if (!context.open_latch.finish()) return IdfModemHttpsCommandResult::failed;
+    if (!context.open_latch.finish()) return IdfModemHttpsCommandResult::open_failed;
     return IdfModemHttpsCommandResult::ok;
 }
 
@@ -2142,7 +2144,9 @@ esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
     }
     const esp_err_t err = submit_owner_command(owner_request, nullptr, false, nullptr, &result);
     if (err == IDF_MODEM_ERR_BUSY) result.message = "Modem command queue is full";
-    else if (err == ESP_ERR_TIMEOUT) result.message = "Modem HTTPS POST timed out";
+    else if (err == ESP_ERR_TIMEOUT && result.message.empty()) {
+        result.message = "Modem HTTPS POST timed out";
+    }
     else if (err == ESP_ERR_INVALID_STATE && result.message.empty()) result.message = "Modem is not started";
     return err;
 }

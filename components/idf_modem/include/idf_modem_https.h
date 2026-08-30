@@ -51,6 +51,7 @@ enum class IdfModemHttpsCommandResult : int {
     modem_error = 1,
     failed = -1,
     timeout = -2,
+    open_failed = -3,
 };
 
 enum class IdfModemHttpsRunResult : int {

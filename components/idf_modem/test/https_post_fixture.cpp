@@ -7,6 +7,9 @@
 #include <string_view>
 #include <vector>
 
+int fixture_tls_setup_result = 0;
+int fixture_tls_handshake_result = 0;
+
 namespace {
 
 using idf_modem_https_wire::HttpResponse;
@@ -41,6 +44,15 @@ bool is_upper_hex(std::string_view value)
     });
 }
 
+void assert_failure_message(std::string_view actual, std::string_view expected)
+{
+    assert(actual == expected);
+    assert(actual != "Test push failed; see the log");
+    for (const std::string_view forbidden : {"AT+", "fixture.example", "internet", "DER", "{}"}) {
+        assert(actual.find(forbidden) == std::string_view::npos);
+    }
+}
+
 enum class InitialStateMode {
     initial,
     connected_then_initial,
@@ -63,6 +75,7 @@ struct InitialStateTranscript {
     size_t state_queries = 0;
     std::vector<std::string> commands;
     std::vector<bool> cleanup;
+    std::string result_message;
 
     static IdfModemHttpsCommandResult send(void* context, std::string_view command,
                                            std::string& response, bool cleanup)
@@ -130,7 +143,9 @@ IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& tran
     IdfModemHttpsCallbacks callbacks{
         &transcript, &InitialStateTranscript::send, &InitialStateTranscript::confirm};
     IdfModemHttpsPostResult result;
-    return idf_modem_https_run_post(request, callbacks, result);
+    const IdfModemHttpsRunResult outcome = idf_modem_https_run_post(request, callbacks, result);
+    transcript.result_message = result.message;
+    return outcome;
 }
 
 void check_initial_state_transcripts()
@@ -140,6 +155,7 @@ void check_initial_state_transcripts()
     assert((initial.commands == std::vector<std::string>{
                                     "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
     assert(std::count(initial.commands.begin(), initial.commands.end(), "AT+MIPCLOSE=0") == 0);
+    assert_failure_message(initial.result_message, "HTTPS modem runtime snapshot failed");
 
     InitialStateTranscript recovered{InitialStateMode::connected_then_initial};
     assert(run_initial_state_transcript(recovered) == IdfModemHttpsRunResult::command_failed);
@@ -147,6 +163,7 @@ void check_initial_state_transcripts()
                                       "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
                                       "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
     assert((recovered.cleanup == std::vector<bool>{false, true, false, false}));
+    assert_failure_message(recovered.result_message, "HTTPS modem runtime snapshot failed");
 
     InitialStateTranscript closed{InitialStateMode::closed_then_initial};
     assert(run_initial_state_transcript(closed) == IdfModemHttpsRunResult::command_failed);
@@ -154,6 +171,7 @@ void check_initial_state_transcripts()
                                    "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
                                    "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
     assert((closed.cleanup == std::vector<bool>{false, true, false, false}));
+    assert_failure_message(closed.result_message, "HTTPS modem runtime snapshot failed");
 
     for (const InitialStateMode mode : {InitialStateMode::state_failed,
                                         InitialStateMode::state_timeout,
@@ -169,6 +187,8 @@ void check_initial_state_transcripts()
         assert((rejected.commands == std::vector<std::string>{"AT+MIPSTATE=0"}));
         assert(std::count(rejected.commands.begin(), rejected.commands.end(),
                           "AT+MIPCLOSE=0") == 0);
+        assert_failure_message(rejected.result_message,
+                               "HTTPS modem initial-state check failed");
     }
 
     for (const InitialStateMode mode : {InitialStateMode::close_failed,
@@ -177,6 +197,8 @@ void check_initial_state_transcripts()
         assert(run_initial_state_transcript(rejected) == IdfModemHttpsRunResult::command_failed);
         assert((rejected.commands == std::vector<std::string>{
                                          "AT+MIPSTATE=0", "AT+MIPCLOSE=0"}));
+        assert_failure_message(rejected.result_message,
+                               "HTTPS modem initial-state check failed");
     }
 
     InitialStateTranscript still_connected{InitialStateMode::connected_after_close};
@@ -184,6 +206,8 @@ void check_initial_state_transcripts()
     assert((still_connected.commands == std::vector<std::string>{
                                          "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
                                          "AT+MIPSTATE=0"}));
+    assert_failure_message(still_connected.result_message,
+                           "HTTPS modem initial-state check failed");
 }
 
 enum class RemoteCloseMode {
@@ -203,6 +227,13 @@ enum class RemoteCloseMode {
     post_open_closed,
     post_open_wrong_cid,
     post_open_invalid,
+    pdp_failure,
+    runtime_config_failure,
+    tls_setup_failure,
+    tls_handshake_failure,
+    request_write_failure,
+    http_non_success,
+    cleanup_failure,
 };
 
 enum class LateOpenKind {
@@ -293,14 +324,14 @@ struct RemoteCloseTranscript {
     {
         auto& transcript = *static_cast<RemoteCloseTranscript*>(context);
         if (cleanup) transcript.open_latch.reset();
-        if (!transcript.open_latch.nonfatal()) return IdfModemHttpsCommandResult::failed;
+        if (!transcript.open_latch.nonfatal()) return IdfModemHttpsCommandResult::open_failed;
         if (command.rfind("AT+MIPSEND=0,", 0) == 0 &&
             transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
             transcript.late_stage == LateOpenStage::after_confirm_before_first_send) {
             assert(transcript.open_latch.connected());
             transcript.late_consumed = true;
             if (!transcript.feed_late_open_split()) {
-                return IdfModemHttpsCommandResult::failed;
+                return IdfModemHttpsCommandResult::open_failed;
             }
         }
         if (command == "AT+MIPSTATE=0") {
@@ -311,7 +342,7 @@ struct RemoteCloseTranscript {
                   transcript.state_queries == 2))) {
                 transcript.late_consumed = true;
                 if (!transcript.open_latch.feed(transcript.late_open_bytes())) {
-                    return IdfModemHttpsCommandResult::failed;
+                    return IdfModemHttpsCommandResult::open_failed;
                 }
             }
             ++transcript.state_queries;
@@ -337,7 +368,7 @@ struct RemoteCloseTranscript {
             }
             response = frame(command, state_body);
             if (!transcript.open_latch.feed(response)) {
-                return IdfModemHttpsCommandResult::failed;
+                return IdfModemHttpsCommandResult::open_failed;
             }
             return IdfModemHttpsCommandResult::ok;
         }
@@ -362,6 +393,10 @@ struct RemoteCloseTranscript {
         }
         if (command == "AT+MIPCFG=\"encoding\",0,1,1" ||
             command == "AT+MIPCFG=\"encoding\",0,0,0") {
+            if (transcript.mode == RemoteCloseMode::runtime_config_failure &&
+                command == "AT+MIPCFG=\"encoding\",0,1,1") {
+                return IdfModemHttpsCommandResult::failed;
+            }
             transcript.encoding_send = command == "AT+MIPCFG=\"encoding\",0,1,1" ? 1 : 0;
             transcript.encoding_receive = transcript.encoding_send;
             response = frame(command, "");
@@ -378,6 +413,9 @@ struct RemoteCloseTranscript {
             return IdfModemHttpsCommandResult::ok;
         }
         if (command == "AT+CGDCONT?") {
+            if (transcript.mode == RemoteCloseMode::pdp_failure) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             response = frame(command, "+CGDCONT: 1,\"IPV4V6\",\"fixture\",,0,0,,,,");
             return IdfModemHttpsCommandResult::ok;
         }
@@ -409,12 +447,15 @@ struct RemoteCloseTranscript {
             }
             response = frame(command, body);
             if (!transcript.open_latch.feed(response)) {
-                return IdfModemHttpsCommandResult::failed;
+                return IdfModemHttpsCommandResult::open_failed;
             }
             return IdfModemHttpsCommandResult::ok;
         }
         constexpr std::string_view send_prefix = "AT+MIPSEND=0,";
         if (command.compare(0, send_prefix.size(), send_prefix) == 0) {
+            if (transcript.mode == RemoteCloseMode::request_write_failure) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             ++transcript.send_commands;
             const size_t comma = command.find(',', send_prefix.size());
             size_t sent = 0;
@@ -437,8 +478,10 @@ struct RemoteCloseTranscript {
                                  "+MIPRD: 0,0,1,41\r\n+MIPURC: \"disconn\",0,2\r\n"
                                  "+MIPURC: \"disconn\",0,2");
             } else {
-                static constexpr std::string_view http =
-                    "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
+                const std::string_view http =
+                    transcript.mode == RemoteCloseMode::http_non_success
+                        ? "HTTP/1.1 503 Service Unavailable\r\nX-Test: remote-close\r\n\r\nbody"
+                        : "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
                 const std::string hex = idf_modem_https_wire::hex_encode(
                     reinterpret_cast<const uint8_t*>(http.data()), http.size());
                 response = frame(command, "+MIPRD: 0,0," + std::to_string(http.size()) + "," +
@@ -449,6 +492,9 @@ struct RemoteCloseTranscript {
         if (command == "AT+MIPCLOSE=0") {
             ++transcript.close_commands;
             transcript.close_was_cleanup = cleanup;
+            if (transcript.mode == RemoteCloseMode::cleanup_failure) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             response = frame(command, "+MIPCLOSE: 0,0");
             return IdfModemHttpsCommandResult::ok;
         }
@@ -463,10 +509,10 @@ struct RemoteCloseTranscript {
             assert(!transcript.open_latch.connected());
             transcript.late_consumed = true;
             if (!transcript.feed_late_open_split()) {
-                return IdfModemHttpsCommandResult::failed;
+                return IdfModemHttpsCommandResult::open_failed;
             }
         }
-        if (!transcript.open_latch.finish()) return IdfModemHttpsCommandResult::failed;
+        if (!transcript.open_latch.finish()) return IdfModemHttpsCommandResult::open_failed;
         return IdfModemHttpsCommandResult::ok;
     }
 };
@@ -481,7 +527,14 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
     request.rootCertificateSha256.fill(0xab);
     IdfModemHttpsCallbacks callbacks{
         &transcript, &RemoteCloseTranscript::send, &RemoteCloseTranscript::confirm};
-    return idf_modem_https_run_post(request, callbacks, result);
+    fixture_tls_setup_result =
+        transcript.mode == RemoteCloseMode::tls_setup_failure ? -1 : 0;
+    fixture_tls_handshake_result =
+        transcript.mode == RemoteCloseMode::tls_handshake_failure ? -1 : 0;
+    const IdfModemHttpsRunResult outcome = idf_modem_https_run_post(request, callbacks, result);
+    fixture_tls_setup_result = 0;
+    fixture_tls_handshake_result = 0;
+    return outcome;
 }
 
 void check_remote_close_transcripts()
@@ -508,6 +561,7 @@ void check_remote_close_transcripts()
                IdfModemHttpsRunResult::response_failed);
         assert(!result.ok && result.responseBytes == 0 && rejected.read_commands == 1 &&
                rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert_failure_message(result.message, "HTTPS response failed");
     }
 
     for (const RemoteCloseMode mode : {RemoteCloseMode::open_ok_connected,
@@ -536,6 +590,7 @@ void check_remote_close_transcripts()
                rejected.send_commands == 0 && rejected.read_commands == 0 &&
                rejected.close_commands == 1 && rejected.close_was_cleanup);
         assert(!rejected.open_latch.active());
+        assert_failure_message(result.message, "HTTPS modem socket open failed");
     }
 
     RemoteCloseTranscript open_timeout{RemoteCloseMode::open_command_timeout};
@@ -545,6 +600,7 @@ void check_remote_close_transcripts()
     assert(!result.ok && open_timeout.state_queries == 1 && open_timeout.open_commands == 1 &&
            open_timeout.send_commands == 0 && open_timeout.read_commands == 0 &&
            open_timeout.close_commands == 1 && open_timeout.close_was_cleanup);
+    assert_failure_message(result.message, "HTTPS modem socket open failed");
 
     for (const RemoteCloseMode mode : {RemoteCloseMode::post_open_closed,
                                        RemoteCloseMode::post_open_wrong_cid,
@@ -558,6 +614,7 @@ void check_remote_close_transcripts()
                rejected.close_commands == 1 && rejected.close_was_cleanup);
         assert(rejected.encoding_send == 0 && rejected.encoding_receive == 0 &&
                rejected.autofree == 0);
+        assert_failure_message(result.message, "HTTPS modem connected-state poll failed");
     }
 
     RemoteCloseTranscript state_timeout{RemoteCloseMode::post_open_initial_timeout};
@@ -567,6 +624,7 @@ void check_remote_close_transcripts()
     assert(!result.ok && state_timeout.state_queries == 22 && state_timeout.open_commands == 1 &&
            state_timeout.send_commands == 0 && state_timeout.read_commands == 0 &&
            state_timeout.close_commands == 1 && state_timeout.close_was_cleanup);
+    assert_failure_message(result.message, "HTTPS modem connected-state poll failed");
 
     for (const LateOpenStage stage : {LateOpenStage::before_first_state,
                                       LateOpenStage::between_initial_polls,
@@ -587,6 +645,7 @@ void check_remote_close_transcripts()
                    rejected.read_commands == 0 && rejected.close_commands == 1 &&
                    rejected.close_was_cleanup);
             assert(!rejected.open_latch.active());
+            assert_failure_message(result.message, "HTTPS modem socket open failed");
         }
     }
 
@@ -605,7 +664,47 @@ void check_remote_close_transcripts()
                    rejected.send_commands == 0 && rejected.read_commands == 0 &&
                    rejected.close_commands == 1 && rejected.close_was_cleanup);
             assert(!rejected.open_latch.active());
+            assert_failure_message(result.message, "HTTPS modem socket open failed");
         }
+    }
+
+    struct FailureCase {
+        RemoteCloseMode mode;
+        IdfModemHttpsRunResult outcome;
+        std::string_view message;
+    };
+    for (const FailureCase failure : {
+             FailureCase{RemoteCloseMode::pdp_failure,
+                         IdfModemHttpsRunResult::command_failed,
+                         "HTTPS modem PDP/APN setup failed"},
+             FailureCase{RemoteCloseMode::runtime_config_failure,
+                         IdfModemHttpsRunResult::command_failed,
+                         "HTTPS modem runtime configuration failed"},
+             FailureCase{RemoteCloseMode::tls_setup_failure,
+                         IdfModemHttpsRunResult::command_failed,
+                         "HTTPS TLS setup failed"},
+             FailureCase{RemoteCloseMode::tls_handshake_failure,
+                         IdfModemHttpsRunResult::command_failed,
+                         "HTTPS TLS handshake failed"},
+             FailureCase{RemoteCloseMode::request_write_failure,
+                         IdfModemHttpsRunResult::command_failed,
+                         "HTTPS request write failed"},
+             FailureCase{RemoteCloseMode::http_non_success,
+                         IdfModemHttpsRunResult::response_failed,
+                         "HTTPS POST returned a non-2xx status"},
+             FailureCase{RemoteCloseMode::cleanup_failure,
+                         IdfModemHttpsRunResult::cleanup_failed,
+                         "HTTPS cleanup failed"},
+         }) {
+        RemoteCloseTranscript rejected{failure.mode};
+        result = {};
+        assert(run_remote_close_transcript(rejected, result) == failure.outcome);
+        assert(!result.ok && rejected.close_commands ==
+                                 (failure.mode == RemoteCloseMode::pdp_failure ||
+                                          failure.mode == RemoteCloseMode::runtime_config_failure
+                                      ? 0U
+                                      : 1U));
+        assert_failure_message(result.message, failure.message);
     }
 
     RemoteCloseTranscript late_success{RemoteCloseMode::open_ok_connected,
