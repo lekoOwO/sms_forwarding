@@ -109,7 +109,7 @@ struct InitialStateTranscript {
                 const std::string_view state =
                     initial ? "+MIPSTATE: 0,,,,\"INITIAL\""
                     : transcript.mode == InitialStateMode::closed_then_initial
-                        ? "+MIPSTATE: 0,,,,\"CLOSED\""
+                        ? "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CLOSED\""
                         : "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
                 response = frame(command, state);
             }
@@ -880,6 +880,48 @@ int main()
     uint8_t closed_cid = 0;
     assert(!parse_mip_state(closed_state_response, state_command, "CONNECTED", closed_cid));
     assert(!parse_mip_state(closed_state_response, state_command, "INITIAL", closed_cid));
+    const std::string populated_closed_state =
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CLOSED\"");
+    assert(classify_mip_state(populated_closed_state, state_command, 0) ==
+           MipStateDisposition::closed);
+    assert(classify_mip_state(
+               frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",1,\"CLOSED\""),
+               state_command, 0) == MipStateDisposition::closed);
+    assert(classify_mip_state(
+               frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",65535,\"CLOSED\""),
+               state_command, 0) == MipStateDisposition::closed);
+    const std::string maximum_address(255, 'a');
+    assert(classify_mip_state(
+               frame(state_command, "+MIPSTATE: 0,\"TCP\",\"" + maximum_address +
+                                      "\",443,\"CLOSED\""),
+               state_command, 0) == MipStateDisposition::closed);
+    std::vector<std::string> invalid_closed_states = {
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",,443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,,\"fixture.example\",443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"UDP\",\"fixture.example\",443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"\",443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",0,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",65536,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",\"443\",\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",+443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CLOSED\",extra"),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture\"evil\",443,\"CLOSED\""),
+        frame(state_command, "+MIPSTATE: 0,\"TCP\",\"fixture\r\n+CEREG: 1,1\",443,\"CLOSED\""),
+    };
+    for (const std::string& invalid : invalid_closed_states) {
+        assert(classify_mip_state(invalid, state_command, 0) == MipStateDisposition::invalid);
+    }
+    const std::string oversized_address(256, 'a');
+    assert(classify_mip_state(
+               frame(state_command, "+MIPSTATE: 0,\"TCP\",\"" + oversized_address +
+                                      "\",443,\"CLOSED\""),
+               state_command, 0) == MipStateDisposition::invalid);
+    std::string control_address = "+MIPSTATE: 0,\"TCP\",\"fixture";
+    control_address.push_back('\x01');
+    control_address += ".example\",443,\"CLOSED\"";
+    assert(classify_mip_state(frame(state_command, control_address), state_command, 0) ==
+           MipStateDisposition::invalid);
     uint8_t state_cid = 0;
     assert(parse_mip_state(state_response, state_command, "CONNECTED", state_cid));
     assert(state_cid == 0);

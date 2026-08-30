@@ -221,6 +221,24 @@ bool parse_mip_open_line(std::string_view line, uint8_t expected_cid)
            parse_uint(fields[1], result) && result == 0;
 }
 
+constexpr size_t kMipAddressMax = 255;
+
+bool mip_address_safe(std::string_view address)
+{
+    return !address.empty() && address.size() <= kMipAddressMax &&
+           std::all_of(address.begin(), address.end(), [](unsigned char ch) {
+               return ch >= 0x21 && ch <= 0x7e && ch != '"' && ch != '\\' && ch != '@';
+           });
+}
+
+bool parse_mip_tcp_endpoint(const std::array<std::string_view, 8>& fields,
+                            const std::array<bool, 8>& quoted)
+{
+    uint32_t port = 0;
+    return quoted[1] && fields[1] == "TCP" && quoted[2] && mip_address_safe(fields[2]) &&
+           !quoted[3] && parse_uint(fields[3], port) && port > 0 && port <= UINT16_MAX;
+}
+
 MipStateDisposition parse_mip_state_disposition(std::string_view response,
                                                 std::string_view command,
                                                 uint8_t& cid)
@@ -258,21 +276,25 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) {
         return MipStateDisposition::invalid;
     }
-    if (fields[4] == "INITIAL" || fields[4] == "CLOSED") {
+    if (fields[4] == "INITIAL") {
         if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
             !fields[2].empty() || !fields[3].empty()) {
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
-        return fields[4] == "INITIAL" ? MipStateDisposition::initial
-                                      : MipStateDisposition::closed;
+        return MipStateDisposition::initial;
     }
-    if (fields[4] == "CONNECTED") {
-        uint32_t port = 0;
-        if (!quoted[1] || fields[1] != "TCP" || !quoted[2] || fields[2].empty() || quoted[3] ||
-            !parse_uint(fields[3], port) || port == 0 || port > UINT16_MAX) {
+    if (fields[4] == "CLOSED") {
+        const bool empty_endpoint = !quoted[1] && !quoted[2] && !quoted[3] &&
+                                    fields[1].empty() && fields[2].empty() && fields[3].empty();
+        if (!empty_endpoint && !parse_mip_tcp_endpoint(fields, quoted)) {
             return MipStateDisposition::invalid;
         }
+        cid = static_cast<uint8_t>(connect_id);
+        return MipStateDisposition::closed;
+    }
+    if (fields[4] == "CONNECTED") {
+        if (!parse_mip_tcp_endpoint(fields, quoted)) return MipStateDisposition::invalid;
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::connected;
     }
