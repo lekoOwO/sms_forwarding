@@ -96,6 +96,19 @@ int main() {
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.message == "HTTPS modem connected-state poll failed");
+    for (const char* message : {
+             "HTTPS modem initial query command failed",
+             "HTTPS modem initial query response invalid",
+             "HTTPS modem stale socket close command failed",
+             "HTTPS modem stale socket close response invalid",
+             "HTTPS modem post-close query command failed",
+             "HTTPS modem post-close query response invalid",
+         }) {
+        modem_message = message;
+        assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                          nullptr, fake_modem_post, transport));
+        assert(transport.message == message);
+    }
     modem_message.assign(200, 'x');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));

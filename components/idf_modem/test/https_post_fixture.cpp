@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 int fixture_tls_setup_result = 0;
@@ -47,11 +48,26 @@ bool is_upper_hex(std::string_view value)
 void assert_failure_message(std::string_view actual, std::string_view expected)
 {
     assert(actual == expected);
+    assert(actual.size() < 96);
     assert(actual != "Test push failed; see the log");
-    for (const std::string_view forbidden : {"AT+", "fixture.example", "internet", "DER", "{}"}) {
+    for (const std::string_view forbidden : {"AT+", "fixture.example", "internet", "DER", "{}",
+                                             "INITIAL", "CONNECTED", "CLOSED", "TCP", "\r", "\n"}) {
         assert(actual.find(forbidden) == std::string_view::npos);
     }
 }
+
+constexpr std::string_view kInitialQueryCommandFailure =
+    "HTTPS modem initial query command failed";
+constexpr std::string_view kInitialQueryResponseInvalid =
+    "HTTPS modem initial query response invalid";
+constexpr std::string_view kStaleCloseCommandFailure =
+    "HTTPS modem stale socket close command failed";
+constexpr std::string_view kStaleCloseResponseInvalid =
+    "HTTPS modem stale socket close response invalid";
+constexpr std::string_view kPostCloseQueryCommandFailure =
+    "HTTPS modem post-close query command failed";
+constexpr std::string_view kPostCloseQueryResponseInvalid =
+    "HTTPS modem post-close query response invalid";
 
 enum class InitialStateMode {
     initial,
@@ -66,6 +82,7 @@ enum class InitialStateMode {
     close_failed,
     close_ambiguous,
     connected_after_close,
+    post_close_state_failed,
 };
 
 struct InitialStateTranscript {
@@ -90,6 +107,10 @@ struct InitialStateTranscript {
                                    transcript.mode == InitialStateMode::closed_then_initial) &&
                                   transcript.state_queries == 2);
             if (transcript.mode == InitialStateMode::state_failed) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (transcript.mode == InitialStateMode::post_close_state_failed &&
+                transcript.state_queries == 2) {
                 return IdfModemHttpsCommandResult::failed;
             }
             if (transcript.mode == InitialStateMode::state_timeout) {
@@ -173,12 +194,14 @@ void check_initial_state_transcripts()
     assert((closed.cleanup == std::vector<bool>{false, true, false, false}));
     assert_failure_message(closed.result_message, "HTTPS modem runtime snapshot failed");
 
-    for (const InitialStateMode mode : {InitialStateMode::state_failed,
-                                        InitialStateMode::state_timeout,
-                                        InitialStateMode::malformed_state,
-                                        InitialStateMode::ambiguous_state,
-                                        InitialStateMode::unknown_state,
-                                        InitialStateMode::wrong_cid}) {
+    for (const auto& [mode, expected_message] : {
+             std::pair{InitialStateMode::state_failed, kInitialQueryCommandFailure},
+             std::pair{InitialStateMode::state_timeout, kInitialQueryCommandFailure},
+             std::pair{InitialStateMode::malformed_state, kInitialQueryResponseInvalid},
+             std::pair{InitialStateMode::ambiguous_state, kInitialQueryResponseInvalid},
+             std::pair{InitialStateMode::unknown_state, kInitialQueryResponseInvalid},
+             std::pair{InitialStateMode::wrong_cid, kInitialQueryResponseInvalid},
+         }) {
         InitialStateTranscript rejected{mode};
         const IdfModemHttpsRunResult expected = mode == InitialStateMode::state_timeout
                                                     ? IdfModemHttpsRunResult::timed_out
@@ -187,18 +210,18 @@ void check_initial_state_transcripts()
         assert((rejected.commands == std::vector<std::string>{"AT+MIPSTATE=0"}));
         assert(std::count(rejected.commands.begin(), rejected.commands.end(),
                           "AT+MIPCLOSE=0") == 0);
-        assert_failure_message(rejected.result_message,
-                               "HTTPS modem initial-state check failed");
+        assert_failure_message(rejected.result_message, expected_message);
     }
 
-    for (const InitialStateMode mode : {InitialStateMode::close_failed,
-                                        InitialStateMode::close_ambiguous}) {
+    for (const auto& [mode, expected_message] : {
+             std::pair{InitialStateMode::close_failed, kStaleCloseCommandFailure},
+             std::pair{InitialStateMode::close_ambiguous, kStaleCloseResponseInvalid},
+         }) {
         InitialStateTranscript rejected{mode};
         assert(run_initial_state_transcript(rejected) == IdfModemHttpsRunResult::command_failed);
         assert((rejected.commands == std::vector<std::string>{
                                          "AT+MIPSTATE=0", "AT+MIPCLOSE=0"}));
-        assert_failure_message(rejected.result_message,
-                               "HTTPS modem initial-state check failed");
+        assert_failure_message(rejected.result_message, expected_message);
     }
 
     InitialStateTranscript still_connected{InitialStateMode::connected_after_close};
@@ -206,8 +229,15 @@ void check_initial_state_transcripts()
     assert((still_connected.commands == std::vector<std::string>{
                                          "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
                                          "AT+MIPSTATE=0"}));
-    assert_failure_message(still_connected.result_message,
-                           "HTTPS modem initial-state check failed");
+    assert_failure_message(still_connected.result_message, kPostCloseQueryResponseInvalid);
+
+    InitialStateTranscript post_close_failed{InitialStateMode::post_close_state_failed};
+    assert(run_initial_state_transcript(post_close_failed) == IdfModemHttpsRunResult::command_failed);
+    assert((post_close_failed.commands == std::vector<std::string>{
+                                           "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
+                                           "AT+MIPSTATE=0"}));
+    assert((post_close_failed.cleanup == std::vector<bool>{false, true, false}));
+    assert_failure_message(post_close_failed.result_message, kPostCloseQueryCommandFailure);
 }
 
 enum class RemoteCloseMode {

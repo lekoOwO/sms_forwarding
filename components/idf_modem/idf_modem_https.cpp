@@ -61,6 +61,19 @@ constexpr std::array<std::string_view,
     "HTTPS cleanup failed",
 };
 
+constexpr std::string_view kInitialQueryCommandFailure =
+    "HTTPS modem initial query command failed";
+constexpr std::string_view kInitialQueryResponseInvalid =
+    "HTTPS modem initial query response invalid";
+constexpr std::string_view kStaleCloseCommandFailure =
+    "HTTPS modem stale socket close command failed";
+constexpr std::string_view kStaleCloseResponseInvalid =
+    "HTTPS modem stale socket close response invalid";
+constexpr std::string_view kPostCloseQueryCommandFailure =
+    "HTTPS modem post-close query command failed";
+constexpr std::string_view kPostCloseQueryResponseInvalid =
+    "HTTPS modem post-close query response invalid";
+
 constexpr std::string_view failure_message(HttpsFailureStage stage)
 {
     return kFailureMessages[static_cast<size_t>(stage)];
@@ -516,44 +529,78 @@ private:
         return outcome;
     }
 
-    bool command(const std::string& text, std::string& response, bool cleanup = false)
+    bool command(const std::string& text, std::string& response, bool cleanup = false,
+                 IdfModemHttpsCommandResult* command_result = nullptr)
     {
-        if (!cleanup && deadline_.expired()) return false;
+        if (!cleanup && deadline_.expired()) {
+            if (command_result) *command_result = IdfModemHttpsCommandResult::failed;
+            return false;
+        }
         const IdfModemHttpsCommandResult result = callbacks_.sendCommand(
             callbacks_.context, text, response, cleanup);
+        if (command_result) *command_result = result;
         if (result == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
         if (result == IdfModemHttpsCommandResult::open_failed) open_failed_ = true;
         return result == IdfModemHttpsCommandResult::ok && response.size() <= kResponseMax;
     }
 
-    bool query_state(std::string_view expected)
+    bool query_state(std::string_view expected, std::string_view command_failure,
+                     std::string_view response_failure)
     {
         const std::string command_text = "AT+MIPSTATE=0";
         std::string response;
         uint8_t cid = 0;
-        return command(command_text, response) && parse_mip_state(response, command_text, expected, cid) &&
-               cid == 0;
+        IdfModemHttpsCommandResult command_result = IdfModemHttpsCommandResult::failed;
+        if (!command(command_text, response, false, &command_result)) {
+            result_.message = command_result == IdfModemHttpsCommandResult::ok
+                                  ? response_failure
+                                  : command_failure;
+            return false;
+        }
+        if (!parse_mip_state(response, command_text, expected, cid) || cid != 0) {
+            result_.message = response_failure;
+            return false;
+        }
+        return true;
     }
 
     bool ensure_initial_state()
     {
         const std::string state_command = "AT+MIPSTATE=0";
         std::string response;
-        if (!command(state_command, response)) return false;
+        IdfModemHttpsCommandResult state_command_result = IdfModemHttpsCommandResult::failed;
+        if (!command(state_command, response, false, &state_command_result)) {
+            result_.message = state_command_result == IdfModemHttpsCommandResult::ok
+                                  ? kInitialQueryResponseInvalid
+                                  : kInitialQueryCommandFailure;
+            return false;
+        }
         const MipStateDisposition disposition = classify_mip_state(response, state_command, 0);
-        if (disposition == MipStateDisposition::invalid) return false;
+        if (disposition == MipStateDisposition::invalid) {
+            result_.message = kInitialQueryResponseInvalid;
+            return false;
+        }
         if (disposition == MipStateDisposition::initial) return true;
         if (disposition != MipStateDisposition::connected &&
             disposition != MipStateDisposition::closed) {
+            result_.message = kInitialQueryResponseInvalid;
             return false;
         }
         const std::string close = "AT+MIPCLOSE=0";
         uint32_t result = 0;
-        if (!command(close, response, true) ||
-            !parse_result(response, close, "+MIPCLOSE:", 0, result) || result != 0) {
+        IdfModemHttpsCommandResult close_command_result = IdfModemHttpsCommandResult::failed;
+        if (!command(close, response, true, &close_command_result)) {
+            result_.message = close_command_result == IdfModemHttpsCommandResult::ok
+                                  ? kStaleCloseResponseInvalid
+                                  : kStaleCloseCommandFailure;
             return false;
         }
-        return query_state("INITIAL");
+        if (!parse_result(response, close, "+MIPCLOSE:", 0, result) || result != 0) {
+            result_.message = kStaleCloseResponseInvalid;
+            return false;
+        }
+        return query_state("INITIAL", kPostCloseQueryCommandFailure,
+                           kPostCloseQueryResponseInvalid);
     }
 
     bool wait_for_connected()

@@ -690,6 +690,18 @@ inline void vTaskDelay(TickType_t) {}
             self.assertEqual(source.count(f'"{message}"'), 1)
             self.assertNotIn("AT+", message)
             self.assertNotIn("fixture", message)
+        for message in (
+            "HTTPS modem initial query command failed",
+            "HTTPS modem initial query response invalid",
+            "HTTPS modem stale socket close command failed",
+            "HTTPS modem stale socket close response invalid",
+            "HTTPS modem post-close query command failed",
+            "HTTPS modem post-close query response invalid",
+        ):
+            self.assertEqual(source.count(f'"{message}"'), 1)
+            self.assertLess(len(message.encode("ascii")), 96)
+            for forbidden in ("AT+", "INITIAL", "CONNECTED", "CLOSED", "TCP", "fixture"):
+                self.assertNotIn(forbidden, message)
         run = function_body(source, "run")
         for stage in (
             "initial_state", "runtime_snapshot", "pdp_apn", "runtime_config",
@@ -700,6 +712,22 @@ inline void vTaskDelay(TickType_t) {}
         post = function_body(owner, "idf_modem_https_post")
         self.assertIn("err == ESP_ERR_TIMEOUT && result.message.empty()", post)
         self.assertNotIn("Test push failed; see the log", source)
+
+    def test_https_initial_state_failure_labels_cover_each_branch(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        ensure_initial = function_body(source, "ensure_initial_state")
+        query_state = function_body(source, "query_state")
+        for label in (
+            "kInitialQueryCommandFailure",
+            "kInitialQueryResponseInvalid",
+            "kStaleCloseCommandFailure",
+            "kStaleCloseResponseInvalid",
+            "kPostCloseQueryCommandFailure",
+            "kPostCloseQueryResponseInvalid",
+        ):
+            self.assertIn(label, ensure_initial + query_state)
+        self.assertIn("query_state(\"INITIAL\", kPostCloseQueryCommandFailure", ensure_initial)
+        self.assertIn("post_close_state_failed", (SOURCE.parent / "test" / "https_post_fixture.cpp").read_text())
 
     def test_https_uart_drain_uses_operation_deadline_and_bounded_cap(self):
         source = SOURCE.read_text()
@@ -762,10 +790,10 @@ inline void vTaskDelay(TickType_t) {}
         ensure_initial = function_body(source, "ensure_initial_state")
         self.assertLess(run.index("ensure_initial_state"), run.index("snapshot_config"))
         self.assertEqual(ensure_initial.count('"AT+MIPCLOSE=0"'), 1)
-        self.assertEqual(ensure_initial.count('query_state("INITIAL")'), 1)
+        self.assertEqual(ensure_initial.count('query_state("INITIAL",'), 1)
         self.assertIn("classify_mip_state", ensure_initial)
         self.assertIn("MipStateDisposition::invalid", ensure_initial)
-        self.assertIn("command(close, response, true)", ensure_initial)
+        self.assertIn("command(close, response, true,", ensure_initial)
         self.assertNotIn("while", ensure_initial)
         self.assertNotIn("MIPOPEN", ensure_initial)
         wait_connected = function_body(
