@@ -8,8 +8,9 @@
 	import * as Accordion from "$lib/components/ui/accordion";
 	import * as Alert from "$lib/components/ui/alert";
 	import { Badge } from "$lib/components/ui/badge";
-	import { Button } from "$lib/components/ui/button";
+	import { Button, buttonVariants } from "$lib/components/ui/button";
 	import * as Card from "$lib/components/ui/card";
+	import { Dialog } from "bits-ui";
 	import * as Empty from "$lib/components/ui/empty";
 	import * as Field from "$lib/components/ui/field";
 	import { Input } from "$lib/components/ui/input";
@@ -24,12 +25,13 @@
 	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
-	import { applyProviderTemplateDefaults, pushSecretRequired } from "$lib/push-template-defaults.js";
+	import { pushProviderKeyFields, pushSecretRequired, switchProviderDraft } from "$lib/push-template-defaults.js";
 	import { closeEsimDeleteDialog, refreshEsimAfterTerminal } from "$lib/esim-ui.js";
 	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushCaStatus, PushChannel, PushTestStatus, UiResult } from "$lib/types";
 
 	type MainTab = "overview" | "notifications" | "messaging" | "cellular" | "device" | "security";
 	type Theme = "light" | "dark";
+	type PushProviderDraft = Pick<PushChannel, "url" | "urlSet" | "key1" | "key1Set" | "key2" | "key2Set" | "customBody" | "customBodySet" | "titleTemplate" | "bodyTemplate">;
 
 	const idle = (): UiResult => ({ state: "idle", code: "", data: {}, detail: "" });
 	const idlePushTest = (): PushTestStatus => ({ queued: false, running: false, done: false, success: false, message: "" });
@@ -74,6 +76,8 @@
 	let snapshot = $state<DeviceSnapshot | null>(null);
 	let loading = $state(true);
 	let loadError = $state("");
+	let pushProviderTypes = $state<number[]>(Array.from({ length: 5 }, () => 1));
+	let pushProviderDrafts = $state<Array<Record<number, PushProviderDraft>>>(Array.from({ length: 5 }, () => ({})));
 	let emailResult = $state(idle());
 	let heartbeatResult = $state(idle());
 	let keepaliveResult = $state(idle());
@@ -88,6 +92,7 @@
 	let networkModeResult = $state(idle());
 	let routingResult = $state(idle());
 	let forwardRulesResult = $state(idle());
+	let forwardRulesDialogOpen = $state(false);
 	let securityResult = $state(idle());
 	let smsResult = $state(idle());
 	let overviewResult = $state(idle());
@@ -171,6 +176,8 @@
 		loadError = "";
 		try {
 			snapshot = await loadSnapshot();
+			pushProviderTypes = snapshot.config.pushChannels.map((channel) => channel.type);
+			pushProviderDrafts = snapshot.config.pushChannels.map(() => ({}));
 			pushCaStatuses = await Promise.all(snapshot.config.pushChannels.map((_channel, index) => loadPushCaStatus(index).catch(() => null)));
 			cellularUrlClears = Array.from({ length: 5 }, () => false);
 			emailEnabledDraft = snapshot.config.emailEnabled;
@@ -457,30 +464,29 @@
 		return t(`providerHint${type}` as TranslationKey);
 	}
 
-	function keyLabels(type: number): [string, string] {
-		if (type === 4 || type === 8) return [t("keySecret"), t("providerParam2")];
-		if (type === 5) return [t("keyToken"), t("keyChannel")];
-		if (type === 6) return [t("keySendKey"), t("providerParam2")];
-		if (type === 9) return [t("keyToken"), t("providerParam2")];
-		if (type === 10) return [t("keyChatId"), t("keyBotToken")];
-		return [t("providerParam1"), t("providerParam2")];
+	function keyLabel(type: number, field: "key1" | "key2") {
+		if (field === "key2") return type === 5 ? t("keyChannel") : t("keyBotToken");
+		if (type === 4 || type === 8) return t("keySecret");
+		if (type === 5 || type === 9) return t("keyToken");
+		if (type === 6) return t("keySendKey");
+		return t("keyChatId");
 	}
 
-	function changeProvider(channel: PushChannel) {
-		channel.url = "";
-		channel.urlSet = false;
-		channel.key1 = "";
-		channel.key1Set = false;
-		channel.key2 = "";
-		channel.key2Set = false;
-		channel.customBody = "";
-		channel.customBodySet = false;
-		applyProviderTemplateDefaults(
+	function endpointLabel(type: number) {
+		return t(`providerEndpoint${type}` as TranslationKey);
+	}
+
+	function changeProvider(channel: PushChannel, index: number) {
+		const previousType = pushProviderTypes[index] ?? channel.type;
+		switchProviderDraft(
 			channel,
+			pushProviderDrafts[index],
+			previousType,
 			channel.type,
 			t("defaultTitleTemplate"),
 			t("defaultBodyTemplate")
 		);
+		pushProviderTypes[index] = channel.type;
 	}
 
 	function savedSecretHint(value: string, isSet: boolean) {
@@ -750,7 +756,7 @@
 						</Accordion.Item>
 						<Accordion.Item value="push">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("pushTitle")}</span><Badge variant={snapshot.status.enabledPushChannels > 0 ? "secondary" : "outline"}>{snapshot.status.enabledPushChannels} / 5</Badge></span></Accordion.Trigger>
-							<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-url-${index}`}>{t("endpoint")}</Field.Label><Input id={`push-url-${index}`} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if [4, 5, 6, 8, 9, 10].includes(channel.type)}<Field.Field><Field.Label for={`push-key1-${index}`}>{keyLabels(channel.type)[0]}</Field.Label><Input id={`push-key1-${index}`} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}</Field.Field><Field.Field><Field.Label for={`push-key2-${index}`}>{keyLabels(channel.type)[1]}</Field.Label><Input id={`push-key2-${index}`} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2"><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} rows={5} class="font-mono" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><p class="text-sm text-muted-foreground" role={pushTestResults[index].done && !pushTestResults[index].success ? "alert" : "status"} aria-live="polite">{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</p></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button onclick={() => save((v) => pushResult = v, pushValues())} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+			<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel, index)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-url-${index}`}>{endpointLabel(channel.type)}</Field.Label><Input id={`push-url-${index}`} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if pushProviderKeyFields(channel.type).includes("key1")}<Field.Field><Field.Label for={`push-key1-${index}`}>{keyLabel(channel.type, "key1")}</Field.Label><Input id={`push-key1-${index}`} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyTokenHint")}</Field.Description>{/if}</Field.Field>{/if}{#if pushProviderKeyFields(channel.type).includes("key2")}<Field.Field><Field.Label for={`push-key2-${index}`}>{keyLabel(channel.type, "key2")}</Field.Label><Input id={`push-key2-${index}`} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyChannelHint")}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2"><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} rows={5} class="font-mono" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><p class="text-sm text-muted-foreground" role={pushTestResults[index].done && !pushTestResults[index].success ? "alert" : "status"} aria-live="polite">{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</p></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button onclick={() => save((v) => pushResult = v, pushValues())} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
 						</Accordion.Item>
 						<Accordion.Item value="push-cellular">
 							<Accordion.Trigger>{t("cellularPushTitle")}</Accordion.Trigger>
@@ -772,7 +778,48 @@
 					<Accordion.Root type="single" value="sms">
 						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="forward-rules"><Accordion.Trigger>{t("forwardRulesTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("forwardRulesDescription")}</p><form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><Field.Group><Field.Field><Field.Label for="forward-rules">{t("forwardRulesTitle")}</Field.Label><Textarea id="forward-rules" rows={10} spellcheck={false} aria-describedby="forward-rules-hint" bind:value={snapshot.config.forwardRules} /><Field.Description id="forward-rules-hint">{t("forwardRulesHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="forward-rules">
+							<Accordion.Trigger>{t("forwardRulesTitle")}</Accordion.Trigger>
+							<Accordion.Content class="flex flex-col gap-5">
+								<div class="flex flex-wrap items-start justify-between gap-3">
+									<p class="max-w-2xl text-muted-foreground">{t("forwardRulesDescription")}</p>
+									<Dialog.Root bind:open={forwardRulesDialogOpen}>
+										<Dialog.Trigger type="button" class={buttonVariants({ variant: "outline", size: "sm" })} aria-haspopup="dialog">{t("forwardRulesTips")}</Dialog.Trigger>
+										<Dialog.Portal>
+										<Dialog.Overlay class="fixed inset-0 bg-black/45" />
+										<Dialog.Content class="fixed left-1/2 top-1/2 flex max-h-[min(42rem,calc(100dvh-2rem))] w-[min(42rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 flex-col gap-5 overflow-y-auto rounded-xl border border-border bg-background p-6 text-foreground shadow-2xl outline-none">
+												<div class="flex flex-col gap-1.5">
+													<Dialog.Title class="text-lg font-semibold">{t("forwardRulesDialogTitle")}</Dialog.Title>
+													<Dialog.Description class="text-sm text-muted-foreground">{t("forwardRulesDialogDescription")}</Dialog.Description>
+												</div>
+												<div class="flex flex-col gap-4 text-sm">
+													<div><p class="font-medium">{t("forwardRulesSyntaxLabel")}</p><p class="mt-1 text-muted-foreground">{t("forwardRulesSyntax")}</p></div>
+													<ul class="list-disc space-y-2 pl-5 text-muted-foreground">
+														<li><code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">kw</code>：{t("forwardRulesKeyword")}</li>
+														<li><code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">from</code>：{t("forwardRulesFrom")}</li>
+														<li><code class="rounded bg-muted px-1 py-0.5 font-mono text-xs">re</code>：{t("forwardRulesRegex")}</li>
+													</ul>
+													<div><p class="font-medium">{t("forwardRulesActionsLabel")}</p><p class="mt-1 text-muted-foreground">{t("forwardRulesActions")}</p></div>
+													<div><p class="font-medium">{t("forwardRulesPrecedenceLabel")}</p><p class="mt-1 text-muted-foreground">{t("forwardRulesPrecedence")}</p></div>
+													<div><p class="font-medium">{t("forwardRulesEmptyLabel")}</p><p class="mt-1 text-muted-foreground">{t("forwardRulesEmpty")}</p></div>
+													<div><p class="font-medium">{t("forwardRulesEscapingLabel")}</p><p class="mt-1 text-muted-foreground">{t("forwardRulesEscaping")}</p></div>
+													<div>
+														<p class="font-medium">{t("forwardRulesExamplesLabel")}</p>
+														<p class="mt-1 text-xs text-muted-foreground">{t("forwardRulesTabNotation")}</p>
+														<ul class="mt-2 space-y-2">
+															<li><code class="block overflow-x-auto rounded-md bg-muted p-2 font-mono text-xs">{t("forwardRulesExample1")}</code></li>
+															<li><code class="block overflow-x-auto rounded-md bg-muted p-2 font-mono text-xs">{t("forwardRulesExample2")}</code></li>
+														</ul>
+													</div>
+												</div>
+												<div class="flex justify-end"><Dialog.Close type="button" class={buttonVariants({ variant: "outline" })}>{t("commonClose")}</Dialog.Close></div>
+											</Dialog.Content>
+										</Dialog.Portal>
+									</Dialog.Root>
+								</div>
+								<form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><Field.Group><Field.Field><Field.Label for="forward-rules">{t("forwardRulesTitle")}</Field.Label><Textarea id="forward-rules" rows={10} spellcheck={false} aria-describedby="forward-rules-hint" bind:value={snapshot.config.forwardRules} /><Field.Description id="forward-rules-hint">{t("forwardRulesHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
+							</Accordion.Content>
+						</Accordion.Item>
 					</Accordion.Root>
 					</section>
 				{:else if mainTab === "cellular"}
@@ -791,7 +838,7 @@
 								<Card.Content><dl class="grid gap-4 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimEidState")}</dt><dd class="mt-1"><Badge variant={esim.eid.available ? "default" : "outline"}>{t(esim.eid.available ? "esimEidAvailable" : "esimEidUnavailable")}</Badge></dd></div><div><dt class="text-sm text-muted-foreground">{t("esimEidLength")}</dt><dd class="mt-1 font-medium tabular-nums">{esim.eid.length}</dd></div></dl></Card.Content>
 							</Card.Root>
 							<section class="flex flex-col gap-4" aria-labelledby="esim-profiles-title">
-								<div><h2 id="esim-profiles-title" class="text-xl font-semibold">{t("esimProfiles")}</h2><p class="mt-1 text-sm text-muted-foreground">{t("esimProfilesDescription")}</p></div>
+								<div><h2 id="esim-profiles-title" class="text-xl font-semibold">{t("esimProfiles")}</h2></div>
 								{#if esim.profiles.length === 0}
 									<Empty.Root><Empty.Header><Empty.Title>{t("esimEmpty")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={() => void runEsimAction("refresh")}>{t("esimRefresh")}</Button></Empty.Content></Empty.Root>
 								{:else}
@@ -811,8 +858,10 @@
 					</section>
 			{:else if mainTab === "device"}
 				<section class="flex flex-col gap-6">
-					<div><h1 class="text-2xl font-semibold tracking-tight">{t("deviceTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("deviceDescription")}</p></div>
-					<Accordion.Root type="single" value="identity">
+						<div><h1 class="text-2xl font-semibold tracking-tight">{t("deviceTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("deviceDescription")}</p></div>
+						<Accordion.Root type="single" value="identity">
+							<section class="device-tool-group" data-tool-group="connection" aria-labelledby="device-group-connection">
+								<div class="device-tool-group-heading"><h2 id="device-group-connection" class="text-sm font-semibold">{t("deviceGroupConnection")}</h2></div>
 							<Accordion.Item value="identity">
 								<Accordion.Trigger>{t("deviceTabIdentity")}</Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex justify-end"><Button type="submit" form="identity-form">{t("commonSave")}</Button></div><ActionResult result={identityResult} title={t("resultTitle")} {locale} /></Accordion.Content>
@@ -866,14 +915,26 @@
 									<ActionResult result={keepaliveResult} title={t("resultTitle")} {locale} />
 								</Accordion.Content>
 							</Accordion.Item>
+						</section>
+						<section class="device-tool-group" data-tool-group="diagnostics" aria-labelledby="device-group-diagnostics">
+							<div class="device-tool-group-heading"><h2 id="device-group-diagnostics" class="text-sm font-semibold">{t("deviceGroupDiagnostics")}</h2></div>
 							<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button></div><ActionResult result={networkResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						</section>
+						<section class="device-tool-group device-tool-group-danger" data-tool-group="danger" aria-labelledby="device-group-danger">
+							<div class="device-tool-group-heading"><div><h2 id="device-group-danger" class="text-sm font-semibold">{t("deviceGroupDanger")}</h2><p class="mt-1 text-xs text-muted-foreground">{t("deviceGroupDangerDescription")}</p></div></div>
+							<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="logs"><Accordion.Trigger onclick={refreshLogs}>{t("deviceTabLogs")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></Empty.Content></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre><div class="flex justify-end"><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></div>{/if}<ActionResult result={logsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						</section>
+						<div>
+							<Accordion.Item value="logs"><Accordion.Trigger onclick={refreshLogs}>{t("deviceTabLogs")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></Empty.Content></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre><div class="flex justify-end"><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></div>{/if}<ActionResult result={logsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						</div>
+						<section class="device-tool-group" data-tool-group="maintenance" aria-labelledby="device-group-maintenance">
+							<div class="device-tool-group-heading"><h2 id="device-group-maintenance" class="text-sm font-semibold">{t("deviceGroupMaintenance")}</h2></div>
+							<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("otaDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						</section>
 					</Accordion.Root>
 					{#if hasMoreLogs}<div class="flex justify-center"><Button variant="outline" onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
 				</section>
