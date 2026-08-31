@@ -346,7 +346,12 @@ int main() {
     validator = web_api.split("function isPushTestStatus", 1)[1].split("function demoResponse", 1)[0]
     assert "Object.keys" not in validator
     assert '"cleanupMessage" in status' in validator
-    assert "pushTestDiagnosticReasons.includes" in validator
+    assert "const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[]" in web_api
+    assert "const pushTestCleanupReasons: readonly PushTestCleanupReason[]" in web_api
+    assert 'reasonValid("failureReason", pushTestDiagnosticReasons)' in validator
+    assert 'reasonValid("cleanupReason", pushTestCleanupReasons)' in validator
+    assert 'reasonValid("cleanupReason", pushTestDiagnosticReasons)' not in validator
+    assert "const pushTestCleanupReasons = pushTestDiagnosticReasons" not in validator
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1
