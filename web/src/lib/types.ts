@@ -28,6 +28,13 @@ export type PushTestDiagnosticReason =
 	| "result_nonzero"
 	| "unknown";
 
+export type PushTestCleanupReason =
+	| "command_failure"
+	| "timeout"
+	| "response_invalid"
+	| "result_nonzero"
+	| "unknown";
+
 export type PushTestStatus = {
 	queued: boolean;
 	running: boolean;
@@ -36,7 +43,7 @@ export type PushTestStatus = {
 	message: string;
 	cleanupMessage?: string;
 	failureReason?: PushTestDiagnosticReason;
-	cleanupReason?: PushTestDiagnosticReason;
+	cleanupReason?: PushTestCleanupReason;
 	resetNeeded?: boolean;
 };
 

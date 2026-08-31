@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestDiagnosticReason, PushTestStatus } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupReason, PushTestDiagnosticReason, PushTestStatus } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -43,6 +43,9 @@ const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
 	"command_failure", "timeout", "response_invalid", "terminal_failure",
 	"poll_timeout", "result_nonzero", "unknown"
 ];
+const pushTestCleanupReasons: readonly PushTestCleanupReason[] = [
+	"command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"
+];
 
 function demoSnapshot(): DeviceSnapshot {
 	return {
@@ -74,10 +77,10 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 	if (!["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") ||
 		typeof status.message !== "string" ||
 		("cleanupMessage" in status && typeof status.cleanupMessage !== "string")) return false;
-	const reasonValid = (key: string) => !(key in status) ||
-		(typeof status[key] === "string" &&
-			pushTestDiagnosticReasons.includes(status[key] as PushTestDiagnosticReason));
-	return reasonValid("failureReason") && reasonValid("cleanupReason") &&
+	const reasonValid = (key: string, allowed: readonly string[]) => !(key in status) ||
+		(typeof status[key] === "string" && allowed.includes(status[key] as string));
+	return reasonValid("failureReason", pushTestDiagnosticReasons) &&
+		reasonValid("cleanupReason", pushTestCleanupReasons) &&
 		(!("resetNeeded" in status) || typeof status.resetNeeded === "boolean");
 }
 

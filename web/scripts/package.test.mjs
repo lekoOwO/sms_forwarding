@@ -176,6 +176,58 @@ test("real push test helper accepts 409 status bodies, polls, and aborts stalled
 	}
 });
 
+test("push test validator keeps cleanup reasons disjoint from primary reasons", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	const previousFetch = globalThis.fetch;
+	let server;
+	try {
+		delete process.env.VITE_DEMO_MODE;
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({
+			server: { middlewareMode: true }, appType: "custom", logLevel: "silent"
+		});
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const validPrimary = {
+			queued: false, running: false, done: true, success: false,
+			message: "bounded failure", failureReason: "terminal_failure"
+		};
+		globalThis.fetch = async (path) => {
+			if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "csrf" }), {
+				status: 200, headers: { "Content-Type": "application/json" }
+			});
+			return new Response(JSON.stringify(validPrimary), {
+				status: 200, headers: { "Content-Type": "application/json" }
+			});
+		};
+		await api.loadSnapshot();
+		const accepted = await api.runPushTest(0, undefined, 1000);
+		assert.equal(accepted.failureReason, "terminal_failure");
+
+		for (const cleanupReason of ["terminal_failure", "poll_timeout"]) {
+			globalThis.fetch = async (path) => {
+				if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "csrf" }), {
+					status: 200, headers: { "Content-Type": "application/json" }
+				});
+				return new Response(JSON.stringify({
+					queued: false, running: false, done: true, success: false,
+					message: "bounded cleanup", cleanupReason
+				}), { status: 200, headers: { "Content-Type": "application/json" } });
+			};
+			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
+		}
+	} finally {
+		globalThis.fetch = previousFetch;
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
+	}
+});
+
 test("CI isolates release credentials from build lifecycle code", () => {
 	const workflow = readFileSync(new URL("../../.github/workflows/build.yml", import.meta.url), "utf8");
 	const [beforeRelease, release = ""] = workflow.split("\n  release:");
