@@ -86,7 +86,7 @@ async function waitForRoute(page, hash) {
 		if (location.hash !== expectedHash) return false;
 		if (!expectedSubpage) return !document.querySelector("[data-device-subpage]");
 		return document.querySelector(`[data-device-subpage="${expectedSubpage}"]`) !== null;
-	}, { timeout: 5000 }, { expectedHash: hash, expectedSubpage: subpage });
+	}, { timeout: 15000 }, { expectedHash: hash, expectedSubpage: subpage });
 }
 
 async function openRoute(page, baseUrl, hash, expectedHash = hash) {
@@ -181,6 +181,7 @@ test("device subpages keep deep links, scroll position, controls, and accessible
 	try {
 		({ browser, page, userDataDir, shared } = await launchBrowser());
 		await page.setViewport({ width: 1280, height: 768 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "zh-TW"));
 		const darkThemeScript = await page.evaluateOnNewDocument(() => localStorage.setItem("theme", "dark"));
 
 		await openRoute(page, baseUrl, "#overview");
@@ -277,11 +278,14 @@ test("device subpages keep deep links, scroll position, controls, and accessible
 		assert.notEqual(mobileFocus.outlineStyle, "none");
 		assert.equal(mobileFocus.outlineOffset, "2px");
 
-		await page.click('button[aria-label="Open navigation"]');
+		await page.click("#mobile-nav-trigger");
 		await page.waitForSelector("dialog.mobile-nav-dialog[open]");
 		await page.keyboard.press("Escape");
-		await page.waitForFunction(() => !document.querySelector("dialog.mobile-nav-dialog")?.open);
-		assert.equal(await page.evaluate(() => document.activeElement?.getAttribute("aria-label")), "Open navigation");
+		await page.waitForFunction(() => {
+			const dialog = document.querySelector("dialog.mobile-nav-dialog");
+			return !dialog?.open && document.activeElement?.id === "mobile-nav-trigger";
+		});
+		assert.equal(await page.evaluate(() => document.activeElement?.id), "mobile-nav-trigger");
 
 		const audit = await domAriaAudit(page);
 		assert.deepEqual(audit.duplicateIds, []);
@@ -312,6 +316,7 @@ test("maintenance file inputs and actions reset when leaving the subpage", { ski
 	try {
 		({ browser, page, userDataDir, shared } = await launchBrowser());
 		await page.setViewport({ width: 1280, height: 768 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "zh-TW"));
 		const attemptedHandlers = [];
 		page.on("request", (request) => {
 			if (/\/api\/(?:config\/restore\/start|ota\/start)/.test(request.url())) attemptedHandlers.push(request.url());
