@@ -169,6 +169,7 @@ def main() -> None:
     assert mutated_pin is not None and mutated_pin.group(1) != key_fingerprint
     sdkconfig = (ROOT / "sdkconfig.defaults").read_text(encoding="utf-8")
     assert "CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y" in sdkconfig
+    assert "CONFIG_APP_REPRODUCIBLE_BUILD=y" in sdkconfig
     assert "CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK" not in sdkconfig
     app_main = (ROOT / "main/app_main.cpp").read_text(encoding="utf-8")
     config_failure = app_main.index("if (cfg_err != ESP_OK)")
