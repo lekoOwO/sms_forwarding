@@ -551,6 +551,48 @@ inline void vTaskDelay(TickType_t) {}
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
 
+            implementation_source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+            mutations = {
+                "reason_removal": implementation_source.replace(
+                    "if (disposition == MipStateDisposition::invalid) {\n"
+                    "                record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);",
+                    "if (disposition == MipStateDisposition::invalid) {",
+                    1,
+                ),
+                "reason_inversion": implementation_source.replace(
+                    "record_failure_reason(deadline_.expired()\n"
+                    "                                  ? IdfModemHttpsDiagnosticReason::timeout\n"
+                    "                                  : IdfModemHttpsDiagnosticReason::poll_timeout);",
+                    "record_failure_reason(deadline_.expired()\n"
+                    "                                  ? IdfModemHttpsDiagnosticReason::poll_timeout\n"
+                    "                                  : IdfModemHttpsDiagnosticReason::timeout);",
+                    1,
+                ),
+                "reason_collapse": implementation_source.replace(
+                    "IdfModemHttpsDiagnosticReason::result_nonzero",
+                    "IdfModemHttpsDiagnosticReason::response_invalid",
+                    1,
+                ),
+            }
+            for name, mutated in mutations.items():
+                self.assertNotEqual(mutated, implementation_source, name)
+                mutated_source = Path(directory) / f"{name}.cpp"
+                mutated_binary = Path(directory) / name
+                mutated_source.write_text(mutated)
+                mutated_compile = subprocess.run(
+                    [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                     "-I", str(stub_root), "-I", str(SOURCE.parent),
+                     "-I", str(SOURCE.parent / "include"),
+                     str(implementation), str(mutated_source), str(fixture),
+                     "-o", str(mutated_binary)],
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(mutated_compile.returncode, 0, mutated_compile.stderr)
+                mutated_run = subprocess.run(
+                    [str(mutated_binary)], check=False, capture_output=True, text=True,
+                )
+                self.assertNotEqual(mutated_run.returncode, 0, name)
+
     def test_https_owner_routes_mip_commands_through_uart_without_prompt_requeue(self):
         source = SOURCE.read_text()
         adapter = function_body(source, "owner_https_send_command")
@@ -717,6 +759,15 @@ inline void vTaskDelay(TickType_t) {}
         result_header = (SOURCE.parent / "include" / "idf_modem_https.h").read_text()
         self.assertIn("MAX_CLEANUP_MESSAGE = 96", result_header)
         self.assertIn("std::string cleanupMessage", result_header)
+        self.assertIn("enum class IdfModemHttpsDiagnosticReason", result_header)
+        for reason in (
+            "command_failure", "timeout", "response_invalid", "terminal_failure",
+            "poll_timeout", "result_nonzero", "unknown",
+        ):
+            self.assertIn(f"{reason} =", result_header)
+        self.assertIn("IdfModemHttpsDiagnosticReason failureReason", result_header)
+        self.assertIn("IdfModemHttpsDiagnosticReason cleanupReason", result_header)
+        self.assertIn("bool cleanupRequiresReset", result_header)
         submit = function_body(owner, "submit_owner_command")
         self.assertEqual(submit.count("*https_result = slot.https_post_result"), 2)
         run = function_body(source, "run")
@@ -729,6 +780,33 @@ inline void vTaskDelay(TickType_t) {}
         post = function_body(owner, "idf_modem_https_post")
         self.assertIn("err == ESP_ERR_TIMEOUT && result.message.empty()", post)
         self.assertNotIn("Test push failed; see the log", source)
+
+    def test_https_diagnostic_reasons_are_fixed_and_cleanup_close_is_reset_sensitive(self):
+        source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        header = (SOURCE.parent / "include" / "idf_modem_https.h").read_text()
+        for reason in (
+            "command_failure", "timeout", "response_invalid", "terminal_failure",
+            "poll_timeout", "result_nonzero", "unknown",
+        ):
+            self.assertIn(f'"{reason}"', header)
+        wait = source.split("bool wait_for_connected()", 1)[1].split(
+            "bool query_config", 1
+        )[0]
+        self.assertIn("IdfModemHttpsDiagnosticReason::command_failure", wait)
+        self.assertIn("IdfModemHttpsDiagnosticReason::timeout", wait)
+        self.assertIn("IdfModemHttpsDiagnosticReason::response_invalid", wait)
+        self.assertIn("IdfModemHttpsDiagnosticReason::terminal_failure", wait)
+        self.assertIn("IdfModemHttpsDiagnosticReason::poll_timeout", wait)
+        cleanup = source.split("void cleanup()", 1)[1].split(
+            "const IdfModemHttpsPostRequest& request_", 1
+        )[0]
+        self.assertIn("IdfModemHttpsDiagnosticReason::result_nonzero", cleanup)
+        self.assertIn("IdfModemHttpsDiagnosticReason::response_invalid", cleanup)
+        self.assertIn("IdfModemHttpsDiagnosticReason::timeout", cleanup)
+        self.assertIn("true);", cleanup)
+        self.assertIn("cleanupRequiresReset", source)
+        self.assertNotIn("response.c_str()", cleanup)
+        self.assertNotIn("response.data()", cleanup)
 
     def test_https_initial_state_failure_labels_cover_each_branch(self):
         source = (SOURCE.parent / "idf_modem_https.cpp").read_text()

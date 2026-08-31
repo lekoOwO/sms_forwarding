@@ -146,7 +146,10 @@ size_t idf_push_utf8_codepoint_count(const std::string& value, size_t limit)
 }
 
 void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
-                                std::string message, std::string cleanup_message)
+                                std::string message, std::string cleanup_message,
+                                IdfModemHttpsDiagnosticReason failure_reason,
+                                IdfModemHttpsDiagnosticReason cleanup_reason,
+                                bool reset_needed)
 {
     if (success) message = "Test push sent";
     else if (message.empty()) message = "Test push failed; see the log";
@@ -160,6 +163,9 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
     job.cleanupMessage.assign(
         cleanup_message.data(),
         std::min(cleanup_message.size(), IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1));
+    job.failureReason = failure_reason;
+    job.cleanupReason = cleanup_reason;
+    job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;
 }
 
 static void append_json_string(std::string& out, const char* key, const std::string& value)
@@ -184,6 +190,22 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
     if (include_cleanup && job.done && !job.cleanupMessage.empty()) {
         out += ",";
         append_json_string(out, "cleanupMessage", job.cleanupMessage);
+    }
+    if (include_cleanup && job.done &&
+        job.failureReason != IdfModemHttpsDiagnosticReason::none) {
+        out += ",";
+        append_json_string(
+            out, "failureReason",
+            std::string(idf_modem_https_diagnostic_reason_name(job.failureReason)));
+    }
+    if (include_cleanup && job.done &&
+        job.cleanupReason != IdfModemHttpsDiagnosticReason::none) {
+        out += ",";
+        append_json_string(
+            out, "cleanupReason",
+            std::string(idf_modem_https_cleanup_reason_name(job.cleanupReason)));
+        out += ",\"resetNeeded\":";
+        out += job.resetNeeded ? "true" : "false";
     }
     out += "}";
     return out;

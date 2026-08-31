@@ -633,7 +633,19 @@ private:
         for (size_t query = 0; query < kConnectedPollMaxQueries; ++query) {
             if (Clock::now() >= poll_end) break;
             std::string response;
-            if (!command(state_command, response)) return false;
+            IdfModemHttpsCommandResult command_result = IdfModemHttpsCommandResult::failed;
+            if (!command(state_command, response, false, &command_result)) {
+                if (command_result == IdfModemHttpsCommandResult::timeout || deadline_.expired()) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::timeout);
+                } else if (command_result == IdfModemHttpsCommandResult::ok) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
+                } else if (command_result == IdfModemHttpsCommandResult::open_failed) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::terminal_failure);
+                } else {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::command_failure);
+                }
+                return false;
+            }
             const MipStateDisposition disposition =
                 classify_mip_state(response, state_command, 0);
             if (disposition == MipStateDisposition::connected) {
@@ -641,15 +653,32 @@ private:
                     callbacks_.confirmOpen(callbacks_.context);
                 if (confirmed == IdfModemHttpsCommandResult::timeout) timed_out_ = true;
                 if (confirmed == IdfModemHttpsCommandResult::open_failed) open_failed_ = true;
+                if (confirmed == IdfModemHttpsCommandResult::timeout) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::timeout);
+                } else if (confirmed == IdfModemHttpsCommandResult::open_failed) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::terminal_failure);
+                } else if (confirmed != IdfModemHttpsCommandResult::ok) {
+                    record_failure_reason(IdfModemHttpsDiagnosticReason::command_failure);
+                }
                 return confirmed == IdfModemHttpsCommandResult::ok;
             }
-            if (disposition != MipStateDisposition::initial) return false;
+            if (disposition == MipStateDisposition::invalid) {
+                record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
+                return false;
+            }
+            if (disposition != MipStateDisposition::initial) {
+                record_failure_reason(IdfModemHttpsDiagnosticReason::terminal_failure);
+                return false;
+            }
             if (query + 1 == kConnectedPollMaxQueries || poll_end - Clock::now() < cadence) {
                 break;
             }
             vTaskDelay(pdMS_TO_TICKS(kConnectedPollCadenceMs));
         }
         timed_out_ = true;
+        record_failure_reason(deadline_.expired()
+                                  ? IdfModemHttpsDiagnosticReason::timeout
+                                  : IdfModemHttpsDiagnosticReason::poll_timeout);
         return false;
     }
 
@@ -828,6 +857,25 @@ private:
         if (result_.cleanupMessage.empty()) result_.cleanupMessage = message;
     }
 
+    void record_cleanup_failure(std::string_view message,
+                                IdfModemHttpsDiagnosticReason reason,
+                                bool requires_reset = false)
+    {
+        cleanup_ok_ = false;
+        if (result_.cleanupMessage.empty()) result_.cleanupMessage = message;
+        if (result_.cleanupReason == IdfModemHttpsDiagnosticReason::none) {
+            result_.cleanupReason = reason;
+        }
+        if (requires_reset) result_.cleanupRequiresReset = true;
+    }
+
+    void record_failure_reason(IdfModemHttpsDiagnosticReason reason)
+    {
+        if (result_.failureReason == IdfModemHttpsDiagnosticReason::none) {
+            result_.failureReason = reason;
+        }
+    }
+
     void cleanup()
     {
         if (cleanup_done_) return;
@@ -836,9 +884,22 @@ private:
         if (maybe_open_) {
             const std::string close = "AT+MIPCLOSE=0";
             uint32_t result = 0;
-            if (!command(close, response, true) ||
-                !parse_result(response, close, "+MIPCLOSE:", 0, result) || result != 0) {
-                record_cleanup_failure(kCleanupSocketCloseFailure);
+            IdfModemHttpsCommandResult close_command_result = IdfModemHttpsCommandResult::failed;
+            if (!command(close, response, true, &close_command_result)) {
+                record_cleanup_failure(
+                    kCleanupSocketCloseFailure,
+                    close_command_result == IdfModemHttpsCommandResult::timeout
+                        ? IdfModemHttpsDiagnosticReason::timeout
+                        : close_command_result == IdfModemHttpsCommandResult::ok
+                            ? IdfModemHttpsDiagnosticReason::response_invalid
+                            : IdfModemHttpsDiagnosticReason::command_failure,
+                    true);
+            } else if (!parse_result(response, close, "+MIPCLOSE:", 0, result)) {
+                record_cleanup_failure(kCleanupSocketCloseFailure,
+                                       IdfModemHttpsDiagnosticReason::response_invalid, true);
+            } else if (result != 0) {
+                record_cleanup_failure(kCleanupSocketCloseFailure,
+                                       IdfModemHttpsDiagnosticReason::result_nonzero, true);
             }
         }
         if (touched_ssl_) {

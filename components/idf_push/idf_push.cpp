@@ -1101,10 +1101,16 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
                             IdfPushNetworkDecision network,
                             bool notify = false, std::string* failure_message = nullptr,
                             bool* permanent_failure = nullptr,
-                            std::string* cleanup_message = nullptr)
+                            std::string* cleanup_message = nullptr,
+                            IdfModemHttpsDiagnosticReason* failure_reason = nullptr,
+                            IdfModemHttpsDiagnosticReason* cleanup_reason = nullptr,
+                            bool* cleanup_requires_reset = nullptr)
 {
     if (permanent_failure) *permanent_failure = false;
     if (cleanup_message) cleanup_message->clear();
+    if (failure_reason) *failure_reason = IdfModemHttpsDiagnosticReason::none;
+    if (cleanup_reason) *cleanup_reason = IdfModemHttpsDiagnosticReason::none;
+    if (cleanup_requires_reset) *cleanup_requires_reset = false;
     if (!channel_valid(input_channel)) return false;
 
     IdfPushCellularTarget cellular_target;
@@ -1309,6 +1315,9 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
         *failure_message = transport.message;
     }
     if (cleanup_message) *cleanup_message = transport.cleanupMessage;
+    if (failure_reason) *failure_reason = transport.failureReason;
+    if (cleanup_reason) *cleanup_reason = transport.cleanupReason;
+    if (cleanup_requires_reset) *cleanup_requires_reset = transport.cleanupRequiresReset;
     // Combine the send and response lines. Keep the channel name and result in one concise log entry.
     if (err == ESP_OK) idf_logf("%s push %s (HTTP %d)", name.c_str(), ok ? "succeeded" : "failed", code);
     else idf_logf("%s push failed: %s", name.c_str(), esp_err_to_name(err));
@@ -1831,6 +1840,9 @@ static bool fail_pending_tests(const char* message)
         job.deadlineUs = 0;
         job.message = message;
         job.cleanupMessage.clear();
+        job.failureReason = IdfModemHttpsDiagnosticReason::none;
+        job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.resetNeeded = false;
     }
     xSemaphoreGive(s_mutex);
     return failed;
@@ -1849,6 +1861,9 @@ static bool expire_test_jobs_locked(int64_t now)
         job.deadlineUs = 0;
         job.message = "Test push timed out before it could start";
         job.cleanupMessage.clear();
+        job.failureReason = IdfModemHttpsDiagnosticReason::none;
+        job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.resetNeeded = false;
     }
     return expired;
 }
@@ -1889,6 +1904,9 @@ static bool process_test_one()
         s_test_jobs[i].deadlineUs = 0;
         s_test_jobs[i].message = "Sending test push";
         s_test_jobs[i].cleanupMessage.clear();
+        s_test_jobs[i].failureReason = IdfModemHttpsDiagnosticReason::none;
+        s_test_jobs[i].cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        s_test_jobs[i].resetNeeded = false;
         channel = cfg.pushChannels[i];
         break;
     }
@@ -1898,6 +1916,9 @@ static bool process_test_one()
     bool ok = false;
     std::string result;
     std::string cleanup_result;
+    IdfModemHttpsDiagnosticReason failure_reason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsDiagnosticReason cleanup_reason = IdfModemHttpsDiagnosticReason::none;
+    bool cleanup_requires_reset = false;
     if (!channel_valid(channel)) {
         result = "Channel configuration changed or is disabled; test canceled";
     } else if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
@@ -1907,13 +1928,15 @@ static bool process_test_one()
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "Test", "This is a test push from SMS Forwarder",
                              ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi,
-                             network, false, &result, nullptr, &cleanup_result);
+                             network, false, &result, nullptr, &cleanup_result,
+                             &failure_reason, &cleanup_reason, &cleanup_requires_reset);
         s_busy.store(false, std::memory_order_relaxed);
     }
 
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         TestJob& job = s_test_jobs[picked];
-        idf_push_complete_test_job(job, ok, std::move(result), std::move(cleanup_result));
+        idf_push_complete_test_job(job, ok, std::move(result), std::move(cleanup_result),
+                                   failure_reason, cleanup_reason, cleanup_requires_reset);
         xSemaphoreGive(s_mutex);
     }
     return true;
@@ -2191,6 +2214,9 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         job.deadlineUs = esp_timer_get_time() + PUSH_TEST_PENDING_MAX_US;
         job.message = "Test push queued; you can continue to refresh the page";
         job.cleanupMessage.clear();
+        job.failureReason = IdfModemHttpsDiagnosticReason::none;
+        job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.resetNeeded = false;
         message = job.message;
     }
     xSemaphoreGive(s_mutex);

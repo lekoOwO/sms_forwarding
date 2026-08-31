@@ -277,6 +277,8 @@ enum class RemoteCloseMode {
     open_malformed,
     open_command_timeout,
     post_open_initial_timeout,
+    post_open_state_command_failure,
+    post_open_state_command_timeout,
     post_open_closed,
     post_open_wrong_cid,
     post_open_invalid,
@@ -301,6 +303,7 @@ enum class CleanupFailure {
 
 enum class CleanupFailurePhase {
     command,
+    command_timeout,
     malformed_response,
     nonzero_response,
     unexpected_response,
@@ -455,6 +458,16 @@ struct RemoteCloseTranscript {
                 if (!transcript.open_latch.feed(transcript.late_open_bytes())) {
                     return IdfModemHttpsCommandResult::open_failed;
                 }
+            }
+            if (transcript.mode == RemoteCloseMode::post_open_state_command_failure &&
+                transcript.state_queries == 1) {
+                ++transcript.state_queries;
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (transcript.mode == RemoteCloseMode::post_open_state_command_timeout &&
+                transcript.state_queries == 1) {
+                ++transcript.state_queries;
+                return IdfModemHttpsCommandResult::timeout;
             }
             ++transcript.state_queries;
             std::string_view state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
@@ -700,6 +713,9 @@ struct RemoteCloseTranscript {
                 if (transcript.cleanup_failure_phase == CleanupFailurePhase::command) {
                     return IdfModemHttpsCommandResult::failed;
                 }
+                if (transcript.cleanup_failure_phase == CleanupFailurePhase::command_timeout) {
+                    return IdfModemHttpsCommandResult::timeout;
+                }
                 if (transcript.cleanup_failure_phase == CleanupFailurePhase::malformed_response) {
                     response = "\r\nAT+MIPCLOSE=0\r\n";
                     return IdfModemHttpsCommandResult::ok;
@@ -874,6 +890,31 @@ void check_remote_close_transcripts()
         assert_failure_message(result.message, "HTTPS modem connected-state poll failed");
     }
 
+    for (const auto& [mode, expected_reason] : {
+             std::pair{RemoteCloseMode::post_open_state_command_failure,
+                       IdfModemHttpsDiagnosticReason::command_failure},
+             std::pair{RemoteCloseMode::post_open_state_command_timeout,
+                       IdfModemHttpsDiagnosticReason::timeout},
+             std::pair{RemoteCloseMode::post_open_invalid,
+                       IdfModemHttpsDiagnosticReason::response_invalid},
+             std::pair{RemoteCloseMode::post_open_closed,
+                       IdfModemHttpsDiagnosticReason::terminal_failure},
+             std::pair{RemoteCloseMode::post_open_initial_timeout,
+                       IdfModemHttpsDiagnosticReason::poll_timeout},
+         }) {
+        RemoteCloseTranscript rejected{mode};
+        result = {};
+        const IdfModemHttpsRunResult expected_outcome =
+            expected_reason == IdfModemHttpsDiagnosticReason::timeout ||
+                    expected_reason == IdfModemHttpsDiagnosticReason::poll_timeout
+                ? IdfModemHttpsRunResult::timed_out
+                : IdfModemHttpsRunResult::command_failed;
+        assert(run_remote_close_transcript(rejected, result) == expected_outcome);
+        assert(result.failureReason == expected_reason);
+        assert(rejected.send_commands == 0 && rejected.read_commands == 0 &&
+               rejected.close_commands == 1 && rejected.close_was_cleanup);
+    }
+
     RemoteCloseTranscript state_timeout{RemoteCloseMode::post_open_initial_timeout};
     result = {};
     assert(run_remote_close_transcript(state_timeout, result) ==
@@ -972,6 +1013,9 @@ void check_remote_close_transcripts()
                                 CleanupFailurePhase::command,
                                 "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
              CleanupFailureCase{CleanupFailure::socket_close,
+                                CleanupFailurePhase::command_timeout,
+                                "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
+             CleanupFailureCase{CleanupFailure::socket_close,
                                 CleanupFailurePhase::malformed_response,
                                 "HTTPS cleanup socket close failed", "AT+MIPCLOSE=0"},
              CleanupFailureCase{CleanupFailure::socket_close,
@@ -1030,6 +1074,20 @@ void check_remote_close_transcripts()
                result.expectedResponseBytes == 0);
         assert_failure_message(result.message, "HTTPS cleanup failed");
         assert_cleanup_message(result, failure.cleanup_message);
+        if (failure.failure == CleanupFailure::socket_close) {
+            const IdfModemHttpsDiagnosticReason expected_cleanup_reason =
+                failure.phase == CleanupFailurePhase::command
+                    ? IdfModemHttpsDiagnosticReason::command_failure
+                    : failure.phase == CleanupFailurePhase::command_timeout
+                        ? IdfModemHttpsDiagnosticReason::timeout
+                        : failure.phase == CleanupFailurePhase::nonzero_response
+                            ? IdfModemHttpsDiagnosticReason::result_nonzero
+                            : IdfModemHttpsDiagnosticReason::response_invalid;
+            assert(result.cleanupReason == expected_cleanup_reason);
+        } else {
+            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::none);
+        }
+        assert(result.cleanupRequiresReset == (failure.failure == CleanupFailure::socket_close));
         assert(cleanup_failed.close_commands == 1 && cleanup_failed.close_was_cleanup);
         assert(std::count(cleanup_failed.cleanup_commands.begin(),
                           cleanup_failed.cleanup_commands.end(), "AT+MIPCLOSE=0") == 1);
@@ -1078,6 +1136,8 @@ void check_remote_close_transcripts()
            result.expectedResponseBytes == 0);
     assert_failure_message(result.message, "HTTPS request write failed");
     assert_cleanup_message(result, "HTTPS cleanup socket close failed");
+    assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure);
+    assert(result.cleanupRequiresReset);
 
     RemoteCloseTranscript first_cleanup_failure_wins{
         RemoteCloseMode::data_then_disconnect, LateOpenKind::none, LateOpenStage::none,
@@ -1087,6 +1147,9 @@ void check_remote_close_transcripts()
            IdfModemHttpsRunResult::cleanup_failed);
     assert_failure_message(result.message, "HTTPS cleanup failed");
     assert_cleanup_message(result, "HTTPS cleanup socket close failed");
+    assert(first_cleanup_failure_wins.cleanup_failure == CleanupFailure::socket_close_and_ssl);
+    assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure);
+    assert(result.cleanupRequiresReset);
     assert(std::count(first_cleanup_failure_wins.cleanup_commands.begin(),
                       first_cleanup_failure_wins.cleanup_commands.end(), "AT+MIPCLOSE=0") == 1);
     assert((first_cleanup_failure_wins.cleanup_steps ==

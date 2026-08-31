@@ -19,12 +19,25 @@ export type PushChannel = {
 	bodyTemplate: string;
 };
 
+export type PushTestDiagnosticReason =
+	| "command_failure"
+	| "timeout"
+	| "response_invalid"
+	| "terminal_failure"
+	| "poll_timeout"
+	| "result_nonzero"
+	| "unknown";
+
 export type PushTestStatus = {
 	queued: boolean;
 	running: boolean;
 	done: boolean;
 	success: boolean;
 	message: string;
+	cleanupMessage?: string;
+	failureReason?: PushTestDiagnosticReason;
+	cleanupReason?: PushTestDiagnosticReason;
+	resetNeeded?: boolean;
 };
 
 export type PushCaStatus = { configured: boolean; sha256: string };

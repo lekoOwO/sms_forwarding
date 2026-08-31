@@ -29,6 +29,9 @@ struct IdfPushTransportResult {
     bool ok = false;
     std::string message;
     std::string cleanupMessage;
+    IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    bool cleanupRequiresReset = false;
 };
 
 using IdfPushWifiRequest = int (*)(const IdfPushHttpRequest& request, int& statusCode);

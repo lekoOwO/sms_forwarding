@@ -144,7 +144,7 @@ def main() -> None:
                       if parameter.get("name") == "detail")
         assert detail["required"] is False
         assert detail["schema"] == {"type": "string", "enum": ["1"]}
-        assert "cleanupMessage" in detail["description"]
+        assert "bounded terminal diagnostic detail" in detail["description"]
     assert push_test["post"]["parameters"][2]["$ref"].endswith("/CsrfToken")
     assert "requestBody" not in push_test["post"]
     assert "body must be empty" in push_test["post"]["description"]
@@ -155,6 +155,7 @@ def main() -> None:
     assert {name: schema["type"] for name, schema in push_status["properties"].items()} == {
         "queued": "boolean", "running": "boolean", "done": "boolean",
         "success": "boolean", "message": "string", "cleanupMessage": "string",
+        "failureReason": "string", "cleanupReason": "string", "resetNeeded": "boolean",
     }
     cleanup_message = push_status["properties"]["cleanupMessage"]
     assert "cleanupMessage" not in push_status["required"]
@@ -167,6 +168,16 @@ def main() -> None:
         "HTTPS cleanup PDP deactivate failed",
         "HTTPS cleanup PDP profile restore failed",
     ]
+    assert push_status["properties"]["failureReason"]["enum"] == [
+        "command_failure", "timeout", "response_invalid", "terminal_failure",
+        "poll_timeout", "result_nonzero", "unknown",
+    ]
+    assert push_status["properties"]["cleanupReason"]["enum"] == [
+        "command_failure", "timeout", "response_invalid", "result_nonzero", "unknown",
+    ]
+    assert {"failureReason", "cleanupReason", "resetNeeded"}.isdisjoint(
+        push_status["required"]
+    )
     assert len(push_status["oneOf"]) == 5
 
     # Provisioning endpoints are firmware-private AP routes. Legacy plaintext

@@ -392,10 +392,10 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get one push channel test status",
-        "description": "Without detail=1, the response keeps the legacy exact five-key status shape. With detail=1, a terminal cleanup failure may add cleanupMessage. Unknown, duplicate, or invalid query fields are rejected.",
+        "description": "Without detail=1, the response keeps the legacy exact five-key status shape. With detail=1, a terminal failure may add bounded cleanupMessage, failureReason, cleanupReason, and resetNeeded fields. Unknown, duplicate, or invalid query fields are rejected.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
-          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to the optional cleanupMessage terminal detail.", "schema": { "type": "string", "enum": ["1"] } }
+          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } }
         ],
         "responses": {
           "200": { "description": "The bounded per-channel test status. Provider credentials are never returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
@@ -406,10 +406,10 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Test one saved push channel",
-        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses keep the legacy exact five-key status shape. With detail=1, a terminal cleanup failure may add cleanupMessage. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses keep the legacy exact five-key status shape. With detail=1, a terminal failure may add bounded cleanupMessage, failureReason, cleanupReason, and resetNeeded fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
-          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to the optional cleanupMessage terminal detail.", "schema": { "type": "string", "enum": ["1"] } },
+          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } },
           { "$ref": "#/components/parameters/CsrfToken" }
         ],
         "responses": {
@@ -885,7 +885,16 @@
               "HTTPS cleanup PDP deactivate failed",
               "HTTPS cleanup PDP profile restore failed"
             ]
-          }
+          },
+          "failureReason": {
+            "type": "string",
+            "enum": ["command_failure", "timeout", "response_invalid", "terminal_failure", "poll_timeout", "result_nonzero", "unknown"]
+          },
+          "cleanupReason": {
+            "type": "string",
+            "enum": ["command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"]
+          },
+          "resetNeeded": { "type": "boolean" }
         },
         "oneOf": [
           { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },

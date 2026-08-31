@@ -26,6 +26,9 @@ static int modem_error = -1;
 static bool modem_ok = true;
 static std::string modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
 static std::string modem_cleanup_message;
+static IdfModemHttpsDiagnosticReason modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
+static IdfModemHttpsDiagnosticReason modem_cleanup_reason = IdfModemHttpsDiagnosticReason::none;
+static bool modem_cleanup_requires_reset = false;
 
 template <typename T, typename = void>
 struct CleanupMessageAccessor {
@@ -48,6 +51,9 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     result.ok = modem_ok;
     result.message = modem_message;
     CleanupMessageAccessor<IdfModemHttpsPostResult>::set(result, modem_cleanup_message);
+    result.failureReason = modem_failure_reason;
+    result.cleanupReason = modem_cleanup_reason;
+    result.cleanupRequiresReset = modem_cleanup_requires_reset;
     return 0;
 }
 
@@ -95,6 +101,9 @@ int main() {
     assert(transport.httpStatus == 204);
     assert(transport.ok);
     assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
+    assert(transport.failureReason == IdfModemHttpsDiagnosticReason::none);
+    assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::none);
+    assert(!transport.cleanupRequiresReset);
 
     modem_status = 503;
     modem_error = 4;
@@ -111,9 +120,12 @@ int main() {
     assert(transport.mhttpError == -1);
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
     modem_message = "HTTPS modem connected-state poll failed";
+    modem_failure_reason = IdfModemHttpsDiagnosticReason::response_invalid;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.message == "HTTPS modem connected-state poll failed");
+    assert(transport.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
+    modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
     for (const char* message : {
              "HTTPS modem initial query command failed",
              "HTTPS modem initial query response invalid",
@@ -135,6 +147,8 @@ int main() {
     modem_ok = false;
     modem_message = "HTTPS request write failed";
     modem_cleanup_message = "HTTPS cleanup socket close failed";
+    modem_cleanup_reason = IdfModemHttpsDiagnosticReason::timeout;
+    modem_cleanup_requires_reset = true;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(!transport.ok);
@@ -142,6 +156,8 @@ int main() {
     assert(transport.message == "HTTPS request write failed");
     assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport) ==
            "HTTPS cleanup socket close failed");
+    assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::timeout);
+    assert(transport.cleanupRequiresReset);
 
     modem_cleanup_message.assign(200, 'y');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,

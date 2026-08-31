@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestStatus } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestDiagnosticReason, PushTestStatus } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -39,6 +39,11 @@ const demoEsim: EsimStatus = {
 	job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE" }
 };
 
+const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
+	"command_failure", "timeout", "response_invalid", "terminal_failure",
+	"poll_timeout", "result_nonzero", "unknown"
+];
+
 function demoSnapshot(): DeviceSnapshot {
 	return {
 		csrfToken: "demo",
@@ -66,8 +71,14 @@ function forwardRulesValid(rules: string) {
 function isPushTestStatus(value: unknown): value is PushTestStatus {
 	if (!value || typeof value !== "object") return false;
 	const status = value as Record<string, unknown>;
-	return ["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") &&
-		typeof status.message === "string";
+	if (!["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") ||
+		typeof status.message !== "string" ||
+		("cleanupMessage" in status && typeof status.cleanupMessage !== "string")) return false;
+	const reasonValid = (key: string) => !(key in status) ||
+		(typeof status[key] === "string" &&
+			pushTestDiagnosticReasons.includes(status[key] as PushTestDiagnosticReason));
+	return reasonValid("failureReason") && reasonValid("cleanupReason") &&
+		(!("resetNeeded" in status) || typeof status.resetNeeded === "boolean");
 }
 
 function demoResponse<T>(path: string, init?: RequestInit): T {

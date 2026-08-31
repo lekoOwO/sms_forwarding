@@ -64,18 +64,30 @@ int main() {
 
     IdfPushTestJobState cleanup_only;
     idf_push_complete_test_job(cleanup_only, false, "HTTPS cleanup failed",
-                               "HTTPS cleanup socket close failed");
+                               "HTTPS cleanup socket close failed",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::timeout, true);
     assert(!cleanup_only.pending && !cleanup_only.running && cleanup_only.done);
     assert(!cleanup_only.success);
     assert(cleanup_only.message == "HTTPS cleanup failed");
     assert(cleanup_only.cleanupMessage == "HTTPS cleanup socket close failed");
+    assert(cleanup_only.cleanupReason == IdfModemHttpsDiagnosticReason::timeout);
+    assert(cleanup_only.resetNeeded);
     assert(idf_push_serialize_test_status(cleanup_only, false) ==
            "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,"
            "\"message\":\"HTTPS cleanup failed\"}");
     assert(idf_push_serialize_test_status(cleanup_only, true) ==
            "{\"queued\":false,\"running\":false,\"done\":true,\"success\":false,"
            "\"message\":\"HTTPS cleanup failed\","
-           "\"cleanupMessage\":\"HTTPS cleanup socket close failed\"}");
+           "\"cleanupMessage\":\"HTTPS cleanup socket close failed\","
+           "\"cleanupReason\":\"timeout\",\"resetNeeded\":true}");
+
+    IdfPushTestJobState trusted_cleanup;
+    idf_push_complete_test_job(trusted_cleanup, false, "HTTPS cleanup failed",
+                               "HTTPS cleanup socket close failed",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::command_failure, false);
+    assert(trusted_cleanup.resetNeeded);
 
     IdfPushTestJobState empty_failure;
     idf_push_complete_test_job(empty_failure, false, "", "");
@@ -90,6 +102,25 @@ int main() {
     assert(idf_push_serialize_test_status(primary_failure, true).find(
         "\"message\":\"HTTPS request write failed\",\"cleanupMessage\":"
         "\"HTTPS cleanup socket close failed\"") != std::string::npos);
+
+    IdfPushTestJobState primary_reason;
+    idf_push_complete_test_job(primary_reason, false,
+                               "HTTPS modem connected-state poll failed", "",
+                               IdfModemHttpsDiagnosticReason::response_invalid,
+                               IdfModemHttpsDiagnosticReason::none, false);
+    assert(idf_push_serialize_test_status(primary_reason, true).find(
+        "\"failureReason\":\"response_invalid\"") != std::string::npos);
+
+    IdfPushTestJobState unknown_reason;
+    idf_push_complete_test_job(
+        unknown_reason, false, "bounded failure", "bounded cleanup",
+        static_cast<IdfModemHttpsDiagnosticReason>(77),
+        IdfModemHttpsDiagnosticReason::terminal_failure, true);
+    const std::string unknown_json = idf_push_serialize_test_status(unknown_reason, true);
+    assert(unknown_json.find("\"failureReason\":\"unknown\"") != std::string::npos);
+    assert(unknown_json.find("\"cleanupReason\":\"unknown\"") != std::string::npos);
+    assert(unknown_json.find("\"resetNeeded\":true") != std::string::npos);
+    assert(unknown_json.find("AT+") == std::string::npos);
 
     IdfPushTestJobState success;
     idf_push_complete_test_job(success, true, "", "");
@@ -127,6 +158,7 @@ int main() {
             [
                 "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
                 f"-I{PUSH}", f"-I{PUSH / 'include'}",
+                f"-I{ROOT / 'components/idf_modem/include'}",
                 f"-I{ROOT / 'components/idf_config/include'}",
                 f"-I{ROOT / 'components/idf_logbuf/include'}",
                 str(ROOT / "components/idf_logbuf/idf_util.cpp"),
@@ -135,6 +167,40 @@ int main() {
             check=True,
         )
         subprocess.run([str(binary_path)], check=True)
+
+        core_source = (PUSH / "idf_push_core.cpp").read_text()
+        mutations = {
+            "raw_leakage": core_source.replace(
+                "std::string(idf_modem_https_diagnostic_reason_name(job.failureReason))",
+                "std::string(\"AT+leak\")",
+                1,
+            ),
+            "reset_inversion": core_source.replace(
+                "job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;",
+                "job.resetNeeded = !reset_needed && cleanup_reason != IdfModemHttpsDiagnosticReason::none;",
+                1,
+            ),
+        }
+        for name, mutated in mutations.items():
+            assert mutated != core_source
+            mutated_source = Path(temp_dir) / f"{name}.cpp"
+            mutated_binary = Path(temp_dir) / name
+            mutated_source.write_text(mutated)
+            subprocess.run(
+                [
+                    "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    f"-I{PUSH}", f"-I{PUSH / 'include'}",
+                    f"-I{ROOT / 'components/idf_modem/include'}",
+                    f"-I{ROOT / 'components/idf_config/include'}",
+                    f"-I{ROOT / 'components/idf_logbuf/include'}",
+                    str(ROOT / "components/idf_logbuf/idf_util.cpp"),
+                    str(mutated_source), str(harness_path), "-o", str(mutated_binary),
+                ],
+                check=True,
+            )
+            mutated_run = subprocess.run([str(mutated_binary)], check=False,
+                                         capture_output=True, text=True)
+            assert mutated_run.returncode != 0, name
 
     source = (PUSH / "idf_push.cpp").read_text()
     header = (PUSH / "include/idf_push.h").read_text()
@@ -171,6 +237,9 @@ int main() {
     )[0]
     assert "std::string* failure_message = nullptr" in send
     assert "std::string* cleanup_message = nullptr" in send
+    assert "IdfModemHttpsDiagnosticReason* failure_reason = nullptr" in send
+    assert "IdfModemHttpsDiagnosticReason* cleanup_reason = nullptr" in send
+    assert "bool* cleanup_requires_reset = nullptr" in send
     assert "cleanup_message->clear()" in send
     assert "*failure_message = transport.message" in send
     assert send.count("*failure_message = transport.message") == 1
@@ -179,6 +248,9 @@ int main() {
     assert send.index("*failure_message = transport.message") < send.index("return ok")
     assert send.index("*cleanup_message = transport.cleanupMessage") < send.index("return ok")
     assert "std::string cleanupMessage" in transport_header
+    assert "IdfModemHttpsDiagnosticReason failureReason" in transport_header
+    assert "IdfModemHttpsDiagnosticReason cleanupReason" in transport_header
+    assert "bool cleanupRequiresReset" in transport_header
     locked_selection = push_worker.split(
         "for (size_t i = 0; i < s_push_jobs.size(); ++i)", 1
     )[1].split("xSemaphoreGive(s_mutex)", 1)[0]
@@ -201,8 +273,9 @@ int main() {
     assert "std::string cleanup_result" in tests
     assert "&result, nullptr, &cleanup_result" in tests
     assert "idf_push_complete_test_job(job, ok, std::move(result)," in tests
-    assert "std::move(cleanup_result))" in tests
-    post_send = tests.split("&result, nullptr, &cleanup_result);", 1)[1]
+    assert "std::move(cleanup_result)," in tests
+    assert "failure_reason, cleanup_reason, cleanup_requires_reset" in tests
+    post_send = tests.split("&result, nullptr, &cleanup_result,", 1)[1]
     completion_call = post_send.split("idf_push_complete_test_job", 1)[0]
     assert "cleanup_result.clear" not in completion_call
 
@@ -249,6 +322,9 @@ int main() {
     before_serialize = status.split("return idf_push_serialize_test_status", 1)[0]
     assert "copy.cleanupMessage.clear" not in before_serialize
     assert "include_cleanup && job.done && !job.cleanupMessage.empty()" in core_source
+    assert "failureReason" in core_header
+    assert "cleanupReason" in core_header
+    assert "resetNeeded" in core_header
 
     assert "using TestJob = IdfPushTestJobState" in source
     fail_pending = source.split("static bool fail_pending_tests", 1)[1].split(
@@ -269,7 +345,8 @@ int main() {
     web_api = (ROOT / "web/src/lib/api.ts").read_text()
     validator = web_api.split("function isPushTestStatus", 1)[1].split("function demoResponse", 1)[0]
     assert "Object.keys" not in validator
-    assert "cleanupMessage" not in validator
+    assert '"cleanupMessage" in status' in validator
+    assert "pushTestDiagnosticReasons.includes" in validator
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1

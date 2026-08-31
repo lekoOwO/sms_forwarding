@@ -31,6 +31,49 @@ struct IdfModemHttpsPostRequest {
     uint32_t timeoutMs = IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS;
 };
 
+enum class IdfModemHttpsDiagnosticReason : uint8_t {
+    none = 0,
+    command_failure = 1,
+    timeout = 2,
+    response_invalid = 3,
+    terminal_failure = 4,
+    poll_timeout = 5,
+    result_nonzero = 6,
+    unknown = 255,
+};
+
+constexpr std::string_view idf_modem_https_diagnostic_reason_name(
+    IdfModemHttpsDiagnosticReason reason)
+{
+    switch (reason) {
+        case IdfModemHttpsDiagnosticReason::command_failure: return "command_failure";
+        case IdfModemHttpsDiagnosticReason::timeout: return "timeout";
+        case IdfModemHttpsDiagnosticReason::response_invalid: return "response_invalid";
+        case IdfModemHttpsDiagnosticReason::terminal_failure: return "terminal_failure";
+        case IdfModemHttpsDiagnosticReason::poll_timeout: return "poll_timeout";
+        case IdfModemHttpsDiagnosticReason::result_nonzero: return "result_nonzero";
+        case IdfModemHttpsDiagnosticReason::none: return {};
+        case IdfModemHttpsDiagnosticReason::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+constexpr std::string_view idf_modem_https_cleanup_reason_name(
+    IdfModemHttpsDiagnosticReason reason)
+{
+    switch (reason) {
+        case IdfModemHttpsDiagnosticReason::command_failure: return "command_failure";
+        case IdfModemHttpsDiagnosticReason::timeout: return "timeout";
+        case IdfModemHttpsDiagnosticReason::response_invalid: return "response_invalid";
+        case IdfModemHttpsDiagnosticReason::result_nonzero: return "result_nonzero";
+        case IdfModemHttpsDiagnosticReason::unknown: return "unknown";
+        case IdfModemHttpsDiagnosticReason::none: return {};
+        case IdfModemHttpsDiagnosticReason::terminal_failure:
+        case IdfModemHttpsDiagnosticReason::poll_timeout: return "unknown";
+    }
+    return "unknown";
+}
+
 struct IdfModemHttpsPostResult {
     static constexpr size_t MAX_CLEANUP_MESSAGE = 96;
     bool ok = false;
@@ -40,6 +83,9 @@ struct IdfModemHttpsPostResult {
     int mhttpError = 0;
     std::string message;
     std::string cleanupMessage;
+    IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    bool cleanupRequiresReset = false;
 };
 
 struct IdfModemHttpsTarget {
