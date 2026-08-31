@@ -225,6 +225,12 @@
 	color: var(--sidebar-foreground);
 }
 
+.device-subnav-link:focus-visible,
+.device-subpage-menu-link:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
+}
+
 .device-subnav-link[data-active="true"] {
 	background: var(--sidebar-accent);
 	color: var(--sidebar-foreground);
@@ -305,6 +311,10 @@
 	display: flex;
 	flex-direction: column;
 	gap: 1.5rem;
+}
+
+.device-page {
+	scroll-margin-top: 6.5rem;
 }
 
 .device-subpage-header {
@@ -399,6 +409,10 @@ dialog::backdrop {
 }
 
 @media (max-width: 639px) {
+	.device-page {
+		scroll-margin-top: 8rem;
+	}
+
 	.app-header-inner {
 		height: auto;
 		min-height: 5rem;

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from "svelte";
+	import { onMount, tick } from "svelte";
 	import MoonIcon from "@lucide/svelte/icons/moon";
 	import MenuIcon from "@lucide/svelte/icons/menu";
 	import SunIcon from "@lucide/svelte/icons/sun";
@@ -138,15 +138,34 @@
 	let originalWifiOpen = $state(Array.from({ length: 5 }, () => false));
 	let openWifiProfiles = $state(Array.from({ length: 5 }, () => false));
 	let currentDeviceSubpage = $derived(deviceSubpages.find((page) => page.value === deviceSubpage) ?? deviceSubpages[0]!);
+	let activeDeviceRoute = "";
+	let routeScrollGeneration = 0;
 
 	const t = (key: TranslationKey) => translate(locale, key);
 
 	onMount(() => {
+		const scrollToDeviceSubpage = async (route: ReturnType<typeof parseDeviceHash>) => {
+			if (route.mainTab !== "device") {
+				routeScrollGeneration += 1;
+				return;
+			}
+			const generation = ++routeScrollGeneration;
+			await tick();
+			if (generation !== routeScrollGeneration) return;
+			document.getElementById(route.canonicalHash.slice(1))?.scrollIntoView({ block: "start", inline: "nearest", behavior: "auto" });
+		};
 		const applyHash = () => {
 			const route = parseDeviceHash(location.hash);
+			const nextDeviceRoute = route.mainTab === "device" ? `device/${route.deviceSubpage}` : route.mainTab;
+			if (activeDeviceRoute === "device/maintenance" && nextDeviceRoute !== activeDeviceRoute) {
+				restoreFile = null;
+				otaFile = null;
+			}
+			activeDeviceRoute = nextDeviceRoute;
 			mainTab = route.mainTab as MainTab;
 			deviceSubpage = route.deviceSubpage as DeviceSubpage;
 			if (location.hash !== route.canonicalHash) history.replaceState(null, "", route.canonicalHash);
+			void scrollToDeviceSubpage(route);
 		};
 		applyHash();
 		window.addEventListener("hashchange", applyHash);
@@ -158,7 +177,7 @@
 			? savedTheme
 			: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 		document.documentElement.classList.toggle("dark", theme === "dark");
-		void refreshSnapshot();
+		void refreshSnapshot().then(() => void scrollToDeviceSubpage(parseDeviceHash(location.hash)));
 		void refreshEsim();
 		return () => {
 			window.removeEventListener("hashchange", applyHash);
@@ -645,11 +664,6 @@
 </dialog>
 
 <main id="main-content" tabindex="-1" class="mx-auto max-w-6xl px-4 py-6 outline-none sm:px-6 sm:py-10">
-	<div class="sr-only" aria-hidden="true">
-		<span id="overview"></span><span id="notifications"></span><span id="messaging"></span>
-		<span id="cellular"></span><span id="device"></span><span id="security"></span>
-		<span id="device/connection"></span><span id="device/diagnostics"></span><span id="device/maintenance"></span><span id="device/advanced"></span>
-	</div>
 	{#if loading}
 		<div class="flex flex-col gap-6" aria-live="polite">
 			<div class="flex flex-col gap-2">
@@ -879,14 +893,14 @@
 						{/if}
 					</section>
 				{:else if mainTab === "device"}
-					<section class="flex flex-col gap-6">
-						<header class="device-subpage-header" aria-labelledby="device-subpage-title">
+					<section id={`device/${deviceSubpage}`} class="device-page flex flex-col gap-6">
+						<section class="device-subpage-header" aria-label={t("deviceTitle")}>
 							<div>
 								<p class="device-breadcrumb">{t("deviceTitle")}</p>
 								<h1 id="device-subpage-title" class="text-2xl font-semibold tracking-tight">{t(currentDeviceSubpage.label)}</h1>
 								<p class="mt-1 max-w-2xl text-sm text-muted-foreground">{t(currentDeviceSubpage.description)}</p>
 							</div>
-						</header>
+						</section>
 						<details class="device-subpage-menu lg:hidden">
 							<summary>{t("deviceSubpageMenu")}: {t(currentDeviceSubpage.label)}</summary>
 							<nav aria-label={t("deviceSubpageMenu")}>
