@@ -158,3 +158,43 @@ test("user-facing copy omits internal opaque-handle and modem implementation wor
 		assert.match(messages.networkModeWarningDescription, /GET|ntfy/i);
 	}
 });
+
+test("device workspace uses four canonical deep-link subpages with safe fallback", async () => {
+	const navigation = await import("../src/lib/device-navigation.js");
+	assert.deepEqual(navigation.parseDeviceHash(""), {
+		mainTab: "overview", deviceSubpage: "connection", canonicalHash: "#overview"
+	});
+	assert.deepEqual(navigation.parseDeviceHash("device"), {
+		mainTab: "device", deviceSubpage: "connection", canonicalHash: "#device/connection"
+	});
+	assert.deepEqual(navigation.parseDeviceHash("device/diagnostics"), {
+		mainTab: "device", deviceSubpage: "diagnostics", canonicalHash: "#device/diagnostics"
+	});
+	assert.deepEqual(navigation.parseDeviceHash("device/not-a-page"), {
+		mainTab: "device", deviceSubpage: "connection", canonicalHash: "#device/connection"
+	});
+	assert.equal(navigation.routeForMainTab("device"), "#device/connection");
+	assert.deepEqual(navigation.DEVICE_SUBPAGES.map(({ value }) => value), ["connection", "diagnostics", "maintenance", "advanced"]);
+	assert.match(pageSource, /addEventListener\("popstate"/);
+	assert.match(pageSource, /history\.replaceState/);
+});
+
+test("device tool inventory appears exactly once across the subpages", async () => {
+	const { DEVICE_TOOL_INVENTORY } = await import("../src/lib/device-navigation.js");
+	const ids = Object.values(DEVICE_TOOL_INVENTORY).flat();
+	assert.equal(new Set(ids).size, ids.length);
+	for (const id of ids) assert.equal(pageSource.match(new RegExp(`data-device-action="${id}"`, "g"))?.length ?? 0, 1, id);
+	for (const subpage of ["connection", "diagnostics", "maintenance", "advanced"])
+		assert.match(pageSource, new RegExp(`data-device-subpage="${subpage}"`));
+});
+
+test("device navigation keeps group labels and children on the shared readable scale", () => {
+	assert.match(pageSource, /class="device-tool-group-heading"[\s\S]*<h2/);
+	assert.match(pageSource, /class="device-subpage-menu(?:[" ])/);
+	assert.match(layoutSource, /\.sidebar-group-label[\s\S]*font-size:\s*0\.875rem/);
+	assert.match(layoutSource, /\.device-tool-group-heading h2[\s\S]*font-size:\s*0\.875rem/);
+	assert.match(layoutSource, /\.device-tool-group \[data-slot="accordion-trigger"\][\s\S]*font-size:\s*0\.875rem/);
+	assert.match(layoutSource, /\.device-subnav[\s\S]*padding-left/);
+	assert.match(layoutSource, /\.device-subpage-menu[\s\S]*overflow-x:\s*hidden/);
+	assert.match(layoutSource, /\.device-tool-group-danger::before[\s\S]*width:\s*2px/);
+});

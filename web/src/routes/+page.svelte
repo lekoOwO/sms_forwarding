@@ -25,11 +25,13 @@
 	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
+	import { DEVICE_SUBPAGES, parseDeviceHash } from "$lib/device-navigation.js";
 	import { pushProviderKeyFields, pushSecretRequired, switchProviderDraft } from "$lib/push-template-defaults.js";
 	import { closeEsimDeleteDialog, refreshEsimAfterTerminal } from "$lib/esim-ui.js";
 	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushCaStatus, PushChannel, PushTestStatus, UiResult } from "$lib/types";
 
 	type MainTab = "overview" | "notifications" | "messaging" | "cellular" | "device" | "security";
+	type DeviceSubpage = "connection" | "diagnostics" | "maintenance" | "advanced";
 	type Theme = "light" | "dark";
 	type PushProviderDraft = Pick<PushChannel, "url" | "urlSet" | "key1" | "key1Set" | "key2" | "key2Set" | "customBody" | "customBodySet" | "titleTemplate" | "bodyTemplate">;
 
@@ -65,10 +67,11 @@
 			{ value: "security", label: "navSecurity" }
 		] }
 	];
-	const validTabs = new Set<MainTab>(["overview", "notifications", "messaging", "cellular", "device", "security"]);
+	const deviceSubpages = DEVICE_SUBPAGES as Array<{ value: DeviceSubpage; label: TranslationKey; description: TranslationKey }>;
 
 	let locale = $state<Locale>("zh-TW");
 	let mainTab = $state<MainTab>("overview");
+	let deviceSubpage = $state<DeviceSubpage>("connection");
 	let mobileNavDialog: HTMLDialogElement;
 	let pushTab = $state("0");
 	let wifiTab = $state("0");
@@ -134,16 +137,20 @@
 	let originalWifiSsids = $state(Array.from({ length: 5 }, () => ""));
 	let originalWifiOpen = $state(Array.from({ length: 5 }, () => false));
 	let openWifiProfiles = $state(Array.from({ length: 5 }, () => false));
+	let currentDeviceSubpage = $derived(deviceSubpages.find((page) => page.value === deviceSubpage) ?? deviceSubpages[0]!);
 
 	const t = (key: TranslationKey) => translate(locale, key);
 
 	onMount(() => {
 		const applyHash = () => {
-			const candidate = location.hash.slice(1) as MainTab;
-			mainTab = validTabs.has(candidate) ? candidate : "overview";
+			const route = parseDeviceHash(location.hash);
+			mainTab = route.mainTab as MainTab;
+			deviceSubpage = route.deviceSubpage as DeviceSubpage;
+			if (location.hash !== route.canonicalHash) history.replaceState(null, "", route.canonicalHash);
 		};
 		applyHash();
 		window.addEventListener("hashchange", applyHash);
+		window.addEventListener("popstate", applyHash);
 		const saved = localStorage.getItem("locale") as Locale | null;
 		locale = saved && ["zh-TW", "zh-CN", "en"].includes(saved) ? saved : detectLocale(navigator.language);
 		const savedTheme = localStorage.getItem("theme") as Theme | null;
@@ -155,6 +162,7 @@
 		void refreshEsim();
 		return () => {
 			window.removeEventListener("hashchange", applyHash);
+			window.removeEventListener("popstate", applyHash);
 			if (esimPollTimer !== undefined) window.clearInterval(esimPollTimer);
 		};
 	});
@@ -166,7 +174,7 @@
 	});
 
 	$effect(() => {
-		if (!autoRefresh || mainTab !== "device") return;
+		if (!autoRefresh || mainTab !== "device" || deviceSubpage !== "diagnostics") return;
 		const timer = window.setInterval(refreshLogs, 2000);
 		return () => window.clearInterval(timer);
 	});
@@ -198,7 +206,6 @@
 
 	function closeMobileNavigation() {
 		if (mobileNavDialog?.open) mobileNavDialog.close();
-		document.getElementById("mobile-nav-trigger")?.focus();
 	}
 
 	async function refreshEsim() {
@@ -584,13 +591,13 @@
 </svelte:head>
 
 <a class="skip-link" href="#main-content">{t("skipToContent")}</a>
-<header class="border-b bg-background/95 supports-[backdrop-filter]:bg-background/80 sticky top-0 z-20 backdrop-blur">
-	<div class="mx-auto flex h-20 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
-		<div class="min-w-0">
+	<header class="app-header sticky top-0 z-20 border-b bg-background/95 supports-[backdrop-filter]:bg-background/80 backdrop-blur">
+	<div class="app-header-inner mx-auto flex h-20 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
+		<div class="app-header-title min-w-0">
 			<p class="truncate text-lg font-semibold tracking-tight sm:text-2xl">{snapshot?.config.deviceName || t("appName")}</p>
 			<p class="truncate text-sm text-muted-foreground">{t("appSubtitle")}</p>
 		</div>
-		<div class="flex items-center gap-2">
+		<div class="app-header-controls flex items-center gap-2">
 			<Button id="mobile-nav-trigger" class="lg:hidden" variant="outline" size="icon-sm" aria-label={t("navMenu")} aria-haspopup="dialog" onclick={openMobileNavigation}>
 				<MenuIcon />
 			</Button>
@@ -621,9 +628,16 @@
 	<nav class="flex flex-col gap-5 pt-5" aria-label={t("navMenuTitle")}>
 		{#each navigationGroups as group (group.label)}
 			<div class="flex flex-col gap-1">
-				<p class="px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t(group.label)}</p>
+				<p class="sidebar-group-label">{t(group.label)}</p>
 				{#each group.items as item (item.value)}
-					<a class="sidebar-link" href={`#${item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+					<a class="sidebar-link" href={`#${item.value === "device" ? "device/connection" : item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+					{#if item.value === "device" && mainTab === "device"}
+						<nav class="device-subnav" aria-label={t("deviceSubpageMenu")}>
+							{#each deviceSubpages as subpage (subpage.value)}
+								<a class="device-subnav-link" href={`#device/${subpage.value}`} data-active={deviceSubpage === subpage.value ? "true" : undefined} aria-current={deviceSubpage === subpage.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(subpage.label)}</a>
+							{/each}
+						</nav>
+					{/if}
 				{/each}
 			</div>
 		{/each}
@@ -634,6 +648,7 @@
 	<div class="sr-only" aria-hidden="true">
 		<span id="overview"></span><span id="notifications"></span><span id="messaging"></span>
 		<span id="cellular"></span><span id="device"></span><span id="security"></span>
+		<span id="device/connection"></span><span id="device/diagnostics"></span><span id="device/maintenance"></span><span id="device/advanced"></span>
 	</div>
 	{#if loading}
 		<div class="flex flex-col gap-6" aria-live="polite">
@@ -658,11 +673,18 @@
 		<div class="app-layout">
 			<aside class="desktop-sidebar hidden lg:block" aria-label={t("navMenuTitle")}>
 				<nav class="flex flex-col gap-5">
-					{#each navigationGroups as group (group.label)}
+		{#each navigationGroups as group (group.label)}
 						<div class="flex flex-col gap-1">
-							<p class="px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t(group.label)}</p>
+							<p class="sidebar-group-label">{t(group.label)}</p>
 							{#each group.items as item (item.value)}
-								<a class="sidebar-link" href={`#${item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+								<a class="sidebar-link" href={`#${item.value === "device" ? "device/connection" : item.value}`} data-active={mainTab === item.value ? "true" : undefined} aria-current={mainTab === item.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(item.label)}</a>
+								{#if item.value === "device" && mainTab === "device"}
+									<nav class="device-subnav" aria-label={t("deviceSubpageMenu")}>
+										{#each deviceSubpages as subpage (subpage.value)}
+											<a class="device-subnav-link" href={`#device/${subpage.value}`} data-active={deviceSubpage === subpage.value ? "true" : undefined} aria-current={deviceSubpage === subpage.value ? "page" : undefined} onclick={closeMobileNavigation}>{t(subpage.label)}</a>
+										{/each}
+									</nav>
+								{/if}
 							{/each}
 						</div>
 					{/each}
@@ -856,15 +878,31 @@
 							</section>
 						{/if}
 					</section>
-			{:else if mainTab === "device"}
-				<section class="flex flex-col gap-6">
-						<div><h1 class="text-2xl font-semibold tracking-tight">{t("deviceTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("deviceDescription")}</p></div>
-						<Accordion.Root type="single" value="identity">
-							<section class="device-tool-group" data-tool-group="connection" aria-labelledby="device-group-connection">
+				{:else if mainTab === "device"}
+					<section class="flex flex-col gap-6">
+						<header class="device-subpage-header" aria-labelledby="device-subpage-title">
+							<div>
+								<p class="device-breadcrumb">{t("deviceTitle")}</p>
+								<h1 id="device-subpage-title" class="text-2xl font-semibold tracking-tight">{t(currentDeviceSubpage.label)}</h1>
+								<p class="mt-1 max-w-2xl text-sm text-muted-foreground">{t(currentDeviceSubpage.description)}</p>
+							</div>
+						</header>
+						<details class="device-subpage-menu lg:hidden">
+							<summary>{t("deviceSubpageMenu")}: {t(currentDeviceSubpage.label)}</summary>
+							<nav aria-label={t("deviceSubpageMenu")}>
+								{#each deviceSubpages as subpage (subpage.value)}
+									<a class="device-subpage-menu-link" href={`#device/${subpage.value}`} data-active={deviceSubpage === subpage.value ? "true" : undefined} aria-current={deviceSubpage === subpage.value ? "page" : undefined}>{t(subpage.label)}</a>
+								{/each}
+							</nav>
+						</details>
+						<Accordion.Root type="multiple" value={deviceSubpage === "connection" ? ["identity", "wifi-profiles", "network-mode", "keepalive-compatibility"] : deviceSubpage === "diagnostics" ? ["diagnostics", "network"] : deviceSubpage === "advanced" ? ["control", "terminal"] : ["config-backup", "config-restore", "ota"]}>
+						{#if deviceSubpage === "connection"}
+						<div class="device-subpage" data-device-subpage="connection">
+								<section class="device-tool-group" data-tool-group="connection" aria-labelledby="device-group-connection">
 								<div class="device-tool-group-heading"><h2 id="device-group-connection" class="text-sm font-semibold">{t("deviceGroupConnection")}</h2></div>
 							<Accordion.Item value="identity">
 								<Accordion.Trigger>{t("deviceTabIdentity")}</Accordion.Trigger>
-								<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex justify-end"><Button type="submit" form="identity-form">{t("commonSave")}</Button></div><ActionResult result={identityResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+									<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" data-device-action="identity-save" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex justify-end"><Button type="submit" form="identity-form">{t("commonSave")}</Button></div><ActionResult result={identityResult} title={t("resultTitle")} {locale} /></Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="wifi-profiles">
 								<Accordion.Trigger>{t("wifiProfilesTitle")}</Accordion.Trigger>
@@ -875,7 +913,7 @@
 										<div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.wifiProfiles as profile, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{t("wifiProfile")} {index + 1}</span><Badge variant={profile.ssid ? "secondary" : "outline"}>{profile.ssid ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>
 										{#each snapshot.config.wifiProfiles as profile, index (index)}
 											<Tabs.Content value={String(index)}>
-												<form class="flex flex-col gap-5" onsubmit={(event) => { event.preventDefault(); void save((value) => wifiResult = value, wifiValues(index)); }}>
+														<form class="flex flex-col gap-5" data-device-action="wifi-profile-save" onsubmit={(event) => { event.preventDefault(); void save((value) => wifiResult = value, wifiValues(index)); }}>
 													<Field.Group>
 														<Field.Field><Field.Label for={`wifi-ssid-${index}`}>{t("wifiSsid")}</Field.Label><Input id={`wifi-ssid-${index}`} maxlength={CONFIG_FIELD_LIMITS.wifiSsid} bind:value={profile.ssid} /><Field.Description>{t("wifiSsidHint")}</Field.Description></Field.Field>
 														<Field.Field data-invalid={wifiPasswordRequired(index) && !profile.password}><Field.Label for={`wifi-password-${index}`}>{t("wifiPassword")}</Field.Label><Input id={`wifi-password-${index}`} type="password" minlength={8} maxlength={CONFIG_FIELD_LIMITS.wifiPassword} pattern={"[ -~]{8,63}"} autocomplete="new-password" required={wifiPasswordRequired(index)} aria-invalid={wifiPasswordRequired(index) && !profile.password} disabled={!profile.ssid || openWifiProfiles[index]} bind:value={profile.password} /><Field.Description>{wifiPasswordRequired(index) ? t("wifiPasswordChangedHint") : t("wifiPasswordHint")}</Field.Description></Field.Field>
@@ -893,7 +931,7 @@
 								<Accordion.Trigger>{t("networkModeTitle")}</Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-5">
 									<Alert.Root><Alert.Title>{t("networkModeWarningTitle")}</Alert.Title><Alert.Description>{t("networkModeWarningDescription")}</Alert.Description></Alert.Root>
-									<form id="network-mode-form" onsubmit={(event) => { event.preventDefault(); void save((value) => networkModeResult = value, { networkMode: snapshot!.config.networkMode }); }}>
+									<form id="network-mode-form" data-device-action="network-mode-save" onsubmit={(event) => { event.preventDefault(); void save((value) => networkModeResult = value, { networkMode: snapshot!.config.networkMode }); }}>
 										<Field.Field><Field.Label for="network-mode">{t("networkMode")}</Field.Label><NativeSelect.Root id="network-mode" class="w-full" bind:value={snapshot.config.networkMode}><NativeSelect.Option value={0}>{t("networkModeWifiOnly")}</NativeSelect.Option><NativeSelect.Option value={1}>{t("networkMode4gOnly")}</NativeSelect.Option><NativeSelect.Option value={2}>{t("networkModeMix")}</NativeSelect.Option></NativeSelect.Root><Field.Description>{t("networkModeHint")}</Field.Description></Field.Field>
 									</form>
 									<div class="flex justify-end"><Button type="submit" form="network-mode-form" disabled={networkModeResult.state === "loading"}>{networkModeResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
@@ -910,33 +948,45 @@
 										<div><dt class="text-sm text-muted-foreground">{t("keepaliveTrafficKB")}</dt><dd class="mt-1 font-medium tabular-nums">{snapshot.config.kaTrafficKB}</dd></div>
 									</dl>
 									{#if snapshot.config.kaEnabled}
-										<div class="flex justify-end"><Button variant="destructive" disabled={keepaliveResult.state === "loading"} onclick={() => { const c = snapshot!.config; void save((value) => keepaliveResult = value, { kaIntervalDays: c.kaIntervalDays, kaTrafficKB: c.kaTrafficKB }); }}>{keepaliveResult.state === "loading" ? t("commonSaving") : t("keepaliveDisable")}</Button></div>
+										<div class="flex justify-end"><Button variant="destructive" data-device-action="keepalive-disable" disabled={keepaliveResult.state === "loading"} onclick={() => { const c = snapshot!.config; void save((value) => keepaliveResult = value, { kaIntervalDays: c.kaIntervalDays, kaTrafficKB: c.kaTrafficKB }); }}>{keepaliveResult.state === "loading" ? t("commonSaving") : t("keepaliveDisable")}</Button></div>
 									{/if}
 									<ActionResult result={keepaliveResult} title={t("resultTitle")} {locale} />
 								</Accordion.Content>
 							</Accordion.Item>
-						</section>
-						<section class="device-tool-group" data-tool-group="diagnostics" aria-labelledby="device-group-diagnostics">
-							<div class="device-tool-group-heading"><h2 id="device-group-diagnostics" class="text-sm font-semibold">{t("deviceGroupDiagnostics")}</h2></div>
-							<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" onclick={() => action((value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button></div><ActionResult result={networkResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						</section>
-						<section class="device-tool-group device-tool-group-danger" data-tool-group="danger" aria-labelledby="device-group-danger">
-							<div class="device-tool-group-heading"><div><h2 id="device-group-danger" class="text-sm font-semibold">{t("deviceGroupDanger")}</h2><p class="mt-1 text-xs text-muted-foreground">{t("deviceGroupDangerDescription")}</p></div></div>
-							<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						</section>
-						<div>
-							<Accordion.Item value="logs"><Accordion.Trigger onclick={refreshLogs}>{t("deviceTabLogs")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></Empty.Content></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre><div class="flex justify-end"><Button variant="outline" onclick={refreshLogs}>{t("refresh")}</Button></div>{/if}<ActionResult result={logsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							</section>
 						</div>
-						<section class="device-tool-group" data-tool-group="maintenance" aria-labelledby="device-group-maintenance">
+						{:else if deviceSubpage === "diagnostics"}
+						<div class="device-subpage" data-device-subpage="diagnostics">
+							<section class="device-tool-group" data-tool-group="diagnostics" aria-labelledby="device-group-diagnostics">
+							<div class="device-tool-group-heading"><h2 id="device-group-diagnostics" class="text-sm font-semibold">{t("deviceGroupDiagnostics")}</h2></div>
+								<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-modem-info" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" data-device-action="diagnostics-signal" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" data-device-action="diagnostics-sim-info" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" data-device-action="diagnostics-modem-signal" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" data-device-action="diagnostics-operator" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" data-device-action="diagnostics-imei" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-network" onclick={() => action((value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" data-device-action="diagnostics-wifi" onclick={() => action((value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" data-device-action="diagnostics-flight" onclick={() => action((value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button></div><ActionResult result={networkResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							</section>
+							<section class="device-tool-group" data-tool-group="history" aria-labelledby="device-group-history">
+								<div class="device-tool-group-heading"><h2 id="device-group-history">{t("deviceHistoryTitle")}</h2><p>{t("deviceHistoryDescription")}</p></div>
+								<div class="device-tool-content"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre>{/if}<div class="flex justify-end"><Button variant="outline" data-device-action="diagnostics-logs-refresh" onclick={refreshLogs}>{t("refresh")}</Button></div><ActionResult result={logsResult} title={t("resultTitle")} {locale} /></div>
+							</section>
+						</div>
+						{:else if deviceSubpage === "advanced"}
+						<div class="device-subpage" data-device-subpage="advanced">
+							<section class="device-tool-group device-tool-group-danger" data-tool-group="danger" aria-labelledby="device-group-danger">
+							<div class="device-tool-group-heading"><div><h2 id="device-group-danger" class="text-sm font-semibold">{t("deviceGroupDanger")}</h2><p class="mt-1 text-xs text-muted-foreground">{t("deviceGroupDangerDescription")}</p></div></div>
+								<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="advanced-wifi-restart" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" data-device-action="advanced-flight-toggle" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" data-device-action="advanced-modem-restart" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" data-device-action="advanced-modem-hard-reset" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form data-device-action="advanced-at-terminal" onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							</section>
+						</div>
+						{:else}
+						<div class="device-subpage" data-device-subpage="maintenance">
+							<section class="device-tool-group" data-tool-group="maintenance" aria-labelledby="device-group-maintenance">
 							<div class="device-tool-group-heading"><h2 id="device-group-maintenance" class="text-sm font-semibold">{t("deviceGroupMaintenance")}</h2></div>
-							<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("otaDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						</section>
-					</Accordion.Root>
-					{#if hasMoreLogs}<div class="flex justify-center"><Button variant="outline" onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
+								<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button data-device-action="maintenance-backup" disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" data-device-action="maintenance-restore" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("otaDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button data-device-action="maintenance-ota" disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							</section>
+						</div>
+						{/if}
+						</Accordion.Root>
+						{#if deviceSubpage === "diagnostics" && hasMoreLogs}<div class="flex justify-center"><Button variant="outline" data-device-action="diagnostics-logs-load-more" onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
 				</section>
 				{:else}
 					<section class="flex flex-col gap-6">
