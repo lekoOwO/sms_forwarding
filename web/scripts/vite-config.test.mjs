@@ -7,6 +7,7 @@ import test from "node:test";
 
 const WEB_ROOT = resolve(new URL("..", import.meta.url).pathname);
 const VITE_BIN = join(WEB_ROOT, "node_modules", "vite", "bin", "vite.js");
+const BUILD_TIMEOUT_MS = 90_000;
 
 function makeFixture(page, routes = {}) {
 	const root = mkdtempSync(join(tmpdir(), "sms-vite-hash-"));
@@ -26,23 +27,40 @@ function makeFixture(page, routes = {}) {
 	return root;
 }
 
-function build(root) {
+function runChild(args, options = {}) {
 	try {
-		const output = execFileSync(process.execPath, [VITE_BIN, "build"], {
-			cwd: root,
-			env: { ...process.env, CI: "1" },
+		const output = execFileSync(process.execPath, args, {
+			...options,
+			timeout: options.timeout ?? BUILD_TIMEOUT_MS,
 			encoding: "utf8",
-			stdio: ["ignore", "pipe", "pipe"],
-			timeout: 30_000
+			stdio: ["ignore", "pipe", "pipe"]
 		});
-		return { status: 0, output };
+		return { status: 0, output, timedOut: false, signal: "" };
 	} catch (error) {
 		const output = [error.stdout, error.stderr]
 			.map((part) => part?.toString() ?? "")
 			.join("\n");
-		return { status: error.status ?? 1, output };
+		return {
+			status: error.status ?? 1,
+			output,
+			timedOut: error.code === "ETIMEDOUT",
+			signal: error.signal ?? ""
+		};
 	}
 }
+
+function build(root) {
+	return runChild([VITE_BIN, "build"], {
+		cwd: root,
+		env: { ...process.env, CI: "1" }
+	});
+}
+
+test("build runner kills a hung child at its explicit timeout", () => {
+	const result = runChild(["-e", "setTimeout(() => {}, 1000)"], { timeout: 50 });
+	assert.equal(result.timedOut, true);
+	assert.equal(result.signal, "SIGTERM");
+});
 
 test("production builds enforce the narrow client hash whitelist", () => {
 	const cases = [
@@ -76,6 +94,8 @@ test("production builds enforce the narrow client hash whitelist", () => {
 		const root = makeFixture(fixture.page, fixture.routes);
 		try {
 			const result = build(root);
+			assert.equal(result.timedOut, false,
+				`${fixture.name} child timed out after ${BUILD_TIMEOUT_MS}ms (signal ${result.signal})`);
 			assert.equal(result.status === 0, fixture.passes, `${fixture.name} build status\n${result.output}`);
 			if (fixture.errorText) assert.match(result.output, new RegExp(fixture.errorText));
 		} finally {
