@@ -205,6 +205,39 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 		const accepted = await api.runPushTest(0, undefined, 1000);
 		assert.equal(accepted.failureReason, "terminal_failure");
 
+		const cleanupMessages = [
+			"HTTPS cleanup socket close failed",
+			"HTTPS cleanup SSL config restore failed",
+			"HTTPS cleanup autofree config restore failed",
+			"HTTPS cleanup encoding config restore failed",
+			"HTTPS cleanup PDP deactivate failed",
+			"HTTPS cleanup PDP profile restore failed"
+		];
+		for (const cleanupMessage of cleanupMessages) {
+			globalThis.fetch = async (path) => {
+				if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "csrf" }), {
+					status: 200, headers: { "Content-Type": "application/json" }
+				});
+				return new Response(JSON.stringify({ ...validPrimary, cleanupMessage }), {
+					status: 200, headers: { "Content-Type": "application/json" }
+				});
+			};
+			await api.loadSnapshot();
+			assert.equal((await api.runPushTest(0, undefined, 1000)).cleanupMessage, cleanupMessage);
+		}
+		for (const cleanupMessage of ["HTTPS cleanup unknown", "HTTPS cleanup socket close failed "]) {
+			globalThis.fetch = async (path) => {
+				if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "csrf" }), {
+					status: 200, headers: { "Content-Type": "application/json" }
+				});
+				return new Response(JSON.stringify({ ...validPrimary, cleanupMessage }), {
+					status: 200, headers: { "Content-Type": "application/json" }
+				});
+			};
+			await api.loadSnapshot();
+			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
+		}
+
 		for (const cleanupReason of ["terminal_failure", "poll_timeout"]) {
 			globalThis.fetch = async (path) => {
 				if (path === "/api/config") return new Response(JSON.stringify({ csrfToken: "csrf" }), {
@@ -215,6 +248,92 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 					message: "bounded cleanup", cleanupReason
 				}), { status: 200, headers: { "Content-Type": "application/json" } });
 			};
+			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
+		}
+	} finally {
+		globalThis.fetch = previousFetch;
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
+	}
+});
+
+test("push test validator accepts only complete terminal transport diagnostics", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	const previousFetch = globalThis.fetch;
+	let server;
+	try {
+		delete process.env.VITE_DEMO_MODE;
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({
+			server: { middlewareMode: true }, appType: "custom", logLevel: "silent"
+		});
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const valid = {
+			queued: false, running: false, done: true, success: false,
+			message: "HTTP rejected", transportPath: "wifi", dispatchAttempted: true,
+			failureStage: "http", httpStatus: 503
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : valid
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		const accepted = await api.runPushTest(0, undefined, 1000);
+		assert.deepEqual([
+			accepted.transportPath, accepted.dispatchAttempted, accepted.failureStage, accepted.httpStatus
+		], ["wifi", true, "http", 503]);
+		const success = {
+			queued: false, running: false, done: true, success: true,
+			message: "Test push sent", transportPath: "wifi", dispatchAttempted: true,
+			failureStage: "none", httpStatus: 204
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : success
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		assert.equal((await api.runPushTest(0, undefined, 1000)).httpStatus, 204);
+		const preflight = {
+			queued: false, running: false, done: true, success: false,
+			message: "Preflight failed", transportPath: "none", dispatchAttempted: false,
+			failureStage: "preflight"
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : preflight
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		assert.equal((await api.runPushTest(0, undefined, 1000)).failureStage, "preflight");
+
+		const invalidStatuses = [
+			{ ...valid, transportPath: "satellite" },
+			{ ...valid, httpStatus: 99 },
+			{ ...valid, dispatchAttempted: false },
+			{ ...valid, dispatchAttempted: undefined },
+			{ ...valid, queued: true, running: false, done: false, success: false },
+			{ ...success, transportPath: "none" },
+			{ ...success, dispatchAttempted: false },
+			{ ...success, transportPath: undefined },
+			{ ...success, dispatchAttempted: undefined },
+			{ ...success, failureStage: undefined },
+			{ ...success, httpStatus: undefined },
+			{ ...success, httpStatus: 503 },
+			{ ...success, failureStage: "http" },
+			{ ...valid, transportPath: undefined },
+			{ ...valid, dispatchAttempted: undefined },
+			{ ...valid, failureStage: undefined },
+			{ ...valid, transportPath: "none", dispatchAttempted: false, failureStage: "none" },
+			{ ...valid, transportPath: "wifi", dispatchAttempted: true, failureStage: "none" },
+			{ ...valid, transportPath: "none", dispatchAttempted: true }
+		];
+		for (const status of invalidStatuses) {
+			globalThis.fetch = async (path) => new Response(JSON.stringify(
+				path === "/api/config" ? { csrfToken: "csrf" } : status
+			), { status: 200, headers: { "Content-Type": "application/json" } });
+			await api.loadSnapshot();
 			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
 		}
 	} finally {

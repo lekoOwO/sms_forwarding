@@ -288,6 +288,9 @@ enum class RemoteCloseMode {
     tls_handshake_failure,
     request_write_failure,
     http_non_success,
+    http_invalid_zero,
+    http_invalid_high,
+    http_invalid_max,
 };
 
 enum class CleanupFailure {
@@ -698,7 +701,13 @@ struct RemoteCloseTranscript {
                 const std::string_view http =
                     transcript.mode == RemoteCloseMode::http_non_success
                         ? "HTTP/1.1 503 Service Unavailable\r\nX-Test: remote-close\r\n\r\nbody"
-                        : "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
+                        : transcript.mode == RemoteCloseMode::http_invalid_zero
+                            ? "HTTP/1.1 000 Invalid\r\nX-Test: remote-close\r\n\r\nbody"
+                            : transcript.mode == RemoteCloseMode::http_invalid_high
+                                ? "HTTP/1.1 600 Invalid\r\nX-Test: remote-close\r\n\r\nbody"
+                                : transcript.mode == RemoteCloseMode::http_invalid_max
+                                    ? "HTTP/1.1 999 Invalid\r\nX-Test: remote-close\r\n\r\nbody"
+                                    : "HTTP/1.1 200 OK\r\nX-Test: remote-close\r\n\r\nbody";
                 const std::string hex = idf_modem_https_wire::hex_encode(
                     reinterpret_cast<const uint8_t*>(http.data()), http.size());
                 response = frame(command, "+MIPRD: 0,0," + std::to_string(http.size()) + "," +
@@ -818,6 +827,7 @@ void check_remote_close_transcripts()
     IdfModemHttpsPostResult result;
     assert(run_remote_close_transcript(delivered, result) == IdfModemHttpsRunResult::ok);
     assert(result.ok && result.httpStatus == 200 && result.responseBytes == http.size());
+    assert(result.failureStage == IdfHttpsFailureStage::none);
     assert(result.expectedResponseBytes == 0);
     assert(CleanupMessageAccessor<IdfModemHttpsPostResult>::get(result).empty());
     assert(delivered.read_commands == 1 && delivered.close_commands == 1 &&
@@ -834,6 +844,7 @@ void check_remote_close_transcripts()
                IdfModemHttpsRunResult::response_failed);
         assert(!result.ok && result.responseBytes == 0 && rejected.read_commands == 1 &&
                rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert(result.failureStage == IdfHttpsFailureStage::response);
         assert_failure_message(result.message, "HTTPS response failed");
     }
 
@@ -862,6 +873,7 @@ void check_remote_close_transcripts()
         assert(!result.ok && rejected.state_queries == 1 && rejected.open_commands == 1 &&
                rejected.send_commands == 0 && rejected.read_commands == 0 &&
                rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert(result.failureStage == IdfHttpsFailureStage::socket);
         assert(!rejected.open_latch.active());
         assert_failure_message(result.message, "HTTPS modem socket open failed");
     }
@@ -885,6 +897,7 @@ void check_remote_close_transcripts()
         assert(!result.ok && rejected.state_queries == 2 && rejected.open_commands == 1 &&
                rejected.send_commands == 0 && rejected.read_commands == 0 &&
                rejected.close_commands == 1 && rejected.close_was_cleanup);
+        assert(result.failureStage == IdfHttpsFailureStage::registration);
         assert(rejected.encoding_send == 0 && rejected.encoding_receive == 0 &&
                rejected.autofree == 0);
         assert_failure_message(result.message, "HTTPS modem connected-state poll failed");
@@ -990,6 +1003,15 @@ void check_remote_close_transcripts()
              FailureCase{RemoteCloseMode::http_non_success,
                          IdfModemHttpsRunResult::response_failed,
                          "HTTPS POST returned a non-2xx status"},
+             FailureCase{RemoteCloseMode::http_invalid_zero,
+                         IdfModemHttpsRunResult::response_failed,
+                         "HTTPS response status is invalid"},
+             FailureCase{RemoteCloseMode::http_invalid_high,
+                         IdfModemHttpsRunResult::response_failed,
+                         "HTTPS response status is invalid"},
+             FailureCase{RemoteCloseMode::http_invalid_max,
+                         IdfModemHttpsRunResult::response_failed,
+                         "HTTPS response status is invalid"},
          }) {
         RemoteCloseTranscript rejected{failure.mode};
         result = {};
@@ -999,6 +1021,22 @@ void check_remote_close_transcripts()
                                           failure.mode == RemoteCloseMode::runtime_config_failure
                                       ? 0U
                                       : 1U));
+        const IdfHttpsFailureStage expected_stage =
+            failure.mode == RemoteCloseMode::pdp_failure
+                ? IdfHttpsFailureStage::pdp
+                : failure.mode == RemoteCloseMode::runtime_config_failure
+                    ? IdfHttpsFailureStage::modem
+                    : failure.mode == RemoteCloseMode::tls_setup_failure ||
+                            failure.mode == RemoteCloseMode::tls_handshake_failure
+                        ? IdfHttpsFailureStage::tls
+                        : failure.mode == RemoteCloseMode::request_write_failure
+                            ? IdfHttpsFailureStage::request
+                            : failure.mode == RemoteCloseMode::http_invalid_zero ||
+                                    failure.mode == RemoteCloseMode::http_invalid_high ||
+                                    failure.mode == RemoteCloseMode::http_invalid_max
+                                ? IdfHttpsFailureStage::response
+                                : IdfHttpsFailureStage::http;
+        assert(result.failureStage == expected_stage);
         assert_failure_message(result.message, failure.message);
     }
 
@@ -1088,6 +1126,7 @@ void check_remote_close_transcripts()
             assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::none);
         }
         assert(result.cleanupRequiresReset == (failure.failure == CleanupFailure::socket_close));
+        assert(result.failureStage == IdfHttpsFailureStage::cleanup);
         assert(cleanup_failed.close_commands == 1 && cleanup_failed.close_was_cleanup);
         assert(std::count(cleanup_failed.cleanup_commands.begin(),
                           cleanup_failed.cleanup_commands.end(), "AT+MIPCLOSE=0") == 1);
@@ -1135,6 +1174,7 @@ void check_remote_close_transcripts()
     assert(!result.ok && result.httpStatus == -1 && result.responseBytes == 0 &&
            result.expectedResponseBytes == 0);
     assert_failure_message(result.message, "HTTPS request write failed");
+    assert(result.failureStage == IdfHttpsFailureStage::request);
     assert_cleanup_message(result, "HTTPS cleanup socket close failed");
     assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure);
     assert(result.cleanupRequiresReset);
@@ -1175,12 +1215,47 @@ void check_remote_close_transcripts()
     assert(!response_success.open_latch.active());
 }
 
+void check_invalid_request_stages()
+{
+    IdfModemHttpsPostRequest request;
+    request.url = "https://fixture.example/notify";
+    request.body = "{}";
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    request.rootCertificateSha256.fill(0xab);
+    IdfModemHttpsCallbacks callbacks;
+    IdfModemHttpsPostResult result;
+
+    request.url = "http://fixture.example/notify";
+    assert(idf_modem_https_run_post(request, callbacks, result) ==
+           IdfModemHttpsRunResult::invalid_request);
+    assert(result.failureStage == IdfHttpsFailureStage::target);
+
+    request.url = "https://fixture.example/notify";
+    request.body.clear();
+    assert(idf_modem_https_run_post(request, callbacks, result) ==
+           IdfModemHttpsRunResult::invalid_request);
+    assert(result.failureStage == IdfHttpsFailureStage::request);
+
+    request.body = "{}";
+    request.rootCertificateDer.clear();
+    assert(idf_modem_https_run_post(request, callbacks, result) ==
+           IdfModemHttpsRunResult::invalid_request);
+    assert(result.failureStage == IdfHttpsFailureStage::ca);
+
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    request.rootCertificateSha256.fill(0xab);
+    assert(idf_modem_https_run_post(request, callbacks, result) ==
+           IdfModemHttpsRunResult::invalid_request);
+    assert(result.failureStage == IdfHttpsFailureStage::modem);
+}
+
 }  // namespace
 
 int main()
 {
     check_initial_state_transcripts();
     check_remote_close_transcripts();
+    check_invalid_request_stages();
     const uint8_t pdp_cid = 1;
     const std::string open_command = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",80,30,2";
     const std::string state_command = "AT+MIPSTATE=0";

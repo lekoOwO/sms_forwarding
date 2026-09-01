@@ -101,6 +101,31 @@ struct OwnerCommandSlot {
 
 static void reset_owner_slot(OwnerCommandSlot& slot);
 
+static bool https_status_valid(int status)
+{
+    return status >= 100 && status <= 599;
+}
+
+static bool https_certificate_material_invalid(const IdfModemHttpsPostRequest& request)
+{
+    return request.rootCertificateDer.empty() ||
+           request.rootCertificateDer.size() > IDF_MODEM_HTTPS_ROOT_DER_MAX ||
+           std::all_of(request.rootCertificateSha256.begin(), request.rootCertificateSha256.end(),
+                       [](uint8_t byte) { return byte == 0; });
+}
+
+static IdfHttpsFailureStage https_request_failure_stage(
+    const IdfModemHttpsPostRequest& request)
+{
+    if (https_certificate_material_invalid(request)) return IdfHttpsFailureStage::ca;
+    IdfModemHttpsTarget target;
+    std::string error;
+    if (!idf_modem_https_parse_url(request.url, target, error)) {
+        return IdfHttpsFailureStage::target;
+    }
+    return IdfHttpsFailureStage::request;
+}
+
 // session_mutex keeps exclusive eSIM multi-command sessions. Command slots never store caller pointers.
 static SemaphoreHandle_t s_session_mutex = nullptr;
 static SemaphoreHandle_t s_command_mutex = nullptr;
@@ -1203,15 +1228,26 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
                                       bool* other_line_present,
                                       uint8_t* msslcipher_telemetry)
 {
+    const auto mark_https_modem_failure = [&]() {
+        if (https_result && request.kind == OwnerCommandKind::https_post) {
+            https_result->ok = false;
+            https_result->failureStage = IdfHttpsFailureStage::modem;
+        }
+    };
     if (!s_started || !s_command_mutex || !s_command_queue || !s_priority_command_queue) {
+        mark_https_modem_failure();
         return ESP_ERR_INVALID_STATE;
     }
     if (!priority && !s_runtime_queue_ready.load(std::memory_order_acquire)) {
         set_query_busy_reason(query_busy_reason,
                               static_cast<uint8_t>(IdfModemUsbQueryBusyReason::gate_closed));
+        mark_https_modem_failure();
         return IDF_MODEM_ERR_BUSY;
     }
-    if (!owner_request_bounded(request)) return ESP_ERR_INVALID_SIZE;
+    if (!owner_request_bounded(request)) {
+        mark_https_modem_failure();
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     bool session_held = false;
     uint32_t wait_margin_ms = request.kind == OwnerCommandKind::pdu ? 7000UL : 1000UL;
@@ -1224,6 +1260,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     if (!priority) {
         if (!s_session_mutex ||
             xSemaphoreTakeRecursive(s_session_mutex, deadline.remaining_ticks()) != pdTRUE) {
+            mark_https_modem_failure();
             return ESP_ERR_TIMEOUT;
         }
         session_held = true;
@@ -1233,9 +1270,13 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
     TickType_t command_wait = std::min(remaining, timeout_ticks_ceil(100));
     if (remaining == 0 || xSemaphoreTake(s_command_mutex, command_wait) != pdTRUE) {
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
-        if (deadline.expired()) return ESP_ERR_TIMEOUT;
+        if (deadline.expired()) {
+            mark_https_modem_failure();
+            return ESP_ERR_TIMEOUT;
+        }
         set_query_busy_reason(query_busy_reason,
                               static_cast<uint8_t>(IdfModemUsbQueryBusyReason::mutex_timeout));
+        mark_https_modem_failure();
         return IDF_MODEM_ERR_BUSY;
     }
     int slot_index = -1;
@@ -1250,12 +1291,14 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
         set_query_busy_reason(query_busy_reason,
                               static_cast<uint8_t>(IdfModemUsbQueryBusyReason::slots_full));
+        mark_https_modem_failure();
         return IDF_MODEM_ERR_BUSY;
     }
 
     if (deadline.expired()) {
         xSemaphoreGive(s_command_mutex);
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+        mark_https_modem_failure();
         return ESP_ERR_TIMEOUT;
     }
 
@@ -1280,6 +1323,7 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
         set_query_busy_reason(query_busy_reason,
                               static_cast<uint8_t>(IdfModemUsbQueryBusyReason::queue_full));
+        mark_https_modem_failure();
         return IDF_MODEM_ERR_BUSY;
     }
     xSemaphoreGive(s_command_mutex);
@@ -1332,6 +1376,10 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         wake_owner_task();
     }
     if (session_held) xSemaphoreGiveRecursive(s_session_mutex);
+    if (https_result && request.kind == OwnerCommandKind::https_post &&
+        result != ESP_OK && https_result->failureStage == IdfHttpsFailureStage::none) {
+        mark_https_modem_failure();
+    }
     return result;
 }
 
@@ -2093,14 +2141,17 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
     const IdfModemStatus status = idf_modem_get_status();
     if (!status.atReady) {
         result.message = "Modem AT is not ready";
+        result.failureStage = IdfHttpsFailureStage::modem;
         return ESP_ERR_INVALID_STATE;
     }
     if (!idf_modem_https_model_allowed(status.model)) {
         result.message = "Cellular HTTPS requires an ML307A modem";
+        result.failureStage = IdfHttpsFailureStage::modem;
         return ESP_ERR_NOT_SUPPORTED;
     }
     if (!idf_modem_data_activation_allowed(status.ceregStat)) {
         result.message = "Cellular HTTPS requires home registration";
+        result.failureStage = IdfHttpsFailureStage::registration;
         return ESP_ERR_INVALID_STATE;
     }
     OwnerHttpsCallbackContext context{deadline, {}};
@@ -2109,6 +2160,13 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
     const IdfModemHttpsRunResult run_result =
         idf_modem_https_run_post(request, callbacks, result);
     context.open_latch.reset();
+    if (run_result == IdfModemHttpsRunResult::ok && !https_status_valid(result.httpStatus)) {
+        result.ok = false;
+        result.failureStage = IdfHttpsFailureStage::response;
+        result.failureReason = IdfModemHttpsDiagnosticReason::response_invalid;
+        result.message = "HTTPS response status is invalid";
+        return ESP_FAIL;
+    }
     switch (run_result) {
         case IdfModemHttpsRunResult::ok:
             return ESP_OK;
@@ -2131,6 +2189,7 @@ esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
     std::string error;
     if (!idf_modem_https_validate_request(request, error)) {
         result.message = error;
+        result.failureStage = https_request_failure_stage(request);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -2148,6 +2207,9 @@ esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
         result.message = "Modem HTTPS POST timed out";
     }
     else if (err == ESP_ERR_INVALID_STATE && result.message.empty()) result.message = "Modem is not started";
+    if (err != ESP_OK && result.failureStage == IdfHttpsFailureStage::none) {
+        result.failureStage = IdfHttpsFailureStage::modem;
+    }
     return err;
 }
 

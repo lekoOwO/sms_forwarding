@@ -42,6 +42,45 @@ enum class IdfModemHttpsDiagnosticReason : uint8_t {
     unknown = 255,
 };
 
+// A bounded, transport-agnostic stage for safe terminal diagnostics. Keep this
+// separate from the modem diagnostic reason: reasons are implementation detail
+// while the stage is part of the push-test status contract.
+enum class IdfHttpsFailureStage : uint8_t {
+    none = 0,
+    preflight,
+    target,
+    ca,
+    modem,
+    registration,
+    pdp,
+    socket,
+    tls,
+    request,
+    response,
+    http,
+    cleanup,
+};
+
+constexpr std::string_view idf_https_failure_stage_name(IdfHttpsFailureStage stage)
+{
+    switch (stage) {
+        case IdfHttpsFailureStage::none: return "none";
+        case IdfHttpsFailureStage::preflight: return "preflight";
+        case IdfHttpsFailureStage::target: return "target";
+        case IdfHttpsFailureStage::ca: return "ca";
+        case IdfHttpsFailureStage::modem: return "modem";
+        case IdfHttpsFailureStage::registration: return "registration";
+        case IdfHttpsFailureStage::pdp: return "pdp";
+        case IdfHttpsFailureStage::socket: return "socket";
+        case IdfHttpsFailureStage::tls: return "tls";
+        case IdfHttpsFailureStage::request: return "request";
+        case IdfHttpsFailureStage::response: return "response";
+        case IdfHttpsFailureStage::http: return "http";
+        case IdfHttpsFailureStage::cleanup: return "cleanup";
+    }
+    return {};
+}
+
 constexpr std::string_view idf_modem_https_diagnostic_reason_name(
     IdfModemHttpsDiagnosticReason reason)
 {
@@ -86,6 +125,7 @@ struct IdfModemHttpsPostResult {
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
     bool cleanupRequiresReset = false;
+    IdfHttpsFailureStage failureStage = IdfHttpsFailureStage::none;
 };
 
 struct IdfModemHttpsTarget {

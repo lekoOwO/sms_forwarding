@@ -47,6 +47,11 @@ std::string url_encode(const std::string& value)
     return out;
 }
 
+bool http_status_valid(int status)
+{
+    return status >= 100 && status <= 599;
+}
+
 }  // namespace
 
 bool idf_push_build_gotify_request(const IdfPushChannel& channel,
@@ -72,12 +77,36 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
 {
     result = IdfPushTransportResult();
     if (network == IdfPushNetworkDecision::Wifi) {
-        if (!wifi_request) return false;
+        result.transportPath = IdfPushTransportPath::Wifi;
+        if (!wifi_request) {
+            result.failureStage = IdfHttpsFailureStage::preflight;
+            return false;
+        }
+        result.dispatchAttempted = true;
         result.error = wifi_request(request, result.httpStatus);
         result.ok = result.error == 0 && result.httpStatus >= 200 && result.httpStatus < 300;
+        if (result.ok) {
+            result.failureStage = IdfHttpsFailureStage::none;
+        } else if (http_status_valid(result.httpStatus) &&
+                   (result.httpStatus < 200 || result.httpStatus >= 300)) {
+            result.failureStage = IdfHttpsFailureStage::http;
+        } else {
+            result.failureStage = result.error == 0 ? IdfHttpsFailureStage::response
+                                                    : IdfHttpsFailureStage::modem;
+        }
         return result.ok;
     }
-    if (network != IdfPushNetworkDecision::Cellular || request.method != "POST" || !cellular_post) {
+    if (network != IdfPushNetworkDecision::Cellular) {
+        result.failureStage = IdfHttpsFailureStage::preflight;
+        return false;
+    }
+    result.transportPath = IdfPushTransportPath::Cellular;
+    if (request.method != "POST") {
+        result.failureStage = IdfHttpsFailureStage::request;
+        return false;
+    }
+    if (!cellular_post) {
+        result.failureStage = IdfHttpsFailureStage::preflight;
         return false;
     }
 
@@ -93,9 +122,11 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     cellular_request.rootCertificateSha256 = request.rootCertificateSha256;
     if (cellular_request.rootCertificateDer.empty()) {
         result.message = "Cellular CA is not provisioned";
+        result.failureStage = IdfHttpsFailureStage::ca;
         return false;
     }
     IdfModemHttpsPostResult cellular_result;
+    result.dispatchAttempted = true;
     result.error = cellular_post(cellular_request, cellular_result);
     result.httpStatus = cellular_result.httpStatus;
     result.mhttpError = cellular_result.mhttpError;
@@ -107,10 +138,20 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     result.failureReason = cellular_result.failureReason;
     result.cleanupReason = cellular_result.cleanupReason;
     result.cleanupRequiresReset = cellular_result.cleanupRequiresReset;
+    result.failureStage = cellular_result.failureStage;
     if (result.message == "HTTPS modem request failed" && result.mhttpError >= 0) {
         result.message += " (code " + std::to_string(result.mhttpError) + ")";
     }
     result.ok = result.error == 0 && cellular_result.ok &&
                 result.httpStatus >= 200 && result.httpStatus < 300;
+    if (result.ok) {
+        result.failureStage = IdfHttpsFailureStage::none;
+    } else if (http_status_valid(result.httpStatus) &&
+               (result.httpStatus < 200 || result.httpStatus >= 300)) {
+        result.failureStage = IdfHttpsFailureStage::http;
+    } else if (result.failureStage == IdfHttpsFailureStage::none) {
+        result.failureStage = result.error == 0 ? IdfHttpsFailureStage::response
+                                                : IdfHttpsFailureStage::modem;
+    }
     return result.ok;
 }

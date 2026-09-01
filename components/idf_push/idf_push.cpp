@@ -1095,6 +1095,13 @@ static void replace_all(std::string& value, const char* from, const char* to)
     }
 }
 
+static IdfPushTransportPath transport_path_for_network(IdfPushNetworkDecision network)
+{
+    if (network == IdfPushNetworkDecision::Wifi) return IdfPushTransportPath::Wifi;
+    if (network == IdfPushNetworkDecision::Cellular) return IdfPushTransportPath::Cellular;
+    return IdfPushTransportPath::None;
+}
+
 static bool send_to_channel(const IdfPushChannel& input_channel, const char* sender_raw,
                             const char* text_raw, const char* timestamp_raw,
                             const IdfPushNotifyView& cfg, const IdfWifiStatus& wifi,
@@ -1104,27 +1111,39 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
                             std::string* cleanup_message = nullptr,
                             IdfModemHttpsDiagnosticReason* failure_reason = nullptr,
                             IdfModemHttpsDiagnosticReason* cleanup_reason = nullptr,
-                            bool* cleanup_requires_reset = nullptr)
+                            bool* cleanup_requires_reset = nullptr,
+                            IdfPushTransportResult* transport_result = nullptr)
 {
+    IdfPushTransportResult transport;
+    transport.transportPath = transport_path_for_network(network);
     if (permanent_failure) *permanent_failure = false;
     if (cleanup_message) cleanup_message->clear();
     if (failure_reason) *failure_reason = IdfModemHttpsDiagnosticReason::none;
     if (cleanup_reason) *cleanup_reason = IdfModemHttpsDiagnosticReason::none;
     if (cleanup_requires_reset) *cleanup_requires_reset = false;
-    if (!channel_valid(input_channel)) return false;
+    auto fail = [&](IdfHttpsFailureStage stage) {
+        transport.failureStage = stage;
+        if (transport_result) *transport_result = transport;
+        return false;
+    };
+    if (!channel_valid(input_channel)) return fail(IdfHttpsFailureStage::target);
 
     IdfPushCellularTarget cellular_target;
     std::vector<uint8_t> cellular_root_der;
     IdfConfigCaStatus cellular_ca_status;
     if (network == IdfPushNetworkDecision::Cellular) {
-        if (!idf_push_prepare_cellular_target(input_channel, cellular_target) ||
-            idf_config_ca_lookup(cellular_target.canonicalOrigin, cellular_root_der,
-                                 &cellular_ca_status) != ESP_OK ||
+        if (!idf_push_prepare_cellular_target(input_channel, cellular_target)) {
+            if (failure_message) *failure_message = "Cellular target is invalid";
+            if (permanent_failure) *permanent_failure = true;
+            return fail(IdfHttpsFailureStage::target);
+        }
+        if (idf_config_ca_lookup(cellular_target.canonicalOrigin, cellular_root_der,
+                                &cellular_ca_status) != ESP_OK ||
             !cellular_ca_status.configured ||
             !sha256_matches(cellular_root_der, cellular_ca_status.sha256)) {
             if (failure_message) *failure_message = "Cellular CA is not provisioned";
             if (permanent_failure) *permanent_failure = true;
-            return false;
+            return fail(IdfHttpsFailureStage::ca);
         }
     }
     IdfPushChannel effective_channel = input_channel;
@@ -1147,13 +1166,13 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             !idf_push_render_template("{message}", values, MAX_RENDERED_BODY_BYTES, false,
                                       notification_body)) {
             idf_log_line("Push title or content is invalid UTF-8, has an invalid title newline, or exceeds the length limit");
-            return false;
+            return fail(IdfHttpsFailureStage::request);
         }
     } else if (!idf_push_render_sms_notification(cfg.notificationLocale, channel.titleTemplate,
                                                   channel.bodyTemplate, values, title,
                                                   notification_body)) {
         idf_log_line("Rendered push template is invalid UTF-8, has an invalid title newline, or exceeds the length limit");
-        return false;
+        return fail(IdfHttpsFailureStage::request);
     }
 
     const std::string title_json = json_escape(title);
@@ -1189,11 +1208,11 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
         case PUSH_TYPE_DINGTALK: {
             url = channel.url;
             if (!channel.key1.empty()) {
-                if (time(nullptr) < 1700000000) return false;
+                if (time(nullptr) < 1700000000) return fail(IdfHttpsFailureStage::request);
                 int64_t ts = utc_millis();
                 std::string sign_data = std::to_string(ts) + "\n" + channel.key1;
                 std::string sign = url_encode(hmac_sha256_base64(sign_data, channel.key1));
-                if (sign.empty()) return false;
+                if (sign.empty()) return fail(IdfHttpsFailureStage::request);
                 url += (url.find('?') == std::string::npos ? "?" : "&");
                 url += "timestamp=" + std::to_string(ts) + "&sign=" + sign;
             }
@@ -1233,7 +1252,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             if (!idf_push_render_template(channel.customBody, escaped,
                                           MAX_RENDERED_CUSTOM_BODY_BYTES, false, body)) {
                 idf_log_line("Rendered custom push is invalid UTF-8 or exceeds the length limit");
-                return false;
+                return fail(IdfHttpsFailureStage::request);
             }
             break;
         }
@@ -1241,10 +1260,10 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             url = channel.url;
             body = "{";
             if (!channel.key1.empty()) {
-                if (time(nullptr) < 1700000000) return false;
+                if (time(nullptr) < 1700000000) return fail(IdfHttpsFailureStage::request);
                 int64_t ts = time(nullptr);
                 std::string sign = hmac_sha256_base64("", std::to_string(ts) + "\n" + channel.key1);
-                if (sign.empty()) return false;
+                if (sign.empty()) return fail(IdfHttpsFailureStage::request);
                 body += "\"timestamp\":\"" + std::to_string(ts) + "\",\"sign\":\"" + sign + "\",";
             }
             body += "\"msg_type\":\"text\",\"content\":{\"text\":\"" + title_json +
@@ -1254,7 +1273,9 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
         case PUSH_TYPE_GOTIFY:
             {
                 IdfPushHttpRequest gotify;
-                if (!idf_push_build_gotify_request(channel, title, notification_body, gotify)) return false;
+                if (!idf_push_build_gotify_request(channel, title, notification_body, gotify)) {
+                    return fail(IdfHttpsFailureStage::request);
+                }
                 url = gotify.url;
                 body = gotify.body;
             }
@@ -1271,7 +1292,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             const std::string content = title + "\n" + notification_body;
             if (idf_push_utf8_codepoint_count(content, 2000) > 2000) {
                 idf_log_line("Discord push content exceeds 2,000 characters");
-                return false;
+                return fail(IdfHttpsFailureStage::request);
             }
             body = "{\"content\":\"" + json_escape(content) +
                    "\",\"allowed_mentions\":{\"parse\":[]}}";
@@ -1286,7 +1307,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             body = notification_body;
             break;
         default:
-            return false;
+            return fail(IdfHttpsFailureStage::target);
     }
 
     std::string name = channel.name.empty() ? ("Channel " + std::to_string(channel.type)) : channel.name;
@@ -1304,7 +1325,6 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
     const IdfConfigStatusView modem_config = network == IdfPushNetworkDecision::Cellular
                                                   ? idf_config_get_status_view()
                                                   : IdfConfigStatusView();
-    IdfPushTransportResult transport;
     const bool dispatched = idf_push_dispatch_request(request, network, modem_config,
                                                        push_wifi_request, push_cellular_post,
                                                        transport);
@@ -1318,6 +1338,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
     if (failure_reason) *failure_reason = transport.failureReason;
     if (cleanup_reason) *cleanup_reason = transport.cleanupReason;
     if (cleanup_requires_reset) *cleanup_requires_reset = transport.cleanupRequiresReset;
+    if (transport_result) *transport_result = transport;
     // Combine the send and response lines. Keep the channel name and result in one concise log entry.
     if (err == ESP_OK) idf_logf("%s push %s (HTTP %d)", name.c_str(), ok ? "succeeded" : "failed", code);
     else idf_logf("%s push failed: %s", name.c_str(), esp_err_to_name(err));
@@ -1843,6 +1864,10 @@ static bool fail_pending_tests(const char* message)
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
         job.resetNeeded = false;
+        job.transportPath = IdfPushTransportPath::None;
+        job.dispatchAttempted = false;
+        job.failureStage = IdfHttpsFailureStage::preflight;
+        job.httpStatus = -1;
     }
     xSemaphoreGive(s_mutex);
     return failed;
@@ -1864,6 +1889,10 @@ static bool expire_test_jobs_locked(int64_t now)
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
         job.resetNeeded = false;
+        job.transportPath = IdfPushTransportPath::None;
+        job.dispatchAttempted = false;
+        job.failureStage = IdfHttpsFailureStage::preflight;
+        job.httpStatus = -1;
     }
     return expired;
 }
@@ -1907,6 +1936,10 @@ static bool process_test_one()
         s_test_jobs[i].failureReason = IdfModemHttpsDiagnosticReason::none;
         s_test_jobs[i].cleanupReason = IdfModemHttpsDiagnosticReason::none;
         s_test_jobs[i].resetNeeded = false;
+        s_test_jobs[i].transportPath = transport_path_for_network(network);
+        s_test_jobs[i].dispatchAttempted = false;
+        s_test_jobs[i].failureStage = IdfHttpsFailureStage::none;
+        s_test_jobs[i].httpStatus = -1;
         channel = cfg.pushChannels[i];
         break;
     }
@@ -1919,24 +1952,31 @@ static bool process_test_one()
     IdfModemHttpsDiagnosticReason failure_reason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanup_reason = IdfModemHttpsDiagnosticReason::none;
     bool cleanup_requires_reset = false;
+    IdfPushTransportResult transport;
+    transport.transportPath = transport_path_for_network(network);
     if (!channel_valid(channel)) {
         result = "Channel configuration changed or is disabled; test canceled";
+        transport.failureStage = IdfHttpsFailureStage::target;
     } else if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
         result = "GET-only provider is not supported over cellular; test canceled";
+        transport.failureStage = IdfHttpsFailureStage::request;
     } else {
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
         ok = send_to_channel(channel, "Test", "This is a test push from SMS Forwarder",
                              ts.empty() ? "Time is not synchronized" : ts.c_str(), cfg, wifi,
                              network, false, &result, nullptr, &cleanup_result,
-                             &failure_reason, &cleanup_reason, &cleanup_requires_reset);
+                             &failure_reason, &cleanup_reason, &cleanup_requires_reset,
+                             &transport);
         s_busy.store(false, std::memory_order_relaxed);
     }
 
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         TestJob& job = s_test_jobs[picked];
         idf_push_complete_test_job(job, ok, std::move(result), std::move(cleanup_result),
-                                   failure_reason, cleanup_reason, cleanup_requires_reset);
+                                   failure_reason, cleanup_reason, cleanup_requires_reset,
+                                   transport.transportPath, transport.dispatchAttempted,
+                                   transport.failureStage, transport.httpStatus);
         xSemaphoreGive(s_mutex);
     }
     return true;
@@ -2217,6 +2257,10 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
         job.resetNeeded = false;
+        job.transportPath = IdfPushTransportPath::None;
+        job.dispatchAttempted = false;
+        job.failureStage = IdfHttpsFailureStage::none;
+        job.httpStatus = -1;
         message = job.message;
     }
     xSemaphoreGive(s_mutex);

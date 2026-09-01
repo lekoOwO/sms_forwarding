@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupReason, PushTestDiagnosticReason, PushTestStatus } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -46,6 +46,32 @@ const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
 const pushTestCleanupReasons: readonly PushTestCleanupReason[] = [
 	"command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"
 ];
+const pushTestCleanupMessages: readonly PushTestCleanupMessage[] = [
+	"HTTPS cleanup socket close failed",
+	"HTTPS cleanup SSL config restore failed",
+	"HTTPS cleanup autofree config restore failed",
+	"HTTPS cleanup encoding config restore failed",
+	"HTTPS cleanup PDP deactivate failed",
+	"HTTPS cleanup PDP profile restore failed"
+];
+const pushTestTransportPaths: readonly PushTestTransportPath[] = ["none", "wifi", "cellular"];
+const pushTestFailureStages: readonly PushTestFailureStage[] = [
+	"none", "preflight", "target", "ca", "modem", "registration", "pdp",
+	"socket", "tls", "request", "response", "http", "cleanup"
+];
+const pushTestDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)[] = [
+	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
+	"transportPath", "dispatchAttempted", "failureStage", "httpStatus"
+];
+const pushTestStatusKeys = new Set([
+	"queued", "running", "done", "success", "message", ...pushTestDiagnosticKeys
+]);
+const pushTestTransportDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)[] = [
+	"transportPath", "dispatchAttempted", "failureStage"
+];
+const pushTestTransportStatusKeys: readonly (keyof PushTestDiagnosticFields)[] = [
+	...pushTestTransportDiagnosticKeys, "httpStatus"
+];
 
 function demoSnapshot(): DeviceSnapshot {
 	return {
@@ -72,16 +98,47 @@ function forwardRulesValid(rules: string) {
 }
 
 function isPushTestStatus(value: unknown): value is PushTestStatus {
-	if (!value || typeof value !== "object") return false;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const status = value as Record<string, unknown>;
-	if (!["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") ||
-		typeof status.message !== "string" ||
-		("cleanupMessage" in status && typeof status.cleanupMessage !== "string")) return false;
-	const reasonValid = (key: string, allowed: readonly string[]) => !(key in status) ||
-		(typeof status[key] === "string" && allowed.includes(status[key] as string));
-	return reasonValid("failureReason", pushTestDiagnosticReasons) &&
-		reasonValid("cleanupReason", pushTestCleanupReasons) &&
-		(!("resetNeeded" in status) || typeof status.resetNeeded === "boolean");
+	if (Object.keys(status).some((key) => !pushTestStatusKeys.has(key)) ||
+		!["queued", "running", "done", "success"].every((key) => typeof status[key] === "boolean") ||
+		typeof status.message !== "string") return false;
+	const lifecycle = (!status.queued && !status.running && !status.done && !status.success) ||
+		(status.queued && !status.running && !status.done && !status.success) ||
+		(!status.queued && status.running && !status.done && !status.success) ||
+		(!status.queued && !status.running && status.done && status.success) ||
+		(!status.queued && !status.running && status.done && !status.success);
+	if (!lifecycle) return false;
+	const has = (key: keyof PushTestDiagnosticFields) => Object.hasOwn(status, key);
+	if (!status.done && pushTestDiagnosticKeys.some(has)) return false;
+	if (has("cleanupMessage") && (typeof status.cleanupMessage !== "string" ||
+		!pushTestCleanupMessages.includes(status.cleanupMessage as PushTestCleanupMessage))) return false;
+	if (has("failureReason") && (typeof status.failureReason !== "string" ||
+		!pushTestDiagnosticReasons.includes(status.failureReason as PushTestDiagnosticReason))) return false;
+	if (has("cleanupReason") && (typeof status.cleanupReason !== "string" ||
+		!pushTestCleanupReasons.includes(status.cleanupReason as PushTestCleanupReason))) return false;
+	if (has("resetNeeded") && typeof status.resetNeeded !== "boolean") return false;
+	if (has("transportPath") && (typeof status.transportPath !== "string" ||
+		!pushTestTransportPaths.includes(status.transportPath as PushTestTransportPath))) return false;
+	if (has("dispatchAttempted") && typeof status.dispatchAttempted !== "boolean") return false;
+	if (has("failureStage") && (typeof status.failureStage !== "string" ||
+		!pushTestFailureStages.includes(status.failureStage as PushTestFailureStage))) return false;
+	const hasTransportDetails = pushTestTransportStatusKeys.some(has);
+	if (hasTransportDetails && !pushTestTransportDiagnosticKeys.every(has)) return false;
+	if (has("httpStatus") && (typeof status.httpStatus !== "number" || !Number.isInteger(status.httpStatus) ||
+		status.httpStatus < 100 || status.httpStatus > 599 || !status.dispatchAttempted)) return false;
+	if (hasTransportDetails) {
+		if (status.success) {
+			if (!(status.transportPath === "wifi" || status.transportPath === "cellular") ||
+				status.dispatchAttempted !== true || !has("httpStatus") ||
+				(status.httpStatus as number) < 200 || (status.httpStatus as number) > 299 ||
+				status.failureStage !== "none") return false;
+		} else {
+			if (status.transportPath === "none" && status.dispatchAttempted) return false;
+			if (status.failureStage === "none") return false;
+		}
+	}
+	return true;
 }
 
 function demoResponse<T>(path: string, init?: RequestInit): T {

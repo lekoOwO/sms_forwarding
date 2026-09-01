@@ -145,11 +145,30 @@ size_t idf_push_utf8_codepoint_count(const std::string& value, size_t limit)
     return count;
 }
 
+static const char* transport_path_name(IdfPushTransportPath path)
+{
+    switch (path) {
+        case IdfPushTransportPath::None: return "none";
+        case IdfPushTransportPath::Wifi: return "wifi";
+        case IdfPushTransportPath::Cellular: return "cellular";
+    }
+    return nullptr;
+}
+
+static bool http_status_valid(int status)
+{
+    return status >= 100 && status <= 599;
+}
+
 void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                 std::string message, std::string cleanup_message,
                                 IdfModemHttpsDiagnosticReason failure_reason,
                                 IdfModemHttpsDiagnosticReason cleanup_reason,
-                                bool reset_needed)
+                                bool reset_needed,
+                                IdfPushTransportPath transport_path,
+                                bool dispatch_attempted,
+                                IdfHttpsFailureStage failure_stage,
+                                int http_status)
 {
     if (success) message = "Test push sent";
     else if (message.empty()) message = "Test push failed; see the log";
@@ -166,6 +185,10 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
     job.failureReason = failure_reason;
     job.cleanupReason = cleanup_reason;
     job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;
+    job.transportPath = transport_path;
+    job.dispatchAttempted = dispatch_attempted;
+    job.failureStage = failure_stage;
+    job.httpStatus = http_status;
 }
 
 static void append_json_string(std::string& out, const char* key, const std::string& value)
@@ -187,6 +210,28 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
     out += "\"done\":"; out += job.done ? "true" : "false"; out += ",";
     out += "\"success\":"; out += job.success ? "true" : "false"; out += ",";
     append_json_string(out, "message", message);
+    if (include_cleanup && job.done) {
+        const char* path = transport_path_name(job.transportPath);
+        const std::string_view stage = idf_https_failure_stage_name(job.failureStage);
+        const bool has_diagnostic = path != nullptr &&
+                                    (job.transportPath != IdfPushTransportPath::None ||
+                                     job.dispatchAttempted ||
+                                     job.failureStage != IdfHttpsFailureStage::none ||
+                                     http_status_valid(job.httpStatus));
+        if (has_diagnostic && !stage.empty()) {
+            out += ",\"transportPath\":\"";
+            out += path;
+            out += "\",\"dispatchAttempted\":";
+            out += job.dispatchAttempted ? "true" : "false";
+            out += ",\"failureStage\":\"";
+            out += stage;
+            out += "\"";
+            if (http_status_valid(job.httpStatus)) {
+                out += ",\"httpStatus\":";
+                out += std::to_string(job.httpStatus);
+            }
+        }
+    }
     if (include_cleanup && job.done && !job.cleanupMessage.empty()) {
         out += ",";
         append_json_string(out, "cleanupMessage", job.cleanupMessage);

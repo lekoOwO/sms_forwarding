@@ -130,6 +130,51 @@ int main() {
            "{\"queued\":false,\"running\":false,\"done\":true,\"success\":true,"
            "\"message\":\"Test push sent\"}");
 
+    IdfPushTestJobState wifi_success;
+    idf_push_complete_test_job(wifi_success, true, "", "",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::none, false,
+                               IdfPushTransportPath::Wifi, true,
+                               IdfHttpsFailureStage::none, 204);
+    assert(idf_push_serialize_test_status(wifi_success, false) ==
+           "{\"queued\":false,\"running\":false,\"done\":true,\"success\":true,"
+           "\"message\":\"Test push sent\"}");
+    assert(idf_push_serialize_test_status(wifi_success, true) ==
+           "{\"queued\":false,\"running\":false,\"done\":true,\"success\":true,"
+           "\"message\":\"Test push sent\",\"transportPath\":\"wifi\","
+           "\"dispatchAttempted\":true,\"failureStage\":\"none\",\"httpStatus\":204}");
+
+    IdfPushTestJobState cellular_http_failure;
+    idf_push_complete_test_job(cellular_http_failure, false, "HTTP failed", "",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::none, false,
+                               IdfPushTransportPath::Cellular, true,
+                               IdfHttpsFailureStage::http, 503);
+    const std::string cellular_json = idf_push_serialize_test_status(cellular_http_failure, true);
+    assert(cellular_json.find("\"transportPath\":\"cellular\"") != std::string::npos);
+    assert(cellular_json.find("\"dispatchAttempted\":true") != std::string::npos);
+    assert(cellular_json.find("\"failureStage\":\"http\"") != std::string::npos);
+    assert(cellular_json.find("\"httpStatus\":503") != std::string::npos);
+
+    IdfPushTestJobState invalid_status;
+    idf_push_complete_test_job(invalid_status, false, "request failed", "",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::none, false,
+                               IdfPushTransportPath::Cellular, true,
+                               IdfHttpsFailureStage::request, 600);
+    assert(idf_push_serialize_test_status(invalid_status, true).find("httpStatus") ==
+           std::string::npos);
+
+    IdfPushTestJobState active_with_stale_diagnostic;
+    active_with_stale_diagnostic.pending = true;
+    active_with_stale_diagnostic.message = "Test push queued";
+    active_with_stale_diagnostic.transportPath = IdfPushTransportPath::Cellular;
+    active_with_stale_diagnostic.dispatchAttempted = true;
+    active_with_stale_diagnostic.failureStage = IdfHttpsFailureStage::http;
+    active_with_stale_diagnostic.httpStatus = 503;
+    assert(idf_push_serialize_test_status(active_with_stale_diagnostic, true).find(
+               "transportPath") == std::string::npos);
+
     IdfPushTestJobState pending;
     pending.pending = true;
     pending.message = "Test push queued";
@@ -340,18 +385,17 @@ int main() {
     # The normal retrying push worker does not request or retain cleanup telemetry.
     assert "cleanup_result" not in push_worker
 
-    # Existing web clients accept extra status members because they validate only
-    # the five required fields and do not enforce an exact key set.
+    # Web clients accept the additive diagnostics only for valid terminal states.
     web_api = (ROOT / "web/src/lib/api.ts").read_text()
     validator = web_api.split("function isPushTestStatus", 1)[1].split("function demoResponse", 1)[0]
-    assert "Object.keys" not in validator
-    assert '"cleanupMessage" in status' in validator
+    assert "Object.keys(status)" in validator
+    assert "pushTestDiagnosticKeys" in validator
+    assert "pushTestTransportDiagnosticKeys" in validator
     assert "const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[]" in web_api
     assert "const pushTestCleanupReasons: readonly PushTestCleanupReason[]" in web_api
-    assert 'reasonValid("failureReason", pushTestDiagnosticReasons)' in validator
-    assert 'reasonValid("cleanupReason", pushTestCleanupReasons)' in validator
-    assert 'reasonValid("cleanupReason", pushTestDiagnosticReasons)' not in validator
-    assert "const pushTestCleanupReasons = pushTestDiagnosticReasons" not in validator
+    assert "pushTestFailureStages" in web_api
+    assert "pushTestTransportPaths" in web_api
+    assert "status.done" in validator
 
     startup = source.split("static bool process_startup_notification()", 1)[1].split(
         "static void push_task", 1

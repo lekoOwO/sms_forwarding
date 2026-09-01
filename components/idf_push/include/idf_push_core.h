@@ -26,6 +26,12 @@ enum class IdfPushNetworkDecision : uint8_t {
     Unsupported,
 };
 
+enum class IdfPushTransportPath : uint8_t {
+    None = 0,
+    Wifi,
+    Cellular,
+};
+
 struct IdfPushTestJobState {
     static constexpr size_t MAX_CLEANUP_MESSAGE = 96;
 
@@ -40,6 +46,10 @@ struct IdfPushTestJobState {
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
     bool resetNeeded = false;
+    IdfPushTransportPath transportPath = IdfPushTransportPath::None;
+    bool dispatchAttempted = false;
+    IdfHttpsFailureStage failureStage = IdfHttpsFailureStage::none;
+    int httpStatus = -1;
 };
 
 bool idf_push_utf8_valid(const std::string& value);
@@ -59,6 +69,10 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                     IdfModemHttpsDiagnosticReason::none,
                                 IdfModemHttpsDiagnosticReason cleanup_reason =
                                     IdfModemHttpsDiagnosticReason::none,
-                                bool reset_needed = false);
+                                bool reset_needed = false,
+                                IdfPushTransportPath transport_path = IdfPushTransportPath::None,
+                                bool dispatch_attempted = false,
+                                IdfHttpsFailureStage failure_stage = IdfHttpsFailureStage::none,
+                                int http_status = -1);
 std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
                                            bool include_cleanup);

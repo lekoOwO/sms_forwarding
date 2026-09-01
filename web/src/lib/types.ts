@@ -35,17 +35,59 @@ export type PushTestCleanupReason =
 	| "result_nonzero"
 	| "unknown";
 
-export type PushTestStatus = {
-	queued: boolean;
-	running: boolean;
-	done: boolean;
-	success: boolean;
-	message: string;
-	cleanupMessage?: string;
+export type PushTestCleanupMessage =
+	| "HTTPS cleanup socket close failed"
+	| "HTTPS cleanup SSL config restore failed"
+	| "HTTPS cleanup autofree config restore failed"
+	| "HTTPS cleanup encoding config restore failed"
+	| "HTTPS cleanup PDP deactivate failed"
+	| "HTTPS cleanup PDP profile restore failed";
+
+export type PushTestTransportPath = "none" | "wifi" | "cellular";
+
+export type PushTestFailureStage =
+	| "none"
+	| "preflight"
+	| "target"
+	| "ca"
+	| "modem"
+	| "registration"
+	| "pdp"
+	| "socket"
+	| "tls"
+	| "request"
+	| "response"
+	| "http"
+	| "cleanup";
+
+export type PushTestDiagnosticFields = {
+	cleanupMessage?: PushTestCleanupMessage;
 	failureReason?: PushTestDiagnosticReason;
 	cleanupReason?: PushTestCleanupReason;
 	resetNeeded?: boolean;
+	transportPath?: PushTestTransportPath;
+	dispatchAttempted?: boolean;
+	failureStage?: PushTestFailureStage;
+	httpStatus?: number;
 };
+
+type PushTestActive = {
+	queued: boolean;
+	running: boolean;
+	done: false;
+	success: false;
+	message: string;
+} & { [Key in keyof PushTestDiagnosticFields]?: never };
+
+type PushTestTerminal = {
+	queued: false;
+	running: false;
+	done: true;
+	success: boolean;
+	message: string;
+} & PushTestDiagnosticFields;
+
+export type PushTestStatus = PushTestActive | PushTestTerminal;
 
 export type PushCaStatus = { configured: boolean; sha256: string };
 

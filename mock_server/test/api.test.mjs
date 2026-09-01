@@ -50,9 +50,9 @@ async function completed(baseUrl, response) {
 	throw new Error("job timeout");
 }
 
-async function completedPushTest(baseUrl, channel) {
+async function completedPushTest(baseUrl, channel, detail = false) {
 	for (let attempt = 0; attempt < 100; attempt += 1) {
-		const status = await (await request(baseUrl, `/api/push/test?channel=${channel}`)).json();
+		const status = await (await request(baseUrl, `/api/push/test?channel=${channel}${detail ? "&detail=1" : ""}`)).json();
 		if (status.done) return status;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
@@ -420,6 +420,56 @@ test("push test request ordering matches firmware and POST accepts no body", asy
 		assert.equal(withBody.status, 400);
 		assert.match((await withBody.json()).message, /body is not allowed/i);
 	});
+});
+
+test("push test detail is strict, terminal-only, and additive", async () => {
+	await withServer(async (baseUrl) => {
+		for (const suffix of [
+			"&detail=0", "&detail=2", "&detail=", "&detail=1&detail=1",
+			"&&detail=1", "&detail=1&", "&unknown=1"
+		]) {
+			const response = await request(baseUrl, `/api/push/test?channel=0${suffix}`);
+			assert.equal(response.status, 400);
+			assert.deepEqual(Object.keys(await response.json()).sort(),
+				["done", "message", "queued", "running", "success"]);
+		}
+
+		const legacy = await (await request(baseUrl, "/api/push/test?channel=0")).json();
+		assert.deepEqual(Object.keys(legacy).sort(),
+			["done", "message", "queued", "running", "success"]);
+		const detail = await (await request(baseUrl, "/api/push/test?channel=0&detail=1")).json();
+		assert.deepEqual(Object.keys(detail).sort(),
+			["done", "message", "queued", "running", "success"]);
+
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
+			push0en: "on", push0type: 1, push0name: "Detailed",
+			push0url: "https://push.example/message"
+		}))).success, true);
+		const legacyPost = await request(baseUrl, "/api/push/test?channel=0", { method: "POST" });
+		assert.equal(legacyPost.status, 202);
+		const legacyPostBody = await legacyPost.json();
+		assert.deepEqual(Object.keys(legacyPostBody).sort(),
+			["done", "message", "queued", "running", "success"]);
+		const queued = await request(baseUrl, "/api/push/test?channel=0&detail=1", { method: "POST" });
+		assert.equal(queued.status, 202);
+		const queuedBody = await queued.json();
+		assert.deepEqual(Object.keys(queuedBody).sort(), [
+			"dispatchAttempted", "done", "failureStage", "httpStatus", "message",
+			"queued", "running", "success", "transportPath"
+		]);
+		assert.deepEqual([
+			queuedBody.transportPath, queuedBody.dispatchAttempted,
+			queuedBody.failureStage, queuedBody.httpStatus
+		], ["wifi", true, "none", 204]);
+		const terminal = await completedPushTest(baseUrl, 0, true);
+		assert.deepEqual(Object.keys(terminal).sort(), [
+			"dispatchAttempted", "done", "failureStage", "httpStatus", "message",
+			"queued", "running", "success", "transportPath"
+		]);
+		assert.deepEqual([
+			terminal.transportPath, terminal.dispatchAttempted, terminal.failureStage, terminal.httpStatus
+		], ["wifi", true, "none", 204]);
+	}, { jobDelayMs: 0 });
 });
 
 test("device restart is authenticated, POST-only, CSRF-protected, empty-body, and single-admission", async () => {

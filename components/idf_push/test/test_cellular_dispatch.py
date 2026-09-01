@@ -23,12 +23,17 @@ static IdfModemHttpsPostRequest captured_request;
 static int modem_calls = 0;
 static int modem_status = 204;
 static int modem_error = -1;
+static int modem_return = 0;
 static bool modem_ok = true;
 static std::string modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
 static std::string modem_cleanup_message;
 static IdfModemHttpsDiagnosticReason modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
 static IdfModemHttpsDiagnosticReason modem_cleanup_reason = IdfModemHttpsDiagnosticReason::none;
 static bool modem_cleanup_requires_reset = false;
+static IdfHttpsFailureStage modem_failure_stage = IdfHttpsFailureStage::none;
+static int wifi_calls = 0;
+static int wifi_status = 204;
+static int wifi_error = 0;
 
 template <typename T, typename = void>
 struct CleanupMessageAccessor {
@@ -54,7 +59,14 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     result.failureReason = modem_failure_reason;
     result.cleanupReason = modem_cleanup_reason;
     result.cleanupRequiresReset = modem_cleanup_requires_reset;
-    return 0;
+    result.failureStage = modem_failure_stage;
+    return modem_return;
+}
+
+static int fake_wifi_request(const IdfPushHttpRequest&, int& status_code) {
+    ++wifi_calls;
+    status_code = wifi_status;
+    return wifi_error;
 }
 
 int main() {
@@ -100,6 +112,9 @@ int main() {
     assert(captured_request.rootCertificateSha256 == request.rootCertificateSha256);
     assert(transport.httpStatus == 204);
     assert(transport.ok);
+    assert(transport.transportPath == IdfPushTransportPath::Cellular);
+    assert(transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::none);
     assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
     assert(transport.failureReason == IdfModemHttpsDiagnosticReason::none);
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::none);
@@ -113,7 +128,11 @@ int main() {
     assert(!transport.ok);
     assert(transport.mhttpError == 4);
     assert(transport.message == "HTTPS modem request failed (code 4)");
+    assert(transport.failureStage == IdfHttpsFailureStage::http);
+    assert(transport.dispatchAttempted);
     modem_error = -1;
+    modem_status = 204;
+    modem_ok = false;
     modem_message = "HTTPS TLS context 1 has no pre-provisioned certificate";
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
@@ -121,11 +140,14 @@ int main() {
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
     modem_message = "HTTPS modem connected-state poll failed";
     modem_failure_reason = IdfModemHttpsDiagnosticReason::response_invalid;
+    modem_failure_stage = IdfHttpsFailureStage::registration;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.message == "HTTPS modem connected-state poll failed");
     assert(transport.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
+    assert(transport.failureStage == IdfHttpsFailureStage::registration);
     modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
+    modem_failure_stage = IdfHttpsFailureStage::none;
     for (const char* message : {
              "HTTPS modem initial query command failed",
              "HTTPS modem initial query response invalid",
@@ -145,6 +167,7 @@ int main() {
     assert(transport.message.size() == IdfPushTransportResult::MAX_MESSAGE);
     modem_status = 200;
     modem_ok = false;
+    modem_failure_stage = IdfHttpsFailureStage::request;
     modem_message = "HTTPS request write failed";
     modem_cleanup_message = "HTTPS cleanup socket close failed";
     modem_cleanup_reason = IdfModemHttpsDiagnosticReason::timeout;
@@ -158,6 +181,7 @@ int main() {
            "HTTPS cleanup socket close failed");
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::timeout);
     assert(transport.cleanupRequiresReset);
+    assert(transport.failureStage == IdfHttpsFailureStage::request);
 
     modem_cleanup_message.assign(200, 'y');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
@@ -167,6 +191,7 @@ int main() {
 
     modem_status = 204;
     modem_ok = true;
+    modem_failure_stage = IdfHttpsFailureStage::none;
     modem_message = "HTTPS POST succeeded";
     modem_cleanup_message.clear();
     assert(idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
@@ -178,6 +203,9 @@ int main() {
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(modem_calls == calls_before_get);
+    assert(transport.transportPath == IdfPushTransportPath::Cellular);
+    assert(!transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::request);
 
     request.method = "POST";
     request.rootCertificateDer.clear();
@@ -186,6 +214,53 @@ int main() {
                                       nullptr, fake_modem_post, transport));
     assert(modem_calls == calls_before_missing_ca);
     assert(transport.message == "Cellular CA is not provisioned");
+    assert(transport.transportPath == IdfPushTransportPath::Cellular);
+    assert(!transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::ca);
+
+    request.method = "POST";
+    request.rootCertificateDer = {'D', 'E', 'R'};
+    wifi_status = 204;
+    wifi_error = 0;
+    assert(idf_push_dispatch_request(request, IdfPushNetworkDecision::Wifi, config,
+                                     fake_wifi_request, nullptr, transport));
+    assert(wifi_calls == 1);
+    assert(transport.transportPath == IdfPushTransportPath::Wifi);
+    assert(transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::none);
+    assert(transport.httpStatus == 204);
+
+    wifi_status = 503;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Wifi, config,
+                                      fake_wifi_request, nullptr, transport));
+    assert(transport.failureStage == IdfHttpsFailureStage::http);
+    assert(transport.httpStatus == 503);
+    assert(transport.dispatchAttempted);
+
+    wifi_status = -1;
+    wifi_error = 42;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Wifi, config,
+                                      fake_wifi_request, nullptr, transport));
+    assert(transport.failureStage == IdfHttpsFailureStage::modem && "wifi callback failure is conservative modem");
+    assert(transport.httpStatus == -1);
+    assert(transport.dispatchAttempted);
+
+    modem_status = -1;
+    modem_error = 42;
+    modem_return = -1;
+    modem_ok = false;
+    modem_failure_stage = IdfHttpsFailureStage::none;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.failureStage == IdfHttpsFailureStage::modem && "cellular callback failure is conservative modem");
+    assert(transport.dispatchAttempted);
+    modem_return = 0;
+
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Wifi, config,
+                                      nullptr, nullptr, transport));
+    assert(transport.transportPath == IdfPushTransportPath::Wifi);
+    assert(!transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::preflight);
 }
 '''
     with tempfile.TemporaryDirectory() as temp_dir:

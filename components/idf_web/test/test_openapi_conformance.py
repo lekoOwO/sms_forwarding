@@ -156,6 +156,8 @@ def main() -> None:
         "queued": "boolean", "running": "boolean", "done": "boolean",
         "success": "boolean", "message": "string", "cleanupMessage": "string",
         "failureReason": "string", "cleanupReason": "string", "resetNeeded": "boolean",
+        "transportPath": "string", "dispatchAttempted": "boolean",
+        "failureStage": "string", "httpStatus": "integer",
     }
     cleanup_message = push_status["properties"]["cleanupMessage"]
     assert "cleanupMessage" not in push_status["required"]
@@ -175,10 +177,63 @@ def main() -> None:
     assert push_status["properties"]["cleanupReason"]["enum"] == [
         "command_failure", "timeout", "response_invalid", "result_nonzero", "unknown",
     ]
+    assert push_status["properties"]["transportPath"]["enum"] == [
+        "none", "wifi", "cellular",
+    ]
+    assert push_status["properties"]["failureStage"]["enum"] == [
+        "none", "preflight", "target", "ca", "modem", "registration", "pdp",
+        "socket", "tls", "request", "response", "http", "cleanup",
+    ]
+    assert push_status["properties"]["httpStatus"] == {
+        "type": "integer", "minimum": 100, "maximum": 599,
+    }
+    assert {"transportPath", "dispatchAttempted", "failureStage", "httpStatus"}.isdisjoint(
+        push_status["required"]
+    )
     assert {"failureReason", "cleanupReason", "resetNeeded"}.isdisjoint(
         push_status["required"]
     )
     assert len(push_status["oneOf"]) == 5
+    active_diagnostic_fields = {
+        "cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
+        "transportPath", "dispatchAttempted", "failureStage", "httpStatus",
+    }
+    active_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("properties", {}).get("done") == {"const": False}
+    )
+    assert {
+        item["required"][0] for item in active_guard["then"]["not"]["anyOf"]
+    } == active_diagnostic_fields
+    http_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["httpStatus"]
+    )
+    assert http_guard["then"] == {
+        "required": ["dispatchAttempted"],
+        "properties": {"dispatchAttempted": {"const": True}},
+    }
+    transport_guard = next(
+        condition for condition in push_status["allOf"]
+        if {tuple(item.get("required", [])) for item in condition.get("if", {}).get("anyOf", [])}
+        == {("transportPath",), ("dispatchAttempted",), ("failureStage",), ("httpStatus",)}
+    )
+    assert transport_guard["then"] == {
+        "required": ["transportPath", "dispatchAttempted", "failureStage"],
+    }
+    success_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("properties", {}).get("success") == {"const": True}
+    )
+    assert success_guard["then"] == {
+        "required": ["transportPath", "dispatchAttempted", "failureStage", "httpStatus"],
+        "properties": {
+            "transportPath": {"enum": ["wifi", "cellular"]},
+            "dispatchAttempted": {"const": True},
+            "failureStage": {"const": "none"},
+            "httpStatus": {"minimum": 200, "maximum": 299},
+        },
+    }
 
     # Provisioning endpoints are firmware-private AP routes. Legacy plaintext
     # Import and raw OTA entry points remain absent; signed OTA uses /api/ota/*.

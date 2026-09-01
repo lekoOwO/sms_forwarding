@@ -768,6 +768,11 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn("IdfModemHttpsDiagnosticReason failureReason", result_header)
         self.assertIn("IdfModemHttpsDiagnosticReason cleanupReason", result_header)
         self.assertIn("bool cleanupRequiresReset", result_header)
+        for stage in (
+            "none", "preflight", "target", "ca", "modem", "registration", "pdp",
+            "socket", "tls", "request", "response", "http", "cleanup",
+        ):
+            self.assertIn(f"IdfHttpsFailureStage::{stage}", result_header)
         submit = function_body(owner, "submit_owner_command")
         self.assertEqual(submit.count("*https_result = slot.https_post_result"), 2)
         run = function_body(source, "run")
@@ -779,6 +784,14 @@ inline void vTaskDelay(TickType_t) {}
             self.assertIn(f"HttpsFailureStage::{stage}", run)
         post = function_body(owner, "idf_modem_https_post")
         self.assertIn("err == ESP_ERR_TIMEOUT && result.message.empty()", post)
+        self.assertIn("result.failureStage", post)
+        owner_post = function_body(owner, "owner_https_post")
+        self.assertIn("result.failureStage = IdfHttpsFailureStage::modem", owner_post)
+        self.assertIn("result.failureStage = IdfHttpsFailureStage::registration", owner_post)
+        self.assertIn("!https_status_valid(result.httpStatus)", owner_post)
+        self.assertIn("return status >= 100 && status <= 599;", owner)
+        self.assertIn("IdfHttpsFailureStage::response", owner_post)
+        self.assertIn("https_result->failureStage = IdfHttpsFailureStage::modem", submit)
         self.assertNotIn("Test push failed; see the log", source)
 
     def test_https_diagnostic_reasons_are_fixed_and_cleanup_close_is_reset_sensitive(self):

@@ -32,6 +32,9 @@ struct IdfPushTransportResult {
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
     bool cleanupRequiresReset = false;
+    IdfPushTransportPath transportPath = IdfPushTransportPath::None;
+    bool dispatchAttempted = false;
+    IdfHttpsFailureStage failureStage = IdfHttpsFailureStage::none;
 };
 
 using IdfPushWifiRequest = int (*)(const IdfPushHttpRequest& request, int& statusCode);

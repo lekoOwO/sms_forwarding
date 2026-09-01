@@ -392,7 +392,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get one push channel test status",
-        "description": "Without detail=1, the response keeps the legacy exact five-key status shape. With detail=1, a terminal failure may add bounded cleanupMessage, failureReason, cleanupReason, and resetNeeded fields. Unknown, duplicate, or invalid query fields are rejected.",
+        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } }
@@ -406,7 +406,7 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Test one saved push channel",
-        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses keep the legacy exact five-key status shape. With detail=1, a terminal failure may add bounded cleanupMessage, failureReason, cleanupReason, and resetNeeded fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } },
@@ -894,7 +894,21 @@
             "type": "string",
             "enum": ["command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"]
           },
-          "resetNeeded": { "type": "boolean" }
+          "resetNeeded": { "type": "boolean" },
+          "transportPath": {
+            "type": "string",
+            "enum": ["none", "wifi", "cellular"]
+          },
+          "dispatchAttempted": { "type": "boolean" },
+          "failureStage": {
+            "type": "string",
+            "enum": ["none", "preflight", "target", "ca", "modem", "registration", "pdp", "socket", "tls", "request", "response", "http", "cleanup"]
+          },
+          "httpStatus": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
         },
         "oneOf": [
           { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },
@@ -902,6 +916,91 @@
           { "properties": { "queued": { "const": false }, "running": { "const": true }, "done": { "const": false }, "success": { "const": false } } },
           { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": true } } },
           { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": false } } }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": { "done": { "const": false } },
+              "required": ["done"]
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  { "required": ["cleanupMessage"] },
+                  { "required": ["failureReason"] },
+                  { "required": ["cleanupReason"] },
+                  { "required": ["resetNeeded"] },
+                  { "required": ["transportPath"] },
+                  { "required": ["dispatchAttempted"] },
+                  { "required": ["failureStage"] },
+                  { "required": ["httpStatus"] }
+                ]
+              }
+            }
+          },
+          {
+            "if": {
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "required": ["transportPath", "dispatchAttempted", "failureStage"]
+            }
+          },
+          {
+            "if": { "required": ["httpStatus"] },
+            "then": {
+              "required": ["dispatchAttempted"],
+              "properties": { "dispatchAttempted": { "const": true } }
+            }
+          },
+          {
+            "if": {
+              "required": ["transportPath"],
+              "properties": { "transportPath": { "const": "none" } }
+            },
+            "then": { "properties": { "dispatchAttempted": { "const": false } } }
+          },
+          {
+            "if": {
+              "required": ["success"],
+              "properties": { "success": { "const": true } },
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "required": ["transportPath", "dispatchAttempted", "failureStage", "httpStatus"],
+              "properties": {
+                "transportPath": { "enum": ["wifi", "cellular"] },
+                "dispatchAttempted": { "const": true },
+                "failureStage": { "const": "none" },
+                "httpStatus": { "minimum": 200, "maximum": 299 }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["success"],
+              "properties": { "success": { "const": false } },
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "properties": { "failureStage": { "not": { "const": "none" } } }
+            }
+          }
         ]
       },
       "WebAccount": {

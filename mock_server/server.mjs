@@ -17,6 +17,26 @@ const defaultOtaPublicKey = createPublicKey({
 	type: "spki"
 });
 
+const pushTestDetailKeys = [
+	"transportPath", "dispatchAttempted", "failureStage", "httpStatus",
+	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded"
+];
+const pushTestDetailFixtures = Object.freeze({
+	wifiSuccess: Object.freeze({ transportPath: "wifi", dispatchAttempted: true, failureStage: "none", httpStatus: 204 }),
+	preflightFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "preflight" }),
+	targetFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "target" })
+});
+
+export function serializePushTestStatus(status, includeDetail = false) {
+	const serialized = {
+		queued: Boolean(status.queued), running: Boolean(status.running), done: Boolean(status.done),
+		success: Boolean(status.success), message: String(status.message ?? "")
+	};
+	if (!includeDetail || !serialized.done) return serialized;
+	for (const key of pushTestDetailKeys) if (Object.hasOwn(status, key)) serialized[key] = status[key];
+	return serialized;
+}
+
 function defaultConfig() {
 	return {
 		deviceName: "SMS Forwarder 000001",
@@ -540,6 +560,19 @@ function boundedUnsigned(value, minimum, maximum) {
 	return Number.isSafeInteger(number) && number >= minimum && number <= maximum ? number : undefined;
 }
 
+function parsePushTestQuery(query, originalUrl = "") {
+	const queryText = originalUrl.split("?", 2)[1] ?? "";
+	if (!queryText || queryText.length > 63 || queryText.startsWith("&") ||
+		queryText.endsWith("&") || queryText.includes("&&")) return undefined;
+	const keys = Object.keys(query);
+	if (keys.length < 1 || keys.length > 2 || !keys.includes("channel") ||
+		keys.some((key) => key !== "channel" && key !== "detail")) return undefined;
+	const channel = boundedUnsigned(query.channel, 0, 4);
+	if (channel === undefined) return undefined;
+	if (!Object.hasOwn(query, "detail")) return { channel, detail: false };
+	return query.detail === "1" ? { channel, detail: true } : undefined;
+}
+
 function saveFieldFamily(field) {
 	const direct = {
 		deviceName: "identity", hostname: "identity", notificationLocale: "locale",
@@ -668,12 +701,12 @@ export function createApp({
 			if (["succeeded", "failed"].includes(job.state) && now() - job.completedAt >= 60000) jobs.delete(id);
 		}
 	};
-	const pushTestFailure = (message) => ({
-		queued: false, running: false, done: true, success: false, message
+	const pushTestFailure = (message, details = {}) => ({
+		queued: false, running: false, done: true, success: false, message, ...details
 	});
 	const expirePushTests = () => pushTests.forEach((status, channel) => {
 		if (!status.queued || !pushTestDeadlines[channel] || now() < pushTestDeadlines[channel]) return;
-		pushTests[channel] = pushTestFailure("Test push timed out before it could start");
+		pushTests[channel] = pushTestFailure("Test push timed out before it could start", pushTestDetailFixtures.preflightFailure);
 		pushTestDeadlines[channel] = 0;
 	});
 	const pushTestActive = () => {
@@ -908,36 +941,38 @@ export function createApp({
 	app.all("/api/push/test", (request, response, next) => {
 		if (request.method === "GET" || request.method === "POST") return next();
 		return response.set("Allow", "GET, POST").status(405)
-			.json(pushTestFailure("Push tests require GET or POST"));
+			.json(serializePushTestStatus(pushTestFailure("Push tests require GET or POST")));
 	});
 	app.get("/api/push/test", (request, response) => {
 		expirePushTests();
-		const channel = boundedUnsigned(request.query.channel, 0, 4);
-		return channel === undefined
-			? response.status(400).json(pushTestFailure("Invalid channel index"))
-			: response.json(pushTests[channel]);
+		const parsed = parsePushTestQuery(request.query, request.originalUrl);
+		return !parsed
+			? response.status(400).json(serializePushTestStatus(pushTestFailure("Invalid channel index")))
+			: response.json(serializePushTestStatus(pushTests[parsed.channel], parsed.detail));
 	});
 	app.post("/api/push/test", (request, response) => {
 		expirePushTests();
 		if (Number(request.headers["content-length"] ?? 0) > 0 || request.headers["transfer-encoding"]) {
-			return response.status(400).json(pushTestFailure("Push test request body is not allowed"));
+			return response.status(400).json(serializePushTestStatus(pushTestFailure("Push test request body is not allowed")));
 		}
-		const channel = boundedUnsigned(request.query.channel, 0, 4);
-		if (channel === undefined) return response.status(400).json(pushTestFailure("Invalid channel index"));
+		const parsed = parsePushTestQuery(request.query, request.originalUrl);
+		if (!parsed) return response.status(400).json(serializePushTestStatus(pushTestFailure("Invalid channel index")));
+		const channel = parsed.channel;
 		const current = pushTests[channel];
-		if (current.queued || current.running) return response.status(409).json(current);
+		if (current.queued || current.running) return response.status(409).json(serializePushTestStatus(current, parsed.detail));
 		expireJobs();
 		if (upload || [...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) {
-			return response.status(409).json(pushTestFailure("Device is busy; try again later"));
+			return response.status(409).json(serializePushTestStatus(pushTestFailure("Device is busy; try again later"), parsed.detail));
 		}
 		if (!state.config.pushEnabled) {
-			return response.status(409).json(pushTestFailure("Push is disabled; test push is unavailable"));
+			return response.status(409).json(serializePushTestStatus(pushTestFailure("Push is disabled; test push is unavailable"), parsed.detail));
 		}
 		if (state.config.networkMode === 1) {
-			return response.status(409).json(pushTestFailure("Cellular push is not supported; test was not queued"));
+			return response.status(409).json(serializePushTestStatus(pushTestFailure("Cellular push is not supported; test was not queued"), parsed.detail));
 		}
 		if (!pushChannelConfigured(state.config.pushChannels[channel])) {
-			return response.status(409).json(pushTestFailure("Channel is disabled or incomplete; save its configuration first"));
+			return response.status(409).json(serializePushTestStatus(pushTestFailure(
+				"Channel is disabled or incomplete; save its configuration first", pushTestDetailFixtures.targetFailure), parsed.detail));
 		}
 		const status = {
 			queued: true, running: false, done: false, success: false,
@@ -952,12 +987,13 @@ export function createApp({
 			status.done = true;
 			status.success = true;
 			status.message = "Test push sent";
+			Object.assign(status, pushTestDetailFixtures.wifiSuccess);
 			pushTestDeadlines[channel] = 0;
 			state.logs.push(`Channel ${channel + 1} test push sent`);
 		};
 		if (jobDelayMs > 0) setTimeout(finish, jobDelayMs);
 		else finish();
-		return response.status(202).json(status);
+		return response.status(202).json(serializePushTestStatus(status, parsed.detail));
 	});
 
 	app.use("/api/push/ca", (_request, response, next) => {

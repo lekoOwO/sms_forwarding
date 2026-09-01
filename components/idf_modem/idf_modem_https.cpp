@@ -98,6 +98,34 @@ constexpr std::string_view failure_message(HttpsFailureStage stage)
     return kFailureMessages[static_cast<size_t>(stage)];
 }
 
+constexpr IdfHttpsFailureStage public_failure_stage(HttpsFailureStage stage)
+{
+    switch (stage) {
+        case HttpsFailureStage::initial_state:
+        case HttpsFailureStage::runtime_snapshot:
+        case HttpsFailureStage::runtime_config:
+            return IdfHttpsFailureStage::modem;
+        case HttpsFailureStage::pdp_apn:
+            return IdfHttpsFailureStage::pdp;
+        case HttpsFailureStage::socket_open:
+            return IdfHttpsFailureStage::socket;
+        case HttpsFailureStage::connected_state:
+            return IdfHttpsFailureStage::registration;
+        case HttpsFailureStage::tls_setup:
+        case HttpsFailureStage::tls_handshake:
+            return IdfHttpsFailureStage::tls;
+        case HttpsFailureStage::request_write:
+            return IdfHttpsFailureStage::request;
+        case HttpsFailureStage::response_read:
+            return IdfHttpsFailureStage::response;
+        case HttpsFailureStage::cleanup:
+            return IdfHttpsFailureStage::cleanup;
+        case HttpsFailureStage::count:
+            return IdfHttpsFailureStage::modem;
+    }
+    return IdfHttpsFailureStage::modem;
+}
+
 using namespace idf_modem_https_wire;
 
 using Clock = std::chrono::steady_clock;
@@ -517,8 +545,16 @@ public:
                            : fail(stage, IdfModemHttpsRunResult::response_failed);
             }
         }
+        const bool valid_http_status = result_.httpStatus >= 100 && result_.httpStatus <= 599;
+        if (!valid_http_status) {
+            result_.message = "HTTPS response status is invalid";
+            record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
+            record_failure_stage(IdfHttpsFailureStage::response);
+            return finish(IdfModemHttpsRunResult::response_failed);
+        }
         if (!idf_modem_https_status_success(result_.httpStatus)) {
             result_.message = "HTTPS POST returned a non-2xx status";
+            record_failure_stage(IdfHttpsFailureStage::http);
             return fail(HttpsFailureStage::response_read,
                         IdfModemHttpsRunResult::response_failed);
         }
@@ -532,6 +568,7 @@ private:
         HttpsFailureStage stage,
         IdfModemHttpsRunResult fallback = IdfModemHttpsRunResult::command_failed)
     {
+        record_failure_stage(public_failure_stage(stage));
         if (result_.message.empty()) result_.message = failure_message(stage);
         if (timed_out_ || deadline_.expired()) return finish(IdfModemHttpsRunResult::timed_out);
         return finish(fallback);
@@ -542,6 +579,10 @@ private:
         cleanup();
         if (!cleanup_ok_) {
             result_.ok = false;
+            if (outcome == IdfModemHttpsRunResult::ok ||
+                result_.failureStage == IdfHttpsFailureStage::none) {
+                result_.failureStage = IdfHttpsFailureStage::cleanup;
+            }
             if (outcome == IdfModemHttpsRunResult::ok || result_.message.empty()) {
                 result_.message = failure_message(HttpsFailureStage::cleanup);
             }
@@ -876,6 +917,13 @@ private:
         }
     }
 
+    void record_failure_stage(IdfHttpsFailureStage stage)
+    {
+        if (result_.failureStage == IdfHttpsFailureStage::none) {
+            result_.failureStage = stage;
+        }
+    }
+
     void cleanup()
     {
         if (cleanup_done_) return;
@@ -1097,20 +1145,43 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
     result = {};
     std::string error;
     IdfModemHttpsTarget target;
-    if (!idf_modem_https_validate_request(request, error) ||
-        !idf_modem_https_parse_url(request.url, target, error)) {
+    const bool certificate_material_invalid =
+        request.rootCertificateDer.empty() ||
+        request.rootCertificateDer.size() > IDF_MODEM_HTTPS_ROOT_DER_MAX ||
+        std::all_of(request.rootCertificateSha256.begin(), request.rootCertificateSha256.end(),
+                    [](uint8_t byte) { return byte == 0; });
+    if (!idf_modem_https_parse_url(request.url, target, error)) {
         result.message = error;
+        result.failureStage = IdfHttpsFailureStage::target;
+        return IdfModemHttpsRunResult::invalid_request;
+    }
+    if (!idf_modem_https_validate_request(request, error)) {
+        result.message = error;
+        result.failureStage = certificate_material_invalid
+                                  ? IdfHttpsFailureStage::ca
+                                  : IdfHttpsFailureStage::request;
         return IdfModemHttpsRunResult::invalid_request;
     }
     if (!callbacks.sendCommand || !callbacks.confirmOpen) {
         result.message = "HTTPS callbacks unavailable";
+        result.failureStage = IdfHttpsFailureStage::modem;
         return IdfModemHttpsRunResult::invalid_request;
     }
     if (!certificate_valid(request)) {
         result.message = "HTTPS pinned certificate is invalid";
+        result.failureStage = IdfHttpsFailureStage::ca;
         return IdfModemHttpsRunResult::invalid_request;
     }
     Deadline deadline(request.timeoutMs);
     MipPostSession session(request, target, callbacks, deadline, result);
-    return session.run();
+    const IdfModemHttpsRunResult outcome = session.run();
+    if (outcome == IdfModemHttpsRunResult::ok &&
+        (result.httpStatus < 100 || result.httpStatus > 599)) {
+        result.ok = false;
+        result.failureStage = IdfHttpsFailureStage::response;
+        result.failureReason = IdfModemHttpsDiagnosticReason::response_invalid;
+        result.message = "HTTPS response status is invalid";
+        return IdfModemHttpsRunResult::response_failed;
+    }
+    return outcome;
 }
