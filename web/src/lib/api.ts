@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestStatus, PushTestTransportPath } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestParseReason, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -46,6 +46,10 @@ const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
 const pushTestCleanupReasons: readonly PushTestCleanupReason[] = [
 	"command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"
 ];
+const pushTestParseReasons: readonly PushTestParseReason[] = [
+	"oversize", "terminal", "urc", "prefix", "field_count", "quote",
+	"cid", "state", "endpoint", "result", "unknown"
+];
 const pushTestCleanupMessages: readonly PushTestCleanupMessage[] = [
 	"HTTPS cleanup socket close failed",
 	"HTTPS cleanup SSL config restore failed",
@@ -61,7 +65,7 @@ const pushTestFailureStages: readonly PushTestFailureStage[] = [
 ];
 const pushTestDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)[] = [
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
-	"transportPath", "dispatchAttempted", "failureStage", "httpStatus"
+	"failureParseReason", "cleanupParseReason", "transportPath", "dispatchAttempted", "failureStage", "httpStatus"
 ];
 const pushTestStatusKeys = new Set([
 	"queued", "running", "done", "success", "message", ...pushTestDiagnosticKeys
@@ -117,6 +121,12 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 		!pushTestDiagnosticReasons.includes(status.failureReason as PushTestDiagnosticReason))) return false;
 	if (has("cleanupReason") && (typeof status.cleanupReason !== "string" ||
 		!pushTestCleanupReasons.includes(status.cleanupReason as PushTestCleanupReason))) return false;
+	if (has("failureParseReason") && (typeof status.failureParseReason !== "string" ||
+		!pushTestParseReasons.includes(status.failureParseReason as PushTestParseReason) ||
+		status.failureReason !== "response_invalid")) return false;
+	if (has("cleanupParseReason") && (typeof status.cleanupParseReason !== "string" ||
+		!pushTestParseReasons.includes(status.cleanupParseReason as PushTestParseReason) ||
+		status.cleanupReason !== "response_invalid")) return false;
 	if (has("resetNeeded") && typeof status.resetNeeded !== "boolean") return false;
 	if (has("transportPath") && (typeof status.transportPath !== "string" ||
 		!pushTestTransportPaths.includes(status.transportPath as PushTestTransportPath))) return false;

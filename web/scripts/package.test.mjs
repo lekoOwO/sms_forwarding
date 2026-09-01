@@ -205,6 +205,22 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 		const accepted = await api.runPushTest(0, undefined, 1000);
 		assert.equal(accepted.failureReason, "terminal_failure");
 
+		const responseInvalid = {
+			queued: false, running: false, done: true, success: false,
+			message: "malformed modem response", failureReason: "response_invalid",
+			failureParseReason: "field_count", cleanupReason: "response_invalid",
+			cleanupParseReason: "quote"
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : responseInvalid
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		const annotated = await api.runPushTest(0, undefined, 1000);
+		assert.deepEqual([
+			annotated.failureReason, annotated.failureParseReason,
+			annotated.cleanupReason, annotated.cleanupParseReason
+		], ["response_invalid", "field_count", "response_invalid", "quote"]);
+
 		const cleanupMessages = [
 			"HTTPS cleanup socket close failed",
 			"HTTPS cleanup SSL config restore failed",
@@ -248,6 +264,20 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 					message: "bounded cleanup", cleanupReason
 				}), { status: 200, headers: { "Content-Type": "application/json" } });
 			};
+			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
+		}
+		for (const status of [
+			{ ...validPrimary, failureParseReason: "field_count" },
+			{ ...validPrimary, failureReason: "command_failure", failureParseReason: "field_count" },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "unknown-value" },
+			{ ...validPrimary, cleanupParseReason: "quote" },
+			{ ...validPrimary, cleanupReason: "timeout", cleanupParseReason: "quote" },
+			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "unknown-value" }
+		]) {
+			globalThis.fetch = async (path) => new Response(JSON.stringify(
+				path === "/api/config" ? { csrfToken: "csrf" } : status
+			), { status: 200, headers: { "Content-Type": "application/json" } });
+			await api.loadSnapshot();
 			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
 		}
 	} finally {

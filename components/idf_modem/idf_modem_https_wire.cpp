@@ -8,6 +8,18 @@
 namespace idf_modem_https_wire {
 namespace {
 
+using ParseReason = IdfModemHttpsParseReason;
+
+void clear_parse_reason(ParseReason* reason)
+{
+    if (reason) *reason = ParseReason::none;
+}
+
+void set_parse_reason(ParseReason* reason, ParseReason value)
+{
+    if (reason && *reason == ParseReason::none) *reason = value;
+}
+
 bool starts_with(std::string_view value, std::string_view prefix)
 {
     return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
@@ -36,14 +48,25 @@ bool parse_uint(std::string_view value, uint32_t& output)
     return true;
 }
 
+enum class CsvFailure : uint8_t {
+    none,
+    field_count,
+    quote,
+};
+
 template <size_t FieldCount>
 bool parse_csv(std::string_view input, std::array<std::string_view, FieldCount>& fields,
-               std::array<bool, FieldCount>& quoted, size_t& count)
+               std::array<bool, FieldCount>& quoted, size_t& count,
+               CsvFailure* failure = nullptr)
 {
     count = 0;
+    if (failure) *failure = CsvFailure::none;
     size_t position = 0;
     while (position <= input.size()) {
-        if (count == fields.size()) return false;
+        if (count == fields.size()) {
+            if (failure) *failure = CsvFailure::field_count;
+            return false;
+        }
         while (position < input.size() && (input[position] == ' ' || input[position] == '\t')) {
             ++position;
         }
@@ -53,13 +76,19 @@ bool parse_csv(std::string_view input, std::array<std::string_view, FieldCount>&
             is_quoted = true;
             const size_t begin = ++position;
             while (position < input.size() && input[position] != '"') ++position;
-            if (position == input.size()) return false;
+            if (position == input.size()) {
+                if (failure) *failure = CsvFailure::quote;
+                return false;
+            }
             value = input.substr(begin, position - begin);
             ++position;
             while (position < input.size() && (input[position] == ' ' || input[position] == '\t')) {
                 ++position;
             }
-            if (position < input.size() && input[position] != ',') return false;
+            if (position < input.size() && input[position] != ',') {
+                if (failure) *failure = CsvFailure::quote;
+                return false;
+            }
         } else {
             const size_t begin = position;
             const size_t comma = input.find(',', position);
@@ -121,10 +150,14 @@ bool header_name_token(std::string_view value)
 }  // namespace
 
 bool scan_frame(std::string_view response, std::string_view command,
-                std::vector<std::string_view>& body)
+                std::vector<std::string_view>& body, ParseReason* reason)
 {
+    clear_parse_reason(reason);
     body.clear();
-    if (response.size() > kResponseMax) return false;
+    if (response.size() > kResponseMax) {
+        set_parse_reason(reason, ParseReason::oversize);
+        return false;
+    }
     size_t position = 0;
     size_t terminal_count = 0;
     bool waiting_for_cmt_pdu = false;
@@ -132,10 +165,16 @@ bool scan_frame(std::string_view response, std::string_view command,
         const size_t end = response.find_first_of("\r\n", position);
         const size_t line_end = end == std::string_view::npos ? response.size() : end;
         const std::string_view line = trim_spaces(response.substr(position, line_end - position));
-        if (line.size() > kLineMax) return false;
+        if (line.size() > kLineMax) {
+            set_parse_reason(reason, ParseReason::oversize);
+            return false;
+        }
         if (!line.empty() && line != command) {
             if (line == "OK") {
-                if (++terminal_count != 1) return false;
+                if (++terminal_count != 1) {
+                    set_parse_reason(reason, ParseReason::terminal);
+                    return false;
+                }
             } else if (line == "ERROR" || starts_with(line, "+CME ERROR") ||
                        starts_with(line, "+CMS ERROR")) {
                 return false;
@@ -155,7 +194,11 @@ bool scan_frame(std::string_view response, std::string_view command,
         while (position < response.size() &&
                (response[position] == '\r' || response[position] == '\n')) ++position;
     }
-    return terminal_count == 1;
+    if (terminal_count != 1) {
+        set_parse_reason(reason, ParseReason::terminal);
+        return false;
+    }
+    return true;
 }
 
 bool parse_mip_urc(std::string_view line, uint32_t& received, uint32_t& total,
@@ -205,20 +248,46 @@ bool consume_nonfatal_mip_urc(std::string_view line)
     return parse_mip_urc(line, received, total, state, disconnected) && !disconnected;
 }
 
-bool parse_mip_open_line(std::string_view line, uint8_t expected_cid)
+bool parse_mip_open_line(std::string_view line, uint8_t expected_cid, ParseReason* reason)
 {
-    if (!starts_with(line, "+MIPOPEN:")) return false;
+    if (!starts_with(line, "+MIPOPEN:")) {
+        set_parse_reason(reason, ParseReason::prefix);
+        return false;
+    }
     std::array<std::string_view, 8> fields;
     std::array<bool, 8> quoted{};
     size_t count = 0;
-    if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count) ||
-        count != 2 || quoted[0] || quoted[1]) {
+    CsvFailure csv_failure = CsvFailure::none;
+    if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count,
+                   &csv_failure)) {
+        set_parse_reason(reason, csv_failure == CsvFailure::quote
+                                  ? ParseReason::quote
+                                  : ParseReason::field_count);
+        return false;
+    }
+    if (count != 2) {
+        set_parse_reason(reason, ParseReason::field_count);
+        return false;
+    }
+    if (quoted[0] || quoted[1]) {
+        set_parse_reason(reason, ParseReason::quote);
         return false;
     }
     uint32_t cid = 0;
     uint32_t result = 0;
-    return parse_uint(fields[0], cid) && cid == expected_cid &&
-           parse_uint(fields[1], result) && result == 0;
+    if (!parse_uint(fields[0], cid) || cid != expected_cid) {
+        set_parse_reason(reason, ParseReason::cid);
+        return false;
+    }
+    if (!parse_uint(fields[1], result)) {
+        set_parse_reason(reason, ParseReason::result);
+        return false;
+    }
+    // A numeric nonzero MIPOPEN result is a modem outcome, not a malformed
+    // frame.  Keep the parser rejection for its existing caller while
+    // leaving parse telemetry unset for this semantic failure.
+    if (result != 0) return false;
+    return true;
 }
 
 constexpr size_t kMipAddressMax = 255;
@@ -232,53 +301,80 @@ bool mip_address_safe(std::string_view address)
 }
 
 bool parse_mip_tcp_endpoint(const std::array<std::string_view, 8>& fields,
-                            const std::array<bool, 8>& quoted)
+                            const std::array<bool, 8>& quoted, ParseReason* reason)
 {
     uint32_t port = 0;
-    return quoted[1] && fields[1] == "TCP" && quoted[2] && mip_address_safe(fields[2]) &&
-           !quoted[3] && parse_uint(fields[3], port) && port > 0 && port <= UINT16_MAX;
+    if (!quoted[1] || fields[1] != "TCP" || !quoted[2] || !mip_address_safe(fields[2]) ||
+        quoted[3] || !parse_uint(fields[3], port) || port == 0 || port > UINT16_MAX) {
+        set_parse_reason(reason, ParseReason::endpoint);
+        return false;
+    }
+    return true;
 }
 
 MipStateDisposition parse_mip_state_disposition(std::string_view response,
                                                 std::string_view command,
-                                                uint8_t& cid)
+                                                uint8_t& cid, ParseReason* reason)
 {
+    clear_parse_reason(reason);
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body)) return MipStateDisposition::invalid;
+    if (!scan_frame(response, command, body, reason)) return MipStateDisposition::invalid;
     std::string_view state_line;
     bool open_seen = false;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
-            if (!consume_nonfatal_mip_urc(line)) return MipStateDisposition::invalid;
+            if (!consume_nonfatal_mip_urc(line)) {
+                set_parse_reason(reason, ParseReason::urc);
+                return MipStateDisposition::invalid;
+            }
         } else if (starts_with(line, "+MIPOPEN")) {
-            if (open_seen || !parse_mip_open_line(line, 0)) {
+            if (open_seen) {
+                set_parse_reason(reason, ParseReason::result);
+                return MipStateDisposition::invalid;
+            }
+            if (!parse_mip_open_line(line, 0, reason)) {
                 return MipStateDisposition::invalid;
             }
             open_seen = true;
         } else if (state_line.empty()) {
             state_line = line;
         } else {
+            set_parse_reason(reason, ParseReason::prefix);
             return MipStateDisposition::invalid;
         }
     }
     if (state_line.empty() || !starts_with(state_line, "+MIPSTATE:")) {
+        set_parse_reason(reason, ParseReason::prefix);
         return MipStateDisposition::invalid;
     }
     std::array<std::string_view, 8> fields;
     std::array<bool, 8> quoted{};
     size_t count = 0;
+    CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(state_line.substr(std::string_view("+MIPSTATE:").size()), fields, quoted,
-                   count) ||
-        count != 5 || quoted[0] || !quoted[4]) {
+                   count, &csv_failure)) {
+        set_parse_reason(reason, csv_failure == CsvFailure::quote
+                                  ? ParseReason::quote
+                                  : ParseReason::field_count);
+        return MipStateDisposition::invalid;
+    }
+    if (count != 5) {
+        set_parse_reason(reason, ParseReason::field_count);
+        return MipStateDisposition::invalid;
+    }
+    if (quoted[0] || !quoted[4]) {
+        set_parse_reason(reason, ParseReason::quote);
         return MipStateDisposition::invalid;
     }
     uint32_t connect_id = 0;
     if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) {
+        set_parse_reason(reason, ParseReason::cid);
         return MipStateDisposition::invalid;
     }
     if (fields[4] == "INITIAL") {
         if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
             !fields[2].empty() || !fields[3].empty()) {
+            set_parse_reason(reason, ParseReason::endpoint);
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
@@ -287,17 +383,20 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     if (fields[4] == "CLOSED") {
         const bool empty_endpoint = !quoted[1] && !quoted[2] && !quoted[3] &&
                                     fields[1].empty() && fields[2].empty() && fields[3].empty();
-        if (!empty_endpoint && !parse_mip_tcp_endpoint(fields, quoted)) {
+        if (!empty_endpoint && !parse_mip_tcp_endpoint(fields, quoted, reason)) {
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::closed;
     }
     if (fields[4] == "CONNECTED") {
-        if (!parse_mip_tcp_endpoint(fields, quoted)) return MipStateDisposition::invalid;
+        if (!parse_mip_tcp_endpoint(fields, quoted, reason)) {
+            return MipStateDisposition::invalid;
+        }
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::connected;
     }
+    set_parse_reason(reason, ParseReason::state);
     return MipStateDisposition::invalid;
 }
 
@@ -343,26 +442,33 @@ bool parse_cfg_response(std::string_view response, std::string_view command,
 }
 
 bool parse_mip_state(std::string_view response, std::string_view command,
-                     std::string_view expected, uint8_t& cid)
+                     std::string_view expected, uint8_t& cid, ParseReason* reason)
 {
     uint8_t parsed_cid = 0;
     const MipStateDisposition disposition =
-        parse_mip_state_disposition(response, command, parsed_cid);
+        parse_mip_state_disposition(response, command, parsed_cid, reason);
     const bool matches =
         (expected == "INITIAL" && disposition == MipStateDisposition::initial) ||
         (expected == "CONNECTED" && disposition == MipStateDisposition::connected);
+    if (!matches && disposition != MipStateDisposition::invalid) {
+        set_parse_reason(reason, ParseReason::state);
+    }
     if (matches) cid = parsed_cid;
     return matches;
 }
 
 MipStateDisposition classify_mip_state(std::string_view response,
                                        std::string_view command,
-                                       uint8_t expected_cid)
+                                       uint8_t expected_cid, ParseReason* reason)
 {
     uint8_t cid = 0;
     const MipStateDisposition disposition =
-        parse_mip_state_disposition(response, command, cid);
-    return cid == expected_cid ? disposition : MipStateDisposition::invalid;
+        parse_mip_state_disposition(response, command, cid, reason);
+    if (disposition != MipStateDisposition::invalid && cid != expected_cid) {
+        set_parse_reason(reason, ParseReason::cid);
+        return MipStateDisposition::invalid;
+    }
+    return disposition;
 }
 
 bool parse_mip_open(std::string_view response, std::string_view command,
@@ -377,7 +483,7 @@ bool parse_mip_open(std::string_view response, std::string_view command,
             continue;
         }
         if (!starts_with(line, "+MIPOPEN:") || present) return false;
-        if (!parse_mip_open_line(line, expected_cid)) return false;
+        if (!parse_mip_open_line(line, expected_cid, nullptr)) return false;
         present = true;
     }
     return true;
@@ -394,7 +500,7 @@ bool MipOpenLatch::consume_line(std::string_view line)
     line = trim_spaces(line);
     if (line.empty()) return true;
     if (starts_with(line, "+MIPOPEN")) {
-        if (success_seen_ || !parse_mip_open_line(line, 0)) return false;
+        if (success_seen_ || !parse_mip_open_line(line, 0, nullptr)) return false;
         success_seen_ = true;
         return true;
     }
@@ -546,27 +652,51 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
 }
 
 bool parse_result(std::string_view response, std::string_view command,
-                  std::string_view prefix, uint8_t expected_cid, uint32_t& value)
+                  std::string_view prefix, uint8_t expected_cid, uint32_t& value,
+                  ParseReason* reason)
 {
+    clear_parse_reason(reason);
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body)) return false;
+    if (!scan_frame(response, command, body, reason)) return false;
     std::string_view result_line;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
-            if (!consume_nonfatal_mip_urc(line)) return false;
+            if (!consume_nonfatal_mip_urc(line)) {
+                set_parse_reason(reason, ParseReason::urc);
+                return false;
+            }
         } else if (starts_with(line, prefix) && result_line.empty()) {
             result_line = line;
         } else {
+            set_parse_reason(reason, ParseReason::prefix);
             return false;
         }
     }
-    if (result_line.empty()) return false;
+    if (result_line.empty()) {
+        set_parse_reason(reason, ParseReason::prefix);
+        return false;
+    }
     std::array<std::string_view, 8> fields;
     std::array<bool, 8> quoted{};
     size_t count = 0;
-    if (!parse_csv(result_line.substr(prefix.size()), fields, quoted, count) || count != 2) return false;
+    CsvFailure csv_failure = CsvFailure::none;
+    if (!parse_csv(result_line.substr(prefix.size()), fields, quoted, count, &csv_failure)) {
+        set_parse_reason(reason, csv_failure == CsvFailure::quote
+                                  ? ParseReason::quote
+                                  : ParseReason::field_count);
+        return false;
+    }
+    if (count != 2) {
+        set_parse_reason(reason, ParseReason::field_count);
+        return false;
+    }
     uint32_t cid = 0;
-    if (!parse_uint(fields[0], cid) || cid != expected_cid || !parse_uint(fields[1], value)) {
+    if (!parse_uint(fields[0], cid) || cid != expected_cid) {
+        set_parse_reason(reason, ParseReason::cid);
+        return false;
+    }
+    if (!parse_uint(fields[1], value)) {
+        set_parse_reason(reason, ParseReason::result);
         return false;
     }
     return true;

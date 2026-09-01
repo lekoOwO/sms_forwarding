@@ -42,6 +42,44 @@ enum class IdfModemHttpsDiagnosticReason : uint8_t {
     unknown = 255,
 };
 
+// A bounded classification for a rejected modem response.  This is only
+// populated when the response grammar rejects a frame; transport, command,
+// result, and HTTP failures intentionally keep the value at none.
+enum class IdfModemHttpsParseReason : uint8_t {
+    none = 0,
+    oversize,
+    terminal,
+    urc,
+    prefix,
+    field_count,
+    quote,
+    cid,
+    state,
+    endpoint,
+    result,
+    unknown = 255,
+};
+
+constexpr std::string_view idf_modem_https_parse_reason_name(
+    IdfModemHttpsParseReason reason)
+{
+    switch (reason) {
+        case IdfModemHttpsParseReason::none: return {};
+        case IdfModemHttpsParseReason::oversize: return "oversize";
+        case IdfModemHttpsParseReason::terminal: return "terminal";
+        case IdfModemHttpsParseReason::urc: return "urc";
+        case IdfModemHttpsParseReason::prefix: return "prefix";
+        case IdfModemHttpsParseReason::field_count: return "field_count";
+        case IdfModemHttpsParseReason::quote: return "quote";
+        case IdfModemHttpsParseReason::cid: return "cid";
+        case IdfModemHttpsParseReason::state: return "state";
+        case IdfModemHttpsParseReason::endpoint: return "endpoint";
+        case IdfModemHttpsParseReason::result: return "result";
+        case IdfModemHttpsParseReason::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
 // A bounded, transport-agnostic stage for safe terminal diagnostics. Keep this
 // separate from the modem diagnostic reason: reasons are implementation detail
 // while the stage is part of the push-test status contract.
@@ -124,6 +162,8 @@ struct IdfModemHttpsPostResult {
     std::string cleanupMessage;
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
+    IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
     bool cleanupRequiresReset = false;
     IdfHttpsFailureStage failureStage = IdfHttpsFailureStage::none;
 };

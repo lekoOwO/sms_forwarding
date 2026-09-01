@@ -19,12 +19,15 @@ const defaultOtaPublicKey = createPublicKey({
 
 const pushTestDetailKeys = [
 	"transportPath", "dispatchAttempted", "failureStage", "httpStatus",
-	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded"
+	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
+	"failureParseReason", "cleanupParseReason"
 ];
 const pushTestDetailFixtures = Object.freeze({
 	wifiSuccess: Object.freeze({ transportPath: "wifi", dispatchAttempted: true, failureStage: "none", httpStatus: 204 }),
 	preflightFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "preflight" }),
-	targetFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "target" })
+	targetFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "target" }),
+	responseInvalidFailure: Object.freeze({ failureReason: "response_invalid", failureParseReason: "field_count" }),
+	responseInvalidCleanup: Object.freeze({ cleanupReason: "response_invalid", cleanupParseReason: "quote" })
 });
 
 export function serializePushTestStatus(status, includeDetail = false) {

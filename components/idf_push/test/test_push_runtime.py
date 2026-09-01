@@ -107,9 +107,49 @@ int main() {
     idf_push_complete_test_job(primary_reason, false,
                                "HTTPS modem connected-state poll failed", "",
                                IdfModemHttpsDiagnosticReason::response_invalid,
-                               IdfModemHttpsDiagnosticReason::none, false);
+                               IdfModemHttpsDiagnosticReason::none, false,
+                               IdfPushTransportPath::Cellular, true,
+                               IdfHttpsFailureStage::registration, -1,
+                               IdfModemHttpsParseReason::state,
+                               IdfModemHttpsParseReason::none);
     assert(idf_push_serialize_test_status(primary_reason, true).find(
         "\"failureReason\":\"response_invalid\"") != std::string::npos);
+    assert(idf_push_serialize_test_status(primary_reason, true).find(
+        "\"failureParseReason\":\"state\"") != std::string::npos);
+
+    IdfPushTestJobState cleanup_parse;
+    idf_push_complete_test_job(cleanup_parse, false, "HTTPS cleanup failed", "cleanup",
+                               IdfModemHttpsDiagnosticReason::none,
+                               IdfModemHttpsDiagnosticReason::response_invalid, true,
+                               IdfPushTransportPath::Cellular, true,
+                               IdfHttpsFailureStage::cleanup, -1,
+                               IdfModemHttpsParseReason::none,
+                               IdfModemHttpsParseReason::terminal);
+    const std::string cleanup_parse_json =
+        idf_push_serialize_test_status(cleanup_parse, true);
+    assert(cleanup_parse_json.find("\"cleanupParseReason\":\"terminal\"") !=
+           std::string::npos);
+
+    IdfPushTestJobState parse_without_response_reason;
+    idf_push_complete_test_job(parse_without_response_reason, false, "timeout", "",
+                               IdfModemHttpsDiagnosticReason::timeout,
+                               IdfModemHttpsDiagnosticReason::none, false,
+                               IdfPushTransportPath::Cellular, true,
+                               IdfHttpsFailureStage::modem, -1,
+                               IdfModemHttpsParseReason::state,
+                               IdfModemHttpsParseReason::none);
+    assert(idf_push_serialize_test_status(parse_without_response_reason, true).find(
+               "ParseReason") == std::string::npos);
+
+    IdfPushTestJobState unknown_parse;
+    idf_push_complete_test_job(
+        unknown_parse, false, "invalid response", "",
+        IdfModemHttpsDiagnosticReason::response_invalid,
+        IdfModemHttpsDiagnosticReason::none, false, IdfPushTransportPath::Cellular, true,
+        IdfHttpsFailureStage::response, -1,
+        static_cast<IdfModemHttpsParseReason>(77), IdfModemHttpsParseReason::none);
+    assert(idf_push_serialize_test_status(unknown_parse, true).find(
+               "\"failureParseReason\":\"unknown\"") != std::string::npos);
 
     IdfPushTestJobState unknown_reason;
     idf_push_complete_test_job(
@@ -172,6 +212,10 @@ int main() {
     active_with_stale_diagnostic.dispatchAttempted = true;
     active_with_stale_diagnostic.failureStage = IdfHttpsFailureStage::http;
     active_with_stale_diagnostic.httpStatus = 503;
+    active_with_stale_diagnostic.failureReason = IdfModemHttpsDiagnosticReason::response_invalid;
+    active_with_stale_diagnostic.failureParseReason = IdfModemHttpsParseReason::state;
+    active_with_stale_diagnostic.cleanupReason = IdfModemHttpsDiagnosticReason::response_invalid;
+    active_with_stale_diagnostic.cleanupParseReason = IdfModemHttpsParseReason::terminal;
     assert(idf_push_serialize_test_status(active_with_stale_diagnostic, true).find(
                "transportPath") == std::string::npos);
 

@@ -31,6 +31,8 @@ struct IdfPushTransportResult {
     std::string cleanupMessage;
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
+    IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
     bool cleanupRequiresReset = false;
     IdfPushTransportPath transportPath = IdfPushTransportPath::None;
     bool dispatchAttempted = false;

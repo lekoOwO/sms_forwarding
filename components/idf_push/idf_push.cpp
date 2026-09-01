@@ -1863,6 +1863,8 @@ static bool fail_pending_tests(const char* message)
         job.cleanupMessage.clear();
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.failureParseReason = IdfModemHttpsParseReason::none;
+        job.cleanupParseReason = IdfModemHttpsParseReason::none;
         job.resetNeeded = false;
         job.transportPath = IdfPushTransportPath::None;
         job.dispatchAttempted = false;
@@ -1888,6 +1890,8 @@ static bool expire_test_jobs_locked(int64_t now)
         job.cleanupMessage.clear();
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.failureParseReason = IdfModemHttpsParseReason::none;
+        job.cleanupParseReason = IdfModemHttpsParseReason::none;
         job.resetNeeded = false;
         job.transportPath = IdfPushTransportPath::None;
         job.dispatchAttempted = false;
@@ -1935,6 +1939,8 @@ static bool process_test_one()
         s_test_jobs[i].cleanupMessage.clear();
         s_test_jobs[i].failureReason = IdfModemHttpsDiagnosticReason::none;
         s_test_jobs[i].cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        s_test_jobs[i].failureParseReason = IdfModemHttpsParseReason::none;
+        s_test_jobs[i].cleanupParseReason = IdfModemHttpsParseReason::none;
         s_test_jobs[i].resetNeeded = false;
         s_test_jobs[i].transportPath = transport_path_for_network(network);
         s_test_jobs[i].dispatchAttempted = false;
@@ -1976,7 +1982,8 @@ static bool process_test_one()
         idf_push_complete_test_job(job, ok, std::move(result), std::move(cleanup_result),
                                    failure_reason, cleanup_reason, cleanup_requires_reset,
                                    transport.transportPath, transport.dispatchAttempted,
-                                   transport.failureStage, transport.httpStatus);
+                                   transport.failureStage, transport.httpStatus,
+                                   transport.failureParseReason, transport.cleanupParseReason);
         xSemaphoreGive(s_mutex);
     }
     return true;
@@ -2256,6 +2263,8 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
         job.cleanupMessage.clear();
         job.failureReason = IdfModemHttpsDiagnosticReason::none;
         job.cleanupReason = IdfModemHttpsDiagnosticReason::none;
+        job.failureParseReason = IdfModemHttpsParseReason::none;
+        job.cleanupParseReason = IdfModemHttpsParseReason::none;
         job.resetNeeded = false;
         job.transportPath = IdfPushTransportPath::None;
         job.dispatchAttempted = false;

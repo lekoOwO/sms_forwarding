@@ -168,7 +168,9 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                 IdfPushTransportPath transport_path,
                                 bool dispatch_attempted,
                                 IdfHttpsFailureStage failure_stage,
-                                int http_status)
+                                int http_status,
+                                IdfModemHttpsParseReason failure_parse_reason,
+                                IdfModemHttpsParseReason cleanup_parse_reason)
 {
     if (success) message = "Test push sent";
     else if (message.empty()) message = "Test push failed; see the log";
@@ -184,6 +186,8 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
         std::min(cleanup_message.size(), IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1));
     job.failureReason = failure_reason;
     job.cleanupReason = cleanup_reason;
+    job.failureParseReason = failure_parse_reason;
+    job.cleanupParseReason = cleanup_parse_reason;
     job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;
     job.transportPath = transport_path;
     job.dispatchAttempted = dispatch_attempted;
@@ -242,6 +246,13 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
         append_json_string(
             out, "failureReason",
             std::string(idf_modem_https_diagnostic_reason_name(job.failureReason)));
+        if (job.failureReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+            job.failureParseReason != IdfModemHttpsParseReason::none) {
+            out += ",";
+            append_json_string(
+                out, "failureParseReason",
+                std::string(idf_modem_https_parse_reason_name(job.failureParseReason)));
+        }
     }
     if (include_cleanup && job.done &&
         job.cleanupReason != IdfModemHttpsDiagnosticReason::none) {
@@ -251,6 +262,13 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
             std::string(idf_modem_https_cleanup_reason_name(job.cleanupReason)));
         out += ",\"resetNeeded\":";
         out += job.resetNeeded ? "true" : "false";
+        if (job.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+            job.cleanupParseReason != IdfModemHttpsParseReason::none) {
+            out += ",";
+            append_json_string(
+                out, "cleanupParseReason",
+                std::string(idf_modem_https_parse_reason_name(job.cleanupParseReason)));
+        }
     }
     out += "}";
     return out;

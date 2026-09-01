@@ -3,7 +3,7 @@ import { createCipheriv, createDecipheriv, createHash, generateKeyPairSync, pbkd
 import { readFile } from "node:fs/promises";
 import { connect } from "node:net";
 import test from "node:test";
-import { createApp } from "../server.mjs";
+import { createApp, serializePushTestStatus } from "../server.mjs";
 
 const auth = `Basic ${Buffer.from("admin:admin123").toString("base64")}`;
 const headers = { Authorization: auth, "X-CSRF-Token": "mock-csrf-token" };
@@ -58,6 +58,21 @@ async function completedPushTest(baseUrl, channel, detail = false) {
 	}
 	throw new Error("push test timeout");
 }
+
+test("push test serializer exposes parse detail only for terminal opt-in responses", () => {
+	const terminal = {
+		queued: false, running: false, done: true, success: false, message: "Malformed response",
+		failureReason: "response_invalid", failureParseReason: "field_count",
+		cleanupReason: "response_invalid", cleanupParseReason: "quote"
+	};
+	assert.deepEqual(serializePushTestStatus(terminal, true), terminal);
+	assert.deepEqual(serializePushTestStatus(terminal), {
+		queued: false, running: false, done: true, success: false, message: "Malformed response"
+	});
+	assert.deepEqual(serializePushTestStatus({ ...terminal, done: false }, true), {
+		queued: false, running: false, done: false, success: false, message: "Malformed response"
+	});
+});
 
 function decrypt(bytes, passphrase) {
 	const value = Buffer.from(bytes);

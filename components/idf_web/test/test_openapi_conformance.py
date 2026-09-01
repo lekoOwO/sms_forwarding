@@ -158,6 +158,7 @@ def main() -> None:
         "failureReason": "string", "cleanupReason": "string", "resetNeeded": "boolean",
         "transportPath": "string", "dispatchAttempted": "boolean",
         "failureStage": "string", "httpStatus": "integer",
+        "failureParseReason": "string", "cleanupParseReason": "string",
     }
     cleanup_message = push_status["properties"]["cleanupMessage"]
     assert "cleanupMessage" not in push_status["required"]
@@ -177,6 +178,16 @@ def main() -> None:
     assert push_status["properties"]["cleanupReason"]["enum"] == [
         "command_failure", "timeout", "response_invalid", "result_nonzero", "unknown",
     ]
+    parse_reasons = [
+        "oversize", "terminal", "urc", "prefix", "field_count", "quote",
+        "cid", "state", "endpoint", "result", "unknown",
+    ]
+    assert push_status["properties"]["failureParseReason"] == {
+        "type": "string", "enum": parse_reasons,
+    }
+    assert push_status["properties"]["cleanupParseReason"] == {
+        "type": "string", "enum": parse_reasons,
+    }
     assert push_status["properties"]["transportPath"]["enum"] == [
         "none", "wifi", "cellular",
     ]
@@ -197,6 +208,7 @@ def main() -> None:
     active_diagnostic_fields = {
         "cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
         "transportPath", "dispatchAttempted", "failureStage", "httpStatus",
+        "failureParseReason", "cleanupParseReason",
     }
     active_guard = next(
         condition for condition in push_status["allOf"]
@@ -233,6 +245,22 @@ def main() -> None:
             "failureStage": {"const": "none"},
             "httpStatus": {"minimum": 200, "maximum": 299},
         },
+    }
+    failure_parse_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["failureParseReason"]
+    )
+    assert failure_parse_guard["then"] == {
+        "required": ["failureReason"],
+        "properties": {"failureReason": {"const": "response_invalid"}},
+    }
+    cleanup_parse_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["cleanupParseReason"]
+    )
+    assert cleanup_parse_guard["then"] == {
+        "required": ["cleanupReason"],
+        "properties": {"cleanupReason": {"const": "response_invalid"}},
     }
 
     # Provisioning endpoints are firmware-private AP routes. Legacy plaintext

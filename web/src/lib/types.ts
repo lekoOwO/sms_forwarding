@@ -35,6 +35,22 @@ export type PushTestCleanupReason =
 	| "result_nonzero"
 	| "unknown";
 
+export type PushTestParseReason =
+	| "oversize"
+	| "terminal"
+	| "urc"
+	| "prefix"
+	| "field_count"
+	| "quote"
+	| "cid"
+	| "state"
+	| "endpoint"
+	| "result"
+	| "unknown";
+
+export type PushTestFailureParseReason = PushTestParseReason;
+export type PushTestCleanupParseReason = PushTestParseReason;
+
 export type PushTestCleanupMessage =
 	| "HTTPS cleanup socket close failed"
 	| "HTTPS cleanup SSL config restore failed"
@@ -64,6 +80,8 @@ export type PushTestDiagnosticFields = {
 	cleanupMessage?: PushTestCleanupMessage;
 	failureReason?: PushTestDiagnosticReason;
 	cleanupReason?: PushTestCleanupReason;
+	failureParseReason?: PushTestFailureParseReason;
+	cleanupParseReason?: PushTestCleanupParseReason;
 	resetNeeded?: boolean;
 	transportPath?: PushTestTransportPath;
 	dispatchAttempted?: boolean;

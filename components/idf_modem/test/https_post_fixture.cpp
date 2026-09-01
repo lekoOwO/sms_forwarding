@@ -29,6 +29,8 @@ using idf_modem_https_wire::parse_result;
 using idf_modem_https_wire::scan_frame;
 using idf_modem_https_wire::build_cgdccont_command;
 
+using ParseReason = IdfModemHttpsParseReason;
+
 std::string frame(std::string_view command, std::string_view body)
 {
     std::string response = "\r\n";
@@ -104,6 +106,7 @@ enum class InitialStateMode {
     wrong_cid,
     close_failed,
     close_ambiguous,
+    close_malformed,
     connected_after_close,
     post_close_state_failed,
 };
@@ -163,6 +166,10 @@ struct InitialStateTranscript {
             if (transcript.mode == InitialStateMode::close_failed) {
                 return IdfModemHttpsCommandResult::failed;
             }
+            if (transcript.mode == InitialStateMode::close_malformed) {
+                response = frame(command, "+MIPCLOSE: 0");
+                return IdfModemHttpsCommandResult::ok;
+            }
             response = frame(command, transcript.mode == InitialStateMode::close_ambiguous
                                           ? "+MIPCLOSE: 0,1"
                                           : "+MIPCLOSE: 0,0");
@@ -177,7 +184,8 @@ struct InitialStateTranscript {
     }
 };
 
-IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& transcript)
+IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& transcript,
+                                                   IdfModemHttpsPostResult* output = nullptr)
 {
     IdfModemHttpsPostRequest request;
     request.url = "https://fixture.example/notify";
@@ -189,6 +197,7 @@ IdfModemHttpsRunResult run_initial_state_transcript(InitialStateTranscript& tran
     IdfModemHttpsPostResult result;
     const IdfModemHttpsRunResult outcome = idf_modem_https_run_post(request, callbacks, result);
     transcript.result_message = result.message;
+    if (output) *output = result;
     return outcome;
 }
 
@@ -239,6 +248,7 @@ void check_initial_state_transcripts()
     for (const auto& [mode, expected_message] : {
              std::pair{InitialStateMode::close_failed, kStaleCloseCommandFailure},
              std::pair{InitialStateMode::close_ambiguous, kStaleCloseResponseInvalid},
+             std::pair{InitialStateMode::close_malformed, kStaleCloseResponseInvalid},
          }) {
         InitialStateTranscript rejected{mode};
         assert(run_initial_state_transcript(rejected) == IdfModemHttpsRunResult::command_failed);
@@ -261,6 +271,97 @@ void check_initial_state_transcripts()
                                            "AT+MIPSTATE=0"}));
     assert((post_close_failed.cleanup == std::vector<bool>{false, true, false}));
     assert_failure_message(post_close_failed.result_message, kPostCloseQueryCommandFailure);
+
+    for (const auto& [mode, expected_parse_reason] : {
+             std::pair{InitialStateMode::malformed_state, ParseReason::field_count},
+             std::pair{InitialStateMode::wrong_cid, ParseReason::cid},
+             std::pair{InitialStateMode::close_malformed, ParseReason::field_count},
+         }) {
+        InitialStateTranscript rejected{mode};
+        IdfModemHttpsPostResult result;
+        assert(run_initial_state_transcript(rejected, &result) ==
+               IdfModemHttpsRunResult::command_failed);
+        assert(result.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
+        assert(result.failureParseReason == expected_parse_reason);
+    }
+
+    InitialStateTranscript nonzero_close{InitialStateMode::close_ambiguous};
+    IdfModemHttpsPostResult nonzero_result;
+    assert(run_initial_state_transcript(nonzero_close, &nonzero_result) ==
+           IdfModemHttpsRunResult::command_failed);
+    assert(nonzero_result.failureParseReason == ParseReason::none);
+}
+
+void check_parse_reasons()
+{
+    const std::string state_command = "AT+MIPSTATE=0";
+    const std::string close_command = "AT+MIPCLOSE=0";
+    auto state_reason = [&](std::string_view body, ParseReason expected) {
+        ParseReason reason = ParseReason::none;
+        assert(classify_mip_state(frame(state_command, body), state_command, 0, &reason) ==
+               MipStateDisposition::invalid);
+        assert(reason == expected);
+    };
+
+    state_reason(std::string(idf_modem_https_wire::kResponseMax + 1, 'x'),
+                 ParseReason::oversize);
+    ParseReason reason = ParseReason::none;
+    const std::string missing_terminal = "\r\n" + state_command +
+                                         "\r\n+MIPSTATE: 0,,,,\"INITIAL\"\r\n";
+    assert(classify_mip_state(missing_terminal, state_command, 0, &reason) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::terminal);
+    state_reason("+MIPURC: \"disconn\",0,0", ParseReason::urc);
+    state_reason("+OTHER: 0", ParseReason::prefix);
+    state_reason("+MIPSTATE: 0,,,,\"INITIAL\",extra", ParseReason::field_count);
+    state_reason("+MIPSTATE: 0,,,,INITIAL", ParseReason::quote);
+    state_reason("+MIPSTATE: 256,,,,\"INITIAL\"", ParseReason::cid);
+    state_reason("+MIPSTATE: 0,,,,\"OTHER\"", ParseReason::state);
+    state_reason("+MIPSTATE: 0,,,,\"CONNECTED\"", ParseReason::endpoint);
+    state_reason("+MIPOPEN: 0,bad\r\n+MIPSTATE: 0,,,,\"INITIAL\"", ParseReason::result);
+    reason = ParseReason::none;
+    assert(classify_mip_state(frame(state_command, "+MIPOPEN: 0,4\r\n+MIPSTATE: 0,,,,\"INITIAL\""),
+                              state_command, 0, &reason) == MipStateDisposition::invalid);
+    assert(reason == ParseReason::none);
+    reason = ParseReason::none;
+    assert(classify_mip_state(
+               frame(state_command, "+MIPOPEN: \"0\",\"0\"\r\n+MIPSTATE: 0,,,,\"INITIAL\""),
+               state_command, 0, &reason) == MipStateDisposition::invalid);
+    assert(reason == ParseReason::quote);
+
+    auto close_reason = [&](std::string_view body, ParseReason expected) {
+        reason = ParseReason::none;
+        uint32_t value = 0;
+        assert(!parse_result(frame(close_command, body), close_command, "+MIPCLOSE:", 0,
+                             value, &reason));
+        assert(reason == expected);
+    };
+    close_reason("+OTHER: 0", ParseReason::prefix);
+    close_reason("+MIPURC: \"disconn\",0,0", ParseReason::urc);
+    close_reason("+MIPCLOSE: 0", ParseReason::field_count);
+    close_reason("+MIPCLOSE: 1,0", ParseReason::cid);
+    close_reason("+MIPCLOSE: 0,bad", ParseReason::result);
+    const std::string close_missing_terminal = "\r\n" + close_command +
+                                                "\r\n+MIPCLOSE: 0,0\r\n";
+    reason = ParseReason::none;
+    uint32_t value = 0;
+    assert(!parse_result(close_missing_terminal, close_command, "+MIPCLOSE:", 0, value,
+                         &reason));
+    assert(reason == ParseReason::terminal);
+    assert(parse_result(frame(close_command, "+MIPCLOSE: 0,1"), close_command,
+                        "+MIPCLOSE:", 0, value, &reason));
+    assert(value == 1 && reason == ParseReason::none);
+
+    reason = ParseReason::none;
+    assert(parse_result(frame(close_command, "+MIPCLOSE: \"0\",\"0\""), close_command,
+                        "+MIPCLOSE:", 0, value, &reason));
+    assert(value == 0 && reason == ParseReason::none);
+
+    const std::string send_command = "AT+MIPSEND=0,4,\"ABCD\"";
+    reason = ParseReason::none;
+    assert(parse_result(frame(send_command, "+MIPSEND: \"0\",\"4\""), send_command,
+                        "+MIPSEND:", 0, value, &reason));
+    assert(value == 4 && reason == ParseReason::none);
 }
 
 enum class RemoteCloseMode {
@@ -1122,8 +1223,14 @@ void check_remote_close_transcripts()
                             ? IdfModemHttpsDiagnosticReason::result_nonzero
                             : IdfModemHttpsDiagnosticReason::response_invalid;
             assert(result.cleanupReason == expected_cleanup_reason);
+            if (failure.phase == CleanupFailurePhase::malformed_response) {
+                assert(result.cleanupParseReason == ParseReason::terminal);
+            } else {
+                assert(result.cleanupParseReason == ParseReason::none);
+            }
         } else {
             assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::none);
+            assert(result.cleanupParseReason == ParseReason::none);
         }
         assert(result.cleanupRequiresReset == (failure.failure == CleanupFailure::socket_close));
         assert(result.failureStage == IdfHttpsFailureStage::cleanup);
@@ -1254,6 +1361,7 @@ void check_invalid_request_stages()
 int main()
 {
     check_initial_state_transcripts();
+    check_parse_reasons();
     check_remote_close_transcripts();
     check_invalid_request_stages();
     const uint8_t pdp_cid = 1;
