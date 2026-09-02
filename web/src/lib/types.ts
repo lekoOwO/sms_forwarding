@@ -59,6 +59,14 @@ export type PushTestCleanupMessage =
 	| "HTTPS cleanup PDP deactivate failed"
 	| "HTTPS cleanup PDP profile restore failed";
 
+export type PushTestParseShape = {
+	fieldCount: number;
+	quoteMask: number;
+	presenceMask: number;
+	stateClass: "none" | "initial" | "closed" | "connected" | "unknown";
+	lineClass: "none" | "missing" | "unexpected" | "duplicate" | "extra";
+};
+
 export type PushTestTransportPath = "none" | "wifi" | "cellular";
 
 export type PushTestFailureStage =
@@ -82,6 +90,8 @@ export type PushTestDiagnosticFields = {
 	cleanupReason?: PushTestCleanupReason;
 	failureParseReason?: PushTestFailureParseReason;
 	cleanupParseReason?: PushTestCleanupParseReason;
+	failureParseShape?: PushTestParseShape;
+	cleanupParseShape?: PushTestParseShape;
 	resetNeeded?: boolean;
 	transportPath?: PushTestTransportPath;
 	dispatchAttempted?: boolean;

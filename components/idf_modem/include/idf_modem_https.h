@@ -80,6 +80,71 @@ constexpr std::string_view idf_modem_https_parse_reason_name(
     return "unknown";
 }
 
+enum class IdfModemHttpsParseStateClass : uint8_t {
+    none = 0,
+    initial,
+    closed,
+    connected,
+    unknown,
+};
+
+constexpr std::string_view idf_modem_https_parse_state_class_name(
+    IdfModemHttpsParseStateClass state)
+{
+    switch (state) {
+        case IdfModemHttpsParseStateClass::none: return "none";
+        case IdfModemHttpsParseStateClass::initial: return "initial";
+        case IdfModemHttpsParseStateClass::closed: return "closed";
+        case IdfModemHttpsParseStateClass::connected: return "connected";
+        case IdfModemHttpsParseStateClass::unknown: return "unknown";
+    }
+    return {};
+}
+
+enum class IdfModemHttpsParseLineClass : uint8_t {
+    none = 0,
+    missing,
+    unexpected,
+    duplicate,
+    extra,
+};
+
+constexpr std::string_view idf_modem_https_parse_line_class_name(
+    IdfModemHttpsParseLineClass line)
+{
+    switch (line) {
+        case IdfModemHttpsParseLineClass::none: return "none";
+        case IdfModemHttpsParseLineClass::missing: return "missing";
+        case IdfModemHttpsParseLineClass::unexpected: return "unexpected";
+        case IdfModemHttpsParseLineClass::duplicate: return "duplicate";
+        case IdfModemHttpsParseLineClass::extra: return "extra";
+    }
+    return {};
+}
+
+struct IdfModemHttpsParsePresence {
+    static constexpr uint8_t mipstate = 1U << 0;
+    static constexpr uint8_t mipopen = 1U << 1;
+    static constexpr uint8_t mipclose = 1U << 2;
+    static constexpr uint8_t mipurc = 1U << 3;
+    static constexpr uint8_t other = 1U << 4;
+    static constexpr uint8_t all = mipstate | mipopen | mipclose | mipurc | other;
+};
+
+// A fixed snapshot of parser structure.  It contains no response values.
+// fieldCount is zero when no CSV line was inspected and eight means eight or
+// more fields.  quoteMask bits 0..7 indicate quoted CSV fields in that line;
+// presenceMask uses the constants above.  The availability flag is internal
+// and is never serialized.
+struct IdfModemHttpsParseShape {
+    bool available;
+    uint8_t fieldCount;
+    uint8_t quoteMask;
+    uint8_t presenceMask;
+    IdfModemHttpsParseStateClass stateClass;
+    IdfModemHttpsParseLineClass lineClass;
+};
+
 // A bounded, transport-agnostic stage for safe terminal diagnostics. Keep this
 // separate from the modem diagnostic reason: reasons are implementation detail
 // while the stage is part of the push-test status contract.
@@ -164,6 +229,8 @@ struct IdfModemHttpsPostResult {
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
+    IdfModemHttpsParseShape failureParseShape{};
+    IdfModemHttpsParseShape cleanupParseShape{};
     bool cleanupRequiresReset = false;
     IdfHttpsFailureStage failureStage = IdfHttpsFailureStage::none;
 };

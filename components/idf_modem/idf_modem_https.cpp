@@ -128,6 +128,7 @@ constexpr IdfHttpsFailureStage public_failure_stage(HttpsFailureStage stage)
 
 using namespace idf_modem_https_wire;
 using ParseReason = IdfModemHttpsParseReason;
+using ParseShape = IdfModemHttpsParseShape;
 
 using Clock = std::chrono::steady_clock;
 
@@ -625,12 +626,14 @@ private:
             return false;
         }
         ParseReason parse_reason = ParseReason::none;
-        if (!parse_mip_state(response, command_text, expected, cid, &parse_reason) || cid != 0) {
+        ParseShape parse_shape{};
+        if (!parse_mip_state(response, command_text, expected, cid, &parse_reason,
+                             &parse_shape) || cid != 0) {
             record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
             if (cid != 0 && parse_reason == ParseReason::none) {
                 parse_reason = ParseReason::cid;
             }
-            record_failure_parse_reason(parse_reason);
+            record_failure_parse_reason(parse_reason, parse_shape);
             result_.message = response_failure;
             return false;
         }
@@ -653,11 +656,12 @@ private:
             return false;
         }
         ParseReason parse_reason = ParseReason::none;
+        ParseShape parse_shape{};
         const MipStateDisposition disposition =
-            classify_mip_state(response, state_command, 0, &parse_reason);
+            classify_mip_state(response, state_command, 0, &parse_reason, &parse_shape);
         if (disposition == MipStateDisposition::invalid) {
             record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
-            record_failure_parse_reason(parse_reason);
+            record_failure_parse_reason(parse_reason, parse_shape);
             result_.message = kInitialQueryResponseInvalid;
             return false;
         }
@@ -681,9 +685,11 @@ private:
             return false;
         }
         parse_reason = ParseReason::none;
-        if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason)) {
+        parse_shape = {};
+        if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason,
+                          &parse_shape)) {
             record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
-            record_failure_parse_reason(parse_reason);
+            record_failure_parse_reason(parse_reason, parse_shape);
             result_.message = kStaleCloseResponseInvalid;
             return false;
         }
@@ -721,8 +727,9 @@ private:
                 return false;
             }
             ParseReason parse_reason = ParseReason::none;
+            ParseShape parse_shape{};
             const MipStateDisposition disposition =
-                classify_mip_state(response, state_command, 0, &parse_reason);
+                classify_mip_state(response, state_command, 0, &parse_reason, &parse_shape);
             if (disposition == MipStateDisposition::connected) {
                 const IdfModemHttpsCommandResult confirmed =
                     callbacks_.confirmOpen(callbacks_.context);
@@ -739,7 +746,7 @@ private:
             }
             if (disposition == MipStateDisposition::invalid) {
                 record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
-                record_failure_parse_reason(parse_reason);
+                record_failure_parse_reason(parse_reason, parse_shape);
                 return false;
             }
             if (disposition != MipStateDisposition::initial) {
@@ -936,7 +943,8 @@ private:
     void record_cleanup_failure(std::string_view message,
                                 IdfModemHttpsDiagnosticReason reason,
                                 bool requires_reset = false,
-                                ParseReason parse_reason = ParseReason::none)
+                                ParseReason parse_reason = ParseReason::none,
+                                ParseShape parse_shape = {})
     {
         cleanup_ok_ = false;
         if (result_.cleanupMessage.empty()) result_.cleanupMessage = message;
@@ -944,6 +952,7 @@ private:
             result_.cleanupReason = reason;
             if (reason == IdfModemHttpsDiagnosticReason::response_invalid) {
                 result_.cleanupParseReason = parse_reason;
+                result_.cleanupParseShape = parse_shape;
             }
         }
         if (requires_reset) result_.cleanupRequiresReset = true;
@@ -956,11 +965,12 @@ private:
         }
     }
 
-    void record_failure_parse_reason(ParseReason reason)
+    void record_failure_parse_reason(ParseReason reason, ParseShape parse_shape = {})
     {
         if (result_.failureReason == IdfModemHttpsDiagnosticReason::response_invalid &&
             result_.failureParseReason == ParseReason::none && reason != ParseReason::none) {
             result_.failureParseReason = reason;
+            result_.failureParseShape = parse_shape;
         }
     }
 
@@ -995,10 +1005,12 @@ private:
                     true, parse_reason);
             } else {
                 ParseReason parse_reason = ParseReason::none;
-                if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason)) {
+                ParseShape parse_shape{};
+                if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason,
+                                  &parse_shape)) {
                     record_cleanup_failure(kCleanupSocketCloseFailure,
                                            IdfModemHttpsDiagnosticReason::response_invalid, true,
-                                           parse_reason);
+                                           parse_reason, parse_shape);
                 } else if (result != 0) {
                     record_cleanup_failure(kCleanupSocketCloseFailure,
                                            IdfModemHttpsDiagnosticReason::result_nonzero, true);

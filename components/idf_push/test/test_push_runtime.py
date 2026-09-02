@@ -116,6 +116,15 @@ int main() {
         "\"failureReason\":\"response_invalid\"") != std::string::npos);
     assert(idf_push_serialize_test_status(primary_reason, true).find(
         "\"failureParseReason\":\"state\"") != std::string::npos);
+    primary_reason.failureParseShape.available = true;
+    primary_reason.failureParseShape.fieldCount = 5;
+    primary_reason.failureParseShape.presenceMask = IdfModemHttpsParsePresence::mipstate;
+    primary_reason.failureParseShape.stateClass = IdfModemHttpsParseStateClass::unknown;
+    const std::string primary_shape_json = idf_push_serialize_test_status(primary_reason, true);
+    assert(primary_shape_json.find("\"failureParseShape\":") != std::string::npos);
+    assert(primary_shape_json.find("\"stateClass\":\"unknown\"") != std::string::npos);
+    assert(idf_push_serialize_test_status(primary_reason, false).find("ParseShape") ==
+           std::string::npos);
 
     IdfPushTestJobState cleanup_parse;
     idf_push_complete_test_job(cleanup_parse, false, "HTTPS cleanup failed", "cleanup",
@@ -129,6 +138,13 @@ int main() {
         idf_push_serialize_test_status(cleanup_parse, true);
     assert(cleanup_parse_json.find("\"cleanupParseReason\":\"terminal\"") !=
            std::string::npos);
+    cleanup_parse.cleanupParseShape.available = true;
+    cleanup_parse.cleanupParseShape.fieldCount = 0;
+    cleanup_parse.cleanupParseShape.presenceMask = IdfModemHttpsParsePresence::mipclose;
+    cleanup_parse.cleanupParseShape.lineClass = IdfModemHttpsParseLineClass::missing;
+    const std::string cleanup_shape_json = idf_push_serialize_test_status(cleanup_parse, true);
+    assert(cleanup_shape_json.find("\"cleanupParseShape\":") != std::string::npos);
+    assert(cleanup_shape_json.find("\"lineClass\":\"missing\"") != std::string::npos);
 
     IdfPushTestJobState parse_without_response_reason;
     idf_push_complete_test_job(parse_without_response_reason, false, "timeout", "",
@@ -140,6 +156,11 @@ int main() {
                                IdfModemHttpsParseReason::none);
     assert(idf_push_serialize_test_status(parse_without_response_reason, true).find(
                "ParseReason") == std::string::npos);
+    parse_without_response_reason.failureParseShape.available = true;
+    parse_without_response_reason.failureParseShape.stateClass =
+        IdfModemHttpsParseStateClass::unknown;
+    assert(idf_push_serialize_test_status(parse_without_response_reason, true).find(
+               "ParseShape") == std::string::npos);
 
     IdfPushTestJobState unknown_parse;
     idf_push_complete_test_job(
@@ -169,6 +190,15 @@ int main() {
     assert(idf_push_serialize_test_status(success, true) ==
            "{\"queued\":false,\"running\":false,\"done\":true,\"success\":true,"
            "\"message\":\"Test push sent\"}");
+
+    IdfPushTestJobState active_with_shape;
+    active_with_shape.pending = true;
+    active_with_shape.message = "Test push queued";
+    active_with_shape.failureReason = IdfModemHttpsDiagnosticReason::response_invalid;
+    active_with_shape.failureParseReason = IdfModemHttpsParseReason::state;
+    active_with_shape.failureParseShape.available = true;
+    assert(idf_push_serialize_test_status(active_with_shape, true).find("ParseShape") ==
+           std::string::npos);
 
     IdfPushTestJobState wifi_success;
     idf_push_complete_test_job(wifi_success, true, "", "",

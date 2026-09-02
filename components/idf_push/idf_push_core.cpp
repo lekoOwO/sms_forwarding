@@ -170,7 +170,9 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                 IdfHttpsFailureStage failure_stage,
                                 int http_status,
                                 IdfModemHttpsParseReason failure_parse_reason,
-                                IdfModemHttpsParseReason cleanup_parse_reason)
+                                IdfModemHttpsParseReason cleanup_parse_reason,
+                                IdfModemHttpsParseShape failure_parse_shape,
+                                IdfModemHttpsParseShape cleanup_parse_shape)
 {
     if (success) message = "Test push sent";
     else if (message.empty()) message = "Test push failed; see the log";
@@ -188,6 +190,12 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
     job.cleanupReason = cleanup_reason;
     job.failureParseReason = failure_parse_reason;
     job.cleanupParseReason = cleanup_parse_reason;
+    job.failureParseShape = failure_reason == IdfModemHttpsDiagnosticReason::response_invalid
+                                ? failure_parse_shape
+                                : IdfModemHttpsParseShape();
+    job.cleanupParseShape = cleanup_reason == IdfModemHttpsDiagnosticReason::response_invalid
+                                ? cleanup_parse_shape
+                                : IdfModemHttpsParseShape();
     job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;
     job.transportPath = transport_path;
     job.dispatchAttempted = dispatch_attempted;
@@ -202,6 +210,33 @@ static void append_json_string(std::string& out, const char* key, const std::str
     out += "\":\"";
     idf_util_json_escape_append(out, value);
     out += "\"";
+}
+
+static bool parse_shape_valid(const IdfModemHttpsParseShape& shape)
+{
+    return shape.available && shape.fieldCount <= 8 &&
+           (shape.presenceMask & static_cast<uint8_t>(~IdfModemHttpsParsePresence::all)) == 0 &&
+           !idf_modem_https_parse_state_class_name(shape.stateClass).empty() &&
+           !idf_modem_https_parse_line_class_name(shape.lineClass).empty();
+}
+
+static void append_parse_shape(std::string& out, const char* key,
+                               const IdfModemHttpsParseShape& shape)
+{
+    out += ",\"";
+    out += key;
+    out += "\":{";
+    out += "\"fieldCount\":";
+    out += std::to_string(shape.fieldCount);
+    out += ",\"quoteMask\":";
+    out += std::to_string(shape.quoteMask);
+    out += ",\"presenceMask\":";
+    out += std::to_string(shape.presenceMask);
+    out += ",\"stateClass\":\"";
+    out += idf_modem_https_parse_state_class_name(shape.stateClass);
+    out += "\",\"lineClass\":\"";
+    out += idf_modem_https_parse_line_class_name(shape.lineClass);
+    out += "\"}";
 }
 
 std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
@@ -252,6 +287,9 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
             append_json_string(
                 out, "failureParseReason",
                 std::string(idf_modem_https_parse_reason_name(job.failureParseReason)));
+            if (parse_shape_valid(job.failureParseShape)) {
+                append_parse_shape(out, "failureParseShape", job.failureParseShape);
+            }
         }
     }
     if (include_cleanup && job.done &&
@@ -268,6 +306,9 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
             append_json_string(
                 out, "cleanupParseReason",
                 std::string(idf_modem_https_parse_reason_name(job.cleanupParseReason)));
+            if (parse_shape_valid(job.cleanupParseShape)) {
+                append_parse_shape(out, "cleanupParseShape", job.cleanupParseShape);
+            }
         }
     }
     out += "}";

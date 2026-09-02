@@ -207,9 +207,17 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 
 		const responseInvalid = {
 			queued: false, running: false, done: true, success: false,
-			message: "malformed modem response", failureReason: "response_invalid",
+		message: "malformed modem response", failureReason: "response_invalid",
 			failureParseReason: "field_count", cleanupReason: "response_invalid",
-			cleanupParseReason: "quote"
+			cleanupParseReason: "quote",
+			failureParseShape: {
+				fieldCount: 5, quoteMask: 16, presenceMask: 1,
+				stateClass: "unknown", lineClass: "none"
+			},
+			cleanupParseShape: {
+				fieldCount: 0, quoteMask: 0, presenceMask: 4,
+				stateClass: "none", lineClass: "missing"
+			}
 		};
 		globalThis.fetch = async (path) => new Response(JSON.stringify(
 			path === "/api/config" ? { csrfToken: "csrf" } : responseInvalid
@@ -218,8 +226,9 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 		const annotated = await api.runPushTest(0, undefined, 1000);
 		assert.deepEqual([
 			annotated.failureReason, annotated.failureParseReason,
-			annotated.cleanupReason, annotated.cleanupParseReason
-		], ["response_invalid", "field_count", "response_invalid", "quote"]);
+			annotated.cleanupReason, annotated.cleanupParseReason,
+			annotated.failureParseShape.stateClass, annotated.cleanupParseShape.lineClass
+		], ["response_invalid", "field_count", "response_invalid", "quote", "unknown", "missing"]);
 
 		const cleanupMessages = [
 			"HTTPS cleanup socket close failed",
@@ -270,9 +279,26 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			{ ...validPrimary, failureParseReason: "field_count" },
 			{ ...validPrimary, failureReason: "command_failure", failureParseReason: "field_count" },
 			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "unknown-value" },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 9, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", extra: 1 } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "invalid" } },
+			{ ...validPrimary, failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+				stateClass: "unknown", lineClass: "none" } },
 			{ ...validPrimary, cleanupParseReason: "quote" },
 			{ ...validPrimary, cleanupReason: "timeout", cleanupParseReason: "quote" },
-			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "unknown-value" }
+			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "unknown-value" },
+			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "quote",
+				cleanupParseShape: { fieldCount: 9, quoteMask: 0, presenceMask: 4,
+					stateClass: "none", lineClass: "missing" } }
 		]) {
 			globalThis.fetch = async (path) => new Response(JSON.stringify(
 				path === "/api/config" ? { csrfToken: "csrf" } : status

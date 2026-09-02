@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestParseReason, PushTestStatus, PushTestTransportPath } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -50,6 +50,12 @@ const pushTestParseReasons: readonly PushTestParseReason[] = [
 	"oversize", "terminal", "urc", "prefix", "field_count", "quote",
 	"cid", "state", "endpoint", "result", "unknown"
 ];
+const pushTestParseStateClasses: readonly PushTestParseShape["stateClass"][] = [
+	"none", "initial", "closed", "connected", "unknown"
+];
+const pushTestParseLineClasses: readonly PushTestParseShape["lineClass"][] = [
+	"none", "missing", "unexpected", "duplicate", "extra"
+];
 const pushTestCleanupMessages: readonly PushTestCleanupMessage[] = [
 	"HTTPS cleanup socket close failed",
 	"HTTPS cleanup SSL config restore failed",
@@ -65,7 +71,8 @@ const pushTestFailureStages: readonly PushTestFailureStage[] = [
 ];
 const pushTestDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)[] = [
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
-	"failureParseReason", "cleanupParseReason", "transportPath", "dispatchAttempted", "failureStage", "httpStatus"
+	"failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape",
+	"transportPath", "dispatchAttempted", "failureStage", "httpStatus"
 ];
 const pushTestStatusKeys = new Set([
 	"queued", "running", "done", "success", "message", ...pushTestDiagnosticKeys
@@ -76,6 +83,27 @@ const pushTestTransportDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)
 const pushTestTransportStatusKeys: readonly (keyof PushTestDiagnosticFields)[] = [
 	...pushTestTransportDiagnosticKeys, "httpStatus"
 ];
+
+function isPushTestParseShape(value: unknown): value is PushTestParseShape {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const shape = value as Record<string, unknown>;
+	if (Object.keys(shape).some((key) => ![
+		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+	].includes(key))) return false;
+	if (![
+		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+	].every((key) => Object.hasOwn(shape, key))) return false;
+	return typeof shape.fieldCount === "number" && Number.isInteger(shape.fieldCount) &&
+		shape.fieldCount >= 0 && shape.fieldCount <= 8 &&
+		typeof shape.quoteMask === "number" && Number.isInteger(shape.quoteMask) &&
+		shape.quoteMask >= 0 && shape.quoteMask <= 255 &&
+		typeof shape.presenceMask === "number" && Number.isInteger(shape.presenceMask) &&
+		shape.presenceMask >= 0 && shape.presenceMask <= 31 &&
+		typeof shape.stateClass === "string" &&
+		pushTestParseStateClasses.includes(shape.stateClass as PushTestParseShape["stateClass"]) &&
+		typeof shape.lineClass === "string" &&
+		pushTestParseLineClasses.includes(shape.lineClass as PushTestParseShape["lineClass"]);
+}
 
 function demoSnapshot(): DeviceSnapshot {
 	return {
@@ -127,6 +155,10 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 	if (has("cleanupParseReason") && (typeof status.cleanupParseReason !== "string" ||
 		!pushTestParseReasons.includes(status.cleanupParseReason as PushTestParseReason) ||
 		status.cleanupReason !== "response_invalid")) return false;
+	if (has("failureParseShape") && (!isPushTestParseShape(status.failureParseShape) ||
+		!has("failureParseReason") || status.failureReason !== "response_invalid")) return false;
+	if (has("cleanupParseShape") && (!isPushTestParseShape(status.cleanupParseShape) ||
+		!has("cleanupParseReason") || status.cleanupReason !== "response_invalid")) return false;
 	if (has("resetNeeded") && typeof status.resetNeeded !== "boolean") return false;
 	if (has("transportPath") && (typeof status.transportPath !== "string" ||
 		!pushTestTransportPaths.includes(status.transportPath as PushTestTransportPath))) return false;

@@ -20,8 +20,12 @@ const defaultOtaPublicKey = createPublicKey({
 const pushTestDetailKeys = [
 	"transportPath", "dispatchAttempted", "failureStage", "httpStatus",
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
-	"failureParseReason", "cleanupParseReason"
+	"failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape"
 ];
+const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"];
+const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"];
+const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "unknown"];
+const pushTestParseLineClasses = ["none", "missing", "unexpected", "duplicate", "extra"];
 const pushTestDetailFixtures = Object.freeze({
 	wifiSuccess: Object.freeze({ transportPath: "wifi", dispatchAttempted: true, failureStage: "none", httpStatus: 204 }),
 	preflightFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "preflight" }),
@@ -30,13 +34,37 @@ const pushTestDetailFixtures = Object.freeze({
 	responseInvalidCleanup: Object.freeze({ cleanupReason: "response_invalid", cleanupParseReason: "quote" })
 });
 
+function serializePushTestParseShape(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value) ||
+		Object.keys(value).length !== pushTestParseShapeKeys.length ||
+		pushTestParseShapeKeys.some((key) => !Object.hasOwn(value, key)) ||
+		Object.keys(value).some((key) => !pushTestParseShapeKeys.includes(key))) return undefined;
+	if (!Number.isInteger(value.fieldCount) || value.fieldCount < 0 || value.fieldCount > 8 ||
+		!Number.isInteger(value.quoteMask) || value.quoteMask < 0 || value.quoteMask > 255 ||
+		!Number.isInteger(value.presenceMask) || value.presenceMask < 0 || value.presenceMask > 31 ||
+		!pushTestParseStateClasses.includes(value.stateClass) ||
+		!pushTestParseLineClasses.includes(value.lineClass)) return undefined;
+	return Object.fromEntries(pushTestParseShapeKeys.map((key) => [key, value[key]]));
+}
+
 export function serializePushTestStatus(status, includeDetail = false) {
 	const serialized = {
 		queued: Boolean(status.queued), running: Boolean(status.running), done: Boolean(status.done),
 		success: Boolean(status.success), message: String(status.message ?? "")
 	};
 	if (!includeDetail || !serialized.done) return serialized;
-	for (const key of pushTestDetailKeys) if (Object.hasOwn(status, key)) serialized[key] = status[key];
+	for (const key of pushTestDetailKeys) {
+		if (!Object.hasOwn(status, key)) continue;
+		if (key === "failureParseShape" || key === "cleanupParseShape") {
+			const reasonKey = key === "failureParseShape" ? "failureReason" : "cleanupReason";
+			const parseReasonKey = key === "failureParseShape" ? "failureParseReason" : "cleanupParseReason";
+			if (status[reasonKey] !== "response_invalid" || !pushTestParseReasons.includes(status[parseReasonKey])) continue;
+			const shape = serializePushTestParseShape(status[key]);
+			if (shape) serialized[key] = shape;
+		} else {
+			serialized[key] = status[key];
+		}
+	}
 	return serialized;
 }
 

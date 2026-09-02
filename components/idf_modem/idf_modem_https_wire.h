@@ -26,17 +26,20 @@ enum class MipStateDisposition : uint8_t {
 
 bool scan_frame(std::string_view response, std::string_view command,
                 std::vector<std::string_view>& body,
-                IdfModemHttpsParseReason* reason = nullptr);
+                IdfModemHttpsParseReason* reason = nullptr,
+                IdfModemHttpsParseShape* shape = nullptr);
 bool parse_cfg_response(std::string_view response, std::string_view command,
                         std::string_view parameter, uint8_t& first, uint8_t& second,
                         bool& has_second);
 bool parse_mip_state(std::string_view response, std::string_view command,
                      std::string_view expected, uint8_t& cid,
-                     IdfModemHttpsParseReason* reason = nullptr);
+                     IdfModemHttpsParseReason* reason = nullptr,
+                     IdfModemHttpsParseShape* shape = nullptr);
 MipStateDisposition classify_mip_state(std::string_view response,
                                        std::string_view command,
                                        uint8_t expected_cid,
-                                       IdfModemHttpsParseReason* reason = nullptr);
+                                       IdfModemHttpsParseReason* reason = nullptr,
+                                       IdfModemHttpsParseShape* shape = nullptr);
 bool parse_mip_open(std::string_view response, std::string_view command,
                     uint8_t expected_cid, bool& present);
 bool parse_mip_urc(std::string_view line, uint32_t& received, uint32_t& total,
@@ -48,7 +51,8 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
                 bool& active);
 bool parse_result(std::string_view response, std::string_view command,
                   std::string_view prefix, uint8_t expected_cid, uint32_t& value,
-                  IdfModemHttpsParseReason* reason = nullptr);
+                  IdfModemHttpsParseReason* reason = nullptr,
+                  IdfModemHttpsParseShape* shape = nullptr);
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
                 uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed);
 std::string hex_encode(const uint8_t* bytes, size_t length);

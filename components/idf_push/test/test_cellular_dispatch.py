@@ -31,6 +31,8 @@ static IdfModemHttpsDiagnosticReason modem_failure_reason = IdfModemHttpsDiagnos
 static IdfModemHttpsDiagnosticReason modem_cleanup_reason = IdfModemHttpsDiagnosticReason::none;
 static IdfModemHttpsParseReason modem_failure_parse_reason = IdfModemHttpsParseReason::none;
 static IdfModemHttpsParseReason modem_cleanup_parse_reason = IdfModemHttpsParseReason::none;
+static IdfModemHttpsParseShape modem_failure_parse_shape;
+static IdfModemHttpsParseShape modem_cleanup_parse_shape;
 static bool modem_cleanup_requires_reset = false;
 static IdfHttpsFailureStage modem_failure_stage = IdfHttpsFailureStage::none;
 static int wifi_calls = 0;
@@ -62,6 +64,8 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     result.cleanupReason = modem_cleanup_reason;
     result.failureParseReason = modem_failure_parse_reason;
     result.cleanupParseReason = modem_cleanup_parse_reason;
+    result.failureParseShape = modem_failure_parse_shape;
+    result.cleanupParseShape = modem_cleanup_parse_shape;
     result.cleanupRequiresReset = modem_cleanup_requires_reset;
     result.failureStage = modem_failure_stage;
     return modem_return;
@@ -122,6 +126,7 @@ int main() {
     assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
     assert(transport.failureReason == IdfModemHttpsDiagnosticReason::none);
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::none);
+    assert(!transport.failureParseShape.available && !transport.cleanupParseShape.available);
     assert(!transport.cleanupRequiresReset);
 
     modem_status = 503;
@@ -142,18 +147,34 @@ int main() {
                                       nullptr, fake_modem_post, transport));
     assert(transport.mhttpError == -1);
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
+    modem_failure_reason = IdfModemHttpsDiagnosticReason::timeout;
+    modem_failure_parse_reason = IdfModemHttpsParseReason::state;
+    modem_failure_parse_shape.available = true;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(!transport.failureParseShape.available);
+    modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
+    modem_failure_parse_reason = IdfModemHttpsParseReason::none;
+    modem_failure_parse_shape = {};
     modem_message = "HTTPS modem connected-state poll failed";
     modem_failure_reason = IdfModemHttpsDiagnosticReason::response_invalid;
     modem_failure_parse_reason = IdfModemHttpsParseReason::state;
+    modem_failure_parse_shape.available = true;
+    modem_failure_parse_shape.fieldCount = 5;
+    modem_failure_parse_shape.presenceMask = IdfModemHttpsParsePresence::mipstate;
+    modem_failure_parse_shape.stateClass = IdfModemHttpsParseStateClass::unknown;
     modem_failure_stage = IdfHttpsFailureStage::registration;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.message == "HTTPS modem connected-state poll failed");
     assert(transport.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
     assert(transport.failureParseReason == IdfModemHttpsParseReason::state);
+    assert(transport.failureParseShape.available &&
+           transport.failureParseShape.stateClass == IdfModemHttpsParseStateClass::unknown);
     assert(transport.failureStage == IdfHttpsFailureStage::registration);
     modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
     modem_failure_parse_reason = IdfModemHttpsParseReason::none;
+    modem_failure_parse_shape = {};
     modem_failure_stage = IdfHttpsFailureStage::none;
     for (const char* message : {
              "HTTPS modem initial query command failed",
@@ -194,10 +215,16 @@ int main() {
 
     modem_cleanup_reason = IdfModemHttpsDiagnosticReason::response_invalid;
     modem_cleanup_parse_reason = IdfModemHttpsParseReason::field_count;
+    modem_cleanup_parse_shape.available = true;
+    modem_cleanup_parse_shape.fieldCount = 1;
+    modem_cleanup_parse_shape.presenceMask = IdfModemHttpsParsePresence::mipclose;
+    modem_cleanup_parse_shape.lineClass = IdfModemHttpsParseLineClass::unexpected;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid);
     assert(transport.cleanupParseReason == IdfModemHttpsParseReason::field_count);
+    assert(transport.cleanupParseShape.available &&
+           transport.cleanupParseShape.lineClass == IdfModemHttpsParseLineClass::unexpected);
 
     modem_cleanup_message.assign(200, 'y');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
@@ -210,6 +237,8 @@ int main() {
     modem_failure_stage = IdfHttpsFailureStage::none;
     modem_cleanup_reason = IdfModemHttpsDiagnosticReason::none;
     modem_cleanup_parse_reason = IdfModemHttpsParseReason::none;
+    modem_failure_parse_shape = {};
+    modem_cleanup_parse_shape = {};
     modem_cleanup_requires_reset = false;
     modem_message = "HTTPS POST succeeded";
     modem_cleanup_message.clear();

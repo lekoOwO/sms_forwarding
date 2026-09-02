@@ -33,6 +33,8 @@ struct IdfPushTransportResult {
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
+    IdfModemHttpsParseShape failureParseShape{};
+    IdfModemHttpsParseShape cleanupParseShape{};
     bool cleanupRequiresReset = false;
     IdfPushTransportPath transportPath = IdfPushTransportPath::None;
     bool dispatchAttempted = false;

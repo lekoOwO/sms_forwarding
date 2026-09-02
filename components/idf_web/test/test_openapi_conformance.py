@@ -152,13 +152,40 @@ def main() -> None:
     push_status = SPEC["components"]["schemas"]["PushTestStatus"]
     assert set(push_status["required"]) == {"queued", "running", "done", "success", "message"}
     assert push_status["additionalProperties"] is False
-    assert {name: schema["type"] for name, schema in push_status["properties"].items()} == {
+    assert {name: schema.get("type", "object" if "$ref" in schema else None)
+            for name, schema in push_status["properties"].items()} == {
         "queued": "boolean", "running": "boolean", "done": "boolean",
         "success": "boolean", "message": "string", "cleanupMessage": "string",
         "failureReason": "string", "cleanupReason": "string", "resetNeeded": "boolean",
         "transportPath": "string", "dispatchAttempted": "boolean",
         "failureStage": "string", "httpStatus": "integer",
         "failureParseReason": "string", "cleanupParseReason": "string",
+        "failureParseShape": "object", "cleanupParseShape": "object",
+    }
+    parse_shape = SPEC["components"]["schemas"]["PushTestParseShape"]
+    assert parse_shape["type"] == "object"
+    assert parse_shape["additionalProperties"] is False
+    assert set(parse_shape["required"]) == {
+        "fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+    }
+    assert parse_shape["properties"] == {
+        "fieldCount": {"type": "integer", "minimum": 0, "maximum": 8},
+        "quoteMask": {"type": "integer", "minimum": 0, "maximum": 255},
+        "presenceMask": {"type": "integer", "minimum": 0, "maximum": 31},
+        "stateClass": {
+            "type": "string",
+            "enum": ["none", "initial", "closed", "connected", "unknown"],
+        },
+        "lineClass": {
+            "type": "string",
+            "enum": ["none", "missing", "unexpected", "duplicate", "extra"],
+        },
+    }
+    assert push_status["properties"]["failureParseShape"] == {
+        "$ref": "#/components/schemas/PushTestParseShape"
+    }
+    assert push_status["properties"]["cleanupParseShape"] == {
+        "$ref": "#/components/schemas/PushTestParseShape"
     }
     cleanup_message = push_status["properties"]["cleanupMessage"]
     assert "cleanupMessage" not in push_status["required"]
@@ -208,7 +235,7 @@ def main() -> None:
     active_diagnostic_fields = {
         "cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
         "transportPath", "dispatchAttempted", "failureStage", "httpStatus",
-        "failureParseReason", "cleanupParseReason",
+        "failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape",
     }
     active_guard = next(
         condition for condition in push_status["allOf"]
@@ -260,6 +287,22 @@ def main() -> None:
     )
     assert cleanup_parse_guard["then"] == {
         "required": ["cleanupReason"],
+        "properties": {"cleanupReason": {"const": "response_invalid"}},
+    }
+    failure_shape_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["failureParseShape"]
+    )
+    assert failure_shape_guard["then"] == {
+        "required": ["failureReason", "failureParseReason"],
+        "properties": {"failureReason": {"const": "response_invalid"}},
+    }
+    cleanup_shape_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["cleanupParseShape"]
+    )
+    assert cleanup_shape_guard["then"] == {
+        "required": ["cleanupReason", "cleanupParseReason"],
         "properties": {"cleanupReason": {"const": "response_invalid"}},
     }
 

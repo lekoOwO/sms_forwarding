@@ -392,7 +392,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get one push channel test status",
-        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
+        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } }
@@ -406,7 +406,7 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Test one saved push channel",
-        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } },
@@ -863,6 +863,25 @@
           "result": { "$ref": "#/components/schemas/ActionResult" }
         }
       },
+      "PushTestParseShape": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded parser structure with no response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; lineClass distinguishes missing, unexpected, duplicate, and extra lines.",
+        "required": ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"],
+        "properties": {
+          "fieldCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "quoteMask": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "presenceMask": { "type": "integer", "minimum": 0, "maximum": 31 },
+          "stateClass": {
+            "type": "string",
+            "enum": ["none", "initial", "closed", "connected", "unknown"]
+          },
+          "lineClass": {
+            "type": "string",
+            "enum": ["none", "missing", "unexpected", "duplicate", "extra"]
+          }
+        }
+      },
       "PushTestStatus": {
         "type": "object",
         "required": ["queued", "running", "done", "success", "message"],
@@ -902,6 +921,8 @@
             "type": "string",
             "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"]
           },
+          "failureParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },
+          "cleanupParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },
           "resetNeeded": { "type": "boolean" },
           "transportPath": {
             "type": "string",
@@ -939,6 +960,8 @@
                   { "required": ["cleanupReason"] },
                   { "required": ["failureParseReason"] },
                   { "required": ["cleanupParseReason"] },
+                  { "required": ["failureParseShape"] },
+                  { "required": ["cleanupParseShape"] },
                   { "required": ["resetNeeded"] },
                   { "required": ["transportPath"] },
                   { "required": ["dispatchAttempted"] },
@@ -959,6 +982,20 @@
             "if": { "required": ["cleanupParseReason"] },
             "then": {
               "required": ["cleanupReason"],
+              "properties": { "cleanupReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": { "required": ["failureParseShape"] },
+            "then": {
+              "required": ["failureReason", "failureParseReason"],
+              "properties": { "failureReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": { "required": ["cleanupParseShape"] },
+            "then": {
+              "required": ["cleanupReason", "cleanupParseReason"],
               "properties": { "cleanupReason": { "const": "response_invalid" } }
             }
           },

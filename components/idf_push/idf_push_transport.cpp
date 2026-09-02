@@ -139,6 +139,12 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     result.cleanupReason = cellular_result.cleanupReason;
     result.failureParseReason = cellular_result.failureParseReason;
     result.cleanupParseReason = cellular_result.cleanupParseReason;
+    if (result.failureReason == IdfModemHttpsDiagnosticReason::response_invalid) {
+        result.failureParseShape = cellular_result.failureParseShape;
+    }
+    if (result.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid) {
+        result.cleanupParseShape = cellular_result.cleanupParseShape;
+    }
     result.cleanupRequiresReset = cellular_result.cleanupRequiresReset;
     result.failureStage = cellular_result.failureStage;
     if (result.message == "HTTPS modem request failed" && result.mhttpError >= 0) {

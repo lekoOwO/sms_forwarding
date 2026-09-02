@@ -9,6 +9,7 @@ namespace idf_modem_https_wire {
 namespace {
 
 using ParseReason = IdfModemHttpsParseReason;
+using ParseShape = IdfModemHttpsParseShape;
 
 void clear_parse_reason(ParseReason* reason)
 {
@@ -18,6 +19,18 @@ void clear_parse_reason(ParseReason* reason)
 void set_parse_reason(ParseReason* reason, ParseReason value)
 {
     if (reason && *reason == ParseReason::none) *reason = value;
+}
+
+void clear_parse_shape(ParseShape* shape)
+{
+    if (shape) *shape = {};
+}
+
+void set_line_class(ParseShape* shape, IdfModemHttpsParseLineClass line)
+{
+    if (shape && shape->lineClass == IdfModemHttpsParseLineClass::none) {
+        shape->lineClass = line;
+    }
 }
 
 bool starts_with(std::string_view value, std::string_view prefix)
@@ -114,6 +127,35 @@ bool is_known_urc(std::string_view line)
                        [line](std::string_view prefix) { return starts_with(line, prefix); });
 }
 
+void mark_presence(ParseShape* shape, std::string_view line)
+{
+    if (!shape) return;
+    if (starts_with(line, "+MIPSTATE")) {
+        shape->presenceMask |= IdfModemHttpsParsePresence::mipstate;
+    } else if (starts_with(line, "+MIPOPEN")) {
+        shape->presenceMask |= IdfModemHttpsParsePresence::mipopen;
+    } else if (starts_with(line, "+MIPCLOSE")) {
+        shape->presenceMask |= IdfModemHttpsParsePresence::mipclose;
+    } else if (starts_with(line, "+MIPURC:")) {
+        shape->presenceMask |= IdfModemHttpsParsePresence::mipurc;
+    } else if (!is_known_urc(line)) {
+        shape->presenceMask |= IdfModemHttpsParsePresence::other;
+    }
+}
+
+template <size_t FieldCount>
+void capture_csv_shape(ParseShape* shape, size_t count,
+                       const std::array<bool, FieldCount>& quoted)
+{
+    if (!shape) return;
+    shape->fieldCount = static_cast<uint8_t>(std::min<size_t>(count, 8));
+    shape->quoteMask = 0;
+    const size_t limit = std::min<size_t>(quoted.size(), 8);
+    for (size_t index = 0; index < limit; ++index) {
+        if (quoted[index]) shape->quoteMask |= static_cast<uint8_t>(1U << index);
+    }
+}
+
 bool looks_like_pdu_line(std::string_view line)
 {
     if (line.size() < 32 || (line.size() & 1) != 0) return false;
@@ -150,9 +192,10 @@ bool header_name_token(std::string_view value)
 }  // namespace
 
 bool scan_frame(std::string_view response, std::string_view command,
-                std::vector<std::string_view>& body, ParseReason* reason)
+                std::vector<std::string_view>& body, ParseReason* reason, ParseShape* shape)
 {
     clear_parse_reason(reason);
+    clear_parse_shape(shape);
     body.clear();
     if (response.size() > kResponseMax) {
         set_parse_reason(reason, ParseReason::oversize);
@@ -183,6 +226,7 @@ bool scan_frame(std::string_view response, std::string_view command,
             } else if (waiting_for_cmt_pdu && looks_like_pdu_line(line)) {
                 waiting_for_cmt_pdu = false;
             } else if (!is_known_urc(line)) {
+                mark_presence(shape, line);
                 body.push_back(line);
                 waiting_for_cmt_pdu = false;
             } else {
@@ -198,6 +242,7 @@ bool scan_frame(std::string_view response, std::string_view command,
         set_parse_reason(reason, ParseReason::terminal);
         return false;
     }
+    if (shape) shape->available = true;
     return true;
 }
 
@@ -248,7 +293,8 @@ bool consume_nonfatal_mip_urc(std::string_view line)
     return parse_mip_urc(line, received, total, state, disconnected) && !disconnected;
 }
 
-bool parse_mip_open_line(std::string_view line, uint8_t expected_cid, ParseReason* reason)
+bool parse_mip_open_line(std::string_view line, uint8_t expected_cid, ParseReason* reason,
+                         ParseShape* shape)
 {
     if (!starts_with(line, "+MIPOPEN:")) {
         set_parse_reason(reason, ParseReason::prefix);
@@ -260,33 +306,41 @@ bool parse_mip_open_line(std::string_view line, uint8_t expected_cid, ParseReaso
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count,
                    &csv_failure)) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return false;
     }
     if (count != 2) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return false;
     }
     if (quoted[0] || quoted[1]) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::quote);
         return false;
     }
     uint32_t cid = 0;
     uint32_t result = 0;
     if (!parse_uint(fields[0], cid) || cid != expected_cid) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return false;
     }
     if (!parse_uint(fields[1], result)) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::result);
         return false;
     }
     // A numeric nonzero MIPOPEN result is a modem outcome, not a malformed
     // frame.  Keep the parser rejection for its existing caller while
     // leaving parse telemetry unset for this semantic failure.
-    if (result != 0) return false;
+    if (result != 0) {
+        clear_parse_shape(shape);
+        return false;
+    }
     return true;
 }
 
@@ -314,36 +368,51 @@ bool parse_mip_tcp_endpoint(const std::array<std::string_view, 8>& fields,
 
 MipStateDisposition parse_mip_state_disposition(std::string_view response,
                                                 std::string_view command,
-                                                uint8_t& cid, ParseReason* reason)
+                                                uint8_t& cid, ParseReason* reason,
+                                                ParseShape* shape)
 {
     clear_parse_reason(reason);
+    clear_parse_shape(shape);
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body, reason)) return MipStateDisposition::invalid;
+    if (!scan_frame(response, command, body, reason, shape)) {
+        return MipStateDisposition::invalid;
+    }
     std::string_view state_line;
     bool open_seen = false;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
             if (!consume_nonfatal_mip_urc(line)) {
+                set_line_class(shape, IdfModemHttpsParseLineClass::unexpected);
                 set_parse_reason(reason, ParseReason::urc);
                 return MipStateDisposition::invalid;
             }
         } else if (starts_with(line, "+MIPOPEN")) {
             if (open_seen) {
+                set_line_class(shape, IdfModemHttpsParseLineClass::duplicate);
                 set_parse_reason(reason, ParseReason::result);
                 return MipStateDisposition::invalid;
             }
-            if (!parse_mip_open_line(line, 0, reason)) {
+            if (!parse_mip_open_line(line, 0, reason, shape)) {
                 return MipStateDisposition::invalid;
             }
             open_seen = true;
         } else if (state_line.empty()) {
             state_line = line;
         } else {
+            set_line_class(shape, starts_with(line, "+MIPSTATE")
+                                      ? IdfModemHttpsParseLineClass::duplicate
+                                      : IdfModemHttpsParseLineClass::extra);
             set_parse_reason(reason, ParseReason::prefix);
             return MipStateDisposition::invalid;
         }
     }
-    if (state_line.empty() || !starts_with(state_line, "+MIPSTATE:")) {
+    if (state_line.empty()) {
+        set_line_class(shape, IdfModemHttpsParseLineClass::missing);
+        set_parse_reason(reason, ParseReason::prefix);
+        return MipStateDisposition::invalid;
+    }
+    if (!starts_with(state_line, "+MIPSTATE:")) {
+        set_line_class(shape, IdfModemHttpsParseLineClass::unexpected);
         set_parse_reason(reason, ParseReason::prefix);
         return MipStateDisposition::invalid;
     }
@@ -353,27 +422,33 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(state_line.substr(std::string_view("+MIPSTATE:").size()), fields, quoted,
                    count, &csv_failure)) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return MipStateDisposition::invalid;
     }
     if (count != 5) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return MipStateDisposition::invalid;
     }
     if (quoted[0] || !quoted[4]) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::quote);
         return MipStateDisposition::invalid;
     }
     uint32_t connect_id = 0;
     if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return MipStateDisposition::invalid;
     }
     if (fields[4] == "INITIAL") {
+        if (shape) shape->stateClass = IdfModemHttpsParseStateClass::initial;
         if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
             !fields[2].empty() || !fields[3].empty()) {
+            capture_csv_shape(shape, count, quoted);
             set_parse_reason(reason, ParseReason::endpoint);
             return MipStateDisposition::invalid;
         }
@@ -381,21 +456,27 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
         return MipStateDisposition::initial;
     }
     if (fields[4] == "CLOSED") {
+        if (shape) shape->stateClass = IdfModemHttpsParseStateClass::closed;
         const bool empty_endpoint = !quoted[1] && !quoted[2] && !quoted[3] &&
                                     fields[1].empty() && fields[2].empty() && fields[3].empty();
         if (!empty_endpoint && !parse_mip_tcp_endpoint(fields, quoted, reason)) {
+            capture_csv_shape(shape, count, quoted);
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::closed;
     }
     if (fields[4] == "CONNECTED") {
+        if (shape) shape->stateClass = IdfModemHttpsParseStateClass::connected;
         if (!parse_mip_tcp_endpoint(fields, quoted, reason)) {
+            capture_csv_shape(shape, count, quoted);
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::connected;
     }
+    if (shape) shape->stateClass = IdfModemHttpsParseStateClass::unknown;
+    capture_csv_shape(shape, count, quoted);
     set_parse_reason(reason, ParseReason::state);
     return MipStateDisposition::invalid;
 }
@@ -442,11 +523,12 @@ bool parse_cfg_response(std::string_view response, std::string_view command,
 }
 
 bool parse_mip_state(std::string_view response, std::string_view command,
-                     std::string_view expected, uint8_t& cid, ParseReason* reason)
+                     std::string_view expected, uint8_t& cid, ParseReason* reason,
+                     ParseShape* shape)
 {
     uint8_t parsed_cid = 0;
     const MipStateDisposition disposition =
-        parse_mip_state_disposition(response, command, parsed_cid, reason);
+        parse_mip_state_disposition(response, command, parsed_cid, reason, shape);
     const bool matches =
         (expected == "INITIAL" && disposition == MipStateDisposition::initial) ||
         (expected == "CONNECTED" && disposition == MipStateDisposition::connected);
@@ -459,11 +541,12 @@ bool parse_mip_state(std::string_view response, std::string_view command,
 
 MipStateDisposition classify_mip_state(std::string_view response,
                                        std::string_view command,
-                                       uint8_t expected_cid, ParseReason* reason)
+                                       uint8_t expected_cid, ParseReason* reason,
+                                       ParseShape* shape)
 {
     uint8_t cid = 0;
     const MipStateDisposition disposition =
-        parse_mip_state_disposition(response, command, cid, reason);
+        parse_mip_state_disposition(response, command, cid, reason, shape);
     if (disposition != MipStateDisposition::invalid && cid != expected_cid) {
         set_parse_reason(reason, ParseReason::cid);
         return MipStateDisposition::invalid;
@@ -483,7 +566,7 @@ bool parse_mip_open(std::string_view response, std::string_view command,
             continue;
         }
         if (!starts_with(line, "+MIPOPEN:") || present) return false;
-        if (!parse_mip_open_line(line, expected_cid, nullptr)) return false;
+        if (!parse_mip_open_line(line, expected_cid, nullptr, nullptr)) return false;
         present = true;
     }
     return true;
@@ -500,7 +583,7 @@ bool MipOpenLatch::consume_line(std::string_view line)
     line = trim_spaces(line);
     if (line.empty()) return true;
     if (starts_with(line, "+MIPOPEN")) {
-        if (success_seen_ || !parse_mip_open_line(line, 0, nullptr)) return false;
+        if (success_seen_ || !parse_mip_open_line(line, 0, nullptr, nullptr)) return false;
         success_seen_ = true;
         return true;
     }
@@ -653,26 +736,35 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
 
 bool parse_result(std::string_view response, std::string_view command,
                   std::string_view prefix, uint8_t expected_cid, uint32_t& value,
-                  ParseReason* reason)
+                  ParseReason* reason, ParseShape* shape)
 {
     clear_parse_reason(reason);
+    clear_parse_shape(shape);
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body, reason)) return false;
+    if (!scan_frame(response, command, body, reason, shape)) return false;
     std::string_view result_line;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
             if (!consume_nonfatal_mip_urc(line)) {
+                set_line_class(shape, IdfModemHttpsParseLineClass::unexpected);
                 set_parse_reason(reason, ParseReason::urc);
                 return false;
             }
         } else if (starts_with(line, prefix) && result_line.empty()) {
             result_line = line;
+        } else if (starts_with(line, prefix)) {
+            set_line_class(shape, IdfModemHttpsParseLineClass::duplicate);
+            set_parse_reason(reason, ParseReason::prefix);
+            return false;
         } else {
+            set_line_class(shape, result_line.empty() ? IdfModemHttpsParseLineClass::unexpected
+                                                      : IdfModemHttpsParseLineClass::extra);
             set_parse_reason(reason, ParseReason::prefix);
             return false;
         }
     }
     if (result_line.empty()) {
+        set_line_class(shape, IdfModemHttpsParseLineClass::missing);
         set_parse_reason(reason, ParseReason::prefix);
         return false;
     }
@@ -681,21 +773,25 @@ bool parse_result(std::string_view response, std::string_view command,
     size_t count = 0;
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(result_line.substr(prefix.size()), fields, quoted, count, &csv_failure)) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return false;
     }
     if (count != 2) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return false;
     }
     uint32_t cid = 0;
     if (!parse_uint(fields[0], cid) || cid != expected_cid) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return false;
     }
     if (!parse_uint(fields[1], value)) {
+        capture_csv_shape(shape, count, quoted);
         set_parse_reason(reason, ParseReason::result);
         return false;
     }

@@ -31,6 +31,8 @@ using idf_modem_https_wire::build_cgdccont_command;
 
 using ParseReason = IdfModemHttpsParseReason;
 
+using ParseShape = IdfModemHttpsParseShape;
+
 std::string frame(std::string_view command, std::string_view body)
 {
     std::string response = "\r\n";
@@ -362,6 +364,87 @@ void check_parse_reasons()
     assert(parse_result(frame(send_command, "+MIPSEND: \"0\",\"4\""), send_command,
                         "+MIPSEND:", 0, value, &reason));
     assert(value == 4 && reason == ParseReason::none);
+}
+
+void check_parse_shapes()
+{
+    const std::string state_command = "AT+MIPSTATE=0";
+    const std::string close_command = "AT+MIPCLOSE=0";
+    ParseReason reason = ParseReason::none;
+    ParseShape shape{};
+
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"OTHER\""),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::state && shape.available);
+    assert(shape.fieldCount == 5 && shape.stateClass == IdfModemHttpsParseStateClass::unknown);
+    assert(shape.presenceMask & IdfModemHttpsParsePresence::mipstate);
+    assert(shape.lineClass == IdfModemHttpsParseLineClass::none);
+
+    reason = ParseReason::none;
+    shape = {};
+    uint8_t cid = 0;
+    assert(!parse_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"CLOSED\""),
+                            state_command, "INITIAL", cid, &reason, &shape));
+    assert(reason == ParseReason::state && shape.stateClass == IdfModemHttpsParseStateClass::closed);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"INITIAL\",extra"),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::field_count && shape.fieldCount == 6);
+    assert(shape.stateClass == IdfModemHttpsParseStateClass::none);
+
+    reason = ParseReason::none;
+    shape = {};
+    const std::string missing_state = frame(state_command, "+MIPOPEN: 0,0");
+    assert(classify_mip_state(missing_state, state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::missing);
+    assert(shape.presenceMask & IdfModemHttpsParsePresence::mipopen);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(frame(state_command, "+OTHER: 0"), state_command, 0, &reason,
+                              &shape) == MipStateDisposition::invalid);
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::unexpected);
+    assert(shape.presenceMask & IdfModemHttpsParsePresence::other);
+
+    reason = ParseReason::none;
+    shape = {};
+    uint32_t value = 0;
+    assert(!parse_result(frame(close_command, "+MIPCLOSE: 0,0\r\n+MIPCLOSE: 0,0"),
+                         close_command, "+MIPCLOSE:", 0, value, &reason, &shape));
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::duplicate);
+    assert(shape.presenceMask & IdfModemHttpsParsePresence::mipclose);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(!parse_result(frame(close_command, "+OTHER: 0"), close_command, "+MIPCLOSE:", 0,
+                         value, &reason, &shape));
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::unexpected);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(!parse_result(frame(close_command, "+MIPCLOSE: 0"), close_command, "+MIPCLOSE:", 0,
+                         value, &reason, &shape));
+    assert(reason == ParseReason::field_count && shape.fieldCount == 1);
+    assert(shape.presenceMask & IdfModemHttpsParsePresence::mipclose);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(frame(state_command, "+MIPOPEN: 0,4\r\n+MIPSTATE: 0,,,,\"INITIAL\""),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::none && !shape.available);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(std::string(idf_modem_https_wire::kResponseMax + 1, 'x'),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::oversize && !shape.available);
 }
 
 enum class RemoteCloseMode {
@@ -1362,6 +1445,7 @@ int main()
 {
     check_initial_state_transcripts();
     check_parse_reasons();
+    check_parse_shapes();
     check_remote_close_transcripts();
     check_invalid_request_stages();
     const uint8_t pdp_cid = 1;

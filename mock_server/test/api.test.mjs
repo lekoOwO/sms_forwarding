@@ -63,7 +63,11 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 	const terminal = {
 		queued: false, running: false, done: true, success: false, message: "Malformed response",
 		failureReason: "response_invalid", failureParseReason: "field_count",
-		cleanupReason: "response_invalid", cleanupParseReason: "quote"
+		cleanupReason: "response_invalid", cleanupParseReason: "quote",
+		failureParseShape: { fieldCount: 5, quoteMask: 16, presenceMask: 1,
+			stateClass: "unknown", lineClass: "none" },
+		cleanupParseShape: { fieldCount: 0, quoteMask: 0, presenceMask: 4,
+			stateClass: "none", lineClass: "missing" }
 	};
 	assert.deepEqual(serializePushTestStatus(terminal, true), terminal);
 	assert.deepEqual(serializePushTestStatus(terminal), {
@@ -72,6 +76,10 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 	assert.deepEqual(serializePushTestStatus({ ...terminal, done: false }, true), {
 		queued: false, running: false, done: false, success: false, message: "Malformed response"
 	});
+	const noShape = serializePushTestStatus({ ...terminal,
+		failureParseReason: "none", cleanupParseReason: "none" }, true);
+	assert.equal(Object.hasOwn(noShape, "failureParseShape"), false);
+	assert.equal(Object.hasOwn(noShape, "cleanupParseShape"), false);
 });
 
 function decrypt(bytes, passphrase) {
