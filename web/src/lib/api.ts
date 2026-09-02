@@ -51,10 +51,13 @@ const pushTestParseReasons: readonly PushTestParseReason[] = [
 	"cid", "state", "endpoint", "result", "unknown"
 ];
 const pushTestParseStateClasses: readonly PushTestParseShape["stateClass"][] = [
-	"none", "initial", "closed", "connected", "unknown"
+	"none", "initial", "closed", "connected", "connecting", "unknown"
 ];
 const pushTestParseLineClasses: readonly PushTestParseShape["lineClass"][] = [
 	"none", "missing", "unexpected", "duplicate", "extra"
+];
+const pushTestParseSingleFieldClasses: readonly PushTestParseShape["singleFieldClass"][] = [
+	"none", "zero", "nonzero", "non_numeric"
 ];
 const pushTestCleanupMessages: readonly PushTestCleanupMessage[] = [
 	"HTTPS cleanup socket close failed",
@@ -88,10 +91,10 @@ function isPushTestParseShape(value: unknown): value is PushTestParseShape {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const shape = value as Record<string, unknown>;
 	if (Object.keys(shape).some((key) => ![
-		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"
 	].includes(key))) return false;
 	if (![
-		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"
 	].every((key) => Object.hasOwn(shape, key))) return false;
 	return typeof shape.fieldCount === "number" && Number.isInteger(shape.fieldCount) &&
 		shape.fieldCount >= 0 && shape.fieldCount <= 8 &&
@@ -102,7 +105,12 @@ function isPushTestParseShape(value: unknown): value is PushTestParseShape {
 		typeof shape.stateClass === "string" &&
 		pushTestParseStateClasses.includes(shape.stateClass as PushTestParseShape["stateClass"]) &&
 		typeof shape.lineClass === "string" &&
-		pushTestParseLineClasses.includes(shape.lineClass as PushTestParseShape["lineClass"]);
+		pushTestParseLineClasses.includes(shape.lineClass as PushTestParseShape["lineClass"]) &&
+		typeof shape.singleFieldClass === "string" &&
+		pushTestParseSingleFieldClasses.includes(
+			shape.singleFieldClass as PushTestParseShape["singleFieldClass"]) &&
+		((shape.fieldCount === 1 && shape.singleFieldClass !== "none") ||
+			(shape.fieldCount !== 1 && shape.singleFieldClass === "none"));
 }
 
 function demoSnapshot(): DeviceSnapshot {

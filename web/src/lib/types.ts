@@ -63,8 +63,9 @@ export type PushTestParseShape = {
 	fieldCount: number;
 	quoteMask: number;
 	presenceMask: number;
-	stateClass: "none" | "initial" | "closed" | "connected" | "unknown";
+	stateClass: "none" | "initial" | "closed" | "connected" | "connecting" | "unknown";
 	lineClass: "none" | "missing" | "unexpected" | "duplicate" | "extra";
+	singleFieldClass: "none" | "zero" | "nonzero" | "non_numeric";
 };
 
 export type PushTestTransportPath = "none" | "wifi" | "cellular";

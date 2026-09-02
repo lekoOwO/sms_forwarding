@@ -22,10 +22,11 @@ const pushTestDetailKeys = [
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
 	"failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape"
 ];
-const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"];
+const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"];
 const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"];
-const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "unknown"];
+const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "connecting", "unknown"];
 const pushTestParseLineClasses = ["none", "missing", "unexpected", "duplicate", "extra"];
+const pushTestParseSingleFieldClasses = ["none", "zero", "nonzero", "non_numeric"];
 const pushTestDetailFixtures = Object.freeze({
 	wifiSuccess: Object.freeze({ transportPath: "wifi", dispatchAttempted: true, failureStage: "none", httpStatus: 204 }),
 	preflightFailure: Object.freeze({ transportPath: "none", dispatchAttempted: false, failureStage: "preflight" }),
@@ -43,7 +44,10 @@ function serializePushTestParseShape(value) {
 		!Number.isInteger(value.quoteMask) || value.quoteMask < 0 || value.quoteMask > 255 ||
 		!Number.isInteger(value.presenceMask) || value.presenceMask < 0 || value.presenceMask > 31 ||
 		!pushTestParseStateClasses.includes(value.stateClass) ||
-		!pushTestParseLineClasses.includes(value.lineClass)) return undefined;
+		!pushTestParseLineClasses.includes(value.lineClass) ||
+		!pushTestParseSingleFieldClasses.includes(value.singleFieldClass) ||
+		(value.fieldCount === 1 ? value.singleFieldClass === "none" :
+			value.singleFieldClass !== "none")) return undefined;
 	return Object.fromEntries(pushTestParseShapeKeys.map((key) => [key, value[key]]));
 }
 

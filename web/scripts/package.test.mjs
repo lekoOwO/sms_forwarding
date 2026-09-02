@@ -212,11 +212,11 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			cleanupParseReason: "quote",
 			failureParseShape: {
 				fieldCount: 5, quoteMask: 16, presenceMask: 1,
-				stateClass: "unknown", lineClass: "none"
+				stateClass: "connecting", lineClass: "none", singleFieldClass: "none"
 			},
 			cleanupParseShape: {
 				fieldCount: 0, quoteMask: 0, presenceMask: 4,
-				stateClass: "none", lineClass: "missing"
+				stateClass: "none", lineClass: "missing", singleFieldClass: "none"
 			}
 		};
 		globalThis.fetch = async (path) => new Response(JSON.stringify(
@@ -228,7 +228,20 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			annotated.failureReason, annotated.failureParseReason,
 			annotated.cleanupReason, annotated.cleanupParseReason,
 			annotated.failureParseShape.stateClass, annotated.cleanupParseShape.lineClass
-		], ["response_invalid", "field_count", "response_invalid", "quote", "unknown", "missing"]);
+		], ["response_invalid", "field_count", "response_invalid", "quote", "connecting", "missing"]);
+		for (const singleFieldClass of ["zero", "nonzero", "non_numeric"]) {
+			const singleFieldResponse = {
+				...responseInvalid,
+				failureParseShape: { fieldCount: 1, quoteMask: 0, presenceMask: 4,
+					stateClass: "none", lineClass: "none", singleFieldClass }
+			};
+			globalThis.fetch = async (path) => new Response(JSON.stringify(
+				path === "/api/config" ? { csrfToken: "csrf" } : singleFieldResponse
+			), { status: 200, headers: { "Content-Type": "application/json" } });
+			await api.loadSnapshot();
+			assert.equal((await api.runPushTest(0, undefined, 1000)).failureParseShape.singleFieldClass,
+				singleFieldClass);
+		}
 
 		const cleanupMessages = [
 			"HTTPS cleanup socket close failed",
@@ -281,24 +294,45 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "unknown-value" },
 			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
 				failureParseShape: { fieldCount: 9, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "none" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "none", extra: 1 } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", singleFieldClass: "none" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "invalid", singleFieldClass: "none" } },
+			{ ...validPrimary, failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+				stateClass: "unknown", lineClass: "none", singleFieldClass: "none" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "invalid" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: 4 } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "nonzero" } },
+			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
 					stateClass: "unknown", lineClass: "none" } },
 			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
+				failureParseShape: { fieldCount: 1, quoteMask: 0, presenceMask: 1,
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "none" } },
+			{ ...validPrimary, failureReason: "terminal_failure", failureParseReason: "field_count",
 				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
-					stateClass: "unknown", lineClass: "none", extra: 1 } },
-			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
-				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
-					stateClass: "unknown" } },
-			{ ...validPrimary, failureReason: "response_invalid", failureParseReason: "field_count",
-				failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
-					stateClass: "unknown", lineClass: "invalid" } },
-			{ ...validPrimary, failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
-				stateClass: "unknown", lineClass: "none" } },
+					stateClass: "unknown", lineClass: "none", singleFieldClass: "none" } },
 			{ ...validPrimary, cleanupParseReason: "quote" },
 			{ ...validPrimary, cleanupReason: "timeout", cleanupParseReason: "quote" },
 			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "unknown-value" },
 			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "quote",
 				cleanupParseShape: { fieldCount: 9, quoteMask: 0, presenceMask: 4,
-					stateClass: "none", lineClass: "missing" } }
+					stateClass: "none", lineClass: "missing", singleFieldClass: "none" } },
+			{ ...validPrimary, cleanupReason: "response_invalid", cleanupParseReason: "quote",
+				cleanupParseShape: { fieldCount: 0, quoteMask: 0, presenceMask: 4,
+					stateClass: "none", lineClass: "missing", singleFieldClass: "invalid" } }
 		]) {
 			globalThis.fetch = async (path) => new Response(JSON.stringify(
 				path === "/api/config" ? { csrfToken: "csrf" } : status

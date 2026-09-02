@@ -65,11 +65,24 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 		failureReason: "response_invalid", failureParseReason: "field_count",
 		cleanupReason: "response_invalid", cleanupParseReason: "quote",
 		failureParseShape: { fieldCount: 5, quoteMask: 16, presenceMask: 1,
-			stateClass: "unknown", lineClass: "none" },
+			stateClass: "unknown", lineClass: "none", singleFieldClass: "none" },
 		cleanupParseShape: { fieldCount: 0, quoteMask: 0, presenceMask: 4,
-			stateClass: "none", lineClass: "missing" }
+			stateClass: "none", lineClass: "missing", singleFieldClass: "none" }
 	};
 	assert.deepEqual(serializePushTestStatus(terminal, true), terminal);
+	const singleField = {
+		...terminal,
+		failureParseShape: { fieldCount: 1, quoteMask: 0, presenceMask: 4,
+			stateClass: "none", lineClass: "none", singleFieldClass: "zero" }
+	};
+	assert.deepEqual(serializePushTestStatus(singleField, true), singleField);
+	const mismatchedSingleField = {
+		...terminal,
+		failureParseShape: { fieldCount: 5, quoteMask: 0, presenceMask: 1,
+			stateClass: "unknown", lineClass: "none", singleFieldClass: "zero" }
+	};
+	assert.equal(Object.hasOwn(serializePushTestStatus(mismatchedSingleField, true),
+		"failureParseShape"), false);
 	assert.deepEqual(serializePushTestStatus(terminal), {
 		queued: false, running: false, done: true, success: false, message: "Malformed response"
 	});

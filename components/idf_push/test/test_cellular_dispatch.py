@@ -219,12 +219,15 @@ int main() {
     modem_cleanup_parse_shape.fieldCount = 1;
     modem_cleanup_parse_shape.presenceMask = IdfModemHttpsParsePresence::mipclose;
     modem_cleanup_parse_shape.lineClass = IdfModemHttpsParseLineClass::unexpected;
+    modem_cleanup_parse_shape.singleFieldClass = IdfModemHttpsParseSingleFieldClass::zero;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid);
     assert(transport.cleanupParseReason == IdfModemHttpsParseReason::field_count);
     assert(transport.cleanupParseShape.available &&
            transport.cleanupParseShape.lineClass == IdfModemHttpsParseLineClass::unexpected);
+    assert(transport.cleanupParseShape.singleFieldClass ==
+           IdfModemHttpsParseSingleFieldClass::zero);
 
     modem_cleanup_message.assign(200, 'y');
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,

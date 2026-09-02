@@ -166,7 +166,8 @@ def main() -> None:
     assert parse_shape["type"] == "object"
     assert parse_shape["additionalProperties"] is False
     assert set(parse_shape["required"]) == {
-        "fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"
+        "fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass",
+        "singleFieldClass",
     }
     assert parse_shape["properties"] == {
         "fieldCount": {"type": "integer", "minimum": 0, "maximum": 8},
@@ -174,11 +175,15 @@ def main() -> None:
         "presenceMask": {"type": "integer", "minimum": 0, "maximum": 31},
         "stateClass": {
             "type": "string",
-            "enum": ["none", "initial", "closed", "connected", "unknown"],
+            "enum": ["none", "initial", "closed", "connected", "connecting", "unknown"],
         },
         "lineClass": {
             "type": "string",
             "enum": ["none", "missing", "unexpected", "duplicate", "extra"],
+        },
+        "singleFieldClass": {
+            "type": "string",
+            "enum": ["none", "zero", "nonzero", "non_numeric"],
         },
     }
     assert push_status["properties"]["failureParseShape"] == {

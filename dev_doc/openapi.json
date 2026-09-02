@@ -866,19 +866,23 @@
       "PushTestParseShape": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Bounded parser structure with no response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; lineClass distinguishes missing, unexpected, duplicate, and extra lines.",
-        "required": ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass"],
+        "description": "Bounded parser structure with no response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; lineClass distinguishes missing, unexpected, duplicate, and extra lines; singleFieldClass is classified only for one CSV field.",
+        "required": ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"],
         "properties": {
           "fieldCount": { "type": "integer", "minimum": 0, "maximum": 8 },
           "quoteMask": { "type": "integer", "minimum": 0, "maximum": 255 },
           "presenceMask": { "type": "integer", "minimum": 0, "maximum": 31 },
           "stateClass": {
             "type": "string",
-            "enum": ["none", "initial", "closed", "connected", "unknown"]
+            "enum": ["none", "initial", "closed", "connected", "connecting", "unknown"]
           },
           "lineClass": {
             "type": "string",
             "enum": ["none", "missing", "unexpected", "duplicate", "extra"]
+          },
+          "singleFieldClass": {
+            "type": "string",
+            "enum": ["none", "zero", "nonzero", "non_numeric"]
           }
         }
       },

@@ -214,10 +214,15 @@ static void append_json_string(std::string& out, const char* key, const std::str
 
 static bool parse_shape_valid(const IdfModemHttpsParseShape& shape)
 {
+    const bool single_field_class_present =
+        shape.singleFieldClass != IdfModemHttpsParseSingleFieldClass::none;
     return shape.available && shape.fieldCount <= 8 &&
            (shape.presenceMask & static_cast<uint8_t>(~IdfModemHttpsParsePresence::all)) == 0 &&
            !idf_modem_https_parse_state_class_name(shape.stateClass).empty() &&
-           !idf_modem_https_parse_line_class_name(shape.lineClass).empty();
+           !idf_modem_https_parse_line_class_name(shape.lineClass).empty() &&
+           !idf_modem_https_parse_single_field_class_name(shape.singleFieldClass).empty() &&
+           ((shape.fieldCount == 1 && single_field_class_present) ||
+            (shape.fieldCount != 1 && !single_field_class_present));
 }
 
 static void append_parse_shape(std::string& out, const char* key,
@@ -236,6 +241,8 @@ static void append_parse_shape(std::string& out, const char* key,
     out += idf_modem_https_parse_state_class_name(shape.stateClass);
     out += "\",\"lineClass\":\"";
     out += idf_modem_https_parse_line_class_name(shape.lineClass);
+    out += "\",\"singleFieldClass\":\"";
+    out += idf_modem_https_parse_single_field_class_name(shape.singleFieldClass);
     out += "\"}";
 }
 

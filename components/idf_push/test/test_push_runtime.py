@@ -123,6 +123,13 @@ int main() {
     const std::string primary_shape_json = idf_push_serialize_test_status(primary_reason, true);
     assert(primary_shape_json.find("\"failureParseShape\":") != std::string::npos);
     assert(primary_shape_json.find("\"stateClass\":\"unknown\"") != std::string::npos);
+    assert(primary_shape_json.find("\"singleFieldClass\":\"none\"") != std::string::npos);
+    primary_reason.failureParseShape.singleFieldClass =
+        IdfModemHttpsParseSingleFieldClass::nonzero;
+    assert(idf_push_serialize_test_status(primary_reason, true).find(
+               "\"failureParseShape\":") == std::string::npos);
+    primary_reason.failureParseShape.singleFieldClass =
+        IdfModemHttpsParseSingleFieldClass::none;
     assert(idf_push_serialize_test_status(primary_reason, false).find("ParseShape") ==
            std::string::npos);
 
@@ -145,6 +152,7 @@ int main() {
     const std::string cleanup_shape_json = idf_push_serialize_test_status(cleanup_parse, true);
     assert(cleanup_shape_json.find("\"cleanupParseShape\":") != std::string::npos);
     assert(cleanup_shape_json.find("\"lineClass\":\"missing\"") != std::string::npos);
+    assert(cleanup_shape_json.find("\"singleFieldClass\":\"none\"") != std::string::npos);
 
     IdfPushTestJobState parse_without_response_reason;
     idf_push_complete_test_job(parse_without_response_reason, false, "timeout", "",

@@ -85,6 +85,7 @@ enum class IdfModemHttpsParseStateClass : uint8_t {
     initial,
     closed,
     connected,
+    connecting,
     unknown,
 };
 
@@ -96,7 +97,27 @@ constexpr std::string_view idf_modem_https_parse_state_class_name(
         case IdfModemHttpsParseStateClass::initial: return "initial";
         case IdfModemHttpsParseStateClass::closed: return "closed";
         case IdfModemHttpsParseStateClass::connected: return "connected";
+        case IdfModemHttpsParseStateClass::connecting: return "connecting";
         case IdfModemHttpsParseStateClass::unknown: return "unknown";
+    }
+    return {};
+}
+
+enum class IdfModemHttpsParseSingleFieldClass : uint8_t {
+    none = 0,
+    zero,
+    nonzero,
+    non_numeric,
+};
+
+constexpr std::string_view idf_modem_https_parse_single_field_class_name(
+    IdfModemHttpsParseSingleFieldClass field)
+{
+    switch (field) {
+        case IdfModemHttpsParseSingleFieldClass::none: return "none";
+        case IdfModemHttpsParseSingleFieldClass::zero: return "zero";
+        case IdfModemHttpsParseSingleFieldClass::nonzero: return "nonzero";
+        case IdfModemHttpsParseSingleFieldClass::non_numeric: return "non_numeric";
     }
     return {};
 }
@@ -143,6 +164,7 @@ struct IdfModemHttpsParseShape {
     uint8_t presenceMask;
     IdfModemHttpsParseStateClass stateClass;
     IdfModemHttpsParseLineClass lineClass;
+    IdfModemHttpsParseSingleFieldClass singleFieldClass;
 };
 
 // A bounded, transport-agnostic stage for safe terminal diagnostics. Keep this

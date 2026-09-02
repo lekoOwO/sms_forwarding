@@ -145,6 +145,7 @@ void mark_presence(ParseShape* shape, std::string_view line)
 
 template <size_t FieldCount>
 void capture_csv_shape(ParseShape* shape, size_t count,
+                       const std::array<std::string_view, FieldCount>& fields,
                        const std::array<bool, FieldCount>& quoted)
 {
     if (!shape) return;
@@ -153,6 +154,17 @@ void capture_csv_shape(ParseShape* shape, size_t count,
     const size_t limit = std::min<size_t>(quoted.size(), 8);
     for (size_t index = 0; index < limit; ++index) {
         if (quoted[index]) shape->quoteMask |= static_cast<uint8_t>(1U << index);
+    }
+    shape->singleFieldClass = IdfModemHttpsParseSingleFieldClass::none;
+    if (count == 1) {
+        uint32_t value = 0;
+        if (!parse_uint(fields[0], value)) {
+            shape->singleFieldClass = IdfModemHttpsParseSingleFieldClass::non_numeric;
+        } else {
+            shape->singleFieldClass = value == 0
+                                           ? IdfModemHttpsParseSingleFieldClass::zero
+                                           : IdfModemHttpsParseSingleFieldClass::nonzero;
+        }
     }
 }
 
@@ -306,31 +318,31 @@ bool parse_mip_open_line(std::string_view line, uint8_t expected_cid, ParseReaso
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(line.substr(std::string_view("+MIPOPEN:").size()), fields, quoted, count,
                    &csv_failure)) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return false;
     }
     if (count != 2) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return false;
     }
     if (quoted[0] || quoted[1]) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::quote);
         return false;
     }
     uint32_t cid = 0;
     uint32_t result = 0;
     if (!parse_uint(fields[0], cid) || cid != expected_cid) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return false;
     }
     if (!parse_uint(fields[1], result)) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::result);
         return false;
     }
@@ -422,25 +434,25 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(state_line.substr(std::string_view("+MIPSTATE:").size()), fields, quoted,
                    count, &csv_failure)) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return MipStateDisposition::invalid;
     }
     if (count != 5) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return MipStateDisposition::invalid;
     }
     if (quoted[0] || !quoted[4]) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::quote);
         return MipStateDisposition::invalid;
     }
     uint32_t connect_id = 0;
     if (!parse_uint(fields[0], connect_id) || connect_id > UINT8_MAX) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return MipStateDisposition::invalid;
     }
@@ -448,7 +460,7 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
         if (shape) shape->stateClass = IdfModemHttpsParseStateClass::initial;
         if (quoted[1] || quoted[2] || quoted[3] || !fields[1].empty() ||
             !fields[2].empty() || !fields[3].empty()) {
-            capture_csv_shape(shape, count, quoted);
+            capture_csv_shape(shape, count, fields, quoted);
             set_parse_reason(reason, ParseReason::endpoint);
             return MipStateDisposition::invalid;
         }
@@ -460,7 +472,7 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
         const bool empty_endpoint = !quoted[1] && !quoted[2] && !quoted[3] &&
                                     fields[1].empty() && fields[2].empty() && fields[3].empty();
         if (!empty_endpoint && !parse_mip_tcp_endpoint(fields, quoted, reason)) {
-            capture_csv_shape(shape, count, quoted);
+            capture_csv_shape(shape, count, fields, quoted);
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
@@ -469,14 +481,18 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
     if (fields[4] == "CONNECTED") {
         if (shape) shape->stateClass = IdfModemHttpsParseStateClass::connected;
         if (!parse_mip_tcp_endpoint(fields, quoted, reason)) {
-            capture_csv_shape(shape, count, quoted);
+            capture_csv_shape(shape, count, fields, quoted);
             return MipStateDisposition::invalid;
         }
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::connected;
     }
-    if (shape) shape->stateClass = IdfModemHttpsParseStateClass::unknown;
-    capture_csv_shape(shape, count, quoted);
+    if (shape) {
+        shape->stateClass = fields[4] == "CONNECTING"
+                                ? IdfModemHttpsParseStateClass::connecting
+                                : IdfModemHttpsParseStateClass::unknown;
+    }
+    capture_csv_shape(shape, count, fields, quoted);
     set_parse_reason(reason, ParseReason::state);
     return MipStateDisposition::invalid;
 }
@@ -773,25 +789,25 @@ bool parse_result(std::string_view response, std::string_view command,
     size_t count = 0;
     CsvFailure csv_failure = CsvFailure::none;
     if (!parse_csv(result_line.substr(prefix.size()), fields, quoted, count, &csv_failure)) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, csv_failure == CsvFailure::quote
                                   ? ParseReason::quote
                                   : ParseReason::field_count);
         return false;
     }
     if (count != 2) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::field_count);
         return false;
     }
     uint32_t cid = 0;
     if (!parse_uint(fields[0], cid) || cid != expected_cid) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::cid);
         return false;
     }
     if (!parse_uint(fields[1], value)) {
-        capture_csv_shape(shape, count, quoted);
+        capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::result);
         return false;
     }

@@ -373,11 +373,26 @@ void check_parse_shapes()
     ParseReason reason = ParseReason::none;
     ParseShape shape{};
 
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"CONNECTING\""),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::state && shape.available && shape.fieldCount == 5);
+    assert(idf_modem_https_parse_state_class_name(shape.stateClass) == "connecting");
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"CONNECTING_EXTRA\""),
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::invalid);
+    assert(reason == ParseReason::state &&
+           shape.stateClass == IdfModemHttpsParseStateClass::unknown);
+
     assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"OTHER\""),
                               state_command, 0, &reason, &shape) ==
            MipStateDisposition::invalid);
     assert(reason == ParseReason::state && shape.available);
     assert(shape.fieldCount == 5 && shape.stateClass == IdfModemHttpsParseStateClass::unknown);
+    assert(shape.singleFieldClass == IdfModemHttpsParseSingleFieldClass::none);
     assert(shape.presenceMask & IdfModemHttpsParsePresence::mipstate);
     assert(shape.lineClass == IdfModemHttpsParseLineClass::none);
 
@@ -430,7 +445,29 @@ void check_parse_shapes()
     assert(!parse_result(frame(close_command, "+MIPCLOSE: 0"), close_command, "+MIPCLOSE:", 0,
                          value, &reason, &shape));
     assert(reason == ParseReason::field_count && shape.fieldCount == 1);
+    assert(shape.singleFieldClass == IdfModemHttpsParseSingleFieldClass::zero);
     assert(shape.presenceMask & IdfModemHttpsParsePresence::mipclose);
+
+    const auto close_single_field = [&](std::string_view field,
+                                        IdfModemHttpsParseSingleFieldClass expected) {
+        reason = ParseReason::none;
+        shape = {};
+        value = 0;
+        assert(!parse_result(frame(close_command, std::string("+MIPCLOSE: ") +
+                                             std::string(field)),
+                             close_command, "+MIPCLOSE:", 0, value, &reason, &shape));
+        assert(reason == ParseReason::field_count && shape.fieldCount == 1);
+        assert(shape.singleFieldClass == expected);
+    };
+    close_single_field("1", IdfModemHttpsParseSingleFieldClass::nonzero);
+    close_single_field("bad", IdfModemHttpsParseSingleFieldClass::non_numeric);
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(!parse_result(frame(close_command, "+MIPCLOSE: 0,bad"), close_command,
+                         "+MIPCLOSE:", 0, value, &reason, &shape));
+    assert(reason == ParseReason::result && shape.fieldCount == 2);
+    assert(shape.singleFieldClass == IdfModemHttpsParseSingleFieldClass::none);
 
     reason = ParseReason::none;
     shape = {};
