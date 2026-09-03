@@ -22,7 +22,7 @@ const pushTestDetailKeys = [
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
 	"failureResponseReason", "failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape"
 ];
-const pushTestFailureResponseReasons = ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"];
+const pushTestFailureResponseReasons = ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown"];
 const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"];
 const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"];
 const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "connecting", "unknown"];

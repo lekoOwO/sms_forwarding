@@ -42,6 +42,7 @@ export type PushTestFailureResponseReason =
 	| "tls_read"
 	| "http_parse"
 	| "http_incomplete"
+	| "modem_command"
 	| "unknown";
 
 export type PushTestParseReason =

@@ -161,6 +161,11 @@ int main() {
     assert(transport.failureStage == IdfHttpsFailureStage::response);
     assert(transport.failureResponseReason == IdfModemHttpsFailureResponseReason::http_parse);
     assert(transport.failureResponseReasonAvailable);
+    modem_failure_response_reason = IdfModemHttpsFailureResponseReason::modem_command;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.failureResponseReason == IdfModemHttpsFailureResponseReason::modem_command);
+    assert(transport.failureResponseReasonAvailable);
     modem_failure_response_reason = IdfModemHttpsFailureResponseReason::unknown;
     modem_failure_response_reason_available = false;
     modem_failure_stage = IdfHttpsFailureStage::none;

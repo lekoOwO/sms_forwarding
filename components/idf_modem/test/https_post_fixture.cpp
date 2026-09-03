@@ -592,11 +592,37 @@ void check_parse_shapes()
     reason = ParseReason::none;
     shape = {};
     requires_confirmation = false;
-    assert(!parse_mip_close_result("\r\nAT+MIPCLOSE=0\r\nOK\r\n+MIPCLOSE:0\r\n",
+    assert(parse_mip_close_result("\r\nAT+MIPCLOSE=0\r\nOK\r\n+MIPCLOSE:0\r\n",
                                   close_command, 0, value, &reason, &shape,
                                   &requires_confirmation));
-    assert(shape.available && shape.fieldCount == 1 && reason == ParseReason::field_count &&
-           !requires_confirmation);
+    assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+           requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(!parse_mip_close_result("\r\nAT+MIPCLOSE=0\r\nOK\r\n+MIPCLOSE:0\r\n+OTHER:0\r\n",
+                                   close_command, 0, value, &reason, &shape,
+                                   &requires_confirmation));
+    assert(reason == ParseReason::prefix && !requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(!parse_mip_close_result("\r\nAT+MIPCLOSE=0\r\nERROR\r\n+MIPCLOSE:0\r\n",
+                                   close_command, 0, value, &reason, &shape,
+                                   &requires_confirmation));
+    assert(reason == ParseReason::none && !requires_confirmation);
+    for (const std::string_view invalid_frame : {
+             "\r\nAT+MIPCLOSE=0\r\n+MIPCLOSE:0\r\n",
+             "\r\nAT+MIPCLOSE=0\r\n+MIPCLOSE:0\r\nOK\r\nOK\r\n",
+             "\r\nAT+MIPCLOSE=0\r\nOK\r\n+MIPCLOSE:0\r\n+MIPCLOSE:0\r\n",
+         }) {
+        reason = ParseReason::none;
+        shape = {};
+        requires_confirmation = false;
+        assert(!parse_mip_close_result(invalid_frame, close_command, 0, value, &reason,
+                                       &shape, &requires_confirmation));
+        assert(!requires_confirmation);
+    }
     reason = ParseReason::none;
     shape = {};
     requires_confirmation = false;
@@ -651,6 +677,7 @@ enum class RemoteCloseMode {
     duplicate_disconnect,
     response_read_timeout,
     response_read_modem_failure,
+    response_read_modem_error,
     response_read_http_parse,
     response_read_http_incomplete,
     tls_read_failure,
@@ -718,6 +745,7 @@ enum class CleanupCloseState {
 enum class CleanupCloseReply {
     canonical,
     padded,
+    after_terminal,
 };
 
 enum class LateOpenKind {
@@ -1147,6 +1175,9 @@ struct RemoteCloseTranscript {
             if (transcript.mode == RemoteCloseMode::response_read_modem_failure) {
                 return IdfModemHttpsCommandResult::failed;
             }
+            if (transcript.mode == RemoteCloseMode::response_read_modem_error) {
+                return IdfModemHttpsCommandResult::modem_error;
+            }
             if (transcript.mode == RemoteCloseMode::disconnect_only) {
                 response = frame(command, "+MIPURC: \"disconn\",0,2");
             } else if (transcript.mode == RemoteCloseMode::unread_data) {
@@ -1198,9 +1229,15 @@ struct RemoteCloseTranscript {
                 }
             }
             if (transcript.mode == RemoteCloseMode::cleanup_single_field_close) {
-                response = frame(command, transcript.cleanup_close_reply == CleanupCloseReply::padded
-                                              ? " \t+MIPCLOSE:\t  0 \t"
-                                              : "+MIPCLOSE: 0");
+                if (transcript.cleanup_close_reply == CleanupCloseReply::after_terminal) {
+                    response = "\r\n";
+                    response.append(command.data(), command.size());
+                    response += "\r\nOK\r\n+MIPCLOSE: 0\r\n";
+                } else {
+                    response = frame(command, transcript.cleanup_close_reply == CleanupCloseReply::padded
+                                                  ? " \t+MIPCLOSE:\t  0 \t"
+                                                  : "+MIPCLOSE: 0");
+                }
             } else {
                 response = frame(command, "+MIPCLOSE: 0,0");
             }
@@ -1318,8 +1355,14 @@ void check_remote_close_transcripts()
                                  IdfModemHttpsRunResult::timed_out, 0},
              ResponseFailureCase{RemoteCloseMode::disconnect_only,
                                  IdfModemHttpsRunResult::response_failed, 1},
-             ResponseFailureCase{RemoteCloseMode::response_read_modem_failure,
+             ResponseFailureCase{RemoteCloseMode::unread_data,
                                  IdfModemHttpsRunResult::response_failed, 2},
+             ResponseFailureCase{RemoteCloseMode::duplicate_disconnect,
+                                 IdfModemHttpsRunResult::response_failed, 2},
+             ResponseFailureCase{RemoteCloseMode::response_read_modem_failure,
+                                 IdfModemHttpsRunResult::response_failed, 6},
+             ResponseFailureCase{RemoteCloseMode::response_read_modem_error,
+                                 IdfModemHttpsRunResult::response_failed, 6},
              ResponseFailureCase{RemoteCloseMode::tls_read_failure,
                                  IdfModemHttpsRunResult::response_failed, 3},
              ResponseFailureCase{RemoteCloseMode::response_read_http_parse,
@@ -1363,44 +1406,66 @@ void check_remote_close_transcripts()
     assert(result.ok && padded_single_field.close_commands == 1 &&
            padded_single_field.state_queries == 3 && !result.cleanupRequiresReset);
 
-    for (const CleanupCloseState state : {CleanupCloseState::connected,
-                                          CleanupCloseState::connecting,
-                                          CleanupCloseState::closed,
-                                          CleanupCloseState::unknown,
-                                          CleanupCloseState::malformed,
-                                          CleanupCloseState::ambiguous,
-                                          CleanupCloseState::command_failure,
-                                          CleanupCloseState::timeout}) {
-        RemoteCloseTranscript unconfirmed{RemoteCloseMode::cleanup_single_field_close};
-        unconfirmed.cleanup_close_state = state;
-        result = {};
-        const IdfModemHttpsRunResult outcome =
-            run_remote_close_transcript(unconfirmed, result);
-        assert(outcome == IdfModemHttpsRunResult::cleanup_failed && !result.ok &&
-               result.cleanupRequiresReset && unconfirmed.close_commands == 1 &&
-               unconfirmed.state_queries == 3);
-        assert(std::count(unconfirmed.cleanup_commands.begin(),
-                          unconfirmed.cleanup_commands.end(), "AT+MIPSTATE=0") == 1);
-        assert_cleanup_action_order(unconfirmed);
-        assert(result.cleanupReason != IdfModemHttpsDiagnosticReason::none);
-        if (state == CleanupCloseState::command_failure) {
-            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure &&
-                   result.cleanupParseReason == ParseReason::none &&
-                   !result.cleanupParseShape.available);
-        } else if (state == CleanupCloseState::timeout) {
-            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::timeout &&
-                   result.cleanupParseReason == ParseReason::none &&
-                   !result.cleanupParseShape.available);
-        } else if (state == CleanupCloseState::connected ||
-                   state == CleanupCloseState::connecting ||
-                   state == CleanupCloseState::closed) {
-            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::terminal_failure &&
-                   result.cleanupParseReason == ParseReason::none &&
-                   !result.cleanupParseShape.available);
-        } else {
-            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid &&
-                   result.cleanupParseReason != ParseReason::none &&
-                   result.cleanupParseShape.available);
+    RemoteCloseTranscript after_terminal_single_field{
+        RemoteCloseMode::cleanup_single_field_close,
+        LateOpenKind::none,
+        LateOpenStage::none,
+        CleanupFailure::none,
+        CleanupFailurePhase::command,
+        CleanupCloseReply::after_terminal};
+    result = {};
+    assert(run_remote_close_transcript(after_terminal_single_field, result) ==
+           IdfModemHttpsRunResult::ok);
+    assert(result.ok && after_terminal_single_field.close_commands == 1 &&
+           after_terminal_single_field.state_queries == 3 && !result.cleanupRequiresReset);
+
+    for (const CleanupCloseReply reply : {CleanupCloseReply::canonical,
+                                          CleanupCloseReply::after_terminal}) {
+        for (const CleanupCloseState state : {CleanupCloseState::connected,
+                                              CleanupCloseState::connecting,
+                                              CleanupCloseState::closed,
+                                              CleanupCloseState::unknown,
+                                              CleanupCloseState::malformed,
+                                              CleanupCloseState::ambiguous,
+                                              CleanupCloseState::command_failure,
+                                              CleanupCloseState::timeout}) {
+            RemoteCloseTranscript unconfirmed{
+                RemoteCloseMode::cleanup_single_field_close,
+                LateOpenKind::none,
+                LateOpenStage::none,
+                CleanupFailure::none,
+                CleanupFailurePhase::command,
+                reply};
+            unconfirmed.cleanup_close_state = state;
+            result = {};
+            const IdfModemHttpsRunResult outcome =
+                run_remote_close_transcript(unconfirmed, result);
+            assert(outcome == IdfModemHttpsRunResult::cleanup_failed && !result.ok &&
+                   result.cleanupRequiresReset && unconfirmed.close_commands == 1 &&
+                   unconfirmed.state_queries == 3);
+            assert(std::count(unconfirmed.cleanup_commands.begin(),
+                              unconfirmed.cleanup_commands.end(), "AT+MIPSTATE=0") == 1);
+            assert_cleanup_action_order(unconfirmed);
+            assert(result.cleanupReason != IdfModemHttpsDiagnosticReason::none);
+            if (state == CleanupCloseState::command_failure) {
+                assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure &&
+                       result.cleanupParseReason == ParseReason::none &&
+                       !result.cleanupParseShape.available);
+            } else if (state == CleanupCloseState::timeout) {
+                assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::timeout &&
+                       result.cleanupParseReason == ParseReason::none &&
+                       !result.cleanupParseShape.available);
+            } else if (state == CleanupCloseState::connected ||
+                       state == CleanupCloseState::connecting ||
+                       state == CleanupCloseState::closed) {
+                assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::terminal_failure &&
+                       result.cleanupParseReason == ParseReason::none &&
+                       !result.cleanupParseShape.available);
+            } else {
+                assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+                       result.cleanupParseReason != ParseReason::none &&
+                       result.cleanupParseShape.available);
+            }
         }
     }
 

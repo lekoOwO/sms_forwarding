@@ -145,6 +145,10 @@ int main() {
     const std::string response_reason_json = idf_push_serialize_test_status(response_reason, true);
     assert(response_reason_json.find("\"failureResponseReason\":\"http_parse\"") !=
            std::string::npos);
+    response_reason.failureResponseReason = IdfModemHttpsFailureResponseReason::modem_command;
+    const std::string command_reason_json = idf_push_serialize_test_status(response_reason, true);
+    assert(command_reason_json.find("\"failureResponseReason\":\"modem_command\"") !=
+           std::string::npos);
     assert(idf_push_serialize_test_status(response_reason, false).find(
                "failureResponseReason") == std::string::npos);
     response_reason.failureResponseReason = IdfModemHttpsFailureResponseReason::tls_read;

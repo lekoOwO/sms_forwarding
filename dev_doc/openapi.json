@@ -915,7 +915,7 @@
           },
           "failureResponseReason": {
             "type": "string",
-            "enum": ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"]
+            "enum": ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown"]
           },
           "cleanupReason": {
             "type": "string",

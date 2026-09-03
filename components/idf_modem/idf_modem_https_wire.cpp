@@ -776,7 +776,7 @@ bool has_single_mip_close_zero(std::string_view response)
             terminal_seen = true;
         } else if (starts_with(normalized, "+MIPCLOSE:") &&
                    trim_spaces(normalized.substr(std::string_view("+MIPCLOSE:").size())) == "0") {
-            if (terminal_seen) return false;
+            if (candidate_seen) return false;
             candidate_seen = true;
         }
         if (end == std::string_view::npos) break;

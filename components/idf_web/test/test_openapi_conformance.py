@@ -209,7 +209,7 @@ def main() -> None:
         "poll_timeout", "result_nonzero", "unknown",
     ]
     assert push_status["properties"]["failureResponseReason"]["enum"] == [
-        "timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown",
+        "timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown",
     ]
     assert push_status["properties"]["cleanupReason"]["enum"] == [
         "command_failure", "timeout", "response_invalid", "result_nonzero", "unknown",

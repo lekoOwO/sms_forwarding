@@ -98,6 +98,8 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 		failureResponseReason: "http_parse"
 	};
 	assert.equal(serializePushTestStatus(responseReason, true).failureResponseReason, "http_parse");
+	assert.equal(serializePushTestStatus({ ...responseReason,
+		failureResponseReason: "modem_command" }, true).failureResponseReason, "modem_command");
 	assert.equal(Object.hasOwn(serializePushTestStatus({ ...responseReason,
 		failureStage: "http" }, true), "failureResponseReason"), false);
 	assert.equal(Object.hasOwn(serializePushTestStatus({ ...responseReason,

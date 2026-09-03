@@ -55,11 +55,33 @@ modem recovery，也沒有因為 ambiguous acknowledgement 再送一次 close、
 其他 recovery action。
 
 目前新增的 outer-space/tab normalization 只接受 single-field CID0 candidate；它
-只有在 cleanup 隨後 exactly one well-formed CID0 `INITIAL` post-state confirmation
-成功時才安全。candidate 本身永遠不是 final success；沒有該 confirmation 時，
-stale、delayed、non-initial、ambiguous 或 timeout 都必須 fail closed 並要求
-reset。這是 bounded implementation contract，不是 R10 對原始空白或通用 modem
-wire grammar 的推論。
+可以出現在唯一 terminal `OK` 的前後，但 frame 仍必須只有一個 candidate、一個
+terminal，且沒有 `ERROR`、duplicate 或未知/額外行。它只有在 cleanup 隨後 exactly
+one well-formed CID0 `INITIAL` post-state confirmation 成功時才安全。candidate 本身
+永遠不是 final success；沒有該 confirmation 時，stale、delayed、non-initial、
+ambiguous 或 timeout 都必須 fail closed 並要求 reset。這是 bounded implementation
+contract，不是 R10 對原始空白、行順序或通用 modem wire grammar 的推論。
+
+## R11 bounded diagnosis
+
+R11 的 sanitized receipt 只保留 bounded parser projections：response stage 的
+`failureResponseReason` 是 `modem_read`；cleanup 是 `response_invalid`、parse
+reason `field_count`；cleanup shape 是 `fieldCount=1`、`quoteMask=0`、
+`presenceMask=4`、state class `none`、line class `none`、single-field class `zero`。
+cleanup 未確認且 `resetNeeded=true`。這個 shape 只表示 parser 到達 single-field
+fallback；shape 不記錄 raw bytes、行順序或 terminal 相對位置，因此不能從它判定
+candidate 在 `OK` 前或後，也不能主張任何通用 ML307 wire grammar。
+
+counter39 將 response-stage owner command failure 與 MIPRD parse rejection 分開為
+`modem_command` 與 `modem_read`。這是 bounded telemetry，沒有增加 raw response、
+errno、modem code 或 endpoint 資料；既有 detail0/active/success coupling 維持不變。
+single-field candidate 的安全性仍只來自 strict frame validation、唯一性與 exactly
+one CID0 `INITIAL` post-state confirmation。這個 confirmation 是安全不變量，不是把
+一次硬體 observation 推廣成 protocol fact。R11 沒有宣稱 modem recovery，也沒有
+因為 ambiguous acknowledgement 再送一次 close、reset 或其他 recovery action。
+若 post-state 已確認為 CID0 `INITIAL`，single-field candidate 即使是 stale
+acknowledgement，也只代表 cleanup goal 已安全達成；這不是對 candidate 的 protocol
+語意或 modem 家族行為的推論。
 
 ## Counter37 行為與安全邊界
 
@@ -70,8 +92,9 @@ wire grammar 的推論。
   並在失敗 shape 中保留 bounded `connecting` state class。
 - MIPCLOSE 的既有 two-field contract 不變。新增的 single-field candidate 只有在
   strict frame、prefix、single-field、unquoted checks 通過後，trim outer SP/TAB
-  後仍精確等於 `0`、且 expected CID 為 0 時才可被接受；這是目前程式的
-  acceptance contract，不是本次硬體觀察已證明的通用 wire fact。
+  後仍精確等於 `0`、expected CID 為 0、且唯一 candidate/terminal 與無錯誤或未知
+  額外行時才可被接受；這是目前程式的 acceptance contract，不是本次硬體觀察
+  已證明的通用 wire fact。
 - single-field acknowledgement 永遠不是 cleanup 的最終成功。cleanup 會透過
   現有 owner 提交 exactly one post-close MIPSTATE query，且只接受 well-formed
   CID0 `INITIAL`；connected、connecting、closed、unknown、schema、timeout 或
@@ -92,8 +115,9 @@ wire grammar 的推論。
    並要求 post-state confirmation。
 2. negative fixtures：tabs、double/leading/trailing spaces、quoted single、
    nonzero、leading-zero、sign、junk、extra、duplicate、after-terminal，及
-   malformed CONNECTING endpoint/CID/quote；generic `parse_result`、MIPSEND、
-   MIPOPEN 行為維持原有 strictness。
+   malformed CONNECTING endpoint/CID/quote；after-terminal candidate 的 duplicate、
+   extra、unknown、ERROR 與 missing/duplicate terminal；generic `parse_result`、
+   MIPSEND、MIPOPEN 行為維持原有 strictness。
 3. stale-close 與 cleanup 的 initial/noninitial/failure/timeout/ambiguity
    bounded fixtures、modem/runtime/push tests、OpenAPI/security checks 與
    CI-equivalent firmware compile 全部通過。

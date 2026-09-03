@@ -52,6 +52,7 @@ enum class IdfModemHttpsFailureResponseReason : uint8_t {
     tls_read,
     http_parse,
     http_incomplete,
+    modem_command,
     unknown,
 };
 
@@ -65,6 +66,7 @@ constexpr std::string_view idf_modem_https_failure_response_reason_name(
         case IdfModemHttpsFailureResponseReason::tls_read: return "tls_read";
         case IdfModemHttpsFailureResponseReason::http_parse: return "http_parse";
         case IdfModemHttpsFailureResponseReason::http_incomplete: return "http_incomplete";
+        case IdfModemHttpsFailureResponseReason::modem_command: return "modem_command";
         case IdfModemHttpsFailureResponseReason::unknown: return "unknown";
     }
     return "unknown";

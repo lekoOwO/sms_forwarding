@@ -435,7 +435,7 @@ private:
         std::string response;
         if (!send_command(command, response, false)) {
             if (!timed_out_ && !open_failed_) {
-                record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
+                record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_command);
             }
             return false;
         }

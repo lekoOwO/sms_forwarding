@@ -47,7 +47,7 @@ const pushTestCleanupReasons: readonly PushTestCleanupReason[] = [
 	"command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"
 ];
 const pushTestFailureResponseReasons: readonly PushTestFailureResponseReason[] = [
-	"timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"
+	"timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown"
 ];
 const pushTestParseReasons: readonly PushTestParseReason[] = [
 	"oversize", "terminal", "urc", "prefix", "field_count", "quote",

@@ -232,13 +232,13 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 		const responseRead = {
 			...responseInvalid,
 			transportPath: "cellular", dispatchAttempted: true, failureStage: "response",
-			failureResponseReason: "http_parse"
+			failureResponseReason: "modem_command"
 		};
 		globalThis.fetch = async (path) => new Response(JSON.stringify(
 			path === "/api/config" ? { csrfToken: "csrf" } : responseRead
 		), { status: 200, headers: { "Content-Type": "application/json" } });
 		await api.loadSnapshot();
-		assert.equal((await api.runPushTest(0, undefined, 1000)).failureResponseReason, "http_parse");
+		assert.equal((await api.runPushTest(0, undefined, 1000)).failureResponseReason, "modem_command");
 		for (const invalidResponse of [
 			{ ...responseRead, failureResponseReason: "not-a-reason" },
 			{ ...responseRead, failureResponseReason: 4 },
