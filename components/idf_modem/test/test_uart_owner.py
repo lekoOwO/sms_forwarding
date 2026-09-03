@@ -620,6 +620,7 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn("HTTPS_CLEANUP_WAIT_MARGIN_MS", submit)
         self.assertIn("HTTPS_CLEANUP_COMMANDS_MAX", source)
         self.assertIn("HTTPS_CLEANUP_CLOSE_COMMANDS_MAX", source)
+        self.assertIn("HTTPS_CLEANUP_CLOSE_STATE_COMMANDS_MAX", source)
         self.assertIn("HTTPS_CLEANUP_CONFIGS_MAX * HTTPS_CLEANUP_CONFIG_COMMANDS_MAX", source)
         self.assertIn("HTTPS_CLEANUP_PDP_COMMANDS_MAX", source)
         self.assertNotIn("3UL * HTTPS_CLEANUP_TIMEOUT_MS", submit)
@@ -678,6 +679,11 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn("return found", wire)
         self.assertIn('expected == "INITIAL"', wire)
         self.assertIn('expected == "CONNECTED"', wire)
+        self.assertIn("parse_mip_close_result", source)
+        self.assertIn("has_exact_single_mip_close_zero", wire)
+        self.assertIn("confirm_cleanup_close_state", source)
+        self.assertEqual(source.count("parse_mip_close_result(response, close"), 2)
+        self.assertNotIn('parse_result(response, close, "+MIPCLOSE:"', source)
 
     def test_https_open_accepts_terminal_and_parses_optional_result_strictly(self):
         source = SOURCE.read_text()

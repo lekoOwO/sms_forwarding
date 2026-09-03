@@ -21,6 +21,7 @@ enum class MipStateDisposition : uint8_t {
     invalid,
     initial,
     connected,
+    connecting,
     closed,
 };
 
@@ -53,6 +54,11 @@ bool parse_result(std::string_view response, std::string_view command,
                   std::string_view prefix, uint8_t expected_cid, uint32_t& value,
                   IdfModemHttpsParseReason* reason = nullptr,
                   IdfModemHttpsParseShape* shape = nullptr);
+bool parse_mip_close_result(std::string_view response, std::string_view command,
+                            uint8_t expected_cid, uint32_t& value,
+                            IdfModemHttpsParseReason* reason = nullptr,
+                            IdfModemHttpsParseShape* shape = nullptr,
+                            bool* requires_confirmation = nullptr);
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
                 uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed);
 std::string hex_encode(const uint8_t* bytes, size_t length);

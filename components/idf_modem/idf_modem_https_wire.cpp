@@ -487,10 +487,18 @@ MipStateDisposition parse_mip_state_disposition(std::string_view response,
         cid = static_cast<uint8_t>(connect_id);
         return MipStateDisposition::connected;
     }
+    if (fields[4] == "CONNECTING") {
+        if (shape) shape->stateClass = IdfModemHttpsParseStateClass::connecting;
+        if (!parse_mip_tcp_endpoint(fields, quoted, reason)) {
+            capture_csv_shape(shape, count, fields, quoted);
+            return MipStateDisposition::invalid;
+        }
+        cid = static_cast<uint8_t>(connect_id);
+        if (shape) shape->stateClass = IdfModemHttpsParseStateClass::none;
+        return MipStateDisposition::connecting;
+    }
     if (shape) {
-        shape->stateClass = fields[4] == "CONNECTING"
-                                ? IdfModemHttpsParseStateClass::connecting
-                                : IdfModemHttpsParseStateClass::unknown;
+        shape->stateClass = IdfModemHttpsParseStateClass::unknown;
     }
     capture_csv_shape(shape, count, fields, quoted);
     set_parse_reason(reason, ParseReason::state);
@@ -548,7 +556,8 @@ bool parse_mip_state(std::string_view response, std::string_view command,
     const bool matches =
         (expected == "INITIAL" && disposition == MipStateDisposition::initial) ||
         (expected == "CONNECTED" && disposition == MipStateDisposition::connected);
-    if (!matches && disposition != MipStateDisposition::invalid) {
+    if (!matches && disposition != MipStateDisposition::invalid &&
+        disposition != MipStateDisposition::connecting) {
         set_parse_reason(reason, ParseReason::state);
     }
     if (matches) cid = parsed_cid;
@@ -750,9 +759,38 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
     return found;
 }
 
-bool parse_result(std::string_view response, std::string_view command,
-                  std::string_view prefix, uint8_t expected_cid, uint32_t& value,
-                  ParseReason* reason, ParseShape* shape)
+namespace {
+
+bool has_exact_single_mip_close_zero(std::string_view response)
+{
+    bool candidate_seen = false;
+    bool terminal_seen = false;
+    size_t position = 0;
+    while (position < response.size()) {
+        const size_t end = response.find_first_of("\r\n", position);
+        const size_t line_end = end == std::string_view::npos ? response.size() : end;
+        const std::string_view line = response.substr(position, line_end - position);
+        if (trim_spaces(line) == "OK") {
+            if (terminal_seen) return false;
+            terminal_seen = true;
+        } else if (line == "+MIPCLOSE:0" || line == "+MIPCLOSE: 0") {
+            if (terminal_seen) return false;
+            candidate_seen = true;
+        }
+        if (end == std::string_view::npos) break;
+        position = end + 1;
+        while (position < response.size() &&
+               (response[position] == '\r' || response[position] == '\n')) {
+            ++position;
+        }
+    }
+    return candidate_seen;
+}
+
+bool parse_result_impl(std::string_view response, std::string_view command,
+                       std::string_view prefix, uint8_t expected_cid,
+                       bool allow_single_close, uint32_t& value,
+                       ParseReason* reason, ParseShape* shape)
 {
     clear_parse_reason(reason);
     clear_parse_shape(shape);
@@ -795,6 +833,15 @@ bool parse_result(std::string_view response, std::string_view command,
                                   : ParseReason::field_count);
         return false;
     }
+    if (count == 1) {
+        if (allow_single_close && expected_cid == 0 && !quoted[0] && fields[0] == "0") {
+            value = 0;
+            return true;
+        }
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, ParseReason::field_count);
+        return false;
+    }
     if (count != 2) {
         capture_csv_shape(shape, count, fields, quoted);
         set_parse_reason(reason, ParseReason::field_count);
@@ -811,6 +858,32 @@ bool parse_result(std::string_view response, std::string_view command,
         set_parse_reason(reason, ParseReason::result);
         return false;
     }
+    return true;
+}
+
+}  // namespace
+
+bool parse_result(std::string_view response, std::string_view command,
+                  std::string_view prefix, uint8_t expected_cid, uint32_t& value,
+                  ParseReason* reason, ParseShape* shape)
+{
+    return parse_result_impl(response, command, prefix, expected_cid, false, value, reason,
+                             shape);
+}
+
+bool parse_mip_close_result(std::string_view response, std::string_view command,
+                            uint8_t expected_cid, uint32_t& value,
+                            ParseReason* reason, ParseShape* shape,
+                            bool* requires_confirmation)
+{
+    if (requires_confirmation) *requires_confirmation = false;
+    const bool allow_single_close = expected_cid == 0 &&
+                                    has_exact_single_mip_close_zero(response);
+    if (!parse_result_impl(response, command, "+MIPCLOSE:", expected_cid, allow_single_close,
+                           value, reason, shape)) {
+        return false;
+    }
+    if (requires_confirmation) *requires_confirmation = allow_single_close;
     return true;
 }
 

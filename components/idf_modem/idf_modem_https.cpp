@@ -640,6 +640,43 @@ private:
         return true;
     }
 
+    bool confirm_cleanup_close_state()
+    {
+        const std::string command_text = "AT+MIPSTATE=0";
+        std::string response;
+        IdfModemHttpsCommandResult command_result = IdfModemHttpsCommandResult::failed;
+        if (!command(command_text, response, true, &command_result)) {
+            const ParseReason parse_reason = command_result == IdfModemHttpsCommandResult::ok
+                                                 ? ParseReason::oversize
+                                                 : ParseReason::none;
+            const IdfModemHttpsDiagnosticReason reason =
+                command_result == IdfModemHttpsCommandResult::timeout
+                    ? IdfModemHttpsDiagnosticReason::timeout
+                    : command_result == IdfModemHttpsCommandResult::ok
+                        ? IdfModemHttpsDiagnosticReason::response_invalid
+                        : IdfModemHttpsDiagnosticReason::command_failure;
+            record_cleanup_failure(kCleanupSocketCloseFailure, reason, true, parse_reason);
+            return false;
+        }
+
+        ParseReason parse_reason = ParseReason::none;
+        ParseShape parse_shape{};
+        const MipStateDisposition disposition =
+            classify_mip_state(response, command_text, 0, &parse_reason, &parse_shape);
+        if (disposition == MipStateDisposition::invalid) {
+            record_cleanup_failure(kCleanupSocketCloseFailure,
+                                   IdfModemHttpsDiagnosticReason::response_invalid, true,
+                                   parse_reason, parse_shape);
+            return false;
+        }
+        if (disposition != MipStateDisposition::initial) {
+            record_cleanup_failure(kCleanupSocketCloseFailure,
+                                   IdfModemHttpsDiagnosticReason::terminal_failure, true);
+            return false;
+        }
+        return true;
+    }
+
     bool ensure_initial_state()
     {
         const std::string state_command = "AT+MIPSTATE=0";
@@ -686,8 +723,8 @@ private:
         }
         parse_reason = ParseReason::none;
         parse_shape = {};
-        if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason,
-                          &parse_shape)) {
+        if (!parse_mip_close_result(response, close, 0, result, &parse_reason,
+                                    &parse_shape)) {
             record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
             record_failure_parse_reason(parse_reason, parse_shape);
             result_.message = kStaleCloseResponseInvalid;
@@ -749,7 +786,8 @@ private:
                 record_failure_parse_reason(parse_reason, parse_shape);
                 return false;
             }
-            if (disposition != MipStateDisposition::initial) {
+            if (disposition != MipStateDisposition::initial &&
+                disposition != MipStateDisposition::connecting) {
                 record_failure_reason(IdfModemHttpsDiagnosticReason::terminal_failure);
                 return false;
             }
@@ -1006,14 +1044,17 @@ private:
             } else {
                 ParseReason parse_reason = ParseReason::none;
                 ParseShape parse_shape{};
-                if (!parse_result(response, close, "+MIPCLOSE:", 0, result, &parse_reason,
-                                  &parse_shape)) {
+                bool close_requires_confirmation = false;
+                if (!parse_mip_close_result(response, close, 0, result, &parse_reason,
+                                            &parse_shape, &close_requires_confirmation)) {
                     record_cleanup_failure(kCleanupSocketCloseFailure,
                                            IdfModemHttpsDiagnosticReason::response_invalid, true,
                                            parse_reason, parse_shape);
                 } else if (result != 0) {
                     record_cleanup_failure(kCleanupSocketCloseFailure,
                                            IdfModemHttpsDiagnosticReason::result_nonzero, true);
+                } else if (close_requires_confirmation) {
+                    confirm_cleanup_close_state();
                 }
             }
         }

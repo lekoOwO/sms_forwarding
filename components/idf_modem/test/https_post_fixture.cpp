@@ -22,6 +22,7 @@ using idf_modem_https_wire::parse_cgdccont;
 using idf_modem_https_wire::parse_cfg_response;
 using idf_modem_https_wire::classify_mip_state;
 using idf_modem_https_wire::parse_mip_state;
+using idf_modem_https_wire::parse_mip_close_result;
 using idf_modem_https_wire::parse_mip_open;
 using idf_modem_https_wire::parse_mip_urc;
 using idf_modem_https_wire::parse_read;
@@ -105,10 +106,12 @@ enum class InitialStateMode {
     malformed_state,
     ambiguous_state,
     unknown_state,
+    connecting_state,
     wrong_cid,
     close_failed,
     close_ambiguous,
     close_malformed,
+    single_field_close_then_initial,
     connected_after_close,
     post_close_state_failed,
 };
@@ -132,7 +135,8 @@ struct InitialStateTranscript {
             ++transcript.state_queries;
             const bool initial = transcript.mode == InitialStateMode::initial ||
                                  ((transcript.mode == InitialStateMode::connected_then_initial ||
-                                   transcript.mode == InitialStateMode::closed_then_initial) &&
+                                   transcript.mode == InitialStateMode::closed_then_initial ||
+                                   transcript.mode == InitialStateMode::single_field_close_then_initial) &&
                                   transcript.state_queries == 2);
             if (transcript.mode == InitialStateMode::state_failed) {
                 return IdfModemHttpsCommandResult::failed;
@@ -151,6 +155,9 @@ struct InitialStateTranscript {
                                           "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"");
             } else if (transcript.mode == InitialStateMode::unknown_state) {
                 response = frame(command, "+MIPSTATE: 0,,,,\"OTHER\"");
+            } else if (transcript.mode == InitialStateMode::connecting_state) {
+                response = frame(command,
+                                 "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTING\"");
             } else if (transcript.mode == InitialStateMode::wrong_cid) {
                 response = frame(command,
                                  "+MIPSTATE: 1,\"TCP\",\"fixture.example\",443,\"CONNECTED\"");
@@ -168,7 +175,8 @@ struct InitialStateTranscript {
             if (transcript.mode == InitialStateMode::close_failed) {
                 return IdfModemHttpsCommandResult::failed;
             }
-            if (transcript.mode == InitialStateMode::close_malformed) {
+            if (transcript.mode == InitialStateMode::close_malformed ||
+                transcript.mode == InitialStateMode::single_field_close_then_initial) {
                 response = frame(command, "+MIPCLOSE: 0");
                 return IdfModemHttpsCommandResult::ok;
             }
@@ -234,6 +242,7 @@ void check_initial_state_transcripts()
              std::pair{InitialStateMode::malformed_state, kInitialQueryResponseInvalid},
              std::pair{InitialStateMode::ambiguous_state, kInitialQueryResponseInvalid},
              std::pair{InitialStateMode::unknown_state, kInitialQueryResponseInvalid},
+             std::pair{InitialStateMode::connecting_state, kInitialQueryResponseInvalid},
              std::pair{InitialStateMode::wrong_cid, kInitialQueryResponseInvalid},
          }) {
         InitialStateTranscript rejected{mode};
@@ -250,7 +259,6 @@ void check_initial_state_transcripts()
     for (const auto& [mode, expected_message] : {
              std::pair{InitialStateMode::close_failed, kStaleCloseCommandFailure},
              std::pair{InitialStateMode::close_ambiguous, kStaleCloseResponseInvalid},
-             std::pair{InitialStateMode::close_malformed, kStaleCloseResponseInvalid},
          }) {
         InitialStateTranscript rejected{mode};
         assert(run_initial_state_transcript(rejected) == IdfModemHttpsRunResult::command_failed);
@@ -258,6 +266,22 @@ void check_initial_state_transcripts()
                                          "AT+MIPSTATE=0", "AT+MIPCLOSE=0"}));
         assert_failure_message(rejected.result_message, expected_message);
     }
+
+    InitialStateTranscript single_field_close{InitialStateMode::close_malformed};
+    assert(run_initial_state_transcript(single_field_close) == IdfModemHttpsRunResult::command_failed);
+    assert((single_field_close.commands == std::vector<std::string>{
+                                         "AT+MIPSTATE=0", "AT+MIPCLOSE=0", "AT+MIPSTATE=0"}));
+    assert_failure_message(single_field_close.result_message, kPostCloseQueryResponseInvalid);
+
+    InitialStateTranscript single_field_close_confirmed{
+        InitialStateMode::single_field_close_then_initial};
+    assert(run_initial_state_transcript(single_field_close_confirmed) ==
+           IdfModemHttpsRunResult::command_failed);
+    assert((single_field_close_confirmed.commands == std::vector<std::string>{
+                                                    "AT+MIPSTATE=0", "AT+MIPCLOSE=0",
+                                                    "AT+MIPSTATE=0", "AT+MIPCFG=\"cid\",0"}));
+    assert_failure_message(single_field_close_confirmed.result_message,
+                           "HTTPS modem runtime snapshot failed");
 
     InitialStateTranscript still_connected{InitialStateMode::connected_after_close};
     assert(run_initial_state_transcript(still_connected) == IdfModemHttpsRunResult::command_failed);
@@ -277,7 +301,7 @@ void check_initial_state_transcripts()
     for (const auto& [mode, expected_parse_reason] : {
              std::pair{InitialStateMode::malformed_state, ParseReason::field_count},
              std::pair{InitialStateMode::wrong_cid, ParseReason::cid},
-             std::pair{InitialStateMode::close_malformed, ParseReason::field_count},
+             std::pair{InitialStateMode::close_malformed, ParseReason::state},
          }) {
         InitialStateTranscript rejected{mode};
         IdfModemHttpsPostResult result;
@@ -364,6 +388,8 @@ void check_parse_reasons()
     assert(parse_result(frame(send_command, "+MIPSEND: \"0\",\"4\""), send_command,
                         "+MIPSEND:", 0, value, &reason));
     assert(value == 4 && reason == ParseReason::none);
+    assert(!parse_result(frame(send_command, "+MIPSEND: 0"), send_command,
+                         "+MIPSEND:", 0, value, &reason));
 }
 
 void check_parse_shapes()
@@ -373,11 +399,49 @@ void check_parse_shapes()
     ParseReason reason = ParseReason::none;
     ParseShape shape{};
 
-    assert(classify_mip_state(frame(state_command, "+MIPSTATE: 0,,,,\"CONNECTING\""),
+    // Counter37 sanitized hardware transcript (see dev_doc/hardware-counter37.md): five
+    // fields, quoteMask=22, and exact uppercase CONNECTING. This is transitional, not
+    // terminal success or a parser failure.
+    const std::string connecting_hardware_frame = frame(
+        state_command, "+MIPOPEN: 0,0\r\n"
+                       "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTING\"");
+    assert(classify_mip_state(connecting_hardware_frame,
+                              state_command, 0, &reason, &shape) ==
+           MipStateDisposition::connecting);
+    assert(reason == ParseReason::none && shape.fieldCount == 0 &&
+           shape.stateClass == IdfModemHttpsParseStateClass::none);
+
+    reason = ParseReason::none;
+    shape = {};
+    uint8_t connecting_cid = 0;
+    assert(!parse_mip_state(connecting_hardware_frame,
+                            state_command, "CONNECTED", connecting_cid, &reason, &shape));
+    assert(reason == ParseReason::none && connecting_cid == 0 && shape.fieldCount == 0 &&
+           shape.stateClass == IdfModemHttpsParseStateClass::none);
+
+    for (const std::string_view invalid_connecting : {
+             "+MIPSTATE: 0,,,,\"CONNECTING\"",
+             "+MIPSTATE: 0,\"UDP\",\"fixture.example\",443,\"CONNECTING\"",
+             "+MIPSTATE: 0,\"TCP\",\"fixture.example\",\"443\",\"CONNECTING\"",
+             "+MIPSTATE: 1,\"TCP\",\"fixture.example\",443,\"CONNECTING\"",
+             "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"connecting\"",
+             "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTING\",extra",
+         }) {
+        reason = ParseReason::none;
+        shape = {};
+        assert(classify_mip_state(frame(state_command, invalid_connecting), state_command, 0,
+                                  &reason, &shape) == MipStateDisposition::invalid);
+        assert(reason != ParseReason::none);
+    }
+
+    reason = ParseReason::none;
+    shape = {};
+    assert(classify_mip_state(frame(state_command,
+                                    "+MIPSTATE: 0,\"TCP\",\"fixture.example\",\"443\",\"CONNECTING\""),
                               state_command, 0, &reason, &shape) ==
            MipStateDisposition::invalid);
-    assert(reason == ParseReason::state && shape.available && shape.fieldCount == 5);
-    assert(idf_modem_https_parse_state_class_name(shape.stateClass) == "connecting");
+    assert(reason == ParseReason::endpoint &&
+           shape.stateClass == IdfModemHttpsParseStateClass::connecting);
 
     reason = ParseReason::none;
     shape = {};
@@ -464,6 +528,86 @@ void check_parse_shapes()
 
     reason = ParseReason::none;
     shape = {};
+    value = 99;
+    bool requires_confirmation = false;
+    assert(parse_mip_close_result(frame(close_command, "+MIPCLOSE:0"), close_command, 0,
+                                  value, &reason, &shape, &requires_confirmation));
+    assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+           requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(!parse_mip_close_result(frame(close_command, "+MIPCLOSE:0"), close_command, 1,
+                                   value, &reason, &shape, &requires_confirmation));
+    assert(reason == ParseReason::field_count && !requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(parse_mip_close_result(frame(close_command, "+MIPCLOSE: 0"), close_command, 0,
+                                  value, &reason, &shape, &requires_confirmation));
+    assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+           requires_confirmation);
+    for (const std::string_view rejected : {"+MIPCLOSE:1", "+MIPCLOSE:bad",
+                                             "+MIPCLOSE:00", "+MIPCLOSE:+0",
+                                             "+MIPCLOSE:-0", "+MIPCLOSE:\"0\"",
+                                             "+MIPCLOSE:\t0", "+MIPCLOSE:  0",
+                                             "+MIPCLOSE: 0 ", "+MIPCLOSE:0 ",
+                                             "+MIPCLOSE:0\t"}) {
+        reason = ParseReason::none;
+        shape = {};
+        value = 0;
+        requires_confirmation = false;
+        assert(!parse_mip_close_result(frame(close_command, rejected),
+                                       close_command, 0, value, &reason, &shape,
+                                       &requires_confirmation));
+        assert(shape.available && shape.fieldCount == 1);
+        assert(reason == ParseReason::field_count);
+        assert(!requires_confirmation);
+    }
+    for (const std::string_view rejected : {" +MIPCLOSE: 0", "+MIPCLOSE:0 "}) {
+        reason = ParseReason::none;
+        shape = {};
+        requires_confirmation = false;
+        assert(!parse_mip_close_result(frame(close_command, rejected), close_command, 0, value,
+                                       &reason, &shape, &requires_confirmation));
+        assert(shape.available && shape.fieldCount == 1);
+        assert(reason == ParseReason::field_count && !requires_confirmation);
+    }
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(!parse_mip_close_result("\r\nAT+MIPCLOSE=0\r\nOK\r\n+MIPCLOSE:0\r\n",
+                                  close_command, 0, value, &reason, &shape,
+                                  &requires_confirmation));
+    assert(shape.available && shape.fieldCount == 1 && reason == ParseReason::field_count &&
+           !requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    requires_confirmation = false;
+    assert(!parse_mip_close_result(frame(close_command, "+MIPCLOSE:0\r\n+MIPCLOSE:0"),
+                                  close_command, 0, value, &reason, &shape,
+                                  &requires_confirmation));
+    assert(reason == ParseReason::prefix && !requires_confirmation);
+    reason = ParseReason::none;
+    shape = {};
+    assert(parse_mip_close_result(frame(close_command, "+MIPCLOSE: 0,0"), close_command, 0,
+                                  value, &reason, &shape, &requires_confirmation));
+    assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+           !requires_confirmation);
+    assert(parse_mip_close_result(frame(close_command, "+MIPCLOSE: \"0\",\"0\""),
+                                  close_command, 0, value, &reason, &shape,
+                                  &requires_confirmation));
+    assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+           !requires_confirmation);
+    assert(!parse_mip_close_result(frame(close_command, "+MIPCLOSE: 0,0,extra"),
+                                   close_command, 0, value, &reason, &shape,
+                                   &requires_confirmation));
+    assert(!parse_mip_close_result(frame(close_command, "+MIPCLOSE: 0,0"), close_command, 1,
+                                   value, &reason, &shape, &requires_confirmation));
+    assert(reason == ParseReason::cid && !requires_confirmation);
+
+    reason = ParseReason::none;
+    shape = {};
     assert(!parse_result(frame(close_command, "+MIPCLOSE: 0,bad"), close_command,
                          "+MIPCLOSE:", 0, value, &reason, &shape));
     assert(reason == ParseReason::result && shape.fieldCount == 2);
@@ -491,6 +635,8 @@ enum class RemoteCloseMode {
     duplicate_disconnect,
     open_ok_connected,
     open_ok_initial_connected,
+    open_ok_connecting_connected,
+    cleanup_single_field_close,
     open_result_failed,
     open_duplicate,
     open_wrong_cid,
@@ -534,6 +680,18 @@ enum class CleanupFailurePhase {
     query_command,
     verify_mismatch,
     profile_mismatch,
+};
+
+enum class CleanupCloseState {
+    initial,
+    connected,
+    connecting,
+    closed,
+    unknown,
+    malformed,
+    ambiguous,
+    command_failure,
+    timeout,
 };
 
 enum class LateOpenKind {
@@ -598,6 +756,7 @@ struct RemoteCloseTranscript {
     uint8_t encoding_receive = 0;
     uint8_t autofree = 0;
     bool pdp_active = true;
+    CleanupCloseState cleanup_close_state = CleanupCloseState::initial;
     std::string current_apn = "fixture";
     std::string current_profile = "1,\"IPV4V6\",\"fixture\",,0,0,,,,";
     std::vector<std::string> cleanup_commands;
@@ -673,6 +832,18 @@ struct RemoteCloseTranscript {
             }
         }
         if (command == "AT+MIPSTATE=0") {
+            if (cleanup && transcript.mode == RemoteCloseMode::cleanup_single_field_close &&
+                transcript.state_queries == 2 &&
+                transcript.cleanup_close_state == CleanupCloseState::command_failure) {
+                ++transcript.state_queries;
+                return IdfModemHttpsCommandResult::failed;
+            }
+            if (cleanup && transcript.mode == RemoteCloseMode::cleanup_single_field_close &&
+                transcript.state_queries == 2 &&
+                transcript.cleanup_close_state == CleanupCloseState::timeout) {
+                ++transcript.state_queries;
+                return IdfModemHttpsCommandResult::timeout;
+            }
             if (transcript.late_open != LateOpenKind::none && !transcript.late_consumed &&
                 ((transcript.late_stage == LateOpenStage::before_first_state &&
                   transcript.state_queries == 1) ||
@@ -700,6 +871,39 @@ struct RemoteCloseTranscript {
                 (transcript.mode == RemoteCloseMode::open_ok_initial_connected &&
                  transcript.state_queries == 2)) {
                 state = "+MIPSTATE: 0,,,,\"INITIAL\"";
+            } else if (cleanup && transcript.mode == RemoteCloseMode::cleanup_single_field_close &&
+                       transcript.state_queries == 3) {
+                switch (transcript.cleanup_close_state) {
+                    case CleanupCloseState::initial:
+                        state = "+MIPSTATE: 0,,,,\"INITIAL\"";
+                        break;
+                    case CleanupCloseState::connected:
+                        state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTED\"";
+                        break;
+                    case CleanupCloseState::connecting:
+                        state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTING\"";
+                        break;
+                    case CleanupCloseState::closed:
+                        state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CLOSED\"";
+                        break;
+                    case CleanupCloseState::unknown:
+                        state = "+MIPSTATE: 0,,,,\"OTHER\"";
+                        break;
+                    case CleanupCloseState::malformed:
+                        state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443";
+                        break;
+                    case CleanupCloseState::ambiguous:
+                        state = "+MIPSTATE: 0,,,,\"INITIAL\"\r\n"
+                                "+MIPSTATE: 0,,,,\"INITIAL\"";
+                        break;
+                    case CleanupCloseState::command_failure:
+                    case CleanupCloseState::timeout:
+                        assert(false);
+                        break;
+                }
+            } else if (transcript.mode == RemoteCloseMode::open_ok_connecting_connected &&
+                       transcript.state_queries == 2) {
+                state = "+MIPSTATE: 0,\"TCP\",\"fixture.example\",443,\"CONNECTING\"";
             } else if (transcript.mode == RemoteCloseMode::post_open_closed) {
                 state = "+MIPSTATE: 0,,,,\"CLOSED\"";
             } else if (transcript.mode == RemoteCloseMode::post_open_wrong_cid) {
@@ -955,7 +1159,9 @@ struct RemoteCloseTranscript {
                     return IdfModemHttpsCommandResult::ok;
                 }
             }
-            response = frame(command, "+MIPCLOSE: 0,0");
+            response = frame(command, transcript.mode == RemoteCloseMode::cleanup_single_field_close
+                                          ? "+MIPCLOSE: 0"
+                                          : "+MIPCLOSE: 0,0");
             return IdfModemHttpsCommandResult::ok;
         }
         return IdfModemHttpsCommandResult::failed;
@@ -1003,11 +1209,12 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
 int cleanup_command_rank(const std::string& command)
 {
     if (command == "AT+MIPCLOSE=0") return 0;
-    if (command.find("MIPCFG=\"ssl\"") != std::string::npos) return 1;
-    if (command.find("MIPCFG=\"autofree\"") != std::string::npos) return 2;
-    if (command.find("MIPCFG=\"encoding\"") != std::string::npos) return 3;
-    if (command == "AT+CGACT=0,1") return 4;
-    if (command.rfind("AT+CGDCONT", 0) == 0) return 5;
+    if (command == "AT+MIPSTATE=0") return 1;
+    if (command.find("MIPCFG=\"ssl\"") != std::string::npos) return 2;
+    if (command.find("MIPCFG=\"autofree\"") != std::string::npos) return 3;
+    if (command.find("MIPCFG=\"encoding\"") != std::string::npos) return 4;
+    if (command == "AT+CGACT=0,1") return 5;
+    if (command.rfind("AT+CGDCONT", 0) == 0) return 6;
     return -1;
 }
 
@@ -1056,6 +1263,62 @@ void check_remote_close_transcripts()
     assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
            delivered.autofree == 0);
 
+    RemoteCloseTranscript single_field_close{RemoteCloseMode::cleanup_single_field_close};
+    result = {};
+    assert(run_remote_close_transcript(single_field_close, result) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && single_field_close.close_commands == 1 &&
+           single_field_close.close_was_cleanup && single_field_close.state_queries == 3);
+    assert(std::count(single_field_close.cleanup_commands.begin(),
+                      single_field_close.cleanup_commands.end(), "AT+MIPSTATE=0") == 1);
+    assert_cleanup_action_order(single_field_close);
+    assert(!result.cleanupRequiresReset);
+    assert(result.failureReason == IdfModemHttpsDiagnosticReason::none &&
+           result.cleanupReason == IdfModemHttpsDiagnosticReason::none &&
+           result.failureParseReason == ParseReason::none &&
+           result.cleanupParseReason == ParseReason::none &&
+           !result.failureParseShape.available && !result.cleanupParseShape.available);
+
+    for (const CleanupCloseState state : {CleanupCloseState::connected,
+                                          CleanupCloseState::connecting,
+                                          CleanupCloseState::closed,
+                                          CleanupCloseState::unknown,
+                                          CleanupCloseState::malformed,
+                                          CleanupCloseState::ambiguous,
+                                          CleanupCloseState::command_failure,
+                                          CleanupCloseState::timeout}) {
+        RemoteCloseTranscript unconfirmed{RemoteCloseMode::cleanup_single_field_close};
+        unconfirmed.cleanup_close_state = state;
+        result = {};
+        const IdfModemHttpsRunResult outcome =
+            run_remote_close_transcript(unconfirmed, result);
+        assert(outcome == IdfModemHttpsRunResult::cleanup_failed && !result.ok &&
+               result.cleanupRequiresReset && unconfirmed.close_commands == 1 &&
+               unconfirmed.state_queries == 3);
+        assert(std::count(unconfirmed.cleanup_commands.begin(),
+                          unconfirmed.cleanup_commands.end(), "AT+MIPSTATE=0") == 1);
+        assert_cleanup_action_order(unconfirmed);
+        assert(result.cleanupReason != IdfModemHttpsDiagnosticReason::none);
+        if (state == CleanupCloseState::command_failure) {
+            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::command_failure &&
+                   result.cleanupParseReason == ParseReason::none &&
+                   !result.cleanupParseShape.available);
+        } else if (state == CleanupCloseState::timeout) {
+            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::timeout &&
+                   result.cleanupParseReason == ParseReason::none &&
+                   !result.cleanupParseShape.available);
+        } else if (state == CleanupCloseState::connected ||
+                   state == CleanupCloseState::connecting ||
+                   state == CleanupCloseState::closed) {
+            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::terminal_failure &&
+                   result.cleanupParseReason == ParseReason::none &&
+                   !result.cleanupParseShape.available);
+        } else {
+            assert(result.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+                   result.cleanupParseReason != ParseReason::none &&
+                   result.cleanupParseShape.available);
+        }
+    }
+
     for (const RemoteCloseMode mode : {RemoteCloseMode::disconnect_only,
                                        RemoteCloseMode::unread_data,
                                        RemoteCloseMode::duplicate_disconnect}) {
@@ -1070,7 +1333,8 @@ void check_remote_close_transcripts()
     }
 
     for (const RemoteCloseMode mode : {RemoteCloseMode::open_ok_connected,
-                                       RemoteCloseMode::open_ok_initial_connected}) {
+                                       RemoteCloseMode::open_ok_initial_connected,
+                                       RemoteCloseMode::open_ok_connecting_connected}) {
         RemoteCloseTranscript accepted{mode};
         result = {};
         assert(run_remote_close_transcript(accepted, result) == IdfModemHttpsRunResult::ok);
