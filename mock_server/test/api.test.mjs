@@ -70,6 +70,13 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 			stateClass: "none", lineClass: "missing", singleFieldClass: "none" }
 	};
 	assert.deepEqual(serializePushTestStatus(terminal, true), terminal);
+	const readData = {
+		...terminal,
+		failureParseReason: "read_data",
+		failureParseShape: { fieldCount: 4, quoteMask: 0, presenceMask: 16,
+			stateClass: "none", lineClass: "none", singleFieldClass: "none" }
+	};
+	assert.deepEqual(serializePushTestStatus(readData, true), readData);
 	const singleField = {
 		...terminal,
 		failureParseShape: { fieldCount: 1, quoteMask: 0, presenceMask: 4,

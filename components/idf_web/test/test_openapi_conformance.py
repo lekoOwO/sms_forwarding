@@ -216,7 +216,7 @@ def main() -> None:
     ]
     parse_reasons = [
         "oversize", "terminal", "urc", "prefix", "field_count", "quote",
-        "cid", "state", "endpoint", "result", "unknown",
+        "cid", "state", "endpoint", "result", "read_data", "unknown",
     ]
     assert push_status["properties"]["failureParseReason"] == {
         "type": "string", "enum": parse_reasons,

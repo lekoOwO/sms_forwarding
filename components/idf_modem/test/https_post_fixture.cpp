@@ -407,6 +407,83 @@ void check_parse_reasons()
                          "+MIPSEND:", 0, value, &reason));
 }
 
+void check_parse_read_reasons()
+{
+    const std::string read_command = "AT+MIPRD=0,4096";
+    auto rejected = [&](std::string_view body, ParseReason expected,
+                        IdfModemHttpsParseLineClass line_class =
+                            IdfModemHttpsParseLineClass::none) {
+        uint32_t unread = 123;
+        std::vector<uint8_t> data{0xde, 0xad};
+        bool remote_closed = true;
+        ParseReason reason = ParseReason::none;
+        ParseShape shape{};
+        assert(!parse_read(frame(read_command, body), read_command, 0, unread, data,
+                           remote_closed, &reason, &shape));
+        assert(reason == expected);
+        assert(unread == 0 && data.empty() && !remote_closed);
+        if (line_class != IdfModemHttpsParseLineClass::none) {
+            assert(shape.lineClass == line_class);
+        }
+    };
+
+    rejected("", ParseReason::prefix, IdfModemHttpsParseLineClass::missing);
+    rejected("+OTHER: 0", ParseReason::prefix, IdfModemHttpsParseLineClass::unexpected);
+    rejected("+MIPRD: 0,0,1,41\r\n+MIPRD: 0,0,1,41",
+             ParseReason::prefix, IdfModemHttpsParseLineClass::duplicate);
+    rejected("+MIPRD: 0,0,1,41\r\n+OTHER: 0",
+             ParseReason::prefix, IdfModemHttpsParseLineClass::extra);
+    rejected("+MIPURC: \"disconn\",0,0", ParseReason::urc);
+    rejected("+MIPURC: \"disconn\",0,2\r\n+MIPURC: \"disconn\",0,2",
+             ParseReason::urc);
+    rejected("ERROR", ParseReason::none);
+    rejected("+CME ERROR: 1", ParseReason::none);
+    rejected(std::string(idf_modem_https_wire::kResponseMax + 1, 'x'),
+             ParseReason::oversize);
+
+    ParseReason reason = ParseReason::none;
+    ParseShape shape{};
+    uint32_t unread = 123;
+    std::vector<uint8_t> data{0xbe, 0xef};
+    bool remote_closed = true;
+    const std::string missing_terminal = "\r\n" + read_command +
+                                         "\r\n+MIPRD: 0,0,0,\r\n";
+    assert(!parse_read(missing_terminal, read_command, 0, unread, data, remote_closed,
+                       &reason, &shape));
+    assert(reason == ParseReason::terminal);
+    assert(unread == 0 && data.empty() && !remote_closed);
+
+    rejected("+MIPRD: 0,0,1", ParseReason::field_count);
+    rejected("+MIPRD: 0,0,1,\"41\"", ParseReason::quote);
+    rejected("+MIPRD: 1,0,1,41", ParseReason::cid);
+    rejected("+MIPRD: 0,bad,1,41", ParseReason::read_data);
+    rejected("+MIPRD: 0,65536,1,41", ParseReason::read_data);
+    rejected("+MIPRD: 0,0,bad,41", ParseReason::read_data);
+    rejected("+MIPRD: 0,0,4097,41", ParseReason::read_data);
+    rejected("+MIPRD: 0,0,2,41", ParseReason::read_data);
+    rejected("+MIPRD: 0,0,1,0G", ParseReason::read_data);
+    rejected("+MIPRD: 0,1,1,41\r\n+MIPURC: \"disconn\",0,2",
+             ParseReason::read_data);
+
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    assert(parse_read(frame(read_command, "+MIPRD: 0,0,0,"), read_command, 0, unread,
+                      data, remote_closed, &reason, &shape));
+    assert(reason == ParseReason::none && unread == 0 && data.empty() && !remote_closed);
+
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = false;
+    assert(parse_read(frame(read_command, "+MIPURC: \"disconn\",0,2"), read_command, 0,
+                      unread, data, remote_closed, &reason, &shape));
+    assert(reason == ParseReason::none && unread == 0 && data.empty() && remote_closed);
+}
+
 void check_parse_shapes()
 {
     const std::string state_command = "AT+MIPSTATE=0";
@@ -1349,26 +1426,28 @@ void check_remote_close_transcripts()
         RemoteCloseMode mode;
         IdfModemHttpsRunResult outcome;
         int code;
+        ParseReason parse_reason;
     };
     for (const ResponseFailureCase failure : {
              ResponseFailureCase{RemoteCloseMode::response_read_timeout,
-                                 IdfModemHttpsRunResult::timed_out, 0},
+                                 IdfModemHttpsRunResult::timed_out, 0, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::disconnect_only,
-                                 IdfModemHttpsRunResult::response_failed, 1},
+                                 IdfModemHttpsRunResult::response_failed, 1, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::unread_data,
-                                 IdfModemHttpsRunResult::response_failed, 2},
+                                 IdfModemHttpsRunResult::response_failed, 2,
+                                 ParseReason::read_data},
              ResponseFailureCase{RemoteCloseMode::duplicate_disconnect,
-                                 IdfModemHttpsRunResult::response_failed, 2},
+                                 IdfModemHttpsRunResult::response_failed, 2, ParseReason::urc},
              ResponseFailureCase{RemoteCloseMode::response_read_modem_failure,
-                                 IdfModemHttpsRunResult::response_failed, 6},
+                                 IdfModemHttpsRunResult::response_failed, 6, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::response_read_modem_error,
-                                 IdfModemHttpsRunResult::response_failed, 6},
+                                 IdfModemHttpsRunResult::response_failed, 6, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::tls_read_failure,
-                                 IdfModemHttpsRunResult::response_failed, 3},
+                                 IdfModemHttpsRunResult::response_failed, 3, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::response_read_http_parse,
-                                 IdfModemHttpsRunResult::response_failed, 4},
+                                 IdfModemHttpsRunResult::response_failed, 4, ParseReason::none},
              ResponseFailureCase{RemoteCloseMode::response_read_http_incomplete,
-                                 IdfModemHttpsRunResult::response_failed, 5},
+                                 IdfModemHttpsRunResult::response_failed, 5, ParseReason::none},
          }) {
         RemoteCloseTranscript rejected{failure.mode};
         result = {};
@@ -1376,6 +1455,13 @@ void check_remote_close_transcripts()
         assert(!result.ok && result.failureStage == IdfHttpsFailureStage::response);
         assert(ResponseFailureReasonAccessor<IdfModemHttpsPostResult>::available(result));
         assert(ResponseFailureReasonAccessor<IdfModemHttpsPostResult>::code(result) == failure.code);
+        assert(result.failureParseReason == failure.parse_reason);
+        if (failure.parse_reason == ParseReason::none) {
+            assert(!result.failureParseShape.available);
+        } else {
+            assert(result.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
+            assert(result.failureParseShape.available);
+        }
     }
 
     RemoteCloseTranscript single_field_close{RemoteCloseMode::cleanup_single_field_close};
@@ -1914,6 +2000,7 @@ int main()
 {
     check_initial_state_transcripts();
     check_parse_reasons();
+    check_parse_read_reasons();
     check_parse_shapes();
     check_remote_close_transcripts();
     check_invalid_request_stages();

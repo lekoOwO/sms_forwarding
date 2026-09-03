@@ -889,14 +889,18 @@ bool parse_mip_close_result(std::string_view response, std::string_view command,
 }
 
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
-                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed)
+                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed,
+                ParseReason* reason, ParseShape* shape)
 {
+    clear_parse_reason(reason);
+    clear_parse_shape(shape);
     unread = 0;
     data.clear();
     remote_closed = false;
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body)) return false;
+    if (!scan_frame(response, command, body, reason, shape)) return false;
     std::string_view read_line;
+    bool saw_remote_closed = false;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
             uint32_t received = 0;
@@ -904,30 +908,76 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
             uint8_t state = 0;
             bool disconnected = false;
             if (!parse_mip_urc(line, received, total, state, disconnected) ||
-                (disconnected && remote_closed)) {
+                (disconnected && saw_remote_closed)) {
+                set_line_class(shape, disconnected && saw_remote_closed
+                                         ? IdfModemHttpsParseLineClass::duplicate
+                                         : IdfModemHttpsParseLineClass::unexpected);
+                set_parse_reason(reason, ParseReason::urc);
                 return false;
             }
-            remote_closed = remote_closed || disconnected;
+            saw_remote_closed = saw_remote_closed || disconnected;
         } else if (starts_with(line, "+MIPRD:") && read_line.empty()) {
             read_line = line;
+        } else if (starts_with(line, "+MIPRD:")) {
+            set_line_class(shape, IdfModemHttpsParseLineClass::duplicate);
+            set_parse_reason(reason, ParseReason::prefix);
+            return false;
         } else {
+            set_line_class(shape, read_line.empty() ? IdfModemHttpsParseLineClass::unexpected
+                                                     : IdfModemHttpsParseLineClass::extra);
+            set_parse_reason(reason, ParseReason::prefix);
             return false;
         }
     }
-    if (read_line.empty()) return remote_closed;
+    if (read_line.empty()) {
+        if (saw_remote_closed) {
+            remote_closed = true;
+            return true;
+        }
+        set_line_class(shape, IdfModemHttpsParseLineClass::missing);
+        set_parse_reason(reason, ParseReason::prefix);
+        return false;
+    }
     std::array<std::string_view, 8> fields;
     std::array<bool, 8> quoted{};
     size_t count = 0;
-    if (!parse_csv(read_line.substr(std::string_view("+MIPRD:").size()), fields, quoted, count) ||
-        count != 4 || quoted[3]) return false;
+    CsvFailure csv_failure = CsvFailure::none;
+    if (!parse_csv(read_line.substr(std::string_view("+MIPRD:").size()), fields, quoted, count,
+                   &csv_failure)) {
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, csv_failure == CsvFailure::quote
+                                  ? ParseReason::quote
+                                  : ParseReason::field_count);
+        return false;
+    }
+    if (count != 4) {
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, ParseReason::field_count);
+        return false;
+    }
+    if (quoted[3]) {
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, ParseReason::quote);
+        return false;
+    }
     uint32_t parsed_cid = 0;
+    uint32_t parsed_unread = 0;
     uint32_t length = 0;
-    if (!parse_uint(fields[0], parsed_cid) || parsed_cid != cid ||
-        !parse_uint(fields[1], unread) || unread > UINT16_MAX ||
+    if (!parse_uint(fields[0], parsed_cid) || parsed_cid != cid) {
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, ParseReason::cid);
+        return false;
+    }
+    if (!parse_uint(fields[1], parsed_unread) || parsed_unread > UINT16_MAX ||
         !parse_uint(fields[2], length) || length > kReadMax ||
         fields[3].size() != static_cast<size_t>(length) * 2U ||
-        (remote_closed && unread != 0)) return false;
-    data.reserve(length);
+        (saw_remote_closed && parsed_unread != 0)) {
+        capture_csv_shape(shape, count, fields, quoted);
+        set_parse_reason(reason, ParseReason::read_data);
+        return false;
+    }
+    std::vector<uint8_t> decoded;
+    decoded.reserve(length);
     for (size_t i = 0; i < fields[3].size(); i += 2) {
         const auto digit = [](unsigned char ch) -> int {
             if (ch >= '0' && ch <= '9') return ch - '0';
@@ -936,9 +986,16 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
         };
         const int high = digit(static_cast<unsigned char>(fields[3][i]));
         const int low = digit(static_cast<unsigned char>(fields[3][i + 1]));
-        if (high < 0 || low < 0) return false;
-        data.push_back(static_cast<uint8_t>((high << 4) | low));
+        if (high < 0 || low < 0) {
+            capture_csv_shape(shape, count, fields, quoted);
+            set_parse_reason(reason, ParseReason::read_data);
+            return false;
+        }
+        decoded.push_back(static_cast<uint8_t>((high << 4) | low));
     }
+    unread = parsed_unread;
+    remote_closed = saw_remote_closed;
+    data = std::move(decoded);
     return true;
 }
 

@@ -397,6 +397,8 @@ public:
     {
         return failure_response_reason_;
     }
+    ParseReason failure_parse_reason() const { return failure_parse_reason_; }
+    const ParseShape& failure_parse_shape() const { return failure_parse_shape_; }
 
 private:
     friend int mip_bio_send(void*, const unsigned char*, size_t);
@@ -442,7 +444,12 @@ private:
         uint32_t unread = 0;
         std::vector<uint8_t> data;
         bool remote_closed = false;
-        if (!parse_read(response, command, 0, unread, data, remote_closed)) {
+        ParseReason parse_reason = ParseReason::none;
+        ParseShape parse_shape{};
+        if (!parse_read(response, command, 0, unread, data, remote_closed,
+                        &parse_reason, &parse_shape)) {
+            failure_parse_reason_ = parse_reason;
+            failure_parse_shape_ = parse_shape;
             record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
             return false;
         }
@@ -499,6 +506,8 @@ private:
     IdfModemHttpsFailureResponseReason failure_response_reason_ =
         IdfModemHttpsFailureResponseReason::unknown;
     bool failure_response_reason_available_ = false;
+    ParseReason failure_parse_reason_ = ParseReason::none;
+    ParseShape failure_parse_shape_{};
 };
 
 int mip_bio_send(void* context, const unsigned char* bytes, size_t length)
@@ -576,6 +585,11 @@ public:
             }
             if (!tls.read_http(result_)) {
                 if (!tls.open_failed()) {
+                    if (tls.failure_parse_reason() != ParseReason::none) {
+                        record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
+                        record_failure_parse_reason(tls.failure_parse_reason(),
+                                                    tls.failure_parse_shape());
+                    }
                     result_.failureResponseReason = tls.failure_response_reason();
                     result_.failureResponseReasonAvailable = true;
                 }

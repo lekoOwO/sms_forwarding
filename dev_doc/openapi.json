@@ -923,11 +923,11 @@
           },
           "failureParseReason": {
             "type": "string",
-            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"]
+            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "read_data", "unknown"]
           },
           "cleanupParseReason": {
             "type": "string",
-            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"]
+            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "read_data", "unknown"]
           },
           "failureParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },
           "cleanupParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },

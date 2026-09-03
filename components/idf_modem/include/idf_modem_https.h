@@ -87,6 +87,7 @@ enum class IdfModemHttpsParseReason : uint8_t {
     state,
     endpoint,
     result,
+    read_data,
     unknown = 255,
 };
 
@@ -105,6 +106,7 @@ constexpr std::string_view idf_modem_https_parse_reason_name(
         case IdfModemHttpsParseReason::state: return "state";
         case IdfModemHttpsParseReason::endpoint: return "endpoint";
         case IdfModemHttpsParseReason::result: return "result";
+        case IdfModemHttpsParseReason::read_data: return "read_data";
         case IdfModemHttpsParseReason::unknown: return "unknown";
     }
     return "unknown";

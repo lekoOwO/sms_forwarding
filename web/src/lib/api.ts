@@ -51,7 +51,7 @@ const pushTestFailureResponseReasons: readonly PushTestFailureResponseReason[] =
 ];
 const pushTestParseReasons: readonly PushTestParseReason[] = [
 	"oversize", "terminal", "urc", "prefix", "field_count", "quote",
-	"cid", "state", "endpoint", "result", "unknown"
+	"cid", "state", "endpoint", "result", "read_data", "unknown"
 ];
 const pushTestParseStateClasses: readonly PushTestParseShape["stateClass"][] = [
 	"none", "initial", "closed", "connected", "connecting", "unknown"

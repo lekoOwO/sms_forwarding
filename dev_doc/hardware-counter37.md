@@ -106,6 +106,33 @@ acknowledgement，也只代表 cleanup goal 已安全達成；這不是對 candi
   不在本報告中 promoted。家族 manual 是 model-mismatch 的 supporting context
   only，不能覆蓋本次 observation，也不能單獨提升為 protocol fact。
 
+## Counter40 MIPRD bounded diagnosis
+
+R12 的既有安全摘要只記錄 response-stage `failureResponseReason=modem_read`；它
+沒有保存 raw response、資料內容、長度、錯誤碼或時間序列，因此不能進一步判斷
+MIPRD 是哪一種 parser rejection。Counter40 只補上 parser 已經看見的 bounded
+分類，沒有把 R12 重新標成成功，也沒有把這筆 observation 推廣成 modem protocol
+fact。
+
+`parse_read()` 現在沿用既有 parser reason：frame/terminal 使用 `terminal` 或
+`oversize`、URC 使用 `urc`、行與 prefix 使用 `prefix`、CSV 欄位與引號使用
+`field_count`/`quote`、CID 使用 `cid`。只有 unread、宣告長度、hex 或 disconnect
+一致性檢查使用新封閉值 `read_data`。shape 仍只保存欄位數、引號遮罩、固定
+presence 與 closed enums；不保存 raw line、資料、長度、offset、error/token、
+timing 或 endpoint/config/credential 資料。
+
+真正的 MIPRD rejection 會同時保留 `failureReason=response_invalid` 與既有
+`failureResponseReason=modem_read`，再由 detail=1 serializer 透出 parser reason，
+detail=0、active、成功與其他 response stage 維持原有 coupling。合法讀取會先在
+暫存 buffer 完成 decode，只有完整通過後才提交 unread/data/remote-close 狀態；
+失敗時不會向上層洩漏部分資料。owner command failure、TLS/HTTP failure 與
+cleanup 行為沒有改變。
+
+callback 回傳 OK 但 response 超過既有整體 response 上限，仍在 `send_command()`
+邊界被拒絕，沒有被重新分類為 `read_data`；這是刻意保留的 bounded residual，
+避免為了 telemetry 改動 command/control flow。這份報告不宣稱 R12 已由新分類
+重新驗證，亦不授權 live push、reset、OTA 或設定寫入。
+
 ## Acceptance promotion path
 
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：

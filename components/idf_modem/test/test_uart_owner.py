@@ -864,6 +864,33 @@ inline void vTaskDelay(TickType_t) {}
         self.assertNotIn("response.c_str()", cleanup)
         self.assertNotIn("response.data()", cleanup)
 
+    def test_https_read_parse_diagnostics_are_bounded_and_response_scoped(self):
+        wire = (SOURCE.parent / "idf_modem_https_wire.cpp").read_text()
+        wire_header = (SOURCE.parent / "idf_modem_https_wire.h").read_text()
+        header = (SOURCE.parent / "include" / "idf_modem_https.h").read_text()
+        self.assertIn("read_data", header)
+        self.assertIn('return "read_data"', header)
+        read_decl = wire_header.split("bool parse_read", 1)[1].split(";", 1)[0]
+        self.assertIn("IdfModemHttpsParseReason* reason", read_decl)
+        self.assertIn("IdfModemHttpsParseShape* shape", read_decl)
+        self.assertIn("std::vector<uint8_t> decoded", wire)
+        self.assertIn("data = std::move(decoded)", wire)
+        receive = function_body((SOURCE.parent / "idf_modem_https.cpp").read_text(),
+                                "receive_mip_bytes")
+        self.assertIn("&parse_reason, &parse_shape", receive)
+        self.assertIn("failure_parse_reason_ = parse_reason", receive)
+        self.assertIn("failure_parse_shape_ = parse_shape", receive)
+        https = (SOURCE.parent / "idf_modem_https.cpp").read_text()
+        read_failure = https.split("if (!tls.read_http(result_))", 1)[1].split(
+            "result_.message", 1
+        )[0]
+        self.assertIn("failure_parse_reason()", read_failure)
+        self.assertIn("IdfModemHttpsDiagnosticReason::response_invalid", read_failure)
+        self.assertIn("record_failure_parse_reason", read_failure)
+        self.assertIn("failureResponseReason = tls.failure_response_reason()", read_failure)
+        self.assertNotIn("response.c_str()", receive)
+        self.assertNotIn("response.data()", receive)
+
     def test_https_initial_state_failure_labels_cover_each_branch(self):
         source = (SOURCE.parent / "idf_modem_https.cpp").read_text()
         ensure_initial = function_body(source, "ensure_initial_state")

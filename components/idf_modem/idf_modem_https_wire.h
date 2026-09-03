@@ -60,7 +60,9 @@ bool parse_mip_close_result(std::string_view response, std::string_view command,
                             IdfModemHttpsParseShape* shape = nullptr,
                             bool* requires_confirmation = nullptr);
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
-                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed);
+                uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed,
+                IdfModemHttpsParseReason* reason = nullptr,
+                IdfModemHttpsParseShape* shape = nullptr);
 std::string hex_encode(const uint8_t* bytes, size_t length);
 
 class MipOpenLatch {

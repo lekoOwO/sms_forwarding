@@ -194,10 +194,31 @@ int main() {
     assert(transport.failureParseShape.available &&
            transport.failureParseShape.stateClass == IdfModemHttpsParseStateClass::unknown);
     assert(transport.failureStage == IdfHttpsFailureStage::registration);
+
+    modem_message = "HTTPS response read failed";
+    modem_failure_reason = IdfModemHttpsDiagnosticReason::response_invalid;
+    modem_failure_parse_reason = IdfModemHttpsParseReason::read_data;
+    modem_failure_parse_shape.available = true;
+    modem_failure_parse_shape.fieldCount = 4;
+    modem_failure_parse_shape.presenceMask = IdfModemHttpsParsePresence::other;
+    modem_failure_response_reason = IdfModemHttpsFailureResponseReason::modem_read;
+    modem_failure_response_reason_available = true;
+    modem_failure_stage = IdfHttpsFailureStage::response;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.failureReason == IdfModemHttpsDiagnosticReason::response_invalid);
+    assert(transport.failureParseReason == IdfModemHttpsParseReason::read_data);
+    assert(transport.failureParseShape.available &&
+           transport.failureParseShape.fieldCount == 4);
+    assert(transport.failureResponseReason == IdfModemHttpsFailureResponseReason::modem_read);
+    assert(transport.failureResponseReasonAvailable);
+    assert(transport.failureStage == IdfHttpsFailureStage::response);
     modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
     modem_failure_parse_reason = IdfModemHttpsParseReason::none;
     modem_failure_parse_shape = {};
     modem_failure_stage = IdfHttpsFailureStage::none;
+    modem_failure_response_reason = IdfModemHttpsFailureResponseReason::unknown;
+    modem_failure_response_reason_available = false;
     for (const char* message : {
              "HTTPS modem initial query command failed",
              "HTTPS modem initial query response invalid",

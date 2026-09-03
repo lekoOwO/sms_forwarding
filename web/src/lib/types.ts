@@ -56,6 +56,7 @@ export type PushTestParseReason =
 	| "state"
 	| "endpoint"
 	| "result"
+	| "read_data"
 	| "unknown";
 
 export type PushTestFailureParseReason = PushTestParseReason;

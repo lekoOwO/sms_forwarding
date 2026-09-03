@@ -24,7 +24,7 @@ const pushTestDetailKeys = [
 ];
 const pushTestFailureResponseReasons = ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown"];
 const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"];
-const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"];
+const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "read_data", "unknown"];
 const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "connecting", "unknown"];
 const pushTestParseLineClasses = ["none", "missing", "unexpected", "duplicate", "extra"];
 const pushTestParseSingleFieldClasses = ["none", "zero", "nonzero", "non_numeric"];

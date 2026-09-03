@@ -229,6 +229,21 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			annotated.cleanupReason, annotated.cleanupParseReason,
 			annotated.failureParseShape.stateClass, annotated.cleanupParseShape.lineClass
 		], ["response_invalid", "field_count", "response_invalid", "quote", "connecting", "missing"]);
+		const readDataResponse = {
+			...responseInvalid,
+			failureParseReason: "read_data",
+			failureParseShape: {
+				fieldCount: 4, quoteMask: 0, presenceMask: 16,
+				stateClass: "none", lineClass: "none", singleFieldClass: "none"
+			}
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : readDataResponse
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		const readData = await api.runPushTest(0, undefined, 1000);
+		assert.equal(readData.failureParseReason, "read_data");
+		assert.equal(readData.failureParseShape.fieldCount, 4);
 		const responseRead = {
 			...responseInvalid,
 			transportPath: "cellular", dispatchAttempted: true, failureStage: "response",
