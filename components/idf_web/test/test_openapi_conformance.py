@@ -156,7 +156,8 @@ def main() -> None:
             for name, schema in push_status["properties"].items()} == {
         "queued": "boolean", "running": "boolean", "done": "boolean",
         "success": "boolean", "message": "string", "cleanupMessage": "string",
-        "failureReason": "string", "cleanupReason": "string", "resetNeeded": "boolean",
+        "failureReason": "string", "failureResponseReason": "string",
+        "cleanupReason": "string", "resetNeeded": "boolean",
         "transportPath": "string", "dispatchAttempted": "boolean",
         "failureStage": "string", "httpStatus": "integer",
         "failureParseReason": "string", "cleanupParseReason": "string",
@@ -207,6 +208,9 @@ def main() -> None:
         "command_failure", "timeout", "response_invalid", "terminal_failure",
         "poll_timeout", "result_nonzero", "unknown",
     ]
+    assert push_status["properties"]["failureResponseReason"]["enum"] == [
+        "timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown",
+    ]
     assert push_status["properties"]["cleanupReason"]["enum"] == [
         "command_failure", "timeout", "response_invalid", "result_nonzero", "unknown",
     ]
@@ -238,7 +242,7 @@ def main() -> None:
     )
     assert len(push_status["oneOf"]) == 5
     active_diagnostic_fields = {
-        "cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
+        "cleanupMessage", "failureReason", "failureResponseReason", "cleanupReason", "resetNeeded",
         "transportPath", "dispatchAttempted", "failureStage", "httpStatus",
         "failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape",
     }
@@ -249,6 +253,17 @@ def main() -> None:
     assert {
         item["required"][0] for item in active_guard["then"]["not"]["anyOf"]
     } == active_diagnostic_fields
+    response_reason_guard = next(
+        condition for condition in push_status["allOf"]
+        if condition.get("if", {}).get("required") == ["failureResponseReason"]
+    )
+    assert response_reason_guard["then"] == {
+        "required": ["failureStage", "success"],
+        "properties": {
+            "failureStage": {"const": "response"},
+            "success": {"const": False},
+        },
+    }
     http_guard = next(
         condition for condition in push_status["allOf"]
         if condition.get("if", {}).get("required") == ["httpStatus"]

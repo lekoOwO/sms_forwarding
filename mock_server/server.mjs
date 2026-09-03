@@ -20,8 +20,9 @@ const defaultOtaPublicKey = createPublicKey({
 const pushTestDetailKeys = [
 	"transportPath", "dispatchAttempted", "failureStage", "httpStatus",
 	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
-	"failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape"
+	"failureResponseReason", "failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape"
 ];
+const pushTestFailureResponseReasons = ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"];
 const pushTestParseShapeKeys = ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"];
 const pushTestParseReasons = ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "unknown"];
 const pushTestParseStateClasses = ["none", "initial", "closed", "connected", "connecting", "unknown"];
@@ -59,6 +60,12 @@ export function serializePushTestStatus(status, includeDetail = false) {
 	if (!includeDetail || !serialized.done) return serialized;
 	for (const key of pushTestDetailKeys) {
 		if (!Object.hasOwn(status, key)) continue;
+		if (key === "failureResponseReason") {
+			if (status.success || status.failureStage !== "response" ||
+				!pushTestFailureResponseReasons.includes(status[key])) continue;
+			serialized[key] = status[key];
+			continue;
+		}
 		if (key === "failureParseShape" || key === "cleanupParseShape") {
 			const reasonKey = key === "failureParseShape" ? "failureReason" : "cleanupReason";
 			const parseReasonKey = key === "failureParseShape" ? "failureParseReason" : "cleanupParseReason";

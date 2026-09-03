@@ -172,7 +172,9 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                 IdfModemHttpsParseReason failure_parse_reason,
                                 IdfModemHttpsParseReason cleanup_parse_reason,
                                 IdfModemHttpsParseShape failure_parse_shape,
-                                IdfModemHttpsParseShape cleanup_parse_shape)
+                                IdfModemHttpsParseShape cleanup_parse_shape,
+                                IdfModemHttpsFailureResponseReason failure_response_reason,
+                                bool failure_response_reason_available)
 {
     if (success) message = "Test push sent";
     else if (message.empty()) message = "Test push failed; see the log";
@@ -188,6 +190,8 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
         std::min(cleanup_message.size(), IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1));
     job.failureReason = failure_reason;
     job.cleanupReason = cleanup_reason;
+    job.failureResponseReason = failure_response_reason;
+    job.failureResponseReasonAvailable = failure_response_reason_available;
     job.failureParseReason = failure_parse_reason;
     job.cleanupParseReason = cleanup_parse_reason;
     job.failureParseShape = failure_reason == IdfModemHttpsDiagnosticReason::response_invalid
@@ -298,6 +302,13 @@ std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
                 append_parse_shape(out, "failureParseShape", job.failureParseShape);
             }
         }
+    }
+    if (include_cleanup && job.done && !job.success &&
+        job.failureStage == IdfHttpsFailureStage::response &&
+        job.failureResponseReasonAvailable) {
+        out += ",\"failureResponseReason\":\"";
+        out += idf_modem_https_failure_response_reason_name(job.failureResponseReason);
+        out += "\"";
     }
     if (include_cleanup && job.done &&
         job.cleanupReason != IdfModemHttpsDiagnosticReason::none) {

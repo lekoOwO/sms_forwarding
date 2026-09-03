@@ -761,7 +761,7 @@ bool parse_cgact(std::string_view response, std::string_view command, uint8_t ci
 
 namespace {
 
-bool has_exact_single_mip_close_zero(std::string_view response)
+bool has_single_mip_close_zero(std::string_view response)
 {
     bool candidate_seen = false;
     bool terminal_seen = false;
@@ -770,10 +770,12 @@ bool has_exact_single_mip_close_zero(std::string_view response)
         const size_t end = response.find_first_of("\r\n", position);
         const size_t line_end = end == std::string_view::npos ? response.size() : end;
         const std::string_view line = response.substr(position, line_end - position);
-        if (trim_spaces(line) == "OK") {
+        const std::string_view normalized = trim_spaces(line);
+        if (normalized == "OK") {
             if (terminal_seen) return false;
             terminal_seen = true;
-        } else if (line == "+MIPCLOSE:0" || line == "+MIPCLOSE: 0") {
+        } else if (starts_with(normalized, "+MIPCLOSE:") &&
+                   trim_spaces(normalized.substr(std::string_view("+MIPCLOSE:").size())) == "0") {
             if (terminal_seen) return false;
             candidate_seen = true;
         }
@@ -834,7 +836,7 @@ bool parse_result_impl(std::string_view response, std::string_view command,
         return false;
     }
     if (count == 1) {
-        if (allow_single_close && expected_cid == 0 && !quoted[0] && fields[0] == "0") {
+        if (allow_single_close && expected_cid == 0) {
             value = 0;
             return true;
         }
@@ -877,8 +879,7 @@ bool parse_mip_close_result(std::string_view response, std::string_view command,
                             bool* requires_confirmation)
 {
     if (requires_confirmation) *requires_confirmation = false;
-    const bool allow_single_close = expected_cid == 0 &&
-                                    has_exact_single_mip_close_zero(response);
+    const bool allow_single_close = expected_cid == 0 && has_single_mip_close_zero(response);
     if (!parse_result_impl(response, command, "+MIPCLOSE:", expected_cid, allow_single_close,
                            value, reason, shape)) {
         return false;

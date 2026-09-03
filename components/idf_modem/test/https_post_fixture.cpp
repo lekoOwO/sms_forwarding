@@ -11,6 +11,7 @@
 
 int fixture_tls_setup_result = 0;
 int fixture_tls_handshake_result = 0;
+int fixture_tls_read_result = 0;
 
 namespace {
 
@@ -33,6 +34,20 @@ using idf_modem_https_wire::build_cgdccont_command;
 using ParseReason = IdfModemHttpsParseReason;
 
 using ParseShape = IdfModemHttpsParseShape;
+
+template <typename T, typename = void>
+struct ResponseFailureReasonAccessor {
+    static bool available(const T&) { return false; }
+    static int code(const T&) { return -1; }
+};
+
+template <typename T>
+struct ResponseFailureReasonAccessor<
+    T, std::void_t<decltype(std::declval<const T&>().failureResponseReason),
+                   decltype(std::declval<const T&>().failureResponseReasonAvailable)>> {
+    static bool available(const T& result) { return result.failureResponseReasonAvailable; }
+    static int code(const T& result) { return static_cast<int>(result.failureResponseReason); }
+};
 
 std::string frame(std::string_view command, std::string_view body)
 {
@@ -534,6 +549,19 @@ void check_parse_shapes()
                                   value, &reason, &shape, &requires_confirmation));
     assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
            requires_confirmation);
+    for (const std::string_view accepted : {
+             " +MIPCLOSE: 0 ", "\t+MIPCLOSE:\t  0\t", "+MIPCLOSE:\t0",
+             "+MIPCLOSE:  0",
+         }) {
+        reason = ParseReason::none;
+        shape = {};
+        value = 99;
+        requires_confirmation = false;
+        assert(parse_mip_close_result(frame(close_command, accepted), close_command, 0,
+                                      value, &reason, &shape, &requires_confirmation));
+        assert(value == 0 && reason == ParseReason::none && shape.fieldCount == 0 &&
+               requires_confirmation);
+    }
     reason = ParseReason::none;
     shape = {};
     requires_confirmation = false;
@@ -549,10 +577,7 @@ void check_parse_shapes()
            requires_confirmation);
     for (const std::string_view rejected : {"+MIPCLOSE:1", "+MIPCLOSE:bad",
                                              "+MIPCLOSE:00", "+MIPCLOSE:+0",
-                                             "+MIPCLOSE:-0", "+MIPCLOSE:\"0\"",
-                                             "+MIPCLOSE:\t0", "+MIPCLOSE:  0",
-                                             "+MIPCLOSE: 0 ", "+MIPCLOSE:0 ",
-                                             "+MIPCLOSE:0\t"}) {
+                                             "+MIPCLOSE:-0", "+MIPCLOSE:\"0\""}) {
         reason = ParseReason::none;
         shape = {};
         value = 0;
@@ -563,15 +588,6 @@ void check_parse_shapes()
         assert(shape.available && shape.fieldCount == 1);
         assert(reason == ParseReason::field_count);
         assert(!requires_confirmation);
-    }
-    for (const std::string_view rejected : {" +MIPCLOSE: 0", "+MIPCLOSE:0 "}) {
-        reason = ParseReason::none;
-        shape = {};
-        requires_confirmation = false;
-        assert(!parse_mip_close_result(frame(close_command, rejected), close_command, 0, value,
-                                       &reason, &shape, &requires_confirmation));
-        assert(shape.available && shape.fieldCount == 1);
-        assert(reason == ParseReason::field_count && !requires_confirmation);
     }
     reason = ParseReason::none;
     shape = {};
@@ -633,6 +649,11 @@ enum class RemoteCloseMode {
     disconnect_only,
     unread_data,
     duplicate_disconnect,
+    response_read_timeout,
+    response_read_modem_failure,
+    response_read_http_parse,
+    response_read_http_incomplete,
+    tls_read_failure,
     open_ok_connected,
     open_ok_initial_connected,
     open_ok_connecting_connected,
@@ -694,6 +715,11 @@ enum class CleanupCloseState {
     timeout,
 };
 
+enum class CleanupCloseReply {
+    canonical,
+    padded,
+};
+
 enum class LateOpenKind {
     none,
     success,
@@ -729,9 +755,10 @@ struct RemoteCloseTranscript {
                                    LateOpenKind late = LateOpenKind::none,
                                    LateOpenStage stage = LateOpenStage::none,
                                    CleanupFailure cleanup = CleanupFailure::none,
-                                   CleanupFailurePhase phase = CleanupFailurePhase::command)
+                                   CleanupFailurePhase phase = CleanupFailurePhase::command,
+                                   CleanupCloseReply close_reply = CleanupCloseReply::canonical)
         : mode(selected), late_open(late), late_stage(stage), cleanup_failure(cleanup),
-          cleanup_failure_phase(phase)
+          cleanup_failure_phase(phase), cleanup_close_reply(close_reply)
     {
         if (cleanup == CleanupFailure::pdp_deactivate ||
             cleanup == CleanupFailure::pdp_profile) {
@@ -744,6 +771,7 @@ struct RemoteCloseTranscript {
     LateOpenStage late_stage;
     CleanupFailure cleanup_failure;
     CleanupFailurePhase cleanup_failure_phase;
+    CleanupCloseReply cleanup_close_reply;
     bool late_consumed = false;
     size_t late_feed_calls = 0;
     size_t state_queries = 0;
@@ -1113,6 +1141,12 @@ struct RemoteCloseTranscript {
         }
         if (command == "AT+MIPRD=0,4096") {
             ++transcript.read_commands;
+            if (transcript.mode == RemoteCloseMode::response_read_timeout) {
+                return IdfModemHttpsCommandResult::timeout;
+            }
+            if (transcript.mode == RemoteCloseMode::response_read_modem_failure) {
+                return IdfModemHttpsCommandResult::failed;
+            }
             if (transcript.mode == RemoteCloseMode::disconnect_only) {
                 response = frame(command, "+MIPURC: \"disconn\",0,2");
             } else if (transcript.mode == RemoteCloseMode::unread_data) {
@@ -1124,7 +1158,11 @@ struct RemoteCloseTranscript {
                                  "+MIPURC: \"disconn\",0,2");
             } else {
                 const std::string_view http =
-                    transcript.mode == RemoteCloseMode::http_non_success
+                    transcript.mode == RemoteCloseMode::response_read_http_parse
+                        ? "NOT-HTTP\r\n\r\n"
+                        : transcript.mode == RemoteCloseMode::response_read_http_incomplete
+                            ? "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nbody"
+                            : transcript.mode == RemoteCloseMode::http_non_success
                         ? "HTTP/1.1 503 Service Unavailable\r\nX-Test: remote-close\r\n\r\nbody"
                         : transcript.mode == RemoteCloseMode::http_invalid_zero
                             ? "HTTP/1.1 000 Invalid\r\nX-Test: remote-close\r\n\r\nbody"
@@ -1159,9 +1197,13 @@ struct RemoteCloseTranscript {
                     return IdfModemHttpsCommandResult::ok;
                 }
             }
-            response = frame(command, transcript.mode == RemoteCloseMode::cleanup_single_field_close
-                                          ? "+MIPCLOSE: 0"
-                                          : "+MIPCLOSE: 0,0");
+            if (transcript.mode == RemoteCloseMode::cleanup_single_field_close) {
+                response = frame(command, transcript.cleanup_close_reply == CleanupCloseReply::padded
+                                              ? " \t+MIPCLOSE:\t  0 \t"
+                                              : "+MIPCLOSE: 0");
+            } else {
+                response = frame(command, "+MIPCLOSE: 0,0");
+            }
             return IdfModemHttpsCommandResult::ok;
         }
         return IdfModemHttpsCommandResult::failed;
@@ -1200,9 +1242,12 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
         transcript.mode == RemoteCloseMode::tls_setup_failure ? -1 : 0;
     fixture_tls_handshake_result =
         transcript.mode == RemoteCloseMode::tls_handshake_failure ? -1 : 0;
+    fixture_tls_read_result =
+        transcript.mode == RemoteCloseMode::tls_read_failure ? -7 : 0;
     const IdfModemHttpsRunResult outcome = idf_modem_https_run_post(request, callbacks, result);
     fixture_tls_setup_result = 0;
     fixture_tls_handshake_result = 0;
+    fixture_tls_read_result = 0;
     return outcome;
 }
 
@@ -1263,6 +1308,33 @@ void check_remote_close_transcripts()
     assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
            delivered.autofree == 0);
 
+    struct ResponseFailureCase {
+        RemoteCloseMode mode;
+        IdfModemHttpsRunResult outcome;
+        int code;
+    };
+    for (const ResponseFailureCase failure : {
+             ResponseFailureCase{RemoteCloseMode::response_read_timeout,
+                                 IdfModemHttpsRunResult::timed_out, 0},
+             ResponseFailureCase{RemoteCloseMode::disconnect_only,
+                                 IdfModemHttpsRunResult::response_failed, 1},
+             ResponseFailureCase{RemoteCloseMode::response_read_modem_failure,
+                                 IdfModemHttpsRunResult::response_failed, 2},
+             ResponseFailureCase{RemoteCloseMode::tls_read_failure,
+                                 IdfModemHttpsRunResult::response_failed, 3},
+             ResponseFailureCase{RemoteCloseMode::response_read_http_parse,
+                                 IdfModemHttpsRunResult::response_failed, 4},
+             ResponseFailureCase{RemoteCloseMode::response_read_http_incomplete,
+                                 IdfModemHttpsRunResult::response_failed, 5},
+         }) {
+        RemoteCloseTranscript rejected{failure.mode};
+        result = {};
+        assert(run_remote_close_transcript(rejected, result) == failure.outcome);
+        assert(!result.ok && result.failureStage == IdfHttpsFailureStage::response);
+        assert(ResponseFailureReasonAccessor<IdfModemHttpsPostResult>::available(result));
+        assert(ResponseFailureReasonAccessor<IdfModemHttpsPostResult>::code(result) == failure.code);
+    }
+
     RemoteCloseTranscript single_field_close{RemoteCloseMode::cleanup_single_field_close};
     result = {};
     assert(run_remote_close_transcript(single_field_close, result) == IdfModemHttpsRunResult::ok);
@@ -1277,6 +1349,19 @@ void check_remote_close_transcripts()
            result.failureParseReason == ParseReason::none &&
            result.cleanupParseReason == ParseReason::none &&
            !result.failureParseShape.available && !result.cleanupParseShape.available);
+
+    RemoteCloseTranscript padded_single_field{
+        RemoteCloseMode::cleanup_single_field_close,
+        LateOpenKind::none,
+        LateOpenStage::none,
+        CleanupFailure::none,
+        CleanupFailurePhase::command,
+        CleanupCloseReply::padded};
+    result = {};
+    assert(run_remote_close_transcript(padded_single_field, result) ==
+           IdfModemHttpsRunResult::ok);
+    assert(result.ok && padded_single_field.close_commands == 1 &&
+           padded_single_field.state_queries == 3 && !result.cleanupRequiresReset);
 
     for (const CleanupCloseState state : {CleanupCloseState::connected,
                                           CleanupCloseState::connecting,
@@ -1317,6 +1402,24 @@ void check_remote_close_transcripts()
                    result.cleanupParseReason != ParseReason::none &&
                    result.cleanupParseShape.available);
         }
+    }
+
+    for (const CleanupCloseState state : {CleanupCloseState::connected,
+                                          CleanupCloseState::ambiguous}) {
+        RemoteCloseTranscript padded_unconfirmed{
+            RemoteCloseMode::cleanup_single_field_close,
+            LateOpenKind::none,
+            LateOpenStage::none,
+            CleanupFailure::none,
+            CleanupFailurePhase::command,
+            CleanupCloseReply::padded};
+        padded_unconfirmed.cleanup_close_state = state;
+        result = {};
+        assert(run_remote_close_transcript(padded_unconfirmed, result) ==
+               IdfModemHttpsRunResult::cleanup_failed);
+        assert(!result.ok && result.cleanupRequiresReset &&
+               padded_unconfirmed.close_commands == 1 &&
+               padded_unconfirmed.state_queries == 3);
     }
 
     for (const RemoteCloseMode mode : {RemoteCloseMode::disconnect_only,

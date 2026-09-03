@@ -35,6 +35,15 @@ export type PushTestCleanupReason =
 	| "result_nonzero"
 	| "unknown";
 
+export type PushTestFailureResponseReason =
+	| "timeout"
+	| "peer_eof"
+	| "modem_read"
+	| "tls_read"
+	| "http_parse"
+	| "http_incomplete"
+	| "unknown";
+
 export type PushTestParseReason =
 	| "oversize"
 	| "terminal"
@@ -89,6 +98,7 @@ export type PushTestDiagnosticFields = {
 	cleanupMessage?: PushTestCleanupMessage;
 	failureReason?: PushTestDiagnosticReason;
 	cleanupReason?: PushTestCleanupReason;
+	failureResponseReason?: PushTestFailureResponseReason;
 	failureParseReason?: PushTestFailureParseReason;
 	cleanupParseReason?: PushTestCleanupParseReason;
 	failureParseShape?: PushTestParseShape;

@@ -229,6 +229,29 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			annotated.cleanupReason, annotated.cleanupParseReason,
 			annotated.failureParseShape.stateClass, annotated.cleanupParseShape.lineClass
 		], ["response_invalid", "field_count", "response_invalid", "quote", "connecting", "missing"]);
+		const responseRead = {
+			...responseInvalid,
+			transportPath: "cellular", dispatchAttempted: true, failureStage: "response",
+			failureResponseReason: "http_parse"
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : responseRead
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		assert.equal((await api.runPushTest(0, undefined, 1000)).failureResponseReason, "http_parse");
+		for (const invalidResponse of [
+			{ ...responseRead, failureResponseReason: "not-a-reason" },
+			{ ...responseRead, failureResponseReason: 4 },
+			{ ...responseRead, failureStage: "http" },
+			{ ...responseRead, success: true },
+			{ ...responseRead, done: false }
+		]) {
+			globalThis.fetch = async (path) => new Response(JSON.stringify(
+				path === "/api/config" ? { csrfToken: "csrf" } : invalidResponse
+			), { status: 200, headers: { "Content-Type": "application/json" } });
+			await api.loadSnapshot();
+			await assert.rejects(api.runPushTest(0, undefined, 1000), /Invalid push test response/);
+		}
 		for (const singleFieldClass of ["zero", "nonzero", "non_numeric"]) {
 			const singleFieldResponse = {
 				...responseInvalid,

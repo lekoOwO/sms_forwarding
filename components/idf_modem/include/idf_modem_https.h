@@ -42,6 +42,34 @@ enum class IdfModemHttpsDiagnosticReason : uint8_t {
     unknown = 255,
 };
 
+// A bounded classification for a failed HTTPS response read.  It is populated
+// only when the response-read stage fails and is kept separate from the
+// transport-independent diagnostic reason.
+enum class IdfModemHttpsFailureResponseReason : uint8_t {
+    timeout = 0,
+    peer_eof,
+    modem_read,
+    tls_read,
+    http_parse,
+    http_incomplete,
+    unknown,
+};
+
+constexpr std::string_view idf_modem_https_failure_response_reason_name(
+    IdfModemHttpsFailureResponseReason reason)
+{
+    switch (reason) {
+        case IdfModemHttpsFailureResponseReason::timeout: return "timeout";
+        case IdfModemHttpsFailureResponseReason::peer_eof: return "peer_eof";
+        case IdfModemHttpsFailureResponseReason::modem_read: return "modem_read";
+        case IdfModemHttpsFailureResponseReason::tls_read: return "tls_read";
+        case IdfModemHttpsFailureResponseReason::http_parse: return "http_parse";
+        case IdfModemHttpsFailureResponseReason::http_incomplete: return "http_incomplete";
+        case IdfModemHttpsFailureResponseReason::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
 // A bounded classification for a rejected modem response.  This is only
 // populated when the response grammar rejects a frame; transport, command,
 // result, and HTTP failures intentionally keep the value at none.
@@ -249,6 +277,9 @@ struct IdfModemHttpsPostResult {
     std::string cleanupMessage;
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsFailureResponseReason failureResponseReason =
+        IdfModemHttpsFailureResponseReason::unknown;
+    bool failureResponseReasonAvailable = false;
     IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseShape failureParseShape{};

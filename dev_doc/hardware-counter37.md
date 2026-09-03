@@ -45,6 +45,22 @@ R9 receipt 的安全 projection 只保留 symbolic status 與 bounded booleans/c
 曾自動執行 reset 或 recovery。R9 沒有 post-close state 證據，不能用 receipt 推論
 MIPCLOSE 已完成有效關閉。
 
+## R10 bounded follow-up
+
+R10 對同一類 counter37 observation 只保留了 response stage 的 bounded failure
+projection；當時 firmware result 沒有 `failureResponseReason`，因此 client 只能
+分類為 `unknown`。cleanup projection 仍是 lexical/normalized MIPCLOSE shape
+failure，沒有 post-close MIPSTATE 證據，不能把它分類為確認成功。R10 沒有宣稱
+modem recovery，也沒有因為 ambiguous acknowledgement 再送一次 close、reset 或
+其他 recovery action。
+
+目前新增的 outer-space/tab normalization 只接受 single-field CID0 candidate；它
+只有在 cleanup 隨後 exactly one well-formed CID0 `INITIAL` post-state confirmation
+成功時才安全。candidate 本身永遠不是 final success；沒有該 confirmation 時，
+stale、delayed、non-initial、ambiguous 或 timeout 都必須 fail closed 並要求
+reset。這是 bounded implementation contract，不是 R10 對原始空白或通用 modem
+wire grammar 的推論。
+
 ## Counter37 行為與安全邊界
 
 - 精確 uppercase `CONNECTING` 在 endpoint、CID、quote 與欄位數通過嚴格驗證後，
@@ -53,7 +69,8 @@ MIPCLOSE 已完成有效關閉。
   gate 仍拒絕它，不會因該狀態執行 stale close。endpoint 語意錯誤仍 fail closed，
   並在失敗 shape 中保留 bounded `connecting` state class。
 - MIPCLOSE 的既有 two-field contract 不變。新增的 single-field candidate 只有在
-  raw line gate 通過精確格式、且 expected CID 為 0 時才可被接受；這是目前程式的
+  strict frame、prefix、single-field、unquoted checks 通過後，trim outer SP/TAB
+  後仍精確等於 `0`、且 expected CID 為 0 時才可被接受；這是目前程式的
   acceptance contract，不是本次硬體觀察已證明的通用 wire fact。
 - single-field acknowledgement 永遠不是 cleanup 的最終成功。cleanup 會透過
   現有 owner 提交 exactly one post-close MIPSTATE query，且只接受 well-formed
@@ -71,7 +88,7 @@ MIPCLOSE 已完成有效關閉。
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：
 
 1. sanitized executable fixtures：exact uppercase `CONNECTING` 只作 bounded
-   transitional disposition；single-field MIPCLOSE 僅依 raw-line contract
+   transitional disposition；single-field MIPCLOSE 僅依 normalized-line contract
    並要求 post-state confirmation。
 2. negative fixtures：tabs、double/leading/trailing spaces、quoted single、
    nonzero、leading-zero、sign、junk、extra、duplicate、after-terminal，及

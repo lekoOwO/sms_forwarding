@@ -449,6 +449,7 @@ struct mbedtls_x509_crt {};
 
 extern int fixture_tls_setup_result;
 extern int fixture_tls_handshake_result;
+extern int fixture_tls_read_result;
 
 inline constexpr int MBEDTLS_ERR_NET_RECV_FAILED = -1;
 inline constexpr int MBEDTLS_ERR_NET_SEND_FAILED = -2;
@@ -509,6 +510,7 @@ inline int mbedtls_ssl_write(mbedtls_ssl_context* ssl, const unsigned char* byte
     return ssl->bio_send ? ssl->bio_send(ssl->bio_context, bytes, length) : -2;
 }
 inline int mbedtls_ssl_read(mbedtls_ssl_context* ssl, unsigned char* bytes, size_t length) {
+    if (fixture_tls_read_result != 0) return fixture_tls_read_result;
     const size_t bounded = length < 7 ? length : 7;
     return ssl->bio_recv ? ssl->bio_recv(ssl->bio_context, bytes, bounded) : -1;
 }
@@ -585,6 +587,41 @@ inline void vTaskDelay(TickType_t) {}
                      "-I", str(SOURCE.parent / "include"),
                      str(implementation), str(mutated_source), str(fixture),
                      "-o", str(mutated_binary)],
+                    check=False, capture_output=True, text=True,
+                )
+                self.assertEqual(mutated_compile.returncode, 0, mutated_compile.stderr)
+                mutated_run = subprocess.run(
+                    [str(mutated_binary)], check=False, capture_output=True, text=True,
+                )
+                self.assertNotEqual(mutated_run.returncode, 0, name)
+
+            wire_source = implementation.read_text()
+            wire_mutations = {
+                "close_exact_value_inversion": wire_source.replace(
+                    'starts_with(normalized, "+MIPCLOSE:") &&\n'
+                    '                   trim_spaces(normalized.substr(std::string_view("+MIPCLOSE:").size())) == "0"',
+                    'starts_with(normalized, "+MIPCLOSE:") &&\n'
+                    '                   trim_spaces(normalized.substr(std::string_view("+MIPCLOSE:").size())) != "0"',
+                    1,
+                ),
+                "close_exact_value_removal": wire_source.replace(
+                    'starts_with(normalized, "+MIPCLOSE:") &&\n'
+                    '                   trim_spaces(normalized.substr(std::string_view("+MIPCLOSE:").size())) == "0"',
+                    'starts_with(normalized, "+MIPCLOSE:")',
+                    1,
+                ),
+            }
+            for name, mutated in wire_mutations.items():
+                self.assertNotEqual(mutated, wire_source, name)
+                mutated_source = Path(directory) / f"{name}.cpp"
+                mutated_binary = Path(directory) / name
+                mutated_source.write_text(mutated)
+                mutated_compile = subprocess.run(
+                    [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                     "-I", str(stub_root), "-I", str(SOURCE.parent),
+                     "-I", str(SOURCE.parent / "include"),
+                     str(mutated_source), str(SOURCE.parent / "idf_modem_https.cpp"),
+                     str(fixture), "-o", str(mutated_binary)],
                     check=False, capture_output=True, text=True,
                 )
                 self.assertEqual(mutated_compile.returncode, 0, mutated_compile.stderr)
@@ -680,7 +717,7 @@ inline void vTaskDelay(TickType_t) {}
         self.assertIn('expected == "INITIAL"', wire)
         self.assertIn('expected == "CONNECTED"', wire)
         self.assertIn("parse_mip_close_result", source)
-        self.assertIn("has_exact_single_mip_close_zero", wire)
+        self.assertIn("has_single_mip_close_zero", wire)
         self.assertIn("confirm_cleanup_close_state", source)
         self.assertEqual(source.count("parse_mip_close_result(response, close"), 2)
         self.assertNotIn('parse_result(response, close, "+MIPCLOSE:"', source)

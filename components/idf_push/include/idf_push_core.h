@@ -45,6 +45,9 @@ struct IdfPushTestJobState {
     std::string cleanupMessage;
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsFailureResponseReason failureResponseReason =
+        IdfModemHttpsFailureResponseReason::unknown;
+    bool failureResponseReasonAvailable = false;
     IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseShape failureParseShape{};
@@ -83,6 +86,9 @@ void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
                                 IdfModemHttpsParseReason cleanup_parse_reason =
                                     IdfModemHttpsParseReason::none,
                                 IdfModemHttpsParseShape failure_parse_shape = {},
-                                IdfModemHttpsParseShape cleanup_parse_shape = {});
+                                IdfModemHttpsParseShape cleanup_parse_shape = {},
+                                IdfModemHttpsFailureResponseReason failure_response_reason =
+                                    IdfModemHttpsFailureResponseReason::unknown,
+                                bool failure_response_reason_available = false);
 std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
                                            bool include_cleanup);

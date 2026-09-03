@@ -29,6 +29,9 @@ static std::string modem_message = "HTTPS TLS context 1 has no pre-provisioned c
 static std::string modem_cleanup_message;
 static IdfModemHttpsDiagnosticReason modem_failure_reason = IdfModemHttpsDiagnosticReason::none;
 static IdfModemHttpsDiagnosticReason modem_cleanup_reason = IdfModemHttpsDiagnosticReason::none;
+static IdfModemHttpsFailureResponseReason modem_failure_response_reason =
+    IdfModemHttpsFailureResponseReason::unknown;
+static bool modem_failure_response_reason_available = false;
 static IdfModemHttpsParseReason modem_failure_parse_reason = IdfModemHttpsParseReason::none;
 static IdfModemHttpsParseReason modem_cleanup_parse_reason = IdfModemHttpsParseReason::none;
 static IdfModemHttpsParseShape modem_failure_parse_shape;
@@ -62,6 +65,8 @@ static int fake_modem_post(const IdfModemHttpsPostRequest& request,
     CleanupMessageAccessor<IdfModemHttpsPostResult>::set(result, modem_cleanup_message);
     result.failureReason = modem_failure_reason;
     result.cleanupReason = modem_cleanup_reason;
+    result.failureResponseReason = modem_failure_response_reason;
+    result.failureResponseReasonAvailable = modem_failure_response_reason_available;
     result.failureParseReason = modem_failure_parse_reason;
     result.cleanupParseReason = modem_cleanup_parse_reason;
     result.failureParseShape = modem_failure_parse_shape;
@@ -126,6 +131,7 @@ int main() {
     assert(CleanupMessageAccessor<IdfPushTransportResult>::get(transport).empty());
     assert(transport.failureReason == IdfModemHttpsDiagnosticReason::none);
     assert(transport.cleanupReason == IdfModemHttpsDiagnosticReason::none);
+    assert(!transport.failureResponseReasonAvailable);
     assert(!transport.failureParseShape.available && !transport.cleanupParseShape.available);
     assert(!transport.cleanupRequiresReset);
 
@@ -147,6 +153,17 @@ int main() {
                                       nullptr, fake_modem_post, transport));
     assert(transport.mhttpError == -1);
     assert(transport.message == "HTTPS TLS context 1 has no pre-provisioned certificate");
+    modem_failure_response_reason = IdfModemHttpsFailureResponseReason::http_parse;
+    modem_failure_response_reason_available = true;
+    modem_failure_stage = IdfHttpsFailureStage::response;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(transport.failureStage == IdfHttpsFailureStage::response);
+    assert(transport.failureResponseReason == IdfModemHttpsFailureResponseReason::http_parse);
+    assert(transport.failureResponseReasonAvailable);
+    modem_failure_response_reason = IdfModemHttpsFailureResponseReason::unknown;
+    modem_failure_response_reason_available = false;
+    modem_failure_stage = IdfHttpsFailureStage::none;
     modem_failure_reason = IdfModemHttpsDiagnosticReason::timeout;
     modem_failure_parse_reason = IdfModemHttpsParseReason::state;
     modem_failure_parse_shape.available = true;

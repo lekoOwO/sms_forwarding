@@ -354,25 +354,49 @@ public:
         while (!deadline_.expired() && !parser.complete()) {
             const int received = mbedtls_ssl_read(ssl_.get(), bytes.data(), bytes.size());
             if (received > 0) {
-                if (!parser.feed(bytes.data(), static_cast<size_t>(received), result)) return false;
+                if (!parser.feed(bytes.data(), static_cast<size_t>(received), result)) {
+                    record_failure_response_reason(
+                        IdfModemHttpsFailureResponseReason::http_parse);
+                    return false;
+                }
                 continue;
             }
             if (received == MBEDTLS_ERR_SSL_WANT_READ || received == MBEDTLS_ERR_SSL_WANT_WRITE) {
                 continue;
             }
             if (received == 0 || received == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-                if (!parser.finish_eof(result)) return false;
+                if (!parser.finish_eof(result)) {
+                    record_failure_response_reason(
+                        parser.header_bytes() == 0
+                            ? IdfModemHttpsFailureResponseReason::peer_eof
+                            : IdfModemHttpsFailureResponseReason::http_incomplete);
+                    return false;
+                }
                 break;
+            }
+            if (timed_out_ || received == MBEDTLS_ERR_SSL_TIMEOUT) {
+                record_failure_response_reason(IdfModemHttpsFailureResponseReason::timeout);
+                return false;
+            }
+            if (!failure_response_reason_available_) {
+                record_failure_response_reason(IdfModemHttpsFailureResponseReason::tls_read);
             }
             return false;
         }
-        if (!parser.complete()) timed_out_ = true;
+        if (!parser.complete()) {
+            timed_out_ = true;
+            record_failure_response_reason(IdfModemHttpsFailureResponseReason::timeout);
+        }
         return parser.complete();
     }
 
     bool timed_out() const { return timed_out_; }
     bool remote_closed() const { return remote_closed_; }
     bool open_failed() const { return open_failed_; }
+    IdfModemHttpsFailureResponseReason failure_response_reason() const
+    {
+        return failure_response_reason_;
+    }
 
 private:
     friend int mip_bio_send(void*, const unsigned char*, size_t);
@@ -409,11 +433,17 @@ private:
         if (length == 0) return true;
         const std::string command = "AT+MIPRD=0,4096";
         std::string response;
-        if (!send_command(command, response, false)) return false;
+        if (!send_command(command, response, false)) {
+            if (!timed_out_ && !open_failed_) {
+                record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
+            }
+            return false;
+        }
         uint32_t unread = 0;
         std::vector<uint8_t> data;
         bool remote_closed = false;
         if (!parse_read(response, command, 0, unread, data, remote_closed)) {
+            record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
             return false;
         }
         if (remote_closed) remote_closed_ = true;
@@ -440,6 +470,14 @@ private:
         return response.size() <= kResponseMax;
     }
 
+    void record_failure_response_reason(IdfModemHttpsFailureResponseReason reason)
+    {
+        if (!failure_response_reason_available_) {
+            failure_response_reason_ = reason;
+            failure_response_reason_available_ = true;
+        }
+    }
+
     const IdfModemHttpsPostRequest& request_;
     const IdfModemHttpsTarget& target_;
     const IdfModemHttpsCallbacks& callbacks_;
@@ -458,6 +496,9 @@ private:
     bool timed_out_ = false;
     bool remote_closed_ = false;
     bool open_failed_ = false;
+    IdfModemHttpsFailureResponseReason failure_response_reason_ =
+        IdfModemHttpsFailureResponseReason::unknown;
+    bool failure_response_reason_available_ = false;
 };
 
 int mip_bio_send(void* context, const unsigned char* bytes, size_t length)
@@ -534,6 +575,10 @@ public:
                                        : fail(stage);
             }
             if (!tls.read_http(result_)) {
+                if (!tls.open_failed()) {
+                    result_.failureResponseReason = tls.failure_response_reason();
+                    result_.failureResponseReasonAvailable = true;
+                }
                 result_.message = tls.open_failed()
                                       ? failure_message(HttpsFailureStage::socket_open)
                                       : tls.timed_out() ? "HTTPS response timed out"

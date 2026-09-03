@@ -392,7 +392,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get one push channel test status",
-        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
+        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, failureResponseReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } }
@@ -406,7 +406,7 @@
       "post": {
         "tags": ["Configuration"],
         "summary": "Test one saved push channel",
-        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, failureResponseReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
         "parameters": [
           { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
           { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } },
@@ -913,6 +913,10 @@
             "type": "string",
             "enum": ["command_failure", "timeout", "response_invalid", "terminal_failure", "poll_timeout", "result_nonzero", "unknown"]
           },
+          "failureResponseReason": {
+            "type": "string",
+            "enum": ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"]
+          },
           "cleanupReason": {
             "type": "string",
             "enum": ["command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"]
@@ -961,6 +965,7 @@
                 "anyOf": [
                   { "required": ["cleanupMessage"] },
                   { "required": ["failureReason"] },
+                  { "required": ["failureResponseReason"] },
                   { "required": ["cleanupReason"] },
                   { "required": ["failureParseReason"] },
                   { "required": ["cleanupParseReason"] },
@@ -972,6 +977,16 @@
                   { "required": ["failureStage"] },
                   { "required": ["httpStatus"] }
                 ]
+              }
+            }
+          },
+          {
+            "if": { "required": ["failureResponseReason"] },
+            "then": {
+              "required": ["failureStage", "success"],
+              "properties": {
+                "failureStage": { "const": "response" },
+                "success": { "const": false }
               }
             }
           },

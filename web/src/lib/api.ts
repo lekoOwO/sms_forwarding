@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureResponseReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -46,6 +46,9 @@ const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
 const pushTestCleanupReasons: readonly PushTestCleanupReason[] = [
 	"command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"
 ];
+const pushTestFailureResponseReasons: readonly PushTestFailureResponseReason[] = [
+	"timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "unknown"
+];
 const pushTestParseReasons: readonly PushTestParseReason[] = [
 	"oversize", "terminal", "urc", "prefix", "field_count", "quote",
 	"cid", "state", "endpoint", "result", "unknown"
@@ -73,7 +76,7 @@ const pushTestFailureStages: readonly PushTestFailureStage[] = [
 	"socket", "tls", "request", "response", "http", "cleanup"
 ];
 const pushTestDiagnosticKeys: readonly (keyof PushTestDiagnosticFields)[] = [
-	"cleanupMessage", "failureReason", "cleanupReason", "resetNeeded",
+	"cleanupMessage", "failureReason", "cleanupReason", "failureResponseReason", "resetNeeded",
 	"failureParseReason", "cleanupParseReason", "failureParseShape", "cleanupParseShape",
 	"transportPath", "dispatchAttempted", "failureStage", "httpStatus"
 ];
@@ -157,6 +160,9 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 		!pushTestDiagnosticReasons.includes(status.failureReason as PushTestDiagnosticReason))) return false;
 	if (has("cleanupReason") && (typeof status.cleanupReason !== "string" ||
 		!pushTestCleanupReasons.includes(status.cleanupReason as PushTestCleanupReason))) return false;
+	if (has("failureResponseReason") && (typeof status.failureResponseReason !== "string" ||
+		!pushTestFailureResponseReasons.includes(status.failureResponseReason as PushTestFailureResponseReason) ||
+		status.success || status.failureStage !== "response")) return false;
 	if (has("failureParseReason") && (typeof status.failureParseReason !== "string" ||
 		!pushTestParseReasons.includes(status.failureParseReason as PushTestParseReason) ||
 		status.failureReason !== "response_invalid")) return false;

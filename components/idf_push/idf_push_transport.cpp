@@ -137,6 +137,8 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
         std::min(cellular_result.cleanupMessage.size(), IdfPushTransportResult::MAX_MESSAGE));
     result.failureReason = cellular_result.failureReason;
     result.cleanupReason = cellular_result.cleanupReason;
+    result.failureResponseReason = cellular_result.failureResponseReason;
+    result.failureResponseReasonAvailable = cellular_result.failureResponseReasonAvailable;
     result.failureParseReason = cellular_result.failureParseReason;
     result.cleanupParseReason = cellular_result.cleanupParseReason;
     if (result.failureReason == IdfModemHttpsDiagnosticReason::response_invalid) {

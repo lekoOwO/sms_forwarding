@@ -31,6 +31,9 @@ struct IdfPushTransportResult {
     std::string cleanupMessage;
     IdfModemHttpsDiagnosticReason failureReason = IdfModemHttpsDiagnosticReason::none;
     IdfModemHttpsDiagnosticReason cleanupReason = IdfModemHttpsDiagnosticReason::none;
+    IdfModemHttpsFailureResponseReason failureResponseReason =
+        IdfModemHttpsFailureResponseReason::unknown;
+    bool failureResponseReasonAvailable = false;
     IdfModemHttpsParseReason failureParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseReason cleanupParseReason = IdfModemHttpsParseReason::none;
     IdfModemHttpsParseShape failureParseShape{};

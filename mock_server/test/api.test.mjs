@@ -93,6 +93,18 @@ test("push test serializer exposes parse detail only for terminal opt-in respons
 		failureParseReason: "none", cleanupParseReason: "none" }, true);
 	assert.equal(Object.hasOwn(noShape, "failureParseShape"), false);
 	assert.equal(Object.hasOwn(noShape, "cleanupParseShape"), false);
+	const responseReason = {
+		...terminal, transportPath: "cellular", dispatchAttempted: true, failureStage: "response",
+		failureResponseReason: "http_parse"
+	};
+	assert.equal(serializePushTestStatus(responseReason, true).failureResponseReason, "http_parse");
+	assert.equal(Object.hasOwn(serializePushTestStatus({ ...responseReason,
+		failureStage: "http" }, true), "failureResponseReason"), false);
+	assert.equal(Object.hasOwn(serializePushTestStatus({ ...responseReason,
+		success: true }, true), "failureResponseReason"), false);
+	assert.equal(Object.hasOwn(serializePushTestStatus({ ...responseReason,
+		failureResponseReason: "not-a-reason" }, true), "failureResponseReason"), false);
+	assert.equal(Object.hasOwn(serializePushTestStatus(responseReason, false), "failureResponseReason"), false);
 });
 
 function decrypt(bytes, passphrase) {
