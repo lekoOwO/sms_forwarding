@@ -1,4 +1,4 @@
-# Counter37 ML307 parser 硬體報告
+# Counter36–42 ML307 parser 與 cellular 硬體報告
 
 ## 範圍與輸入
 
@@ -179,7 +179,33 @@ bounded cadence 回到同一 operation deadline，回傳 WANT_READ 而非 EOF，
 HTTP response。未知行、SMS/PDU、錯誤、duplicate terminal 與真正的 MIPRD data path
 仍維持原有 fail-closed 行為。
 
-## Acceptance promotion path
+R13 的 terminal-only no-data 與 R14 的失敗 receipt 仍是 parser/cleanup 的
+implementation contract 與 bounded failure record；它們不是 R15 成功結果的回溯解釋，
+也不因 R15 而取得通用 protocol 語意。R15 是另一筆 counter42 的 bounded hardware
+observation，結果與前述 parser candidate 的 promotion path 分開記錄如下。
+
+## Counter42 R15 successful cellular evidence
+
+### Hardware boundary and provenance
+
+這是一筆單次、去識別化的 counter42 硬體觀察。來源是私有 R15 receipt 的
+SHA-256 `3e60616890633fcb20be98a1b57fe8d8c8694851569660393ed0bfed5e6fcdb7`；本節只
+引用 receipt 的安全 projection。
+
+- 板型：去識別化 receipt 未保留，因此不作板型或裝置識別聲明。
+- 模組：ML307 family；exact variant 與 modem firmware 未保留。
+- 輸入：R15 counter42 執行中，使用既有已設定的單一 candidate，執行 exactly one
+  cellular push，並完成 bounded mode cleanup。
+- 觀察結果：cellular transport 回報 HTTP 200（2xx）；application-level success
+  保持 `unknown`。cleanup confirmed，最後為 mode 0、workers idle，且
+  `resetNeeded=false`。
+
+本紀錄不保存或重述 raw endpoint、token、message、device identity、CA data、raw
+HTTP、raw modem 或設定內容。它證明這一次 counter42 輸入在該硬體觀察中完成一次
+cellular push 與安全 cleanup；它不保證其他 endpoint、訊息、網路條件或 modem
+variant，也不把 R13/R14 的 parser shape 提升為通用 wire grammar。
+
+## Acceptance promotion path for parser candidates
 
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：
 
@@ -195,5 +221,6 @@ HTTP response。未知行、SMS/PDU、錯誤、duplicate terminal 與真正的 M
    bounded fixtures、modem/runtime/push tests、OpenAPI/security checks 與
    CI-equivalent firmware compile 全部通過。
 
-在上述證據完成前，這份文件只是一筆 bounded hardware classification，不授權
-live reset、push、OTA 或任何設定寫入。
+上述 promotion path 只針對 R13/R14 parser candidates；R15 的成功結果是另外保存的
+bounded hardware evidence。兩者都不授權額外的 live reset、push、OTA 或任何設定寫入，
+也不取代目前 source、fixture 與安全 gate 的驗證。
