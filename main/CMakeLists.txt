@@ -15,13 +15,13 @@ set(MAIN_REQUIRES
 )
 if(SMS_USB_RECOVERY)
   list(APPEND MAIN_SRCS "usb_recovery.cpp")
-  list(APPEND MAIN_REQUIRES esp_driver_usb_serial_jtag)
 endif()
 
 idf_component_register(
   SRCS ${MAIN_SRCS}
   INCLUDE_DIRS "."
   REQUIRES ${MAIN_REQUIRES}
+  PRIV_REQUIRES esp_driver_usb_serial_jtag
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE

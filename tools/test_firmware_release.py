@@ -23,7 +23,7 @@ ACTION_PINS = {
     "actions/upload-artifact": ("ea165f8d65b6e75b540449e92b4886f43607fa02", "v4.6.2"),
     "actions/download-artifact": ("d3f86a106a0bac45b974a628896c90dbdf5c8093", "v4.3.0"),
 }
-IDF_IMAGE = "espressif/idf@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b"
+IDF_IMAGE = "espressif/idf@sha256:e3d941cb983e028aad1e2f5ecb2837254e467f2b71f3e0af67e7337bd27ae177"
 
 
 def yaml_node(text: str, indent: int, key: str) -> tuple[str, str]:

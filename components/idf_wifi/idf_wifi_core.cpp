@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "esp_idf_version.h"
+
 bool idf_wifi_profile_matches_auth(bool open_profile, wifi_auth_mode_t authmode)
 {
     if (open_profile) return authmode == WIFI_AUTH_OPEN;
@@ -10,8 +12,10 @@ bool idf_wifi_profile_matches_auth(bool open_profile, wifi_auth_mode_t authmode)
         case WIFI_AUTH_WPA_WPA2_PSK:
         case WIFI_AUTH_WPA3_PSK:
         case WIFI_AUTH_WPA2_WPA3_PSK:
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         case WIFI_AUTH_WPA3_EXT_PSK:
         case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE:
+#endif
             return true;
         default:
             return false;

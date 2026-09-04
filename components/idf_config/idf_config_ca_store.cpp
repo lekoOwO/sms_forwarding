@@ -9,7 +9,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
-#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -155,7 +155,10 @@ bool canonicalOriginValid(const std::string& origin)
 
 esp_err_t sha256(const uint8_t* data, size_t length, Digest& digest)
 {
-    return mbedtls_sha256(data, length, digest.data(), 0) == 0 ? ESP_OK : ESP_ERR_INVALID_STATE;
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info && mbedtls_md(info, data, length, digest.data()) == 0
+               ? ESP_OK
+               : ESP_ERR_INVALID_STATE;
 }
 
 void put16(std::vector<uint8_t>& bytes, uint16_t value)

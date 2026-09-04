@@ -50,9 +50,9 @@ BOOTLOADER_IMAGE_RELATIVE_PATHS = (
     Path("build/idf-usb-recovery/bootloader/bootloader.bin"),
     Path("build/idf-ota-test/bootloader/bootloader.bin"),
 )
-ESPTOOL = os.environ.get("ESPTOOL", "esptool.py")
+ESPTOOL = os.environ.get("ESPTOOL", "esptool")
 IDF_IMAGE = EXPECTED_IDF_IMAGE
-CONTAINER_PYTHON = "/opt/esp/python_env/idf5.5_py3.12_env/bin/python"
+CONTAINER_PYTHON = "/opt/esp/python_env/idf6.0_py3.12_env/bin/python"
 CONTAINER_DEVICE_PATH = "/dev/sms-device"
 DEVICE_PREFIX = "/dev/serial/by-id/"
 SYSFS_TTY_ROOT = Path("/sys/class/tty")
@@ -274,7 +274,7 @@ def resolve_esptool() -> str:
         return "host"
     if shutil.which("docker"):
         return "container"
-    raise usb_recovery.DeviceError("esptool.py and docker are not installed")
+    raise usb_recovery.DeviceError("esptool and docker are not installed")
 
 
 def _container_path(path: Path) -> str:
@@ -340,7 +340,7 @@ def _cleanup_docker_container(name: str) -> None:
 
 def _docker_command(
     arguments: list[str], device: SerialDevice, image: Path | None = None,
-    program: str | None = "esptool.py", entrypoint: str | None = None,
+    program: str | None = "esptool", entrypoint: str | None = None,
     *, container_name: str | None = None, output: Path | None = None,
     output_mount: Path | None = None,
 ) -> list[str]:
@@ -472,14 +472,14 @@ def _run_esptool(
 
 
 def run_esptool(device: SerialDevice, timeout: float) -> None:
-    """以固定 reset options 執行 esptool chip_id。"""
+    """以固定 reset options 執行 esptool chip-id。"""
     device = _resolve_esptool_device(device, timeout)
     _run_esptool([
         "--chip", "esp32c3",
         "--port", device.by_id,
         "--before", "usb_reset",
         "--after", "hard_reset",
-        "chip_id",
+        "chip-id",
     ], device, timeout)
 
 
@@ -2548,7 +2548,7 @@ def _replace_active_app(
     arguments = [
         "--chip", "esp32c3", "--port", device_path,
         "--before", "usb_reset", "--after", "no_reset",
-        "write_flash", f"0x{offset:X}", str(snapshot),
+        "write-flash", f"0x{offset:X}", str(snapshot),
     ]
     try:
         _flash_esptool(
@@ -2646,7 +2646,7 @@ def _read_app_flash_digest(
             device_path, expected_target, [
                 "--chip", "esp32c3", "--port", device_path,
                 "--before", "usb_reset", "--after", after,
-                "read_flash", f"0x{offset:X}", str(size), str(output),
+                "read-flash", f"0x{offset:X}", str(size), str(output),
             ], timeout, output=output, output_mount=Path(directory), recover=recover,
             stable_identity=stable_identity,
         )
@@ -2663,7 +2663,7 @@ def _verify_app_flash(
     _flash_esptool(device_path, expected_target, [
         "--chip", "esp32c3", "--port", device_path,
         "--before", "usb_reset", "--after", after,
-        "verify_flash", f"0x{offset:X}", str(image),
+        "verify-flash", f"0x{offset:X}", str(image),
     ], timeout, image=image, recover=recover, stable_identity=stable_identity)
 
 
@@ -2769,7 +2769,7 @@ def _flash_command(args: argparse.Namespace) -> int:
         arguments = [
             "--chip", "esp32c3", "--port", device_path,
             "--before", "usb_reset", "--after", "hard_reset",
-            "write_flash", f"0x{offset:X}", str(snapshot),
+            "write-flash", f"0x{offset:X}", str(snapshot),
         ]
         reconciled = False
         try:
@@ -2794,7 +2794,7 @@ def _flash_command(args: argparse.Namespace) -> int:
             )
         plan.update({
             "status": "reconciled" if reconciled else "flashed",
-            "verification": "readback_sha256" if reconciled else "verify_flash",
+            "verification": "readback_sha256" if reconciled else "verify-flash",
             "sha256": digest,
             "written": True,
         })
@@ -2841,7 +2841,7 @@ def _flash_bootloader_command(args: argparse.Namespace) -> int:
         "usb_reset",
         "--after",
         "hard_reset",
-        "write_flash",
+        "write-flash",
         f"0x{BOOTLOADER_OFFSET:X}",
         str(image),
     ]

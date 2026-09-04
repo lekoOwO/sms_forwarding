@@ -48,5 +48,33 @@ class RollbackBuildGateTests(unittest.TestCase):
             check_idf_baseline.check_app_size(build)
 
 
+class EsptoolCommandGateTests(unittest.TestCase):
+    def test_idf6_esptool_commands_are_current(self):
+        check_idf_baseline.check_esptool_commands()
+
+    def test_legacy_esptool_executable_is_rejected(self):
+        device_source = 'ESPTOOL = os.environ.get("ESPTOOL", "esptool.py")'
+        with self.assertRaisesRegex(SystemExit, "legacy esptool"):
+            check_idf_baseline.validate_esptool_commands(device_source, "")
+
+    def test_legacy_esptool_subcommand_is_rejected(self):
+        device_source = (
+            'ESPTOOL = os.environ.get("ESPTOOL", "esptool")\n'
+            'program: str | None = "esptool"\n'
+            '"chip-id" "read-flash" "write_flash" "verify-flash"'
+        )
+        with self.assertRaisesRegex(SystemExit, "legacy esptool"):
+            check_idf_baseline.validate_esptool_commands(device_source, "")
+
+    def test_legacy_merge_subcommand_is_rejected(self):
+        device_source = (
+            'ESPTOOL = os.environ.get("ESPTOOL", "esptool")\n'
+            'program: str | None = "esptool"\n'
+            '"chip-id" "read-flash" "write-flash" "verify-flash"'
+        )
+        with self.assertRaisesRegex(SystemExit, "legacy esptool"):
+            check_idf_baseline.validate_esptool_commands(device_source, "merge_bin")
+
+
 if __name__ == "__main__":
     unittest.main()

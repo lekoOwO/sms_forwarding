@@ -4,7 +4,7 @@
 
 ## 工具鏈基線
 
-本專案的支援基線固定為 ESP-IDF 5.5.4 與 ESP32-C3。CI 使用固定 digest 的 `espressif/idf` container。
+本專案的支援基線固定為 ESP-IDF 6.0.2 與 ESP32-C3。CI 使用固定 digest 的 `espressif/idf` container。
 
 Production build output 必須位於 `build/idf`，而 production `sdkconfig` 必須位於 `build/sdkconfig`。
 USB recovery build output 位於 `build/idf-usb-recovery`，其 `sdkconfig` 位於 `build/sdkconfig-usb-recovery`。
@@ -33,7 +33,7 @@ scripts/dev.sh dev-logs
 scripts/dev.sh dev-stop
 ```
 
-`dev-shell` 與 `firmware-build` 會在需要時啟動 service。`dev-shell` 會載入固定的 ESP-IDF 5.5.4 環境。
+`dev-shell` 與 `firmware-build` 會在需要時啟動 service。`dev-shell` 會載入固定的 ESP-IDF 6.0.2 環境。
 
 ## 建置韌體
 
@@ -46,8 +46,8 @@ scripts/dev.sh firmware-build
 如果 host 已安裝 ESP-IDF，請設定 `IDF_PATH` 並使用單一裝置入口。Production 是預設，release 必須明確指定：
 
 ```sh
-IDF_PATH=/path/to/esp-idf-v5.5.4 python3 tools/device.py build
-IDF_PATH=/path/to/esp-idf-v5.5.4 python3 tools/device.py build --release
+IDF_PATH=/path/to/esp-idf-v6.0.2 python3 tools/device.py build
+IDF_PATH=/path/to/esp-idf-v6.0.2 python3 tools/device.py build --release
 ```
 
 `tools/device.py` 會拒絕其他 ESP-IDF 版本，並在 build 後執行 image size check。
@@ -63,7 +63,7 @@ python3 tools/check_idf_baseline.py --build-dir build/idf
 USB 恢復預設關閉。需要測試時，使用獨立的 build 與 sdkconfig overlay：
 
 ```sh
-IDF_PATH=/path/to/esp-idf-v5.5.4 python3 tools/device.py build --usb-dev
+IDF_PATH=/path/to/esp-idf-v6.0.2 python3 tools/device.py build --usb-dev
 python3 tools/test_usb_recovery.py
 python3 tools/device.py --device /dev/serial/by-id/usb-... state
 python3 tools/device.py --device /dev/serial/by-id/usb-... diag all
@@ -104,8 +104,8 @@ Live flash 同樣要求 baseline check、SHA-256 pin 與 exact by-id basename co
 health task 會 fail closed 並保留 counter，不會清除 OTA floor；完成 bootloader 遷移後才可繼續 OTA。
 `diag --raw` 必須明確指定，資料只寫到 stdout，不會寫入 evidence。
 裝置路徑可由 `SMS_DEVICE` 提供；沒有明確 `/dev/serial/by-id/` 路徑時會 fail closed。
-若 host 沒有 `esptool.py`，`reset` 與 live app slot flash 會使用既有 pinned
-ESP-IDF 5.5.4 image；工具先解析 exact `/dev/serial/by-id/` symlink 並驗證其
+若 host 沒有 `esptool`，`reset` 與 live app slot flash 會使用既有 pinned
+ESP-IDF 6.0.2 image；工具先解析 exact `/dev/serial/by-id/` symlink 並驗證其
 target 是 character device，再以該 resolved target 映射為 container 內的單一
 `/dev/sms-device`。container 使用 `--pull=never`、`--network=none`、read-only
 worktree，不會直接映射 symlink、整個 `/dev` 或啟用 privileged mode。host 的
@@ -114,6 +114,17 @@ container 內不會遞迴啟動 container。固定的 `/dev/sms-device` 只在
 `device.py` 傳遞的 hidden internal marker 下被 backend 接受；host CLI 仍只能使用
 explicit by-id path。container 只另外掛載 16 MiB、`nosuid,nodev,noexec` 的
 `/tmp` tmpfs，供 ESP-IDF entrypoint 使用；不會增加其他 writable volume。
+
+### PSA configuration-backup hardware verification pending
+
+IDF 6.0.2 移除了舊的 Mbed TLS GCM/PBKDF2 headers；target path 現在使用 PSA
+PBKDF2-HMAC-SHA256 與 PSA AES-256-GCM。現有 host fixed vector 仍由 OpenSSL
+path 驗證 envelope bytes，pinned IDF 6.0.2 只完成 compile/link 與 source
+contract checks。尚未在實機執行 PSA fixed-vector round-trip，也尚未在實機
+驗證 PSA key derivation abort、key destroy failure 的 cleanup 行為；因此不能
+宣稱 PSA target runtime 與 host vector 等價。完成此項需要記錄板型、模組、
+輸入與去識別化 observed result 的獨立硬體報告。
+
 USB recovery 的 state 與單一 query container process budget 不超過 30 秒，並且永遠不超過呼叫端剩餘
 deadline；host 無法取得 tty 時，`diag all` 使用單一 development-only batch process，最多使用呼叫端剩餘的 90 秒總 deadline。
 state backend 保留 5 秒單次 timeout，外層最多提供 30 秒以涵蓋既有 retries。

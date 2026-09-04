@@ -35,7 +35,7 @@ class MockDevStackTests(unittest.TestCase):
         dev = config["services"]["dev"]
         self.assertEqual(
             dev["image"],
-            "espressif/idf@sha256:b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b",
+            "espressif/idf@sha256:e3d941cb983e028aad1e2f5ecb2837254e467f2b71f3e0af67e7337bd27ae177",
         )
         self.assertNotIn("build", dev)
         self.assertEqual(dev["working_dir"], "/workspace")

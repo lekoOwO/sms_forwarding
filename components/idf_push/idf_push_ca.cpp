@@ -23,10 +23,12 @@
 #include "idf_push_cellular.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#endif
 #include "mbedtls/net_sockets.h"
-#include "mbedtls/sha256.h"
+#include "mbedtls/md.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 
@@ -165,23 +167,35 @@ bool tls_chain_probe(const std::string& origin, std::string& hostname,
     mbedtls_net_context net;
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config config;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ctr_drbg_context drbg;
     mbedtls_entropy_context entropy;
+#endif
     mbedtls_net_init(&net);
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&config);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ctr_drbg_init(&drbg);
     mbedtls_entropy_init(&entropy);
+#endif
     net.fd = fd;
     bool ok = false;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     const char personalization[] = "push-ca-probe";
-    if (mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
-                              reinterpret_cast<const unsigned char*>(personalization),
-                              sizeof(personalization) - 1) == 0 &&
+    const bool random_ready = mbedtls_ctr_drbg_seed(
+        &drbg, mbedtls_entropy_func, &entropy,
+        reinterpret_cast<const unsigned char*>(personalization),
+        sizeof(personalization) - 1) == 0;
+#else
+    const bool random_ready = true;
+#endif
+    if (random_ready &&
         mbedtls_ssl_config_defaults(&config, MBEDTLS_SSL_IS_CLIENT,
                                     MBEDTLS_SSL_TRANSPORT_STREAM,
                                     MBEDTLS_SSL_PRESET_DEFAULT) == 0) {
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         mbedtls_ssl_conf_rng(&config, mbedtls_ctr_drbg_random, &drbg);
+#endif
         mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_REQUIRED);
         if (esp_crt_bundle_attach(&config) == ESP_OK && mbedtls_ssl_setup(&ssl, &config) == 0 &&
             mbedtls_ssl_set_hostname(&ssl, hostname.c_str()) == 0) {
@@ -210,15 +224,18 @@ bool tls_chain_probe(const std::string& origin, std::string& hostname,
     }
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&config);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     mbedtls_ctr_drbg_free(&drbg);
     mbedtls_entropy_free(&entropy);
+#endif
     close(fd);
     return ok;
 }
 
 bool sha256(const uint8_t* data, size_t length, std::array<uint8_t, 32>& output)
 {
-    return mbedtls_sha256(data, length, output.data(), 0) == 0;
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info && mbedtls_md(info, data, length, output.data()) == 0;
 }
 
 bool allowlisted(const std::array<uint8_t, 32>& hash)

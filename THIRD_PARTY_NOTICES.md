@@ -9,7 +9,7 @@ text is in [components/idf_pdu/LICENSE](components/idf_pdu/LICENSE).
 The component is rebuilt from the checked-in source by the ESP-IDF build:
 
 ```sh
-IDF_PATH=/path/to/esp-idf-v5.5.4 ./tools/idf.sh build
+IDF_PATH=/path/to/esp-idf-v6.0.2 ./tools/idf.sh build
 ```
 
 After the pinned build completes, verify it with:

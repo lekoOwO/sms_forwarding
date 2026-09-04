@@ -6,10 +6,9 @@
 #include "config_schema_generated.h"
 
 #ifdef ESP_PLATFORM
-#include "mbedtls/gcm.h"
 #include "mbedtls/md.h"
-#include "mbedtls/pkcs5.h"
 #include "mbedtls/platform_util.h"
+#include "psa/crypto.h"
 #else
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -35,24 +34,44 @@ bool valid_header(const uint8_t* input, size_t input_size)
            input[15] == static_cast<uint8_t>(BACKUP_KDF_ITERATIONS >> 24);
 }
 
-bool derive_key(const std::string& passphrase, const uint8_t* salt, uint8_t key[32])
-{
-#ifdef ESP_PLATFORM
-    return mbedtls_pkcs5_pbkdf2_hmac_ext(MBEDTLS_MD_SHA256,
-        reinterpret_cast<const unsigned char*>(passphrase.data()), passphrase.size(),
-        salt, BACKUP_SALT_BYTES, BACKUP_KDF_ITERATIONS, 32, key) == 0;
-#else
-    return PKCS5_PBKDF2_HMAC(passphrase.data(), static_cast<int>(passphrase.size()), salt,
-                            BACKUP_SALT_BYTES, BACKUP_KDF_ITERATIONS, EVP_sha256(), 32, key) == 1;
-#endif
-}
-
 void clear_key(uint8_t key[32])
 {
 #ifdef ESP_PLATFORM
     mbedtls_platform_zeroize(key, 32);
 #else
     OPENSSL_cleanse(key, 32);
+#endif
+}
+
+bool derive_key(const std::string& passphrase, const uint8_t* salt, uint8_t key[32])
+{
+#ifdef ESP_PLATFORM
+    psa_key_derivation_operation_t operation = PSA_KEY_DERIVATION_OPERATION_INIT;
+    psa_status_t status = psa_key_derivation_setup(
+        &operation, PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256));
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_integer(
+            &operation, PSA_KEY_DERIVATION_INPUT_COST, BACKUP_KDF_ITERATIONS);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_bytes(
+            &operation, PSA_KEY_DERIVATION_INPUT_SALT, salt, BACKUP_SALT_BYTES);
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_input_bytes(
+            &operation, PSA_KEY_DERIVATION_INPUT_PASSWORD,
+            reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
+    }
+    if (status == PSA_SUCCESS) {
+        status = psa_key_derivation_output_bytes(&operation, key, 32);
+    }
+    const psa_status_t abort_status = psa_key_derivation_abort(&operation);
+    const bool ok = status == PSA_SUCCESS && abort_status == PSA_SUCCESS;
+    if (!ok) clear_key(key);
+    return ok;
+#else
+    return PKCS5_PBKDF2_HMAC(passphrase.data(), static_cast<int>(passphrase.size()), salt,
+                            BACKUP_SALT_BYTES, BACKUP_KDF_ITERATIONS, EVP_sha256(), 32, key) == 1;
 #endif
 }
 }
@@ -96,14 +115,28 @@ IdfWebCryptoResult idf_web_encrypt_backup(const uint8_t* plaintext, size_t plain
     }
     int rc = -1;
 #ifdef ESP_PLATFORM
-    mbedtls_gcm_context context;
-    mbedtls_gcm_init(&context);
-    if (mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256) == 0) {
-        rc = mbedtls_gcm_crypt_and_tag(&context, MBEDTLS_GCM_ENCRYPT, plaintext_size, iv, BACKUP_IV_BYTES,
-            out, BACKUP_AAD_BYTES, plaintext, out + BACKUP_HEADER_BYTES,
-            BACKUP_TAG_BYTES, out + BACKUP_HEADER_BYTES + plaintext_size);
+    const psa_algorithm_t algorithm =
+        PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_GCM, BACKUP_TAG_BYTES);
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_ENCRYPT);
+    psa_set_key_algorithm(&attributes, algorithm);
+    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
+    psa_status_t status = psa_import_key(&attributes, key, 32, &key_id);
+    psa_reset_key_attributes(&attributes);
+    size_t output_size = 0;
+    bool crypto_ok = false;
+    if (status == PSA_SUCCESS) {
+        const psa_status_t operation_status = psa_aead_encrypt(key_id, algorithm, iv, BACKUP_IV_BYTES,
+            out, BACKUP_AAD_BYTES, plaintext, plaintext_size,
+            out + BACKUP_HEADER_BYTES, plaintext_size + BACKUP_TAG_BYTES, &output_size);
+        const psa_status_t destroy_status = psa_destroy_key(key_id);
+        crypto_ok = operation_status == PSA_SUCCESS && destroy_status == PSA_SUCCESS &&
+                    output_size == plaintext_size + BACKUP_TAG_BYTES;
     }
-    mbedtls_gcm_free(&context);
+    rc = crypto_ok ? 0 : -1;
 #else
     EVP_CIPHER_CTX* context = EVP_CIPHER_CTX_new();
     int length = 0;
@@ -147,14 +180,28 @@ IdfWebCryptoResult idf_web_decrypt_backup(const uint8_t* encrypted, size_t encry
     }
     int rc = -1;
 #ifdef ESP_PLATFORM
-    mbedtls_gcm_context context;
-    mbedtls_gcm_init(&context);
-    if (mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES, key, 256) == 0) {
-        rc = mbedtls_gcm_auth_decrypt(&context, length, encrypted + 32, BACKUP_IV_BYTES,
-            encrypted, BACKUP_AAD_BYTES, encrypted + BACKUP_HEADER_BYTES + length,
-            BACKUP_TAG_BYTES, encrypted + BACKUP_HEADER_BYTES, output.data.get());
+    const psa_algorithm_t algorithm =
+        PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_GCM, BACKUP_TAG_BYTES);
+    psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t key_id = 0;
+    psa_set_key_type(&attributes, PSA_KEY_TYPE_AES);
+    psa_set_key_bits(&attributes, 256);
+    psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attributes, algorithm);
+    psa_set_key_lifetime(&attributes, PSA_KEY_LIFETIME_VOLATILE);
+    psa_status_t status = psa_import_key(&attributes, key, 32, &key_id);
+    psa_reset_key_attributes(&attributes);
+    size_t output_size = 0;
+    bool crypto_ok = false;
+    if (status == PSA_SUCCESS) {
+        const psa_status_t operation_status = psa_aead_decrypt(key_id, algorithm, encrypted + 32, BACKUP_IV_BYTES,
+            encrypted, BACKUP_AAD_BYTES, encrypted + BACKUP_HEADER_BYTES,
+            length + BACKUP_TAG_BYTES, output.data.get(), length, &output_size);
+        const psa_status_t destroy_status = psa_destroy_key(key_id);
+        crypto_ok = operation_status == PSA_SUCCESS && destroy_status == PSA_SUCCESS &&
+                    output_size == length;
     }
-    mbedtls_gcm_free(&context);
+    rc = crypto_ok ? 0 : -1;
 #else
     EVP_CIPHER_CTX* context = EVP_CIPHER_CTX_new();
     int out_length = 0;

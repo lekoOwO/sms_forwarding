@@ -61,6 +61,38 @@ def definition_body(source: str, declaration: str) -> str:
     raise AssertionError(f"unterminated definition: {declaration}")
 
 
+def assert_idf6_crypto_contract(source: str) -> None:
+    assert '"psa/crypto.h"' in source
+    assert '"mbedtls/gcm.h"' not in source
+    assert '"mbedtls/pkcs5.h"' not in source
+    assert "PSA_ALG_PBKDF2_HMAC(PSA_ALG_SHA_256)" in source
+    assert "PSA_KEY_DERIVATION_INPUT_COST, BACKUP_KDF_ITERATIONS);" in source
+    assert "PSA_KEY_DERIVATION_INPUT_SALT, salt, BACKUP_SALT_BYTES" in source
+    assert "PSA_KEY_DERIVATION_INPUT_PASSWORD" in source
+    assert "reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size()" in source
+    assert "psa_key_derivation_output_bytes(&operation, key, 32)" in source
+    assert "psa_key_derivation_abort(&operation)" in source
+    assert "PSA_ALG_AEAD_WITH_SHORTENED_TAG(PSA_ALG_GCM, BACKUP_TAG_BYTES)" in source
+    assert source.count("psa_set_key_type(&attributes, PSA_KEY_TYPE_AES)") == 2
+    assert source.count("psa_set_key_bits(&attributes, 256)") == 2
+    assert "psa_aead_encrypt(key_id, algorithm, iv, BACKUP_IV_BYTES" in source
+    assert "out, BACKUP_AAD_BYTES, plaintext, plaintext_size" in source
+    assert "out + BACKUP_HEADER_BYTES, plaintext_size + BACKUP_TAG_BYTES" in source
+    assert "psa_aead_decrypt(key_id, algorithm, encrypted + 32, BACKUP_IV_BYTES" in source
+    assert "encrypted, BACKUP_AAD_BYTES, encrypted + BACKUP_HEADER_BYTES" in source
+    assert "length + BACKUP_TAG_BYTES, output.data.get(), length" in source
+    assert source.count("destroy_status == PSA_SUCCESS") == 2
+    assert source.count("rc = crypto_ok ? 0 : -1;") == 2
+
+
+def run_idf6_crypto_contract(source: str) -> bool:
+    try:
+        assert_idf6_crypto_contract(source)
+    except AssertionError:
+        return False
+    return True
+
+
 def run_guard_seam(source: str, mutate_idle=None, mutate_cellular=None):
     def guard_body(name):
         for declaration in (
@@ -821,6 +853,19 @@ int main() {
             check=True,
         )
         subprocess.run([str(binary_path)], check=True)
+
+    crypto_source = (WEB / "idf_web_crypto.cpp").read_text()
+    assert run_idf6_crypto_contract(crypto_source)
+    assert not run_idf6_crypto_contract(crypto_source.replace(
+        "PSA_KEY_DERIVATION_INPUT_COST, BACKUP_KDF_ITERATIONS",
+        "PSA_KEY_DERIVATION_INPUT_COST, BACKUP_KDF_ITERATIONS + 1", 1))
+    assert not run_idf6_crypto_contract(crypto_source.replace(
+        "out, BACKUP_AAD_BYTES, plaintext, plaintext_size",
+        "out, BACKUP_AAD_BYTES - 1, plaintext, plaintext_size", 1))
+    assert not run_idf6_crypto_contract(crypto_source.replace(
+        "destroy_status == PSA_SUCCESS", "true", 1))
+    assert not run_idf6_crypto_contract(crypto_source.replace(
+        "psa_key_derivation_abort(&operation)", "psa_key_derivation_setup(&operation, 0)", 1))
 
     source = (WEB / "idf_web.cpp").read_text()
     assert run_guard_seam(source).returncode == 0

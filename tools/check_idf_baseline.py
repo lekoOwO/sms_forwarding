@@ -10,10 +10,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_IDF = "5.5.4"
+EXPECTED_IDF = "6.0.2"
 EXPECTED_IDF_IMAGE = (
     "espressif/idf@sha256:"
-    "b9f2d6ea1c19e0c9f7959bdb74a9e3c775642f9d0f3b841937c5fa3363db892b"
+    "e3d941cb983e028aad1e2f5ecb2837254e467f2b71f3e0af67e7337bd27ae177"
 )
 EXPECTED_PARTITIONS = {
     "nvs": ("data", "nvs", 0x9000, 0x5000),
@@ -77,6 +77,28 @@ def check_idf_pins() -> None:
         and './tools/idf.sh build' not in workflow
     ):
         fail("CI build command is not deterministic")
+
+
+def validate_esptool_commands(device_source: str, workflow_source: str) -> None:
+    stale = ("esptool.py", "chip_id", "read_flash", "write_flash", "verify_flash", "merge_bin")
+    for token in stale:
+        if token in device_source or token in workflow_source:
+            fail(f"legacy esptool command remains: {token}")
+    if 'ESPTOOL = os.environ.get("ESPTOOL", "esptool")' not in device_source:
+        fail("device helper does not default to the IDF6 esptool executable")
+    if 'program: str | None = "esptool"' not in device_source:
+        fail("container helper does not use the IDF6 esptool executable")
+    for command in ("chip-id", "read-flash", "write-flash", "verify-flash"):
+        if f'"{command}"' not in device_source:
+            fail(f"device helper is missing the IDF6 esptool command: {command}")
+    if "esptool --chip esp32c3 merge-bin" not in workflow_source:
+        fail("CI does not use the IDF6 merge-bin command")
+
+
+def check_esptool_commands() -> None:
+    device_source = (ROOT / "tools/device.py").read_text(encoding="utf-8")
+    workflow_source = (ROOT / ".github/workflows/build.yml").read_text(encoding="utf-8")
+    validate_esptool_commands(device_source, workflow_source)
 
 
 def check_license_notice() -> None:
@@ -168,6 +190,7 @@ def main() -> int:
     args = parser.parse_args()
     check_partition_table()
     check_idf_pins()
+    check_esptool_commands()
     check_license_notice()
     if args.build_dir:
         check_app_size(args.build_dir)

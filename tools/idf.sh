@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-expected_idf_version="5.5.4"
+expected_idf_version="6.0.2"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 build_dir="$repo_root/build/idf"
 sdkconfig="$repo_root/build/sdkconfig"

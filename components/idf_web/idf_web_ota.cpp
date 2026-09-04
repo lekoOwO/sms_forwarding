@@ -8,8 +8,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 #include "mbedtls/pk.h"
-#include "mbedtls/sha256.h"
 #include "nvs.h"
 
 namespace {
@@ -49,13 +49,19 @@ extern const uint8_t ota_public_key_b64_end[] asm("_binary_ota_public_key_der_b6
 struct RuntimeContext {
     esp_ota_handle_t handle = 0;
     const esp_partition_t* target = nullptr;
-    mbedtls_sha256_context hash;
+    mbedtls_md_context_t hash;
     bool hash_initialized = false;
 };
 
 static RuntimeContext s_runtime;
 static SemaphoreHandle_t s_mutex = nullptr;
 static std::unique_ptr<IdfWebOtaSession> s_session;
+
+bool sha256(const uint8_t* data, size_t length, uint8_t output[32])
+{
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info && mbedtls_md(info, data, length, output) == 0;
+}
 
 bool read_counter(nvs_handle_t handle, const char* key, uint32_t& value)
 {
@@ -100,7 +106,7 @@ bool verify_signature(void*, const uint8_t* manifest, size_t manifest_size,
     size_t key_size = 0;
     if (!decode_embedded_public_key(key_der, sizeof(key_der), &key_size)) return false;
     uint8_t digest[32] = {};
-    if (mbedtls_sha256(manifest, manifest_size, digest, 0) != 0) {
+    if (!sha256(manifest, manifest_size, digest)) {
         std::memset(key_der, 0, sizeof(key_der));
         return false;
     }
@@ -120,24 +126,31 @@ bool verify_signature(void*, const uint8_t* manifest, size_t manifest_size,
 bool hash_begin(void* raw)
 {
     auto& runtime = *static_cast<RuntimeContext*>(raw);
-    if (runtime.hash_initialized) mbedtls_sha256_free(&runtime.hash);
-    mbedtls_sha256_init(&runtime.hash);
+    if (runtime.hash_initialized) mbedtls_md_free(&runtime.hash);
+    mbedtls_md_init(&runtime.hash);
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info || mbedtls_md_setup(&runtime.hash, info, 0) != 0 ||
+        mbedtls_md_starts(&runtime.hash) != 0) {
+        mbedtls_md_free(&runtime.hash);
+        runtime.hash_initialized = false;
+        return false;
+    }
     runtime.hash_initialized = true;
-    return mbedtls_sha256_starts(&runtime.hash, 0) == 0;
+    return true;
 }
 
 bool hash_update(void* raw, const uint8_t* data, size_t size)
 {
     auto& runtime = *static_cast<RuntimeContext*>(raw);
-    return runtime.hash_initialized && mbedtls_sha256_update(&runtime.hash, data, size) == 0;
+    return runtime.hash_initialized && mbedtls_md_update(&runtime.hash, data, size) == 0;
 }
 
 bool hash_matches(void* raw, const char* expected_hex)
 {
     auto& runtime = *static_cast<RuntimeContext*>(raw);
     uint8_t digest[32] = {};
-    if (!runtime.hash_initialized || mbedtls_sha256_finish(&runtime.hash, digest) != 0) return false;
-    mbedtls_sha256_free(&runtime.hash);
+    if (!runtime.hash_initialized || mbedtls_md_finish(&runtime.hash, digest) != 0) return false;
+    mbedtls_md_free(&runtime.hash);
     runtime.hash_initialized = false;
     unsigned difference = 0;
     for (size_t i = 0; i < sizeof(digest); ++i) {
@@ -187,7 +200,7 @@ void abort_update(void* raw)
     runtime.handle = 0;
     runtime.target = nullptr;
     if (runtime.hash_initialized) {
-        mbedtls_sha256_free(&runtime.hash);
+        mbedtls_md_free(&runtime.hash);
         runtime.hash_initialized = false;
     }
 }
@@ -424,9 +437,9 @@ esp_err_t idf_web_ota_get_public_key_sha256(uint8_t output[32])
         std::memset(output, 0, 32);
         return ESP_FAIL;
     }
-    const int hash_error = mbedtls_sha256(key_der, key_size, output, 0);
+    const bool hash_ok = sha256(key_der, key_size, output);
     std::memset(key_der, 0, sizeof(key_der));
-    if (hash_error != 0) {
+    if (!hash_ok) {
         std::memset(output, 0, 32);
         return ESP_FAIL;
     }

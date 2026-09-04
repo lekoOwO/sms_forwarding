@@ -32,12 +32,21 @@ typedef enum {
 } wifi_auth_mode_t;
 '''
 
+ESP_IDF_VERSION = r'''#pragma once
+#define ESP_IDF_VERSION_VAL(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+#ifndef ESP_IDF_VERSION
+#define ESP_IDF_VERSION ESP_IDF_VERSION_VAL(6, 0, 2)
+#endif
+'''
+
 HARNESS = r'''
 #include <array>
 #include <cassert>
 #include <string>
 #include <vector>
 
+#include "esp_idf_version.h"
 #include "idf_wifi_core.h"
 
 int main() {
@@ -50,8 +59,13 @@ int main() {
     assert(idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA_WPA2_PSK));
     assert(idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA3_PSK));
     assert(idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA2_WPA3_PSK));
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     assert(idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA3_EXT_PSK));
     assert(idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE));
+#else
+    assert(!idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA3_EXT_PSK));
+    assert(!idf_wifi_profile_matches_auth(false, WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE));
+#endif
     assert(!idf_wifi_profile_matches_auth(false, WIFI_AUTH_ENTERPRISE));
     assert(!idf_wifi_profile_matches_auth(false, WIFI_AUTH_WAPI_PSK));
     assert(!idf_wifi_profile_matches_auth(false, WIFI_AUTH_OWE));
@@ -104,18 +118,21 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="idf-wifi-security-") as temp_dir:
         temp = Path(temp_dir)
         (temp / "esp_wifi_types.h").write_text(WIFI_TYPES, encoding="utf-8")
+        (temp / "esp_idf_version.h").write_text(ESP_IDF_VERSION, encoding="utf-8")
         harness = temp / "wifi_security_test.cpp"
-        binary = temp / "wifi_security_test"
         harness.write_text(HARNESS, encoding="utf-8")
-        subprocess.run(
-            [
-                "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                f"-I{temp}", f"-I{WIFI / 'include'}",
-                str(WIFI / "idf_wifi_core.cpp"), str(harness), "-o", str(binary),
-            ],
-            check=True,
-        )
-        subprocess.run([str(binary)], check=True)
+        for label, version in (("idf5", "50000"), ("idf6", "60002")):
+            binary = temp / f"wifi_security_test_{label}"
+            subprocess.run(
+                [
+                    "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                    f"-DESP_IDF_VERSION={version}",
+                    f"-I{temp}", f"-I{WIFI / 'include'}",
+                    str(WIFI / "idf_wifi_core.cpp"), str(harness), "-o", str(binary),
+                ],
+                check=True,
+            )
+            subprocess.run([str(binary)], check=True)
 
     source = (WIFI / "idf_wifi.cpp").read_text(encoding="utf-8")
     assert '"%s%02X%02X%02X", AP_SSID_PREFIX, mac[3], mac[4], mac[5]' in source

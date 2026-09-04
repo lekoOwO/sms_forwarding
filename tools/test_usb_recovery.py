@@ -2565,6 +2565,21 @@ class UsbRecoveryBuildGuardTest(unittest.TestCase):
             self.assertNotRegex(symbols, r"idf_usb_recovery_start|idf_modem_usb_query|usb_query_command")
             self.assertNotRegex(symbols, r"idf_web_ota_migration_recover")
 
+    def test_idf6_usb_dependency_is_static_for_requirements_scan(self):
+        main_cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+        self.assertRegex(
+            main_cmake,
+            r"PRIV_REQUIRES\s+esp_driver_usb_serial_jtag",
+        )
+        self.assertEqual(main_cmake.count("esp_driver_usb_serial_jtag"), 1)
+
+        mutated = main_cmake.replace(
+            "  PRIV_REQUIRES esp_driver_usb_serial_jtag\n", "", 1
+        )
+        self.assertNotIn("PRIV_REQUIRES esp_driver_usb_serial_jtag", mutated)
+        with self.assertRaises(AssertionError):
+            self.assertRegex(mutated, r"PRIV_REQUIRES\s+esp_driver_usb_serial_jtag")
+
 
 if __name__ == "__main__":
     unittest.main()

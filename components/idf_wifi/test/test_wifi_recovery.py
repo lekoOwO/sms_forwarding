@@ -25,6 +25,14 @@ typedef enum {
 } wifi_auth_mode_t;
 '''
 
+    ESP_IDF_VERSION = r'''#pragma once
+#define ESP_IDF_VERSION_VAL(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+#ifndef ESP_IDF_VERSION
+#define ESP_IDF_VERSION ESP_IDF_VERSION_VAL(6, 0, 2)
+#endif
+'''
+
     POLICY_HARNESS = r'''
 #include <cassert>
 
@@ -91,6 +99,7 @@ int main() {
         with tempfile.TemporaryDirectory(prefix="idf-wifi-recovery-") as temp_dir:
             temp = Path(temp_dir)
             (temp / "esp_wifi_types.h").write_text(self.WIFI_TYPES, encoding="utf-8")
+            (temp / "esp_idf_version.h").write_text(self.ESP_IDF_VERSION, encoding="utf-8")
             harness = temp / "wifi_recovery_test.cpp"
             binary = temp / "wifi_recovery_test"
             harness.write_text(self.POLICY_HARNESS, encoding="utf-8")
@@ -259,6 +268,7 @@ int main() {
         with tempfile.TemporaryDirectory(prefix="idf-wifi-recovery-integration-") as temp_dir:
             temp = Path(temp_dir)
             (temp / "esp_wifi_types.h").write_text(self.WIFI_TYPES, encoding="utf-8")
+            (temp / "esp_idf_version.h").write_text(self.ESP_IDF_VERSION, encoding="utf-8")
             harness = temp / "wifi_recovery_integration_test.cpp"
             binary = temp / "wifi_recovery_integration_test"
             harness.write_text(self.INTEGRATION_HARNESS, encoding="utf-8")

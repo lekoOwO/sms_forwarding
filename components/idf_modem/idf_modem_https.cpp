@@ -15,10 +15,13 @@
 #include <string_view>
 #include <vector>
 
+#include "esp_idf_version.h"
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#endif
+#include "mbedtls/md.h"
 #include "mbedtls/net_sockets.h"
-#include "mbedtls/sha256.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "freertos/FreeRTOS.h"
@@ -212,7 +215,8 @@ bool sha256_matches(const std::vector<uint8_t>& der,
         return false;
     }
     std::array<uint8_t, 32> actual{};
-    if (mbedtls_sha256(der.data(), der.size(), actual.data(), 0) != 0) return false;
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info || mbedtls_md(info, der.data(), der.size(), actual.data()) != 0) return false;
     uint8_t difference = 0;
     for (size_t i = 0; i < actual.size(); ++i) difference |= actual[i] ^ expected[i];
     std::fill(actual.begin(), actual.end(), 0);
@@ -263,8 +267,10 @@ public:
         if (ssl_initialized_) mbedtls_ssl_free(ssl_.get());
         if (config_initialized_) mbedtls_ssl_config_free(config_.get());
         if (certificate_initialized_) mbedtls_x509_crt_free(certificate_.get());
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         if (drbg_initialized_) mbedtls_ctr_drbg_free(drbg_.get());
         if (entropy_initialized_) mbedtls_entropy_free(entropy_.get());
+#endif
     }
 
     bool init()
@@ -284,6 +290,7 @@ public:
         mbedtls_x509_crt_init(certificate_.get());
         certificate_initialized_ = true;
 
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         drbg_ = std::unique_ptr<mbedtls_ctr_drbg_context>(new (std::nothrow) mbedtls_ctr_drbg_context);
         if (!drbg_) return false;
         mbedtls_ctr_drbg_init(drbg_.get());
@@ -293,16 +300,21 @@ public:
         if (!entropy_) return false;
         mbedtls_entropy_init(entropy_.get());
         entropy_initialized_ = true;
+#endif
         if (mbedtls_x509_crt_parse_der(certificate_.get(), request_.rootCertificateDer.data(),
                                        request_.rootCertificateDer.size()) != 0) return false;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         static constexpr char personalization[] = "idf-modem-mip-tls";
         if (mbedtls_ctr_drbg_seed(drbg_.get(), mbedtls_entropy_func, entropy_.get(),
                                   reinterpret_cast<const unsigned char*>(personalization),
-                                  sizeof(personalization) - 1) != 0 ||
-            mbedtls_ssl_config_defaults(config_.get(), MBEDTLS_SSL_IS_CLIENT,
+                                  sizeof(personalization) - 1) != 0) return false;
+#endif
+        if (mbedtls_ssl_config_defaults(config_.get(), MBEDTLS_SSL_IS_CLIENT,
                                         MBEDTLS_SSL_TRANSPORT_STREAM,
                                         MBEDTLS_SSL_PRESET_DEFAULT) != 0) return false;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
         mbedtls_ssl_conf_rng(config_.get(), mbedtls_ctr_drbg_random, drbg_.get());
+#endif
         mbedtls_ssl_conf_authmode(config_.get(), MBEDTLS_SSL_VERIFY_REQUIRED);
         mbedtls_ssl_conf_min_tls_version(config_.get(), MBEDTLS_SSL_VERSION_TLS1_2);
         mbedtls_ssl_conf_max_tls_version(config_.get(), MBEDTLS_SSL_VERSION_TLS1_2);
@@ -504,14 +516,18 @@ private:
     std::unique_ptr<mbedtls_ssl_context> ssl_;
     std::unique_ptr<mbedtls_ssl_config> config_;
     std::unique_ptr<mbedtls_x509_crt> certificate_;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     std::unique_ptr<mbedtls_ctr_drbg_context> drbg_;
     std::unique_ptr<mbedtls_entropy_context> entropy_;
+#endif
     std::vector<uint8_t> pending_;
     bool ssl_initialized_ = false;
     bool config_initialized_ = false;
     bool certificate_initialized_ = false;
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
     bool drbg_initialized_ = false;
     bool entropy_initialized_ = false;
+#endif
     bool timed_out_ = false;
     bool remote_closed_ = false;
     bool open_failed_ = false;
