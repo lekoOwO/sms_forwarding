@@ -1,9 +1,15 @@
 #include "idf_esim.h"
+#include "idf_esim_codec.h"
+#include "idf_esim_lpa.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <ctype.h>
 #include <iterator>
+#include <limits>
+#include <memory>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,12 +31,11 @@ static constexpr size_t STORE_DATA_MSS = 120;
 static constexpr size_t APDU_RESPONSE_DATA_MAX = 16 * 1024;
 static constexpr size_t GET_RESPONSE_CHAIN_MAX = 64;
 
-struct Tlv {
-    std::vector<uint8_t> tag;
-    std::vector<uint8_t> value;
-    std::vector<Tlv> children;
-    bool constructed = false;
-};
+using idf_esim_internal::Tlv;
+using idf_esim_internal::append_tlv;
+using idf_esim_internal::first_child;
+using idf_esim_internal::parse_tlv;
+using idf_esim_internal::tag_is;
 
 struct ProfileIdentifier {
     std::vector<uint8_t> tag;
@@ -175,128 +180,6 @@ static int tlv_int_value(const Tlv& tlv, int def = 0)
     return static_cast<int>(out);
 }
 
-static bool tag_is(const Tlv& tlv, const uint8_t* tag, size_t len)
-{
-    return tlv.tag.size() == len && memcmp(tlv.tag.data(), tag, len) == 0;
-}
-
-template <size_t N>
-static bool tag_is(const Tlv& tlv, const uint8_t (&tag)[N])
-{
-    return tag_is(tlv, tag, N);
-}
-
-template <size_t N>
-static const Tlv* first_child(const Tlv& tlv, const uint8_t (&tag)[N])
-{
-    const auto child = std::find_if(tlv.children.begin(), tlv.children.end(), [&](const Tlv& item) {
-        return tag_is(item, tag);
-    });
-    return child == tlv.children.end() ? nullptr : &*child;
-}
-
-static bool parse_tlv_one(const std::vector<uint8_t>& data, size_t end, size_t& pos, Tlv& out,
-                          std::string& message, int depth = 0)
-{
-    // ES10c responses have three or four nested levels. Limit depth so malformed data cannot exhaust the task stack.
-    if (depth > 8) {
-        message = "TLV nesting is too deep";
-        return false;
-    }
-    if (pos >= end) {
-        message = "TLV data is empty";
-        return false;
-    }
-    size_t tag_start = pos;
-    uint8_t first = data[pos++];
-    out = Tlv();
-    out.constructed = (first & 0x20) != 0;
-    if ((first & 0x1F) == 0x1F) {
-        while (pos < end) {
-            uint8_t b = data[pos++];
-            if ((b & 0x80) == 0) break;
-        }
-        if ((data[pos - 1] & 0x80) != 0) {
-            message = "TLV tag is incomplete";
-            return false;
-        }
-    }
-    out.tag.assign(data.begin() + tag_start, data.begin() + pos);
-    if (pos >= end) {
-        message = "TLV length is missing";
-        return false;
-    }
-    uint8_t len0 = data[pos++];
-    size_t len = 0;
-    if ((len0 & 0x80) == 0) {
-        len = len0;
-    } else {
-        size_t count = len0 & 0x7F;
-        if (count == 0 || count > 3 || pos + count > end) {
-            message = "TLV length format is not supported";
-            return false;
-        }
-        for (size_t i = 0; i < count; ++i) len = (len << 8) | data[pos++];
-    }
-    if (pos + len > end) {
-        message = "TLV length exceeds the response";
-        return false;
-    }
-    out.value.assign(data.begin() + pos, data.begin() + pos + len);
-    if (out.constructed) {
-        size_t child_pos = pos;
-        size_t child_end = pos + len;
-        while (child_pos < child_end) {
-            Tlv child;
-            if (!parse_tlv_one(data, child_end, child_pos, child, message, depth + 1)) return false;
-            out.children.push_back(std::move(child));
-        }
-    }
-    pos += len;
-    return true;
-}
-
-static bool parse_tlv(const std::vector<uint8_t>& data, Tlv& out, std::string& message)
-{
-    size_t pos = 0;
-    if (!parse_tlv_one(data, data.size(), pos, out, message)) return false;
-    if (pos != data.size()) {
-        message = "TLV response contains extra data";
-        return false;
-    }
-    return true;
-}
-
-static void append_len(std::vector<uint8_t>& out, size_t len)
-{
-    if (len < 0x80) {
-        out.push_back(static_cast<uint8_t>(len));
-    } else if (len <= 0xFF) {
-        out.push_back(0x81);
-        out.push_back(static_cast<uint8_t>(len));
-    } else {
-        out.push_back(0x82);
-        out.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
-        out.push_back(static_cast<uint8_t>(len & 0xFF));
-    }
-}
-
-static void append_tlv(std::vector<uint8_t>& out,
-                       const uint8_t* tag,
-                       size_t tag_len,
-                       const std::vector<uint8_t>& value)
-{
-    out.insert(out.end(), tag, tag + tag_len);
-    append_len(out, value.size());
-    out.insert(out.end(), value.begin(), value.end());
-}
-
-template <size_t N>
-static void append_tlv(std::vector<uint8_t>& out, const uint8_t (&tag)[N], const std::vector<uint8_t>& value)
-{
-    append_tlv(out, tag, N, value);
-}
-
 static std::string status_word_text(uint16_t sw)
 {
     char buf[96];
@@ -313,72 +196,202 @@ static std::string status_word_text(uint16_t sw)
     }
 }
 
-static std::string first_line_containing(const std::string& resp, const char* needle)
+static bool parse_size_token(const std::string& value, size_t& out)
 {
-    size_t p = resp.find(needle);
-    if (p == std::string::npos) return {};
-    size_t start = resp.rfind('\n', p);
-    start = (start == std::string::npos) ? 0 : start + 1;
-    size_t end = resp.find('\n', p);
-    if (end == std::string::npos) end = resp.size();
-    std::string line = resp.substr(start, end - start);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    return idf_util_trim_copy(line);
+    std::string text = idf_util_trim_copy(value);
+    if (text.empty()) return false;
+    size_t parsed = 0;
+    for (char ch : text) {
+        if (!isdigit(static_cast<unsigned char>(ch))) return false;
+        size_t digit = static_cast<size_t>(ch - '0');
+        if (parsed > (std::numeric_limits<size_t>::max() - digit) / 10U) return false;
+        parsed = parsed * 10U + digit;
+    }
+    out = parsed;
+    return true;
+}
+
+enum class EsimResponsePolicy {
+    strict_lpa,
+    legacy_profile,
+};
+
+static bool is_profile_sms_pdu(const std::string& row)
+{
+    if (row.size() < 32U || (row.size() & 1U) != 0U) return false;
+    return std::all_of(row.begin(), row.end(), [](char ch) { return hex_value(ch) >= 0; });
+}
+
+static bool is_profile_urc(const std::string& row, bool& expects_sms_pdu)
+{
+    if (row == "RING" || row.rfind("+CMTI:", 0) == 0 ||
+        row.rfind("+CLIP:", 0) == 0 || row.rfind("+CEREG:", 0) == 0) {
+        return true;
+    }
+    if (row.rfind("+CMT:", 0) == 0) {
+        if (expects_sms_pdu) return false;
+        expects_sms_pdu = true;
+        return true;
+    }
+    return false;
+}
+
+static bool find_unique_response_line(const std::string& response,
+                                      const std::string& command,
+                                      const char* prefix,
+                                      std::string& line,
+                                      EsimResponsePolicy policy)
+{
+    line.clear();
+    bool found = false;
+    bool final_seen = false;
+    bool echo_seen = false;
+    bool expects_sms_pdu = false;
+    size_t pos = 0;
+    while (pos <= response.size()) {
+        size_t end = response.find('\n', pos);
+        if (end == std::string::npos) end = response.size();
+        const std::string row = idf_util_trim_copy(response.substr(pos, end - pos));
+        if (!row.empty()) {
+            if (expects_sms_pdu) {
+                if (policy != EsimResponsePolicy::legacy_profile || !is_profile_sms_pdu(row)) {
+                    return false;
+                }
+                expects_sms_pdu = false;
+            } else if (row == "OK") {
+                if (final_seen) return false;
+                final_seen = true;
+            } else if (final_seen) {
+                return false;
+            } else if (row.rfind("AT+", 0) == 0) {
+                if (echo_seen || row != command) return false;
+                echo_seen = true;
+            } else if (row == "ERROR" || row.rfind("+CME ERROR", 0) == 0 ||
+                       row.rfind("+CMS ERROR", 0) == 0) {
+                return false;
+            } else if (row.rfind(prefix, 0) == 0) {
+                if (found) return false;
+                line = row;
+                found = true;
+            } else if (policy == EsimResponsePolicy::legacy_profile &&
+                       is_profile_urc(row, expects_sms_pdu)) {
+                // Only the modem's bounded preserved URCs are ignored for legacy profile reads.
+            } else {
+                return false;
+            }
+        }
+        if (end == response.size()) break;
+        pos = end + 1U;
+    }
+    return found && final_seen && !expects_sms_pdu;
 }
 
 static bool parse_quoted_hex_response(const std::string& resp,
+                                      const std::string& command,
                                       const char* prefix,
                                       std::vector<uint8_t>& out,
-                                      std::string& message)
+                                      std::string& message,
+                                      EsimResponsePolicy policy)
 {
-    std::string line = first_line_containing(resp, prefix);
-    if (line.empty()) {
-        message = "The modem did not return APDU data";
+    out.clear();
+    std::string line;
+    if (!find_unique_response_line(resp, command, prefix, line, policy)) {
+        message = "The modem APDU response is incomplete";
         return false;
     }
-    std::string hex;
-    size_t q1 = line.find('"');
-    size_t q2 = (q1 == std::string::npos) ? std::string::npos : line.find('"', q1 + 1);
-    if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
-        hex = line.substr(q1 + 1, q2 - q1 - 1);
-    } else {
-        size_t comma = line.find(',');
-        if (comma != std::string::npos) hex = idf_util_trim_copy(line.substr(comma + 1));
-        if (!hex.empty() && hex.front() == '"') hex.erase(0, 1);
-        if (!hex.empty() && hex.back() == '"') hex.pop_back();
-    }
-    if (hex.empty()) {
+    const size_t colon = line.find(':');
+    const size_t comma = line.find(',', colon == std::string::npos ? 0U : colon + 1U);
+    if (colon == std::string::npos || comma == std::string::npos) {
         message = "The modem APDU response format cannot be parsed";
         return false;
     }
-    if (!hex_to_bytes(hex, out)) {
+    size_t declared_length = 0;
+    if (!parse_size_token(line.substr(colon + 1U, comma - colon - 1U), declared_length) ||
+        declared_length > APDU_RESPONSE_DATA_MAX * 2U) {
+        message = "The modem APDU response length is invalid";
+        return false;
+    }
+    const size_t q1 = line.find('"', comma + 1U);
+    if (q1 == std::string::npos || !idf_util_trim_copy(line.substr(comma + 1U, q1 - comma - 1U)).empty()) {
+        message = "The modem APDU response data is not quoted";
+        return false;
+    }
+    const size_t q2 = line.find('"', q1 + 1U);
+    if (q2 == std::string::npos || !idf_util_trim_copy(line.substr(q2 + 1U)).empty()) {
+        message = "The modem APDU response quotes are invalid";
+        return false;
+    }
+    const std::string hex = line.substr(q1 + 1U, q2 - q1 - 1U);
+    if (declared_length != hex.size() || hex.empty() || (hex.size() & 1U) != 0U ||
+        !hex_to_bytes(hex, out)) {
         message = "The modem APDU response is not valid hex";
+        out.clear();
         return false;
     }
     return true;
 }
 
-static bool parse_ccho_channel(const std::string& resp, int& channel)
+static bool parse_ccho_channel(const std::string& resp,
+                               const std::string& command,
+                               int& channel,
+                               int& candidate_channel,
+                               EsimResponsePolicy policy)
 {
-    std::string line = first_line_containing(resp, "+CCHO:");
-    if (!line.empty()) {
-        const char* p = strchr(line.c_str(), ':');
-        if (!p) return false;
-        return parse_positive_int_token(p + 1, channel);
-    }
-
-    // Some modems return only a bare number. Skip echo, OK, and empty lines.
+    channel = 0;
+    candidate_channel = 0;
+    bool found = false;
+    bool final_seen = false;
+    bool echo_seen = false;
+    bool expects_sms_pdu = false;
     size_t pos = 0;
-    while (pos < resp.size()) {
+    while (pos <= resp.size()) {
         size_t end = resp.find('\n', pos);
         if (end == std::string::npos) end = resp.size();
-        std::string row = idf_util_trim_copy(resp.substr(pos, end - pos));
-        if (!row.empty() && row != "OK" && row.rfind("AT+", 0) != 0) {
-            if (parse_positive_int_token(row, channel)) return true;
+        const std::string row = idf_util_trim_copy(resp.substr(pos, end - pos));
+        if (!row.empty()) {
+            if (expects_sms_pdu) {
+                if (policy != EsimResponsePolicy::legacy_profile || !is_profile_sms_pdu(row)) {
+                    return false;
+                }
+                expects_sms_pdu = false;
+            } else if (row == "OK") {
+                if (final_seen) return false;
+                final_seen = true;
+            } else if (final_seen) {
+                return false;
+            } else if (row.rfind("AT+", 0) == 0) {
+                if (echo_seen || row != command) return false;
+                echo_seen = true;
+            } else if (row == "ERROR" || row.rfind("+CME ERROR", 0) == 0 ||
+                       row.rfind("+CMS ERROR", 0) == 0) {
+                return false;
+            } else if (row.rfind("+CCHO:", 0) == 0) {
+                const size_t colon = row.find(':');
+                int parsed = 0;
+                if (found || colon == std::string::npos ||
+                    !parse_positive_int_token(row.substr(colon + 1U), parsed)) {
+                    return false;
+                }
+                channel = parsed;
+                candidate_channel = parsed;
+                found = true;
+            } else if (all_digits(row)) {
+                int parsed = 0;
+                if (found || !parse_positive_int_token(row, parsed)) return false;
+                channel = parsed;
+                candidate_channel = parsed;
+                found = true;
+            } else if (policy == EsimResponsePolicy::legacy_profile &&
+                       is_profile_urc(row, expects_sms_pdu)) {
+                // Only the modem's bounded preserved URCs are ignored for legacy profile reads.
+            } else {
+                return false;
+            }
         }
-        pos = end + 1;
+        if (end == resp.size()) break;
+        pos = end + 1U;
     }
-    return false;
+    return found && final_seen && !expects_sms_pdu;
 }
 
 static uint8_t class_byte_for_channel(uint8_t cla, int channel)
@@ -396,43 +409,64 @@ static uint16_t response_sw(const std::vector<uint8_t>& resp)
 static constexpr bool response_sw_ok(uint16_t sw) { return sw == 0x9000 || (sw >> 8) == 0x91; }
 static_assert(response_sw_ok(0x9000) && response_sw_ok(0x9108) && !response_sw_ok(0x9300));
 
+static esp_err_t declare_terminal_capability(std::string& message)
+{
+    static constexpr const char* TERMINAL_CAPABILITY_CMD =
+        "AT+CSIM=20,\"80AA000005A903830107\"";
+    std::string response;
+    esp_err_t err = idf_modem_send_at(TERMINAL_CAPABILITY_CMD, 10000, response);
+    const bool has_csim_line = response.find("+CSIM:") != std::string::npos;
+    if (err != ESP_OK && !has_csim_line) {
+        message = "Terminal capability command failed";
+        return err;
+    }
+    uint16_t status = 0;
+    const idf_esim_internal::CsimParseResult result =
+        idf_esim_internal::parse_terminal_capability_csim(response, status, message);
+    if (result == idf_esim_internal::CsimParseResult::success) return ESP_OK;
+    return result == idf_esim_internal::CsimParseResult::status_error ? ESP_ERR_NOT_SUPPORTED : ESP_FAIL;
+}
+
 class EsimApduSession {
 public:
+    explicit EsimApduSession(bool terminal_capability_required = false,
+                             EsimResponsePolicy response_policy = EsimResponsePolicy::strict_lpa)
+        : m_terminal_capability_required(terminal_capability_required),
+          m_response_policy(response_policy)
+    {
+    }
+
     esp_err_t open(std::string& message)
     {
         if (m_open) return ESP_OK;
+        if (m_terminal_capability_required) {
+            const esp_err_t capability_err = declare_terminal_capability(message);
+            if (capability_err != ESP_OK) return capability_err;
+        }
         std::string cmd = "AT+CCHO=\"";
         cmd += ISDR_AID_HEX;
         cmd += "\"";
         std::string resp;
+        int candidate_channel = 0;
         esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
-        if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
+        if (err != ESP_OK ||
+            !parse_ccho_channel(resp, cmd, m_channel, candidate_channel, m_response_policy)) {
             // An abnormal previous session can leave a logical channel open. Close channels 1 through 3 and retry once.
-            for (int ch = 1; ch <= 3; ++ch) {
-                char cchc[24];
-                snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", ch);
-                std::string ignored;
-                idf_modem_send_at(cchc, 3000, ignored);
-            }
+            close_known_channels(candidate_channel);
             resp.clear();
             err = idf_modem_send_at(cmd, 30000, resp);
+            candidate_channel = 0;
         }
-        if (err != ESP_OK || !parse_ccho_channel(resp, m_channel)) {
-            message = "Failed to open the eUICC logical channel: ";
-            message += resp.empty() ? esp_err_to_name(err) : resp;
-            // A stale proactive session can make CCHO return CME ERROR until a UICC reset clears it.
-            message += "; if this repeats, restart the modem from the overview page";
+        if (err != ESP_OK ||
+            !parse_ccho_channel(resp, cmd, m_channel, candidate_channel, m_response_policy)) {
+            message = (err == ESP_OK) ? "Failed to open the eUICC logical channel: invalid response"
+                                      : "Failed to open the eUICC logical channel: modem command failed";
+            close_known_channels(candidate_channel);
             return err == ESP_OK ? ESP_FAIL : err;
         }
         if (m_channel <= 0 || m_channel > 19) {
-            char buf[96];
-            snprintf(buf, sizeof(buf), "The modem returned unsupported logical channel %d", m_channel);
-            message = buf;
-            // close() only acts when m_open is true. Close this out-of-range channel directly to prevent a channel leak.
-            char cchc[24];
-            snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", m_channel);
-            std::string ignored;
-            idf_modem_send_at(cchc, 5000, ignored);
+            message = "The modem returned an unsupported logical channel";
+            close_known_channels(m_channel);
             m_channel = 0;
             return ESP_FAIL;
         }
@@ -473,10 +507,13 @@ public:
         std::string resp;
         esp_err_t err = idf_modem_send_at(cmd, 30000, resp);
         if (err != ESP_OK) {
-            message = resp.empty() ? std::string(esp_err_to_name(err)) : resp;
+            message = "APDU modem command failed";
             return err;
         }
-        if (!parse_quoted_hex_response(resp, "+CGLA:", response, message)) return ESP_FAIL;
+        if (!parse_quoted_hex_response(resp, cmd, "+CGLA:", response, message, m_response_policy)) {
+            response.clear();
+            return ESP_FAIL;
+        }
         if (response.size() < 2) {
             message = "APDU response is too short";
             return ESP_FAIL;
@@ -494,32 +531,80 @@ public:
         }
         response_data.clear();
         size_t offset = 0;
-        uint8_t p2 = 0;
+        uint16_t block_number = 0;
         while (offset < payload.size()) {
             size_t n = std::min(STORE_DATA_MSS, payload.size() - offset);
             bool last = (offset + n == payload.size());
-            std::vector<uint8_t> apdu;
-            apdu.reserve(5 + n);
-            apdu.push_back(class_byte_for_channel(0x80, m_channel));
-            apdu.push_back(0xE2);
-            apdu.push_back(last ? 0x91 : 0x11);
-            apdu.push_back(p2);
-            apdu.push_back(static_cast<uint8_t>(n));
-            apdu.insert(apdu.end(), payload.begin() + offset, payload.begin() + offset + n);
-
-            std::vector<uint8_t> resp;
-            esp_err_t err = transmit_apdu(apdu, resp, message);
-            if (err != ESP_OK) return err;
-            err = collect_response(resp, response_data, message);
+            if (block_number > 0xFFU) {
+                message = "STORE DATA segment is too large";
+                return ESP_ERR_INVALID_SIZE;
+            }
+            esp_err_t err = exchange_store_data_block(
+                payload.data() + offset, n, last, static_cast<uint8_t>(block_number),
+                response_data, message);
             if (err != ESP_OK) return err;
 
             offset += n;
-            ++p2;
+            ++block_number;
         }
         return ESP_OK;
     }
 
+    esp_err_t exchange_store_data_block(const uint8_t* data,
+                                        size_t length,
+                                        bool last,
+                                        uint8_t block_number,
+                                        std::vector<uint8_t>& response_data,
+                                        std::string& message)
+    {
+        if (!data || length == 0U || length > STORE_DATA_MSS) {
+            response_data.clear();
+            message = "STORE DATA block size is invalid";
+            return ESP_ERR_INVALID_ARG;
+        }
+        std::vector<uint8_t> apdu;
+        apdu.reserve(5U + length);
+        apdu.push_back(class_byte_for_channel(0x80, m_channel));
+        apdu.push_back(0xE2);
+        apdu.push_back(last ? 0x91 : 0x11);
+        apdu.push_back(block_number);
+        apdu.push_back(static_cast<uint8_t>(length));
+        apdu.insert(apdu.end(), data, data + length);
+
+        std::vector<uint8_t> resp;
+        const esp_err_t err = transmit_apdu(apdu, resp, message);
+        if (err != ESP_OK) {
+            response_data.clear();
+            return err;
+        }
+        std::vector<uint8_t> collected;
+        const esp_err_t collect_err = collect_response(resp, collected, message);
+        if (collect_err != ESP_OK) {
+            response_data.clear();
+            return collect_err;
+        }
+        response_data.swap(collected);
+        return ESP_OK;
+    }
+
 private:
+    void close_known_channels(int parsed_channel = 0)
+    {
+        if (parsed_channel > 0 && parsed_channel <= 999) {
+            char cchc[24];
+            snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", parsed_channel);
+            std::string ignored;
+            idf_modem_send_at(cchc, 3000, ignored);
+        }
+        for (int ch = 1; ch <= 3; ++ch) {
+            if (ch == parsed_channel) continue;
+            char cchc[24];
+            snprintf(cchc, sizeof(cchc), "AT+CCHC=%d", ch);
+            std::string ignored;
+            idf_modem_send_at(cchc, 3000, ignored);
+        }
+    }
+
     esp_err_t collect_response(const std::vector<uint8_t>& first,
                                std::vector<uint8_t>& out,
                                std::string& message)
@@ -560,24 +645,47 @@ private:
 
     int m_channel = 0;
     bool m_open = false;
+    bool m_terminal_capability_required = false;
+    EsimResponsePolicy m_response_policy = EsimResponsePolicy::strict_lpa;
 };
+
+class EsimOperationGuard {
+public:
+    EsimOperationGuard() { idf_modem_begin_esim_operation(); }
+    ~EsimOperationGuard() { idf_modem_end_esim_operation(); }
+};
+
+static esp_err_t invoke_es10_raw(const std::vector<uint8_t>& request,
+                                 bool terminal_capability_required,
+                                 std::vector<uint8_t>& response,
+                                 std::string& message,
+                                 EsimResponsePolicy response_policy = EsimResponsePolicy::strict_lpa)
+{
+    response.clear();
+    EsimOperationGuard guard;
+    EsimApduSession session(terminal_capability_required, response_policy);
+    const esp_err_t err = session.open(message);
+    if (err != ESP_OK) return err;
+    const esp_err_t exchange_err = session.exchange_store_data(request, response, message);
+    if (exchange_err != ESP_OK) response.clear();
+    return exchange_err;
+}
 
 static esp_err_t invoke_es10c(const std::vector<uint8_t>& request,
                               Tlv& response,
                               std::string& message)
 {
-    struct OperationGuard {
-        OperationGuard() { idf_modem_begin_esim_operation(); }
-        ~OperationGuard() { idf_modem_end_esim_operation(); }
-    } guard;
-    EsimApduSession session;
-    esp_err_t err = session.open(message);
-    if (err != ESP_OK) return err;
     std::vector<uint8_t> raw;
-    err = session.exchange_store_data(request, raw, message);
+    const esp_err_t err = invoke_es10_raw(
+        request, false, raw, message, EsimResponsePolicy::legacy_profile);
     if (err != ESP_OK) return err;
     if (!parse_tlv(raw, response, message)) return ESP_FAIL;
     return ESP_OK;
+}
+
+static std::vector<uint8_t> make_empty_request(uint8_t tag_low)
+{
+    return {0xBF, tag_low, 0x00};
 }
 
 static std::vector<uint8_t> make_get_eid_request()
@@ -1044,6 +1152,62 @@ static esp_err_t set_profile_nickname(const std::string& raw,
     return ESP_FAIL;
 }
 
+static esp_err_t read_lpa_preflight(EsimApduSession& session,
+                                    std::vector<uint8_t>* raw_info1,
+                                    std::string& message)
+{
+    std::vector<uint8_t> raw;
+    idf_esim_internal::EuiccInfo1Fields info1;
+    esp_err_t err = session.exchange_store_data(make_empty_request(0x20), raw, message);
+    if (err != ESP_OK) return err;
+    if (!idf_esim_internal::parse_euicc_info1(raw, info1, message)) return ESP_FAIL;
+    if (raw_info1) *raw_info1 = std::move(raw);
+
+    raw.clear();
+    idf_esim_internal::EuiccInfo2Fields info2;
+    err = session.exchange_store_data(make_empty_request(0x22), raw, message);
+    if (err != ESP_OK) return err;
+    if (!idf_esim_internal::parse_euicc_info2(raw, info2, message)) return ESP_FAIL;
+    return ESP_OK;
+}
+
+static esp_err_t read_lpa_auth_material(std::vector<uint8_t>& euicc_info1,
+                                        std::array<uint8_t, 16>& challenge,
+                                        std::string& message)
+{
+    euicc_info1.clear();
+    challenge.fill(0);
+    EsimOperationGuard guard;
+    EsimApduSession session(true);
+    esp_err_t err = session.open(message);
+    if (err != ESP_OK) return err;
+
+    err = read_lpa_preflight(session, &euicc_info1, message);
+    if (err != ESP_OK) {
+        euicc_info1.clear();
+        return err;
+    }
+
+    std::vector<uint8_t> raw;
+    err = session.exchange_store_data(make_empty_request(0x2E), raw, message);
+    if (err != ESP_OK) {
+        euicc_info1.clear();
+        return err;
+    }
+    if (!idf_esim_internal::parse_euicc_challenge(raw, challenge.data(), message)) {
+        euicc_info1.clear();
+        challenge.fill(0);
+        return ESP_FAIL;
+    }
+    message = "eUICC LPA authentication material is ready";
+    return ESP_OK;
+}
+
+struct IdfEsimLpaBppSessionImpl {
+    std::unique_ptr<EsimOperationGuard> guard;
+    std::unique_ptr<EsimApduSession> session;
+};
+
 }  // namespace
 
 void idf_esim_init(void)
@@ -1055,6 +1219,237 @@ void idf_esim_init(void)
 esp_err_t idf_esim_get_eid(std::string& eid, std::string& message)
 {
     return read_eid(eid, message);
+}
+
+esp_err_t idf_esim_lpa_get_auth_material(std::vector<uint8_t>& euicc_info1,
+                                         std::array<uint8_t, 16>& challenge,
+                                         std::string& safe_message)
+{
+    return read_lpa_auth_material(euicc_info1, challenge, safe_message);
+}
+
+esp_err_t idf_esim_lpa_authenticate_server(const std::vector<uint8_t>& request,
+                                           std::vector<uint8_t>& response,
+                                           std::string& safe_message)
+{
+    response.clear();
+    if (request.empty() || request.size() > APDU_RESPONSE_DATA_MAX) {
+        safe_message = "AuthenticateServer data object size is invalid";
+        return ESP_ERR_INVALID_SIZE;
+    }
+    static constexpr uint8_t TAG_AUTHENTICATE_SERVER[] = {0xBF, 0x38};
+    Tlv request_tlv;
+    if (!parse_tlv(request, request_tlv, safe_message) ||
+        !tag_is(request_tlv, TAG_AUTHENTICATE_SERVER)) {
+        safe_message = "AuthenticateServer data object tag is invalid";
+        return ESP_ERR_INVALID_ARG;
+    }
+    return invoke_es10_raw(request, true, response, safe_message);
+}
+
+esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
+                                        std::vector<uint8_t>& response,
+                                        std::string& safe_message)
+{
+    response.clear();
+    if (request.empty() || request.size() > APDU_RESPONSE_DATA_MAX) {
+        safe_message = "PrepareDownload data object size is invalid";
+        return ESP_ERR_INVALID_SIZE;
+    }
+    static constexpr uint8_t TAG_PREPARE_DOWNLOAD[] = {0xBF, 0x21};
+    Tlv request_tlv;
+    if (!parse_tlv(request, request_tlv, safe_message) ||
+        !tag_is(request_tlv, TAG_PREPARE_DOWNLOAD)) {
+        safe_message = "PrepareDownload data object tag is invalid";
+        return ESP_ERR_INVALID_ARG;
+    }
+    return invoke_es10_raw(request, true, response, safe_message);
+}
+
+esp_err_t idf_esim_lpa_retrieve_notifications(std::vector<uint8_t>& encoded_response,
+                                              size_t& list_offset,
+                                              size_t& list_length,
+                                              std::string& safe_message)
+{
+    encoded_response.clear();
+    list_offset = 0;
+    list_length = 0;
+    static constexpr uint8_t TAG_RETRIEVE_NOTIFICATIONS[] = {0xBF, 0x2B};
+    static constexpr uint8_t TAG_NOTIFICATION_LIST[] = {0xA0};
+    static constexpr uint8_t TAG_RESULT_ERROR[] = {0x81};
+    const std::vector<uint8_t> request = {0xBF, 0x2B, 0x00};
+
+    esp_err_t err = invoke_es10_raw(request, true, encoded_response, safe_message);
+    if (err != ESP_OK) return err;
+
+    size_t pos = 0;
+    idf_esim_internal::TlvSpan root;
+    if (!idf_esim_internal::parse_tlv_span(
+            encoded_response, encoded_response.size(), pos, root, safe_message) ||
+        pos != encoded_response.size() ||
+        !idf_esim_internal::tag_is(encoded_response, root, TAG_RETRIEVE_NOTIFICATIONS)) {
+        encoded_response.clear();
+        safe_message = "RetrieveNotificationsList response tag is invalid";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    pos = root.valueOffset;
+    const size_t root_end = root.valueOffset + root.valueLength;
+    idf_esim_internal::TlvSpan choice;
+    if (!idf_esim_internal::parse_tlv_span(
+            encoded_response, root_end, pos, choice, safe_message) || pos != root_end) {
+        encoded_response.clear();
+        safe_message = "RetrieveNotificationsList response choice is invalid";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (idf_esim_internal::tag_is(encoded_response, choice, TAG_RESULT_ERROR)) {
+        if (choice.valueLength == 1U && encoded_response[choice.valueOffset] == 127U) {
+            safe_message = "The eUICC could not retrieve pending notifications";
+        } else {
+            safe_message = "RetrieveNotificationsList error result is invalid";
+        }
+        encoded_response.clear();
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    if (!idf_esim_internal::tag_is(encoded_response, choice, TAG_NOTIFICATION_LIST)) {
+        encoded_response.clear();
+        safe_message = "RetrieveNotificationsList success result is invalid";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    list_offset = choice.valueOffset;
+    list_length = choice.valueLength;
+    return ESP_OK;
+}
+
+esp_err_t idf_esim_lpa_remove_notification(uint32_t sequence_number,
+                                           std::string& safe_message)
+{
+    std::vector<uint8_t> integer;
+    uint32_t value = sequence_number;
+    do {
+        integer.push_back(static_cast<uint8_t>(value & 0xFFU));
+        value >>= 8U;
+    } while (value != 0U);
+    std::reverse(integer.begin(), integer.end());
+    if ((integer.front() & 0x80U) != 0U) integer.insert(integer.begin(), 0U);
+
+    static constexpr uint8_t TAG_REMOVE_NOTIFICATION[] = {0xBF, 0x30};
+    static constexpr uint8_t TAG_SEQUENCE_NUMBER[] = {0x80};
+    std::vector<uint8_t> body;
+    append_tlv(body, TAG_SEQUENCE_NUMBER, integer);
+    std::vector<uint8_t> request;
+    append_tlv(request, TAG_REMOVE_NOTIFICATION, body);
+    std::vector<uint8_t> response;
+    esp_err_t err = invoke_es10_raw(request, true, response, safe_message);
+    if (err != ESP_OK) return err;
+
+    static constexpr uint8_t TAG_STATUS[] = {0x80};
+    Tlv root;
+    if (!parse_tlv(response, root, safe_message) ||
+        !tag_is(root, TAG_REMOVE_NOTIFICATION) || root.children.size() != 1U ||
+        !tag_is(root.children.front(), TAG_STATUS) ||
+        root.children.front().value.size() != 1U) {
+        safe_message = "RemoveNotificationFromList response is invalid";
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    switch (root.children.front().value[0]) {
+        case 0x00:
+            return ESP_OK;
+        case 0x01:
+            idf_log_line("eSIM pending notification is already absent");
+            return ESP_OK;
+        case 0x7F:
+            safe_message = "The eUICC failed to remove the pending notification";
+            return ESP_FAIL;
+        default:
+            safe_message = "RemoveNotificationFromList returned an unknown status";
+            return ESP_ERR_INVALID_RESPONSE;
+    }
+}
+
+IdfEsimLpaBppSession::IdfEsimLpaBppSession() : impl_(nullptr) {}
+
+IdfEsimLpaBppSession::IdfEsimLpaBppSession(IdfEsimLpaBppSession&& other) noexcept
+    : impl_(other.impl_)
+{
+    other.impl_ = nullptr;
+}
+
+IdfEsimLpaBppSession& IdfEsimLpaBppSession::operator=(IdfEsimLpaBppSession&& other) noexcept
+{
+    if (this == &other) return *this;
+    close();
+    impl_ = other.impl_;
+    other.impl_ = nullptr;
+    return *this;
+}
+
+IdfEsimLpaBppSession::~IdfEsimLpaBppSession()
+{
+    close();
+}
+
+esp_err_t IdfEsimLpaBppSession::begin_segment(std::string& safe_message)
+{
+    close();
+    auto* impl = new (std::nothrow) IdfEsimLpaBppSessionImpl();
+    if (!impl) {
+        safe_message = "BPP segment session is out of memory";
+        return ESP_ERR_NO_MEM;
+    }
+    impl->guard.reset(new (std::nothrow) EsimOperationGuard());
+    impl->session.reset(new (std::nothrow) EsimApduSession(true));
+    if (!impl->guard || !impl->session) {
+        impl->session.reset();
+        impl->guard.reset();
+        delete impl;
+        safe_message = "BPP segment session is out of memory";
+        return ESP_ERR_NO_MEM;
+    }
+    const esp_err_t err = impl->session->open(safe_message);
+    if (err != ESP_OK) {
+        impl->session.reset();
+        impl->guard.reset();
+        delete impl;
+        return err;
+    }
+    impl_ = impl;
+    return ESP_OK;
+}
+
+esp_err_t IdfEsimLpaBppSession::write_block(const uint8_t* data,
+                                            size_t length,
+                                            bool last,
+                                            uint16_t block_number,
+                                            std::vector<uint8_t>& response,
+                                            std::string& safe_message)
+{
+    auto* impl = static_cast<IdfEsimLpaBppSessionImpl*>(impl_);
+    if (!impl || !impl->session) {
+        response.clear();
+        safe_message = "BPP segment session is not open";
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (block_number > 0xFFU) {
+        response.clear();
+        safe_message = "BPP block number is out of range";
+        return ESP_ERR_INVALID_ARG;
+    }
+    return impl->session->exchange_store_data_block(data, length, last,
+                                                    static_cast<uint8_t>(block_number),
+                                                    response, safe_message);
+}
+
+void IdfEsimLpaBppSession::close()
+{
+    auto* impl = static_cast<IdfEsimLpaBppSessionImpl*>(impl_);
+    if (!impl) return;
+    if (impl->session) impl->session->close();
+    impl->session.reset();
+    impl->guard.reset();
+    delete impl;
+    impl_ = nullptr;
 }
 
 esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& profiles,
