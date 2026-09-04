@@ -431,6 +431,12 @@ class UartOwnerContractTest(unittest.TestCase):
             freertos = stub_root / "freertos"
             mbedtls.mkdir(parents=True)
             freertos.mkdir(parents=True)
+            (stub_root / "esp_idf_version.h").write_text(r'''
+#pragma once
+#define ESP_IDF_VERSION_VAL(major, minor, patch) \
+    ((major) * 10000 + (minor) * 100 + (patch))
+#define ESP_IDF_VERSION ESP_IDF_VERSION_VAL(6, 0, 2)
+''')
             (stub_root / "mbedtls_stub.h").write_text(r'''
 #pragma once
 #include <cstddef>
@@ -446,6 +452,7 @@ struct mbedtls_ssl_context {
     int (*bio_recv)(void*, unsigned char*, size_t) = nullptr;
 };
 struct mbedtls_x509_crt {};
+struct mbedtls_md_info_t {};
 
 extern int fixture_tls_setup_result;
 extern int fixture_tls_handshake_result;
@@ -474,6 +481,16 @@ inline void mbedtls_entropy_init(mbedtls_entropy_context*) {}
 inline void mbedtls_entropy_free(mbedtls_entropy_context*) {}
 inline int mbedtls_entropy_func(void*, unsigned char*, size_t) { return 0; }
 inline int mbedtls_sha256(const unsigned char*, size_t, unsigned char* output, int) {
+    std::memset(output, 0xab, 32);
+    return 0;
+}
+inline constexpr int MBEDTLS_MD_SHA256 = 0;
+inline const mbedtls_md_info_t* mbedtls_md_info_from_type(int) {
+    static const mbedtls_md_info_t info{};
+    return &info;
+}
+inline int mbedtls_md(const mbedtls_md_info_t*, const unsigned char*, size_t,
+                      unsigned char* output) {
     std::memset(output, 0xab, 32);
     return 0;
 }
@@ -521,7 +538,8 @@ inline int mbedtls_x509_crt_get_ca_istrue(const mbedtls_x509_crt*) { return 1; }
 inline int mbedtls_x509_crt_check_key_usage(const mbedtls_x509_crt*, unsigned int) { return 0; }
 ''')
             for header in (
-                "ctr_drbg.h", "entropy.h", "net_sockets.h", "sha256.h", "ssl.h", "x509_crt.h"
+                "ctr_drbg.h", "entropy.h", "md.h", "net_sockets.h", "sha256.h", "ssl.h",
+                "x509_crt.h"
             ):
                 (mbedtls / header).write_text('#include "../mbedtls_stub.h"\n')
             (freertos / "FreeRTOS.h").write_text(r'''
