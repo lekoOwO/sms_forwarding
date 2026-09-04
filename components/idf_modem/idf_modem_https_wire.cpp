@@ -948,7 +948,7 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
             remote_closed = true;
             return true;
         }
-        if (body.empty() && command_echo_count == 1 && !ignored_auxiliary_seen) {
+        if (body.empty() && command_echo_count <= 1 && !ignored_auxiliary_seen) {
             if (no_data) *no_data = true;
             return true;
         }

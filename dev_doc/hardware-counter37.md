@@ -157,6 +157,28 @@ bytes，也不能透過 EOF 完成 HTTP parser；deadline、TLS、HTTP 與 retry
 「暫時沒有資料」。若未來遇到其他空 frame，必須重新提供 bounded fixture 或硬體報告，
 且不得因此放寬未知行、輔助訊息或 EOF 語意。
 
+## Counter42 echo-free implementation correction
+
+目前 source 的 owner UART path 會在寫入 MIP command 前做 bounded pending drain，之後把
+UART 收到的 bytes 原樣放入 response 與 scanner；owner 不會自行加入或移除 command echo
+（`components/idf_modem/idf_modem.cpp:1972-1983,2060-2072`）。但啟動與 recovery 的
+`try_unlock_sim()` 及 `configure_sms_and_registration()` 都會送出 `ATE0`，而目前沒有
+`ATE1` 路徑（同檔 `:1501`、`:2587`）。因此 command echo 是可選的 source/runtime
+狀態，不可作為 production response 必然存在的前提；這段只記錄 implementation
+contract，不宣稱任何通用 ML307 wire grammar。
+
+R14 receipt 的安全 projection 只記錄 cellular dispatch attempted、mode1/push/cleanup
+各一次，最後落在 response/cleanup failure；response 的 bounded reason 是
+`modem_read` + `prefix`，cleanup 需要 reset。這個 receipt 沒有保存或證明 raw response
+是否含 echo，也沒有宣稱 push 成功、modem recovery 或 protocol 語意。
+
+Counter42 因此只把 terminal-only no-data 的 echo 條件由「恰好一個」調整為「零或一個」：
+唯一 terminal、空 retained body、無被忽略的輔助行與非 disconnect remote-close 等既有
+guards 全部保留；duplicate echo 仍拒絕。成功仍只是 provisional no-data，transport 以
+bounded cadence 回到同一 operation deadline，回傳 WANT_READ 而非 EOF，不會直接完成
+HTTP response。未知行、SMS/PDU、錯誤、duplicate terminal 與真正的 MIPRD data path
+仍維持原有 fail-closed 行為。
+
 ## Acceptance promotion path
 
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：
