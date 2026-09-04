@@ -28,7 +28,9 @@ enum class MipStateDisposition : uint8_t {
 bool scan_frame(std::string_view response, std::string_view command,
                 std::vector<std::string_view>& body,
                 IdfModemHttpsParseReason* reason = nullptr,
-                IdfModemHttpsParseShape* shape = nullptr);
+                IdfModemHttpsParseShape* shape = nullptr,
+                uint8_t* command_echo_count = nullptr,
+                bool* ignored_auxiliary_seen = nullptr);
 bool parse_cfg_response(std::string_view response, std::string_view command,
                         std::string_view parameter, uint8_t& first, uint8_t& second,
                         bool& has_second);
@@ -62,7 +64,8 @@ bool parse_mip_close_result(std::string_view response, std::string_view command,
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
                 uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed,
                 IdfModemHttpsParseReason* reason = nullptr,
-                IdfModemHttpsParseShape* shape = nullptr);
+                IdfModemHttpsParseShape* shape = nullptr,
+                bool* no_data = nullptr);
 std::string hex_encode(const uint8_t* bytes, size_t length);
 
 class MipOpenLatch {

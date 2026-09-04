@@ -133,6 +133,30 @@ callback 回傳 OK 但 response 超過既有整體 response 上限，仍在 `sen
 避免為了 telemetry 改動 command/control flow。這份報告不宣稱 R12 已由新分類
 重新驗證，亦不授權 live push、reset、OTA 或設定寫入。
 
+## Counter41 R13 terminal-only no-data implementation contract
+
+Counter41 定義一個只有 command echo 與唯一 terminal `OK`、沒有 retained result 的
+bounded implementation contract；這不是硬體報告。R13 沒有保存板型、modem、輸入、
+observed result provenance、raw response、hash、時間序列或裝置資料，因此本節不把
+這個形狀提升為通用 modem protocol fact，也不記錄或重述 raw modem、host、IP、URL、
+token、CSRF、憑證或設定內容。
+
+Counter41 只在 `parse_read()` 內分類這個狹窄形狀：必須存在 command echo，
+`scan_frame()` 必須確認唯一 terminal，body 必須為空，且沒有被 scanner 忽略的
+已知 URC、SMS indication 或 PDU。未知/額外行、非 disconnect MIPURC、ERROR/CME/CMS、
+缺少或重複 terminal 仍 fail closed。輸出會先清為 zero/empty/not-closed；只有
+`no_data=true` 這個 internal provisional disposition 成功時才返回，永遠不設定
+remote-close，也不表示 HTTP response 或 delivery success。
+
+transport 會把該 disposition 轉成 non-closed empty read，並以現有 bounded poll
+cadence、按剩餘 operation deadline 截斷的 RTOS delay 後再輪詢。它不能直接餵出 HTTP
+bytes，也不能透過 EOF 完成 HTTP parser；deadline、TLS、HTTP 與 retry/control flow
+仍維持既有邊界。明確 disconnect URC 仍是唯一可設定 remote-close 的空讀路徑。
+
+這是對這個 R13-shaped input 的最小安全分類，不是宣稱空 body 在所有 ML307 韌體上都代表
+「暫時沒有資料」。若未來遇到其他空 frame，必須重新提供 bounded fixture 或硬體報告，
+且不得因此放寬未知行、輔助訊息或 EOF 語意。
+
 ## Acceptance promotion path
 
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：

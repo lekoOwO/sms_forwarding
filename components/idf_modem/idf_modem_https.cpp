@@ -444,10 +444,11 @@ private:
         uint32_t unread = 0;
         std::vector<uint8_t> data;
         bool remote_closed = false;
+        bool no_data = false;
         ParseReason parse_reason = ParseReason::none;
         ParseShape parse_shape{};
         if (!parse_read(response, command, 0, unread, data, remote_closed,
-                        &parse_reason, &parse_shape)) {
+                        &parse_reason, &parse_shape, &no_data)) {
             failure_parse_reason_ = parse_reason;
             failure_parse_shape_ = parse_shape;
             record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
@@ -455,7 +456,18 @@ private:
         }
         if (remote_closed) remote_closed_ = true;
         pending_ = std::move(data);
-        if (pending_.empty()) return true;
+        if (pending_.empty()) {
+            if (no_data && !deadline_.expired()) {
+                const int64_t remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline_.end() - Clock::now()).count();
+                if (remaining_ms > 0) {
+                    const uint32_t delay_ms = static_cast<uint32_t>(std::min<int64_t>(
+                        remaining_ms, static_cast<int64_t>(kConnectedPollCadenceMs)));
+                    if (delay_ms > 0) vTaskDelay(pdMS_TO_TICKS(delay_ms));
+                }
+            }
+            return true;
+        }
         const size_t count = std::min(length, pending_.size());
         std::copy_n(pending_.begin(), count, bytes);
         pending_.erase(pending_.begin(), pending_.begin() + static_cast<ptrdiff_t>(count));

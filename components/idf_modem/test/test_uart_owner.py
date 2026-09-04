@@ -533,7 +533,10 @@ using TickType_t = uint32_t;
             (freertos / "task.h").write_text(r'''
 #pragma once
 #include "FreeRTOS.h"
-inline void vTaskDelay(TickType_t) {}
+extern int fixture_vtask_delay_calls;
+inline void vTaskDelay(TickType_t) {
+    ++fixture_vtask_delay_calls;
+}
 ''')
             binary = Path(directory) / "https_post_fixture"
             compile_result = subprocess.run(

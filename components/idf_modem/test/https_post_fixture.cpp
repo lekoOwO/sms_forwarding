@@ -12,6 +12,7 @@
 int fixture_tls_setup_result = 0;
 int fixture_tls_handshake_result = 0;
 int fixture_tls_read_result = 0;
+int fixture_vtask_delay_calls = 0;
 
 namespace {
 
@@ -416,18 +417,56 @@ void check_parse_read_reasons()
         uint32_t unread = 123;
         std::vector<uint8_t> data{0xde, 0xad};
         bool remote_closed = true;
+        bool no_data = true;
         ParseReason reason = ParseReason::none;
         ParseShape shape{};
         assert(!parse_read(frame(read_command, body), read_command, 0, unread, data,
-                           remote_closed, &reason, &shape));
+                           remote_closed, &reason, &shape, &no_data));
         assert(reason == expected);
-        assert(unread == 0 && data.empty() && !remote_closed);
+        assert(unread == 0 && data.empty() && !remote_closed && !no_data);
         if (line_class != IdfModemHttpsParseLineClass::none) {
             assert(shape.lineClass == line_class);
         }
     };
 
-    rejected("", ParseReason::prefix, IdfModemHttpsParseLineClass::missing);
+    ParseReason reason = ParseReason::none;
+    ParseShape shape{};
+    uint32_t unread = 123;
+    std::vector<uint8_t> data{0xbe, 0xef};
+    bool remote_closed = true;
+    bool no_data = true;
+    assert(parse_read(frame(read_command, ""), read_command, 0, unread, data, remote_closed,
+                      &reason, &shape, &no_data));
+    assert(reason == ParseReason::none && unread == 0 && data.empty() && !remote_closed &&
+           no_data && shape.available && shape.presenceMask == 0);
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    no_data = true;
+    const std::string no_echo = "\r\nOK\r\n";
+    assert(!parse_read(no_echo, read_command, 0, unread, data, remote_closed, &reason, &shape,
+                       &no_data));
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::missing &&
+           unread == 0 && data.empty() && !remote_closed && !no_data);
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    no_data = true;
+    const std::string duplicate_echo = "\r\n" + read_command + "\r\n" + read_command +
+                                       "\r\nOK\r\n";
+    assert(!parse_read(duplicate_echo, read_command, 0, unread, data, remote_closed, &reason,
+                       &shape, &no_data));
+    assert(reason == ParseReason::prefix && shape.lineClass == IdfModemHttpsParseLineClass::missing &&
+           unread == 0 && data.empty() && !remote_closed && !no_data);
+    rejected("+CEREG: 1,1", ParseReason::prefix, IdfModemHttpsParseLineClass::missing);
+    rejected("+CMT: 1\r\n0123456789ABCDEF0123456789ABCDEF",
+             ParseReason::prefix, IdfModemHttpsParseLineClass::missing);
+    rejected("+MIPURC: \"rtcp\",0,0,0", ParseReason::prefix,
+             IdfModemHttpsParseLineClass::missing);
     rejected("+OTHER: 0", ParseReason::prefix, IdfModemHttpsParseLineClass::unexpected);
     rejected("+MIPRD: 0,0,1,41\r\n+MIPRD: 0,0,1,41",
              ParseReason::prefix, IdfModemHttpsParseLineClass::duplicate);
@@ -441,17 +480,13 @@ void check_parse_read_reasons()
     rejected(std::string(idf_modem_https_wire::kResponseMax + 1, 'x'),
              ParseReason::oversize);
 
-    ParseReason reason = ParseReason::none;
-    ParseShape shape{};
-    uint32_t unread = 123;
-    std::vector<uint8_t> data{0xbe, 0xef};
-    bool remote_closed = true;
     const std::string missing_terminal = "\r\n" + read_command +
                                          "\r\n+MIPRD: 0,0,0,\r\n";
+    no_data = true;
     assert(!parse_read(missing_terminal, read_command, 0, unread, data, remote_closed,
-                       &reason, &shape));
+                       &reason, &shape, &no_data));
     assert(reason == ParseReason::terminal);
-    assert(unread == 0 && data.empty() && !remote_closed);
+    assert(unread == 0 && data.empty() && !remote_closed && !no_data);
 
     rejected("+MIPRD: 0,0,1", ParseReason::field_count);
     rejected("+MIPRD: 0,0,1,\"41\"", ParseReason::quote);
@@ -470,18 +505,22 @@ void check_parse_read_reasons()
     unread = 123;
     data = {0xbe, 0xef};
     remote_closed = true;
+    no_data = true;
     assert(parse_read(frame(read_command, "+MIPRD: 0,0,0,"), read_command, 0, unread,
-                      data, remote_closed, &reason, &shape));
-    assert(reason == ParseReason::none && unread == 0 && data.empty() && !remote_closed);
+                      data, remote_closed, &reason, &shape, &no_data));
+    assert(reason == ParseReason::none && unread == 0 && data.empty() && !remote_closed &&
+           !no_data);
 
     reason = ParseReason::none;
     shape = {};
     unread = 123;
     data = {0xbe, 0xef};
     remote_closed = false;
+    no_data = true;
     assert(parse_read(frame(read_command, "+MIPURC: \"disconn\",0,2"), read_command, 0,
-                      unread, data, remote_closed, &reason, &shape));
-    assert(reason == ParseReason::none && unread == 0 && data.empty() && remote_closed);
+                      unread, data, remote_closed, &reason, &shape, &no_data));
+    assert(reason == ParseReason::none && unread == 0 && data.empty() && remote_closed &&
+           !no_data);
 }
 
 void check_parse_shapes()
@@ -753,6 +792,8 @@ enum class RemoteCloseMode {
     unread_data,
     duplicate_disconnect,
     response_read_timeout,
+    response_read_no_data_then_data,
+    response_read_no_data_then_timeout,
     response_read_modem_failure,
     response_read_modem_error,
     response_read_http_parse,
@@ -1255,7 +1296,15 @@ struct RemoteCloseTranscript {
             if (transcript.mode == RemoteCloseMode::response_read_modem_error) {
                 return IdfModemHttpsCommandResult::modem_error;
             }
-            if (transcript.mode == RemoteCloseMode::disconnect_only) {
+            if (transcript.mode == RemoteCloseMode::response_read_no_data_then_timeout &&
+                transcript.read_commands > 1) {
+                return IdfModemHttpsCommandResult::timeout;
+            }
+            if ((transcript.mode == RemoteCloseMode::response_read_no_data_then_timeout ||
+                 transcript.mode == RemoteCloseMode::response_read_no_data_then_data) &&
+                transcript.read_commands == 1) {
+                response = frame(command, "");
+            } else if (transcript.mode == RemoteCloseMode::disconnect_only) {
                 response = frame(command, "+MIPURC: \"disconn\",0,2");
             } else if (transcript.mode == RemoteCloseMode::unread_data) {
                 response = frame(command,
@@ -1421,6 +1470,22 @@ void check_remote_close_transcripts()
            delivered.close_was_cleanup);
     assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
            delivered.autofree == 0);
+
+    fixture_vtask_delay_calls = 0;
+    RemoteCloseTranscript no_data_then_data{RemoteCloseMode::response_read_no_data_then_data};
+    result = {};
+    assert(run_remote_close_transcript(no_data_then_data, result) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && no_data_then_data.read_commands == 2 &&
+           no_data_then_data.close_commands == 1 && no_data_then_data.close_was_cleanup &&
+           fixture_vtask_delay_calls >= 1);
+
+    fixture_vtask_delay_calls = 0;
+    RemoteCloseTranscript no_data_timeout{RemoteCloseMode::response_read_no_data_then_timeout};
+    result = {};
+    assert(run_remote_close_transcript(no_data_timeout, result) == IdfModemHttpsRunResult::timed_out);
+    assert(!result.ok && result.responseBytes == 0 && no_data_timeout.read_commands == 2 &&
+           no_data_timeout.close_commands == 1 && no_data_timeout.close_was_cleanup &&
+           fixture_vtask_delay_calls >= 1 && result.failureStage == IdfHttpsFailureStage::response);
 
     struct ResponseFailureCase {
         RemoteCloseMode mode;

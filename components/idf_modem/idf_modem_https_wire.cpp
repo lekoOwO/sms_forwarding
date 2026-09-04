@@ -204,10 +204,13 @@ bool header_name_token(std::string_view value)
 }  // namespace
 
 bool scan_frame(std::string_view response, std::string_view command,
-                std::vector<std::string_view>& body, ParseReason* reason, ParseShape* shape)
+                std::vector<std::string_view>& body, ParseReason* reason, ParseShape* shape,
+                uint8_t* command_echo_count, bool* ignored_auxiliary_seen)
 {
     clear_parse_reason(reason);
     clear_parse_shape(shape);
+    if (command_echo_count) *command_echo_count = 0;
+    if (ignored_auxiliary_seen) *ignored_auxiliary_seen = false;
     body.clear();
     if (response.size() > kResponseMax) {
         set_parse_reason(reason, ParseReason::oversize);
@@ -224,8 +227,10 @@ bool scan_frame(std::string_view response, std::string_view command,
             set_parse_reason(reason, ParseReason::oversize);
             return false;
         }
-        if (!line.empty() && line != command) {
-            if (line == "OK") {
+        if (!line.empty()) {
+            if (line == command) {
+                if (command_echo_count && *command_echo_count < 2) ++*command_echo_count;
+            } else if (line == "OK") {
                 if (++terminal_count != 1) {
                     set_parse_reason(reason, ParseReason::terminal);
                     return false;
@@ -234,14 +239,17 @@ bool scan_frame(std::string_view response, std::string_view command,
                        starts_with(line, "+CMS ERROR")) {
                 return false;
             } else if (starts_with(line, "+CMT:")) {
+                if (ignored_auxiliary_seen) *ignored_auxiliary_seen = true;
                 waiting_for_cmt_pdu = true;
             } else if (waiting_for_cmt_pdu && looks_like_pdu_line(line)) {
+                if (ignored_auxiliary_seen) *ignored_auxiliary_seen = true;
                 waiting_for_cmt_pdu = false;
             } else if (!is_known_urc(line)) {
                 mark_presence(shape, line);
                 body.push_back(line);
                 waiting_for_cmt_pdu = false;
             } else {
+                if (ignored_auxiliary_seen) *ignored_auxiliary_seen = true;
                 waiting_for_cmt_pdu = false;
             }
         }
@@ -890,15 +898,21 @@ bool parse_mip_close_result(std::string_view response, std::string_view command,
 
 bool parse_read(std::string_view response, std::string_view command, uint8_t cid,
                 uint32_t& unread, std::vector<uint8_t>& data, bool& remote_closed,
-                ParseReason* reason, ParseShape* shape)
+                ParseReason* reason, ParseShape* shape, bool* no_data)
 {
     clear_parse_reason(reason);
     clear_parse_shape(shape);
+    if (no_data) *no_data = false;
     unread = 0;
     data.clear();
     remote_closed = false;
     std::vector<std::string_view> body;
-    if (!scan_frame(response, command, body, reason, shape)) return false;
+    uint8_t command_echo_count = 0;
+    bool ignored_auxiliary_seen = false;
+    if (!scan_frame(response, command, body, reason, shape, &command_echo_count,
+                    &ignored_auxiliary_seen)) {
+        return false;
+    }
     std::string_view read_line;
     bool saw_remote_closed = false;
     for (std::string_view line : body) {
@@ -932,6 +946,10 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
     if (read_line.empty()) {
         if (saw_remote_closed) {
             remote_closed = true;
+            return true;
+        }
+        if (body.empty() && command_echo_count == 1 && !ignored_auxiliary_seen) {
+            if (no_data) *no_data = true;
             return true;
         }
         set_line_class(shape, IdfModemHttpsParseLineClass::missing);
