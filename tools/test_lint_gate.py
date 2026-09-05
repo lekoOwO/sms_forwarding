@@ -86,6 +86,7 @@ class LintGateTests(unittest.TestCase):
             "python3 components/idf_modem/test/test_uart_owner.py",
             "python3 components/idf_esim/test/test_lpa.py",
             "python3 components/idf_lpa/test/test_rsp.py",
+            "python3 components/idf_lpa/test/test_es9_transport.py",
             "python3 components/idf_push/test/test_push_runtime.py",
             "python3 components/idf_sms/test/test_sms_retention_policy.py",
             "python3 components/idf_wifi/test/test_wifi_security.py",
