@@ -1124,3 +1124,88 @@ test("eSIM and API jobs admit in one direction at a time", async () => {
 		assert.equal((await apiBlocked.json()).code, "ACTION_BUSY");
 	}, { jobDelayMs: 100 });
 });
+
+test("eSIM installation binds one confirmation to its active job without exposing secrets", async () => {
+	await withServer(async (baseUrl) => {
+		const activationCode = "LPA:1$example.invalid$INSTALL-SECRET";
+		const pending = await form(baseUrl, "/api/esim", { action: "install", activationCode });
+		assert.equal(pending.status, 202);
+		const { data: { jobId } } = await pending.json();
+		const status = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(status.job.id, jobId);
+		assert.equal(status.job.stage, "awaiting_confirmation");
+		assert.equal(status.job.confirmationRequired, true);
+		assert.equal(status.job.state, "running");
+		assert.equal(JSON.stringify(status).includes("INSTALL-SECRET"), false);
+		await assertAction(await form(baseUrl, "/api/esim", { action: "refresh" }), 409, "ACTION_ESIM_BUSY");
+		assert.equal(status.job.profileName, "Installed profile");
+		assert.equal(status.job.providerName, "Example carrier");
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId: jobId + 1, accepted: "true", confirmationCode: "private-code" }), 409, "ACTION_ESIM_CONFIRMATION_STALE");
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true", confirmationCode: "x".repeat(129) }), 400, "ACTION_INPUT_INVALID");
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true" }), 400, "ACTION_INPUT_INVALID");
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true", confirmationCode: "private-code", nickname: "extra" }), 400, "ACTION_INPUT_INVALID");
+		const confirm = await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true", confirmationCode: "private-code" });
+		assert.equal(confirm.status, 202);
+		assert.equal((await confirm.json()).data.jobId, jobId);
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true", confirmationCode: "private-code" }), 409, "ACTION_ESIM_CONFIRMATION_STALE");
+		const finished = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(finished.job.state, "succeeded");
+		assert.equal(finished.job.confirmationRequired, false);
+		assert.equal(finished.job.stage, "completed");
+		assert.equal(finished.profiles.at(-1).state, "disabled");
+		assert.equal(JSON.stringify(finished).includes("private-code"), false);
+	}, { esimConfirmationRequired: true });
+});
+
+test("installed eSIM remains successful when server notification is pending", async () => {
+	await withServer(async (baseUrl) => {
+		const before = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal((await form(baseUrl, "/api/esim", { action: "install", activationCode: "LPA:1$example.invalid$PENDING-NOTIFICATION" })).status, 202);
+		const pending = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(pending.job.stage, "awaiting_confirmation");
+		assert.equal(pending.job.confirmationRequired, false);
+		assert.equal(pending.profiles.length, before.profiles.length);
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId: pending.job.id, accepted: "true", confirmationCode: "unrequested" }), 400, "ACTION_INPUT_INVALID");
+		assert.equal((await form(baseUrl, "/api/esim", { action: "confirm", jobId: pending.job.id, accepted: "true" })).status, 202);
+		const after = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(after.job.state, "succeeded");
+		assert.equal(after.job.success, true);
+		assert.equal(after.job.notificationPending, true);
+		assert.equal(after.job.code, "ACTION_ESIM_NOTIFICATION_PENDING");
+		assert.equal(after.profiles.length, before.profiles.length + 1);
+		assert.equal(after.profiles.find((profile) => profile.state === "enabled")?.nickname, "Primary");
+	}, { esimNotificationPending: true });
+});
+
+test("eSIM confirmation expires without another status request and releases admission", async () => {
+	const timers = [];
+	let clock = 1000;
+	await withServer(async (baseUrl) => {
+		const accepted = await form(baseUrl, "/api/esim", { action: "install", activationCode: "LPA:1$example.invalid$EXPIRY" });
+		assert.equal(accepted.status, 202);
+		const { data: { jobId } } = await accepted.json();
+		assert.equal(timers.length, 1);
+		clock += timers[0].delay;
+		timers[0].run();
+		await assertAction(await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "true", confirmationCode: "late" }), 409, "ACTION_ESIM_CONFIRMATION_STALE");
+		const status = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(status.job.state, "failed");
+		assert.equal(status.job.confirmationRequired, false);
+		assert.equal((await form(baseUrl, "/api/esim", { action: "refresh" })).status, 202);
+	}, { esimConfirmationRequired: true, now: () => clock,
+		esimSchedule: (run, delay) => { timers.push({ run, delay }); } });
+});
+
+test("postponing eSIM consent makes no profile change and releases the active job", async () => {
+	await withServer(async (baseUrl) => {
+		const before = await (await request(baseUrl, "/api/esim")).json();
+		const accepted = await form(baseUrl, "/api/esim", { action: "install", activationCode: "LPA:1$example.invalid$POSTPONE" });
+		assert.equal(accepted.status, 202);
+		const { data: { jobId } } = await accepted.json();
+		assert.equal((await form(baseUrl, "/api/esim", { action: "confirm", jobId, accepted: "false" })).status, 202);
+		const status = await (await request(baseUrl, "/api/esim")).json();
+		assert.equal(status.job.code, "ACTION_ESIM_POSTPONED");
+		assert.deepEqual(status.profiles, before.profiles);
+		assert.equal((await form(baseUrl, "/api/esim", { action: "refresh" })).status, 202);
+	});
+});

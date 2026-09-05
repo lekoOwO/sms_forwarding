@@ -113,7 +113,7 @@
       "get": {
         "tags": ["Cellular & eSIM"],
         "summary": "Get eSIM structural status and masked profiles",
-        "description": "Returns only EID structural metadata and opaque profile handles. ICCID, ISD-P AID, EID, operator, server, and modem identifiers never appear in this response. The response is not cached.",
+        "description": "Returns EID structural metadata and opaque profile handles. ICCID, ISD-P AID, EID, network identifiers, server addresses, and modem identifiers never appear. During authenticated installation consent, bounded profile and provider display names are included. The response is not cached.",
         "responses": {
           "200": { "description": "The current cached eSIM view.", "headers": { "Cache-Control": { "schema": { "type": "string", "const": "no-store, max-age=0" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EsimStatus" } } } },
           "400": { "$ref": "#/components/responses/InputTooLong" },
@@ -124,7 +124,7 @@
       "post": {
         "tags": ["Cellular & eSIM"],
         "summary": "Queue an eSIM profile action",
-        "description": "Queues refresh, EID info, enable, disable, delete, switch, or nickname actions. Mutations use a server-issued opaque handle. The firmware re-reads the current profile snapshot before it mutates a profile, so an old handle fails closed. The request body is form encoded and limited to action, handle, and nickname.",
+        "description": "Queues profile actions or installation without automatically enabling the installed profile. Profile mutations require a current opaque handle. Install accepts exactly action and activationCode. After authenticated profile details are available, confirm accepts exactly action, jobId, accepted (true or false), and confirmationCode only when accepted=true and the carrier requires a code. Consent is required even without a carrier code. accepted=false postpones the installation without terminating the carrier order. Confirmation expires after at most five minutes without status polling. The form-encoded body is limited to 2048 bytes and four fields. Codes stay in memory and are never logged or returned. Poll GET /api/esim for the exact accepted job ID, not /api/jobs. One job is retained until the next job or reboot. Installation uses bounded phases without an overall job TTL. Installed profiles with pending notification report success with ACTION_ESIM_NOTIFICATION_PENDING. Uncertain installation or cancellation failure must not trigger automatic activation-code reuse. Only ordinary three-field activation codes and profiles without policy-rule restrictions are supported.",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
         "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "$ref": "#/components/schemas/EsimAction" } } } },
         "responses": {
@@ -132,7 +132,7 @@
           "400": { "$ref": "#/components/responses/InputTooLong" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "description": "The CSRF token is invalid." },
-          "409": { "description": "The device is busy or the opaque handle is stale.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "The device is busy, the profile handle is stale, or confirmation does not match an active pending installation.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
           "413": { "$ref": "#/components/responses/BodyTooLarge" }
         }
       }
@@ -687,6 +687,11 @@
 			  "ACTION_ESIM_FAILED",
 			  "ACTION_ESIM_BUSY",
 			  "ACTION_ESIM_HANDLE_STALE",
+			  "ACTION_ESIM_CONFIRMATION_STALE",
+			  "ACTION_ESIM_NOTIFICATION_PENDING",
+			  "ACTION_ESIM_INSTALLATION_UNCERTAIN",
+			  "ACTION_ESIM_POSTPONED",
+			  "ACTION_ESIM_CANCELLATION_FAILED",
 			  "PUSH_CA_PROBE_READY",
 			  "PUSH_CA_PROBE_FAILED",
 			  "PUSH_CA_INSTALLED",
@@ -801,13 +806,24 @@
       "EsimAction": {
         "type": "object",
         "additionalProperties": false,
-        "maxProperties": 3,
+        "maxProperties": 4,
         "required": ["action"],
         "properties": {
-          "action": { "type": "string", "enum": ["refresh", "info", "enable", "disable", "delete", "switch", "nickname"], "x-maxUtf8Bytes": 16 },
+          "action": { "type": "string", "enum": ["refresh", "info", "enable", "disable", "delete", "switch", "nickname", "install", "confirm"], "x-maxUtf8Bytes": 16 },
           "handle": { "type": "string", "pattern": "^p[0-9a-f]{16}$", "x-maxUtf8Bytes": 17, "description": "Opaque profile selector issued by GET /api/esim." },
-          "nickname": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64 }
-        }
+          "nickname": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64 },
+          "activationCode": { "type": "string", "minLength": 1, "maxLength": 516, "x-maxUtf8Bytes": 516, "writeOnly": true },
+          "jobId": { "type": "string", "pattern": "^[1-9][0-9]{0,9}$", "description": "Exact current installation job ID, at most 4294967295." },
+          "accepted": { "type": "string", "enum": ["true", "false"] },
+          "confirmationCode": { "type": "string", "pattern": "^[ -~]{1,128}$", "writeOnly": true }
+        },
+        "oneOf": [
+          { "properties": { "action": { "enum": ["refresh", "info"] } }, "maxProperties": 1 },
+          { "required": ["handle"], "properties": { "action": { "enum": ["enable", "disable", "delete", "switch"] } }, "maxProperties": 2 },
+          { "required": ["handle"], "maxProperties": 3, "properties": { "action": { "const": "nickname" } }, "not": { "anyOf": [{ "required": ["activationCode"] }, { "required": ["jobId"] }, { "required": ["accepted"] }, { "required": ["confirmationCode"] }] } },
+          { "required": ["activationCode"], "properties": { "action": { "const": "install" } }, "maxProperties": 2 },
+          { "required": ["jobId", "accepted"], "properties": { "action": { "const": "confirm" } }, "not": { "anyOf": [{ "required": ["activationCode"] }, { "required": ["handle"] }, { "required": ["nickname"] }] }, "if": { "properties": { "accepted": { "const": "false" } } }, "then": { "maxProperties": 3 } }
+        ]
       },
       "EsimProfile": {
         "type": "object",
@@ -823,14 +839,19 @@
       },
       "EsimJob": {
         "type": "object",
-        "required": ["id", "state", "action", "success", "code"],
+        "required": ["id", "state", "action", "success", "code", "stage", "confirmationRequired", "notificationPending", "profileName", "providerName"],
         "additionalProperties": false,
         "properties": {
           "id": { "type": "integer", "minimum": 0 },
           "state": { "type": "string", "enum": ["idle", "queued", "running", "succeeded", "failed"] },
-          "action": { "type": "string", "enum": ["", "refresh", "info", "enable", "disable", "delete", "switch", "nickname"] },
+          "action": { "type": "string", "enum": ["", "refresh", "info", "enable", "disable", "delete", "switch", "nickname", "install"] },
           "success": { "type": "boolean" },
-          "code": { "type": "string", "enum": ["ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED"] }
+          "code": { "type": "string", "enum": ["ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED", "ACTION_ESIM_NOTIFICATION_PENDING", "ACTION_ESIM_INSTALLATION_UNCERTAIN", "ACTION_ESIM_POSTPONED", "ACTION_ESIM_CANCELLATION_FAILED"] },
+          "stage": { "type": "string", "enum": ["", "validating", "recovering_notifications", "authenticating", "awaiting_confirmation", "preparing", "downloading", "notifying", "completed"] },
+          "confirmationRequired": { "type": "boolean", "description": "Whether the carrier requires a confirmation code. Consent is requested by running state and awaiting_confirmation stage even when this is false." },
+          "notificationPending": { "type": "boolean" },
+          "profileName": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 256 },
+          "providerName": { "type": "string", "maxLength": 32, "x-maxUtf8Bytes": 128 }
         }
       },
       "EsimStatus": {

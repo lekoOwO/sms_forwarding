@@ -166,6 +166,9 @@ bool operation_spec(IdfLpaEs9Operation operation, OperationSpec& spec) noexcept
     case IdfLpaEs9Operation::handle_notification:
         spec = {"/gsma/rsp2/es9plus/handleNotification", true};
         return true;
+    case IdfLpaEs9Operation::cancel_session:
+        spec = {"/gsma/rsp2/es9plus/cancelSession", false};
+        return true;
     }
     return false;
 }
@@ -890,6 +893,7 @@ bool idf_lpa_es9_get_bound_profile_package(
     std::string_view smdp_host,
     std::string_view request_json,
     std::string_view expected_transaction_id,
+    const LpaRspProfileMetadata& expected_metadata,
     std::vector<std::uint8_t>& profile_installation_result,
     std::string& safe_message,
     IdfLpaEs9TransportError& error)
@@ -904,17 +908,25 @@ bool idf_lpa_es9_get_bound_profile_package(
     const bool request_message_overlap = input_overlaps_output(request_json, safe_message);
     const bool transaction_message_overlap =
         input_overlaps_output(expected_transaction_id, safe_message);
+    const bool metadata_overlap =
+        input_overlaps_output(expected_metadata.profile_name, profile_installation_result) ||
+        input_overlaps_output(expected_metadata.service_provider_name, profile_installation_result) ||
+        input_overlaps_output(expected_metadata.profile_name, safe_message) ||
+        input_overlaps_output(expected_metadata.service_provider_name, safe_message);
     secure_clear(profile_installation_result);
     secure_clear(safe_message);
     error = IdfLpaEs9TransportError::none;
     if (host_pir_overlap || request_pir_overlap || transaction_pir_overlap ||
-        host_message_overlap || request_message_overlap || transaction_message_overlap) {
+        host_message_overlap || request_message_overlap || transaction_message_overlap || metadata_overlap) {
         return fail(error, IdfLpaEs9TransportError::invalid_request);
     }
     if (!valid_smdp_host(smdp_host)) {
         return fail(error, IdfLpaEs9TransportError::invalid_host);
     }
     if (request_json.empty() ||
+        expected_metadata.has_policy_rules ||
+        expected_metadata.profile_name.size() > IDF_LPA_RSP_MAX_PROFILE_NAME_BYTES ||
+        expected_metadata.service_provider_name.size() > IDF_LPA_RSP_MAX_PROVIDER_NAME_BYTES ||
         request_json.size() > IDF_LPA_ES9_MAX_JSON_BYTES ||
         request_json.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         return fail(error, IdfLpaEs9TransportError::invalid_request);
@@ -922,12 +934,13 @@ bool idf_lpa_es9_get_bound_profile_package(
 
 #ifndef ESP_PLATFORM
     (void)expected_transaction_id;
+    (void)expected_metadata;
     (void)smdp_host;
     (void)request_json;
     return fail(error, IdfLpaEs9TransportError::transport);
 #else
     Deadline deadline(IDF_LPA_ES9_BPP_TRANSACTION_TIMEOUT_MS);
-    IdfLpaBppStream bpp(expected_transaction_id);
+    IdfLpaBppStream bpp(expected_transaction_id, expected_metadata);
     std::string url;
     url.reserve(8U + smdp_host.size() +
                 std::string_view("/gsma/rsp2/es9plus/getBoundProfilePackage").size());

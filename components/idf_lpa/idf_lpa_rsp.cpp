@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -590,6 +591,46 @@ bool ranges_overlap(const void* left,
     return left_begin < right_end && right_begin < left_end;
 }
 
+bool tagged(const idf_esim_internal::Tlv& value,
+             std::initializer_list<std::uint8_t> tag) noexcept
+{
+    return tag_matches(value, tag.begin(), tag.size());
+}
+
+bool ordered_fields(const idf_esim_internal::Tlv& value,
+                      std::initializer_list<std::initializer_list<std::uint8_t>> tags)
+{
+    if (value.children.size() != tags.size()) return false;
+    std::size_t index = 0;
+    for (const auto& tag : tags) if (!tagged(value.children[index++], tag)) return false;
+    return true;
+}
+
+bool read_object(const std::vector<std::uint8_t>& encoded,
+                   std::initializer_list<std::uint8_t> tag,
+                   SensitiveTlv& holder, LpaRspError& error)
+{
+    if (!parse_der_root(encoded.data(), encoded.size(), holder, error)) return false;
+    return tagged(holder.value, tag) || fail(error, LpaRspError::der_root);
+}
+
+bool output_aliases(const std::vector<std::uint8_t>& output,
+                      std::initializer_list<const std::vector<std::uint8_t>*> inputs)
+{
+    for (const auto* input : inputs) {
+        if (input == &output || ranges_overlap(input->data(), input->size(),
+                                                output.data(), output.capacity())) return true;
+    }
+    return false;
+}
+
+void append_object(std::vector<std::uint8_t>& output,
+                     std::initializer_list<std::uint8_t> tag,
+                     const std::vector<std::uint8_t>& value)
+{
+    idf_esim_internal::append_tlv(output, tag.begin(), tag.size(), value);
+}
+
 bool valid_smdp_host(std::string_view value) noexcept
 {
     if (value.empty() || value.size() > 253U) return false;
@@ -677,9 +718,83 @@ bool valid_iccid(const std::vector<std::uint8_t>& value) noexcept
     return true;
 }
 
+bool display_utf8(const std::vector<std::uint8_t>& value, std::size_t max_characters) noexcept
+{
+    if (value.size() > max_characters * 4U) return false;
+    std::size_t position = 0, characters = 0;
+    while (position < value.size()) {
+        const std::uint8_t first = value[position++];
+        std::uint32_t code = first;
+        unsigned following = 0;
+        if (first >= 0xC2U && first <= 0xDFU) { code &= 0x1FU; following = 1; }
+        else if (first >= 0xE0U && first <= 0xEFU) { code &= 0x0FU; following = 2; }
+        else if (first >= 0xF0U && first <= 0xF4U) { code &= 0x07U; following = 3; }
+        else if (first >= 0x80U) return false;
+        if (following > value.size() - position) return false;
+        for (unsigned index = 0; index < following; ++index) {
+            const std::uint8_t next = value[position++];
+            if ((next & 0xC0U) != 0x80U) return false;
+            code = (code << 6U) | (next & 0x3FU);
+        }
+        if ((following == 1 && code < 0x80U) || (following == 2 && code < 0x800U) ||
+            (following == 3 && code < 0x10000U) || code > 0x10FFFFU ||
+            (code >= 0xD800U && code <= 0xDFFFU) || code < 0x20U ||
+            (code >= 0x7FU && code <= 0x9FU) ||
+            (code >= 0x2028U && code <= 0x202EU) ||
+            (code >= 0x2066U && code <= 0x2069U) || ++characters > max_characters) return false;
+    }
+    return true;
+}
+
+bool named_bits(const std::vector<std::uint8_t>& value) noexcept
+{
+    if (value.empty() || value[0] > 7U) return false;
+    if (value.size() == 1U) return value[0] == 0;
+    const unsigned unused = value[0];
+    return value.back() != 0 && (value.back() & ((1U << unused) - 1U)) == 0 &&
+           ((value.back() >> unused) & 1U) == 1U;
+}
+
+bool metadata_owner(const idf_esim_internal::Tlv& owner) noexcept
+{
+    if (owner.children.empty() || owner.children.size() > 3U ||
+        !tagged(owner.children[0], {0x80}) || owner.children[0].value.size() != 3U) return false;
+    const auto& mcc = owner.children[0].value;
+    if ((mcc[0] & 0x0FU) > 9U || (mcc[0] >> 4U) > 9U || (mcc[1] & 0x0FU) > 9U ||
+        ((mcc[1] >> 4U) > 9U && (mcc[1] >> 4U) != 0x0FU) ||
+        (mcc[2] & 0x0FU) > 9U || (mcc[2] >> 4U) > 9U) return false;
+    unsigned previous = 0;
+    for (std::size_t index = 1; index < owner.children.size(); ++index) {
+        const auto& field = owner.children[index];
+        if (field.tag.size() != 1U || field.tag[0] < 0x81U || field.tag[0] > 0x82U ||
+            field.tag[0] <= previous) return false;
+        previous = field.tag[0];
+    }
+    return true;
+}
+
+bool metadata_notifications(const idf_esim_internal::Tlv& list) noexcept
+{
+    for (const auto& item : list.children) {
+        if (!tagged(item, {0x30}) || !ordered_fields(item, {{0x80}, {0x81}}) ||
+            !named_bits(item.children[0].value) || item.children[0].value.size() != 2U ||
+            item.children[0].value[0] < 4U) return false;
+        const auto& address = item.children[1].value;
+        if (!valid_smdp_host(std::string_view(reinterpret_cast<const char*>(address.data()),
+                                              address.size()))) return false;
+    }
+    return true;
+}
+
 bool valid_download_error_code(std::uint32_t value) noexcept
 {
     return (value >= 1U && value <= 5U) || value == 127U;
+}
+
+bool valid_cancel_reason(LpaRspCancelReason reason) noexcept
+{
+    const auto value = static_cast<std::uint8_t>(reason);
+    return value <= 5U || value == 127U;
 }
 
 bool valid_bpp_command_id(std::uint32_t value) noexcept
@@ -715,7 +830,8 @@ const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) n
     static constexpr std::uint8_t kSequence[] = {0x30U};
     static constexpr std::uint8_t kAuthenticateServerResponse[] = {0xBFU, 0x38U};
     static constexpr std::uint8_t kPrepareDownloadResponse[] = {0xBFU, 0x21U};
-    static constexpr std::uint8_t kProfileMetadata[] = {0xBFU, 0x2FU};
+    static constexpr std::uint8_t kProfileMetadata[] = {0xBFU, 0x25U};
+    static constexpr std::uint8_t kNotificationMetadata[] = {0xBFU, 0x2FU};
     static constexpr std::uint8_t kProfileInstallationResult[] = {0xBFU, 0x37U};
     static constexpr std::uint8_t kSignature[] = {0x5FU, 0x37U};
     static constexpr std::uint8_t kCiKey[] = {0x04U};
@@ -731,9 +847,11 @@ const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) n
         size = sizeof(kPrepareDownloadResponse);
         return kPrepareDownloadResponse;
     case LpaRspDerObject::profile_metadata:
-    case LpaRspDerObject::notification_metadata:
         size = sizeof(kProfileMetadata);
         return kProfileMetadata;
+    case LpaRspDerObject::notification_metadata:
+        size = sizeof(kNotificationMetadata);
+        return kNotificationMetadata;
     case LpaRspDerObject::profile_installation_result:
         size = sizeof(kProfileInstallationResult);
         return kProfileInstallationResult;
@@ -1176,11 +1294,13 @@ bool idf_lpa_rsp_parse_smdp_signed2(const std::uint8_t* object,
         (confirmation->value[0] != 0x00U && confirmation->value[0] != 0xFFU)) {
         return fail(error, LpaRspError::confirmation_malformed);
     }
-    for (const idf_esim_internal::Tlv& child : holder.value.children) {
-        if (!tag_matches(child, kTransaction, sizeof(kTransaction)) &&
-            !tag_matches(child, kConfirmation, sizeof(kConfirmation))) {
-            return fail(error, LpaRspError::der_malformed);
-        }
+    const auto& fields = holder.value.children;
+    if (fields.size() < 2U || fields.size() > 3U ||
+        !tag_matches(fields[0], kTransaction, sizeof(kTransaction)) ||
+        !tag_matches(fields[1], kConfirmation, sizeof(kConfirmation)) ||
+        (fields.size() == 3U && (!tagged(fields[2], {0x5F, 0x49}) ||
+         fields[2].value.empty() || fields[2].value.size() > kMaxOtpkBytes))) {
+        return fail(error, LpaRspError::der_malformed);
     }
     confirmation_required = confirmation->value[0] == 0xFFU;
     return true;
@@ -1194,7 +1314,7 @@ bool idf_lpa_rsp_compute_hash_cc(std::string_view confirmation_code,
 {
     secure_zero(hash_cc.data(), hash_cc.size());
     error = LpaRspError::none;
-    if (confirmation_code.empty() || confirmation_code.size() > 128U || !transaction_id ||
+    if (confirmation_code.empty() || confirmation_code.size() > IDF_LPA_RSP_MAX_CONFIRMATION_BYTES || !transaction_id ||
         transaction_size == 0U || transaction_size > kMaxTransactionBytes) {
         return fail(error, LpaRspError::crypto_input);
     }
@@ -1204,7 +1324,7 @@ bool idf_lpa_rsp_compute_hash_cc(std::string_view confirmation_code,
 #ifdef ESP_PLATFORM
     if (psa_crypto_init() != PSA_SUCCESS) return fail(error, LpaRspError::crypto_failure);
 #endif
-    std::array<std::uint8_t, 128> confirmation_bytes = {};
+    std::array<std::uint8_t, IDF_LPA_RSP_MAX_CONFIRMATION_BYTES> confirmation_bytes = {};
     std::memcpy(confirmation_bytes.data(), confirmation_code.data(), confirmation_code.size());
     std::array<std::uint8_t, 32> first = {};
     std::array<std::uint8_t, 48> combined = {};
@@ -1228,6 +1348,314 @@ bool idf_lpa_rsp_compute_hash_cc(std::string_view confirmation_code,
         secure_zero(hash_cc.data(), hash_cc.size());
         return fail(error, LpaRspError::crypto_failure);
     }
+    return true;
+}
+
+bool idf_lpa_rsp_build_authenticate_server_request(
+    const std::vector<std::uint8_t>& server_signed1,
+    const std::vector<std::uint8_t>& server_signature1,
+    const std::vector<std::uint8_t>& ci_key_id,
+    const std::vector<std::uint8_t>& server_certificate,
+    std::string_view matching_id, std::string_view imei,
+    const std::vector<std::uint8_t>& device_capabilities,
+    std::vector<std::uint8_t>& request, LpaRspError& error)
+{
+    error = LpaRspError::none;
+    if (output_aliases(request, {&server_signed1, &server_signature1, &ci_key_id,
+                                 &server_certificate, &device_capabilities}) ||
+        ranges_overlap(matching_id.data(), matching_id.size(), request.data(), request.capacity()) ||
+        ranges_overlap(imei.data(), imei.size(), request.data(), request.capacity())) {
+        return prepare_fail(request, error, LpaRspError::der_malformed);
+    }
+    clear_bytes(request);
+    if (!idf_lpa_rsp_validate_matching_id(matching_id, error)) return false;
+    if (imei.size() != 15U || !std::all_of(imei.begin(), imei.end(),
+            [](char ch) { return ch >= '0' && ch <= '9'; })) {
+        return fail(error, LpaRspError::crypto_input);
+    }
+    SensitiveTlv signed1, signature, key, certificate, capabilities;
+    if (!read_object(server_signed1, {0x30}, signed1, error) ||
+        !read_object(server_signature1, {0x5F, 0x37}, signature, error) ||
+        !read_object(ci_key_id, {0x04}, key, error) ||
+        !read_object(server_certificate, {0x30}, certificate, error) ||
+        !read_object(device_capabilities, {0x30}, capabilities, error)) return false;
+    if (!ordered_fields(signed1.value, {{0x80}, {0x81}, {0x83}, {0x84}}) ||
+        signed1.value.children[0].value.empty() ||
+        signed1.value.children[0].value.size() > kMaxTransactionBytes ||
+        signed1.value.children[1].value.size() != 16U ||
+        signed1.value.children[3].value.size() != 16U ||
+        signature.value.value.empty() || signature.value.value.size() > kMaxSignatureBytes ||
+        key.value.value.empty() || key.value.value.size() > kMaxCiKeyBytes ||
+        certificate.value.value.empty() || device_capabilities.size() > 256U) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    const auto& address = signed1.value.children[2].value;
+    if (!valid_smdp_host(std::string_view(reinterpret_cast<const char*>(address.data()),
+                                          address.size()))) {
+        return fail(error, LpaRspError::address_mismatch);
+    }
+    const std::size_t request_bound = server_signed1.size() + server_signature1.size() +
+        ci_key_id.size() + server_certificate.size() + device_capabilities.size() +
+        matching_id.size() + 64U;
+    if (request_bound > IDF_LPA_RSP_MAX_OBJECT_BYTES) {
+        return fail(error, LpaRspError::object_too_large);
+    }
+
+    std::vector<std::uint8_t> tbcd(8), device, context, body;
+    device.reserve(device_capabilities.size() + 24U);
+    context.reserve(device_capabilities.size() + matching_id.size() + 40U);
+    body.reserve(request_bound);
+    request.reserve(request_bound);
+    for (std::size_t index = 0; index < 7U; ++index) {
+        tbcd[index] = static_cast<std::uint8_t>((imei[index * 2U] - '0') |
+                                               ((imei[index * 2U + 1U] - '0') << 4U));
+    }
+    // SGP.22 §4.2：末字节高半字节为校验位，低半字节为 F。
+    tbcd[7] = static_cast<std::uint8_t>(((imei[14] - '0') << 4U) | 0x0FU);
+    std::vector<std::uint8_t> tac(tbcd.begin(), tbcd.begin() + 4);
+    std::vector<std::uint8_t> matching_bytes(matching_id.begin(), matching_id.end());
+    append_object(device, {0x80}, tac);
+    append_object(device, {0xA1}, capabilities.value.value);
+    append_object(device, {0x82}, tbcd);
+    append_object(context, {0x80}, matching_bytes);
+    append_object(context, {0xA1}, device);
+    for (const auto* part : {&server_signed1, &server_signature1, &ci_key_id, &server_certificate}) {
+        body.insert(body.end(), part->begin(), part->end());
+    }
+    append_object(body, {0xA0}, context);
+    append_object(request, {0xBF, 0x38}, body);
+    clear_bytes(tbcd); clear_bytes(tac); clear_bytes(matching_bytes);
+    clear_bytes(device); clear_bytes(context); clear_bytes(body);
+    return true;
+}
+
+bool idf_lpa_rsp_parse_authenticate_server_response(
+    const std::uint8_t* object, std::size_t object_size,
+    const std::vector<std::uint8_t>& expected_request,
+    std::vector<std::uint8_t>& authenticate_client_response, LpaRspError& error)
+{
+    error = LpaRspError::none;
+    if (output_aliases(authenticate_client_response, {&expected_request}) ||
+        ranges_overlap(object, object_size, authenticate_client_response.data(),
+                       authenticate_client_response.capacity())) {
+        return prepare_fail(authenticate_client_response, error, LpaRspError::der_malformed);
+    }
+    clear_bytes(authenticate_client_response);
+    SensitiveTlv request, response;
+    if (!read_object(expected_request, {0xBF, 0x38}, request, error) ||
+        !parse_der_root(object, object_size, response, error)) return false;
+    if (!ordered_fields(request.value, {{0x30}, {0x5F, 0x37}, {0x04}, {0x30}, {0xA0}}) ||
+        !ordered_fields(request.value.children[0], {{0x80}, {0x81}, {0x83}, {0x84}}) ||
+        !tagged(response.value, {0xBF, 0x38}) || response.value.children.size() != 1U) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    const auto& original = request.value.children[0].children;
+    if (original[0].value.empty() || original[0].value.size() > kMaxTransactionBytes ||
+        original[1].value.size() != 16U || original[3].value.size() != 16U) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    const auto& choice = response.value.children[0];
+    if (tagged(choice, {0xA1})) {
+        if (!ordered_fields(choice, {{0x80}, {0x02}})) return fail(error, LpaRspError::der_malformed);
+        if (choice.children[0].value != original[0].value) return fail(error, LpaRspError::transaction_mismatch);
+        std::uint32_t code = 0;
+        if (!canonical_nonnegative_integer(choice.children[1].value, 1, code) ||
+            !((code >= 1U && code <= 7U) || code == 127U)) return fail(error, LpaRspError::der_malformed);
+        return fail(error, LpaRspError::server_error);
+    }
+    if (!tagged(choice, {0xA0}) ||
+        !ordered_fields(choice, {{0x30}, {0x5F, 0x37}, {0x30}, {0x30}}) ||
+        !ordered_fields(choice.children[0], {{0x80}, {0x83}, {0x84}, {0xBF, 0x22}, {0xA0}}) ||
+        choice.children[1].value.empty() || choice.children[1].value.size() > kMaxSignatureBytes ||
+        choice.children[2].value.empty() || choice.children[3].value.empty()) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    const auto& signed1 = choice.children[0].children;
+    if (signed1[0].value != original[0].value) return fail(error, LpaRspError::transaction_mismatch);
+    const std::string_view address(reinterpret_cast<const char*>(original[2].value.data()),
+                                    original[2].value.size());
+    if (!valid_smdp_host(address) || !equal_ascii_ci(signed1[1].value, address)) {
+        return fail(error, LpaRspError::address_mismatch);
+    }
+    if (signed1[2].value != original[3].value) return fail(error, LpaRspError::challenge_mismatch);
+    if (signed1[3].value.empty() || signed1[4].value != request.value.children[4].value) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    authenticate_client_response.assign(object, object + object_size);
+    return true;
+}
+
+bool idf_lpa_rsp_build_prepare_download_request(
+    const std::vector<std::uint8_t>& smdp_signed2,
+    const std::vector<std::uint8_t>& smdp_signature2,
+    const std::vector<std::uint8_t>& smdp_certificate,
+    const std::array<std::uint8_t, 32>* hash_cc,
+    std::vector<std::uint8_t>& request, LpaRspError& error)
+{
+    error = LpaRspError::none;
+    if (output_aliases(request, {&smdp_signed2, &smdp_signature2, &smdp_certificate}) ||
+        (hash_cc && ranges_overlap(hash_cc->data(), hash_cc->size(), request.data(), request.capacity()))) {
+        return prepare_fail(request, error, LpaRspError::der_malformed);
+    }
+    clear_bytes(request);
+    SensitiveTlv signed2, signature, certificate;
+    if (!read_object(smdp_signed2, {0x30}, signed2, error) ||
+        !read_object(smdp_signature2, {0x5F, 0x37}, signature, error) ||
+        !read_object(smdp_certificate, {0x30}, certificate, error)) return false;
+    if (signed2.value.children.empty() || !tagged(signed2.value.children[0], {0x80}) ||
+        signature.value.value.empty() || signature.value.value.size() > kMaxSignatureBytes ||
+        certificate.value.value.empty()) return fail(error, LpaRspError::der_malformed);
+    const auto& transaction = signed2.value.children[0].value;
+    bool confirmation_required = false;
+    if (!idf_lpa_rsp_parse_smdp_signed2(smdp_signed2.data(), smdp_signed2.size(),
+            transaction.data(), transaction.size(), confirmation_required, error)) return false;
+    if (confirmation_required && !hash_cc) return fail(error, LpaRspError::confirmation_malformed);
+    const std::size_t request_bound = smdp_signed2.size() + smdp_signature2.size() +
+        smdp_certificate.size() + 40U;
+    if (request_bound > IDF_LPA_RSP_MAX_OBJECT_BYTES) {
+        return fail(error, LpaRspError::object_too_large);
+    }
+    std::vector<std::uint8_t> body;
+    body.reserve(request_bound);
+    request.reserve(request_bound);
+    body.insert(body.end(), smdp_signed2.begin(), smdp_signed2.end());
+    body.insert(body.end(), smdp_signature2.begin(), smdp_signature2.end());
+    if (hash_cc) {
+        std::vector<std::uint8_t> hash(hash_cc->begin(), hash_cc->end());
+        append_object(body, {0x04}, hash);
+        clear_bytes(hash);
+    }
+    body.insert(body.end(), smdp_certificate.begin(), smdp_certificate.end());
+    append_object(request, {0xBF, 0x21}, body);
+    clear_bytes(body);
+    return true;
+}
+
+bool idf_lpa_rsp_parse_profile_metadata(const std::uint8_t* object, std::size_t object_size,
+                                         LpaRspProfileMetadata& metadata, LpaRspError& error)
+{
+    const bool alias = ranges_overlap(object, object_size, metadata.service_provider_name.data(),
+                                      metadata.service_provider_name.capacity()) ||
+        ranges_overlap(object, object_size, metadata.profile_name.data(), metadata.profile_name.capacity());
+    clear_string(metadata.service_provider_name);
+    clear_string(metadata.profile_name);
+    metadata.has_policy_rules = false;
+    error = LpaRspError::none;
+    if (alias) return fail(error, LpaRspError::der_malformed);
+    SensitiveTlv holder;
+    if (!parse_der_root(object, object_size, holder, error)) return false;
+    if (!tagged(holder.value, {0xBF, 0x25})) return fail(error, LpaRspError::der_root);
+    const auto& fields = holder.value.children;
+    if (fields.size() < 3U || !tagged(fields[0], {0x5A}) || !valid_iccid(fields[0].value) ||
+        !tagged(fields[1], {0x91}) || !display_utf8(fields[1].value, 32U) ||
+        !tagged(fields[2], {0x92}) || !display_utf8(fields[2].value, 64U)) {
+        return fail(error, LpaRspError::der_malformed);
+    }
+    bool icon_type = false, owner = false, policy = false;
+    unsigned previous = 0;
+    for (std::size_t index = 3; index < fields.size(); ++index) {
+        const auto& field = fields[index];
+        unsigned order = 0;
+        std::uint32_t code = 0;
+        if (tagged(field, {0x93})) {
+            order = 1; icon_type = true;
+            if (!canonical_nonnegative_integer(field.value, 1, code) || code > 1U)
+                return fail(error, LpaRspError::der_malformed);
+        } else if (tagged(field, {0x94})) {
+            order = 2;
+            if (!icon_type || field.value.size() > 1024U) return fail(error, LpaRspError::der_malformed);
+        } else if (tagged(field, {0x95})) {
+            order = 3;
+            if (!canonical_nonnegative_integer(field.value, 1, code) || code > 2U)
+                return fail(error, LpaRspError::der_malformed);
+        } else if (tagged(field, {0xB6})) {
+            order = 4;
+            if (!metadata_notifications(field)) return fail(error, LpaRspError::der_malformed);
+        } else if (tagged(field, {0xB7})) {
+            order = 5; owner = true;
+            if (!metadata_owner(field)) return fail(error, LpaRspError::der_malformed);
+        } else if (tagged(field, {0x99})) {
+            order = 6;
+            if (!named_bits(field.value)) return fail(error, LpaRspError::der_malformed);
+            policy = field.value.size() > 1U;
+        } else if (tagged(field, {0xBF, 0x22}) || tagged(field, {0xBF, 0x23})) {
+            order = field.tag.back() == 0x22U ? 7 : 8;
+            for (const auto& extension : field.children) {
+                if (!tagged(extension, {0x30}) ||
+                    !ordered_fields(extension, {{0x80}, {0xA1}}) ||
+                    !valid_oid(extension.children[0].value) ||
+                    extension.children[1].children.size() != 1U)
+                    return fail(error, LpaRspError::der_malformed);
+            }
+        } else return fail(error, LpaRspError::der_malformed);
+        if (order <= previous) return fail(error, LpaRspError::der_duplicate);
+        previous = order;
+    }
+    if (policy && !owner) return fail(error, LpaRspError::der_malformed);
+    metadata.service_provider_name.assign(reinterpret_cast<const char*>(fields[1].value.data()),
+                                           fields[1].value.size());
+    metadata.profile_name.assign(reinterpret_cast<const char*>(fields[2].value.data()), fields[2].value.size());
+    metadata.has_policy_rules = policy;
+    return true;
+}
+
+bool idf_lpa_rsp_build_cancel_session_request(
+    const std::uint8_t* transaction, std::size_t transaction_size, LpaRspCancelReason reason,
+    std::vector<std::uint8_t>& request, LpaRspError& error)
+{
+    error = LpaRspError::none;
+    const bool alias = ranges_overlap(transaction, transaction_size, request.data(), request.capacity());
+    clear_bytes(request);
+    if (alias) return fail(error, LpaRspError::der_malformed);
+    if (!transaction || transaction_size == 0U || transaction_size > kMaxTransactionBytes)
+        return fail(error, LpaRspError::transaction_mismatch);
+    if (!valid_cancel_reason(reason)) return fail(error, LpaRspError::der_malformed);
+    std::vector<std::uint8_t> tx(transaction, transaction + transaction_size), body;
+    body.reserve(24U);
+    request.reserve(28U);
+    append_object(body, {0x80}, tx);
+    append_object(body, {0x81}, {static_cast<std::uint8_t>(reason)});
+    append_object(request, {0xBF, 0x41}, body);
+    clear_bytes(tx); clear_bytes(body);
+    return true;
+}
+
+bool idf_lpa_rsp_parse_cancel_session_response(
+    const std::uint8_t* object, std::size_t object_size,
+    const std::uint8_t* transaction, std::size_t transaction_size,
+    LpaRspCancelReason reason, std::vector<std::uint8_t>& response, LpaRspError& error)
+{
+    error = LpaRspError::none;
+    const bool alias = ranges_overlap(object, object_size, response.data(), response.capacity()) ||
+        ranges_overlap(transaction, transaction_size, response.data(), response.capacity());
+    clear_bytes(response);
+    if (alias) return fail(error, LpaRspError::der_malformed);
+    if (!transaction || transaction_size == 0U || transaction_size > kMaxTransactionBytes)
+        return fail(error, LpaRspError::transaction_mismatch);
+    if (!valid_cancel_reason(reason)) return fail(error, LpaRspError::der_malformed);
+    SensitiveTlv holder;
+    if (!parse_der_root(object, object_size, holder, error)) return false;
+    if (!tagged(holder.value, {0xBF, 0x41})) return fail(error, LpaRspError::der_root);
+    if (holder.value.children.size() != 1U) return fail(error, LpaRspError::der_malformed);
+    const auto& choice = holder.value.children[0];
+    std::uint32_t code = 0;
+    if (tagged(choice, {0x81})) {
+        if (!canonical_nonnegative_integer(choice.value, 1U, code) || (code != 5U && code != 127U))
+            return fail(error, LpaRspError::der_malformed);
+        return fail(error, LpaRspError::server_error);
+    }
+    if (!tagged(choice, {0xA0}) || !ordered_fields(choice, {{0x30}, {0x5F, 0x37}}) ||
+        !ordered_fields(choice.children[0], {{0x80}, {0x81}, {0x82}}) ||
+        choice.children[1].value.empty() || choice.children[1].value.size() > kMaxSignatureBytes)
+        return fail(error, LpaRspError::der_malformed);
+    const auto& signed_data = choice.children[0].children;
+    if (signed_data[0].value.size() != transaction_size ||
+        std::memcmp(signed_data[0].value.data(), transaction, transaction_size) != 0)
+        return fail(error, LpaRspError::transaction_mismatch);
+    if (!valid_oid(signed_data[1].value) ||
+        !canonical_nonnegative_integer(signed_data[2].value, 1U, code) ||
+        code != static_cast<std::uint8_t>(reason)) return fail(error, LpaRspError::der_malformed);
+    response.assign(object, object + object_size);
     return true;
 }
 
@@ -1403,16 +1831,19 @@ bool idf_lpa_rsp_parse_prepare_download_response(
     return true;
 }
 
-bool idf_lpa_rsp_parse_profile_installation_result(
+static bool parse_installation_notification(
     const std::uint8_t* object,
     std::size_t object_size,
     const std::uint8_t* expected_transaction,
     std::size_t expected_transaction_size,
     std::string_view expected_activation_host,
+    bool pending,
+    bool& installed,
     std::uint32_t& sequence_number,
     std::string& notification_address,
     LpaRspError& error)
 {
+    installed = false;
     error = LpaRspError::none;
     const bool output_alias =
         ranges_overlap(object, object_size, notification_address.data(),
@@ -1427,8 +1858,8 @@ bool idf_lpa_rsp_parse_profile_installation_result(
     }
     sequence_number = 0U;
     clear_string(notification_address);
-    if (!expected_transaction || expected_transaction_size == 0U ||
-        expected_transaction_size > kMaxTransactionBytes) {
+    if (!pending && (!expected_transaction || expected_transaction_size == 0U ||
+        expected_transaction_size > kMaxTransactionBytes)) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::transaction_mismatch);
     }
@@ -1532,9 +1963,10 @@ bool idf_lpa_rsp_parse_profile_installation_result(
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::der_malformed);
     }
-    if (transaction->value.size() != expected_transaction_size ||
-        std::memcmp(transaction->value.data(), expected_transaction,
-                    expected_transaction_size) != 0) {
+    if (transaction->value.empty() || transaction->value.size() > kMaxTransactionBytes ||
+        (!pending && (transaction->value.size() != expected_transaction_size ||
+         std::memcmp(transaction->value.data(), expected_transaction,
+                     expected_transaction_size) != 0))) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::transaction_mismatch);
     }
@@ -1669,9 +2101,10 @@ bool idf_lpa_rsp_parse_profile_installation_result(
             return pir_fail(sequence_number, notification_address, error,
                             LpaRspError::der_malformed);
         }
-        // 不回傳或複製 eUICC 錯誤細節。
-        return pir_fail(sequence_number, notification_address, error,
-                        LpaRspError::server_error);
+        // 失败通知仍须发送，但不回传 eUICC 错误细节，也不能视为安装成功。
+        sequence_number = parsed_sequence;
+        notification_address.assign(parsed_address.data(), parsed_address.size());
+        return true;
     }
     if (!success) {
         return pir_fail(sequence_number, notification_address, error,
@@ -1713,6 +2146,42 @@ bool idf_lpa_rsp_parse_profile_installation_result(
 
     sequence_number = parsed_sequence;
     notification_address.assign(parsed_address.data(), parsed_address.size());
+    installed = true;
     error = LpaRspError::none;
     return true;
+}
+
+bool idf_lpa_rsp_parse_profile_installation_notification(
+    const std::uint8_t* object, std::size_t object_size,
+    const std::uint8_t* expected_transaction, std::size_t expected_transaction_size,
+    std::string_view expected_activation_host, bool& installed,
+    std::uint32_t& sequence_number, std::string& notification_address, LpaRspError& error)
+{
+    return parse_installation_notification(
+        object, object_size, expected_transaction, expected_transaction_size,
+        expected_activation_host, false, installed, sequence_number, notification_address, error);
+}
+
+bool idf_lpa_rsp_parse_profile_installation_result(
+    const std::uint8_t* object, std::size_t object_size,
+    const std::uint8_t* expected_transaction, std::size_t expected_transaction_size,
+    std::string_view expected_activation_host, std::uint32_t& sequence_number,
+    std::string& notification_address, LpaRspError& error)
+{
+    bool installed = false;
+    if (!idf_lpa_rsp_parse_profile_installation_notification(
+            object, object_size, expected_transaction, expected_transaction_size,
+            expected_activation_host, installed, sequence_number, notification_address, error)) {
+        return false;
+    }
+    return installed || pir_fail(sequence_number, notification_address, error, LpaRspError::server_error);
+}
+
+bool idf_lpa_rsp_parse_pending_installation_notification(
+    const std::uint8_t* object, std::size_t object_size,
+    std::string_view expected_activation_host, bool& installed,
+    std::uint32_t& sequence_number, std::string& notification_address, LpaRspError& error)
+{
+    return parse_installation_notification(object, object_size, nullptr, 0,
+        expected_activation_host, true, installed, sequence_number, notification_address, error);
 }

@@ -22,7 +22,7 @@
 	import { Switch } from "$lib/components/ui/switch";
 	import * as Tabs from "$lib/components/ui/tabs";
 	import { Textarea } from "$lib/components/ui/textarea";
-	import { demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
+	import { confirmEsimInstall, demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, startEsimInstall, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
 	import { DEVICE_SUBPAGES, parseDeviceHash } from "$lib/device-navigation.js";
@@ -117,6 +117,17 @@
 	let esimResult = $state(idle());
 	let esimPollTimer: number | undefined;
 	let esimPollBusy = false;
+	let esimPollGeneration = 0;
+	let activationCode = $state("");
+	let confirmationCode = $state("");
+	let esimInstallSubmitting = $state(false);
+	let esimBusy = $derived(esimResult.state === "loading" || esim?.job.state === "queued" || esim?.job.state === "running");
+	const esimStageKeys: Record<string, TranslationKey> = {
+		validating: "esimStageValidating", recovering_notifications: "esimStageRecovering",
+		authenticating: "esimStageAuthenticating", awaiting_confirmation: "esimStageConfirmation",
+		preparing: "esimStagePreparing", downloading: "esimStageDownloading",
+		notifying: "esimStageNotifying", completed: "esimStageCompleted"
+	};
 	let deleteHandle = $state("");
 	let deleteOriginId = $state("");
 	let deleteDialog: HTMLDialogElement;
@@ -241,6 +252,7 @@
 	}
 
 	function stopEsimPoll() {
+		esimPollGeneration += 1;
 		if (esimPollTimer !== undefined) {
 			window.clearInterval(esimPollTimer);
 			esimPollTimer = undefined;
@@ -249,18 +261,25 @@
 
 	function startEsimPoll(jobId: number) {
 		stopEsimPoll();
+		const generation = esimPollGeneration;
 		const deadline = Date.now() + 90000;
 		const poll = async () => {
 			if (esimPollBusy) return;
 			esimPollBusy = true;
 			try {
 				const status = await loadEsim();
-				if (status.job.id >= jobId && (status.job.state === "succeeded" || status.job.state === "failed")) {
+				if (generation !== esimPollGeneration) return;
+				if (status.job.id !== jobId) {
 					stopEsimPoll();
+					esim = status;
+					esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
+				} else if (status.job.state === "succeeded" || status.job.state === "failed") {
+					stopEsimPoll();
+					confirmationCode = "";
 					const freshStatus = await refreshEsimAfterTerminal(loadEsim, status);
 					esim = freshStatus;
 					esimResult = { state: freshStatus.job.success ? "success" : "error", code: freshStatus.job.code, data: {}, detail: "" };
-				} else if (Date.now() >= deadline) {
+				} else if (status.job.action !== "install" && Date.now() >= deadline) {
 					esim = status;
 					stopEsimPoll();
 					esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
@@ -268,6 +287,7 @@
 					esim = status;
 				}
 			} catch {
+				if (generation !== esimPollGeneration) return;
 				stopEsimPoll();
 				esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
 			} finally {
@@ -276,6 +296,36 @@
 		};
 		void poll();
 		esimPollTimer = window.setInterval(() => void poll(), 750);
+	}
+
+	async function submitEsimInstall(confirmation = false, accepted = true) {
+		if (esimInstallSubmitting || (confirmation ? esim?.job.stage !== "awaiting_confirmation" : esimBusy)) return;
+		esimInstallSubmitting = true;
+		esimResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
+		try {
+			const pending = confirmation
+				? confirmEsimInstall(esim!.job.id, accepted, accepted && esim!.job.confirmationRequired ? confirmationCode : undefined)
+				: startEsimInstall(activationCode);
+			activationCode = "";
+			confirmationCode = "";
+			const result = await pending;
+			if (!result.success || result.code !== "ACTION_JOB_ACCEPTED") {
+				esimResult = { state: "error", code: result.code, data: {}, detail: "" };
+				await refreshEsim();
+				return;
+			}
+			const jobId = Number(result.data.jobId);
+			if (!Number.isInteger(jobId) || jobId <= 0) throw new Error("Invalid eSIM job.");
+			if (confirmation && esim) esim.job.stage = accepted ? "preparing" : "";
+			startEsimPoll(jobId);
+		} catch {
+			esimResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: "" };
+			await refreshEsim();
+		} finally {
+			activationCode = "";
+			confirmationCode = "";
+			esimInstallSubmitting = false;
+		}
 	}
 
 	async function runEsimAction(actionName: string, profile?: EsimProfile, nickname?: string) {
@@ -873,17 +923,42 @@
 								<Card.Header><Card.Title>{t("esimEid")}</Card.Title><Card.Description>{t(esim.eid.available ? "esimEidAvailable" : "esimEidUnavailable")}</Card.Description></Card.Header>
 								<Card.Content><dl class="grid gap-4 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimEidState")}</dt><dd class="mt-1"><Badge variant={esim.eid.available ? "default" : "outline"}>{t(esim.eid.available ? "esimEidAvailable" : "esimEidUnavailable")}</Badge></dd></div><div><dt class="text-sm text-muted-foreground">{t("esimEidLength")}</dt><dd class="mt-1 font-medium tabular-nums">{esim.eid.length}</dd></div></dl></Card.Content>
 							</Card.Root>
+							<Card.Root>
+								<Card.Header><Card.Title>{t("esimInstallTitle")}</Card.Title><Card.Description>{t("esimInstallDescription")}</Card.Description></Card.Header>
+								<Card.Content class="flex flex-col gap-4">
+									<form class="flex flex-col items-start gap-3" onsubmit={(event) => { event.preventDefault(); void submitEsimInstall(); }}>
+										<Field.Field><Field.Label for="esim-activation-code">{t("esimActivationCode")}</Field.Label><Input id="esim-activation-code" type="password" autocomplete="off" autocapitalize="none" spellcheck={false} maxlength={516} required disabled={esimBusy} bind:value={activationCode} /></Field.Field>
+										<Button type="submit" disabled={esimBusy || !activationCode || esimInstallSubmitting}>{t("esimInstallStart")}</Button>
+									</form>
+									{#if esim.job.action === "install" && esim.job.stage && (esimBusy || esim.job.success)}
+										<p class="flex items-center gap-2 text-sm" role="status" aria-live="polite">{#if esimBusy}<Spinner />{/if}{t(esimStageKeys[esim.job.stage] ?? "commonRunning")}</p>
+									{/if}
+									{#if esim.job.state === "running" && esim.job.stage === "awaiting_confirmation"}
+										<form class="flex flex-col items-start gap-3" onsubmit={(event) => { event.preventDefault(); void submitEsimInstall(true); }}>
+											<div><h3 class="font-medium">{t("esimConsentTitle")}</h3><p class="mt-1 text-sm text-muted-foreground">{t("esimConsentDescription")}</p></div>
+											<dl class="grid w-full gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimProfileName")}</dt><dd class="mt-1 break-words">{esim.job.profileName || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProviderName")}</dt><dd class="mt-1 break-words">{esim.job.providerName || t("commonUnknown")}</dd></div></dl>
+											{#if esim.job.confirmationRequired}
+											<Field.Field><Field.Label for="esim-confirmation-code">{t("esimConfirmationCode")}</Field.Label><Input id="esim-confirmation-code" type="password" autocomplete="off" autocapitalize="none" spellcheck={false} maxlength={128} required disabled={esimInstallSubmitting} aria-describedby="esim-confirmation-help" bind:value={confirmationCode} /><Field.Description id="esim-confirmation-help">{t("esimConfirmationHelp")}</Field.Description></Field.Field>
+											{/if}
+											<div class="flex flex-wrap gap-2"><Button type="submit" disabled={esimInstallSubmitting || (esim.job.confirmationRequired && !confirmationCode)}>{t("esimConfirm")}</Button><Button type="button" variant="outline" disabled={esimInstallSubmitting} onclick={() => void submitEsimInstall(true, false)}>{t("esimPostpone")}</Button></div>
+										</form>
+									{/if}
+									{#if esim.job.notificationPending || esim.job.code === "ACTION_ESIM_INSTALLATION_UNCERTAIN"}
+										<Alert.Root><Alert.Title>{t("esimInstallNotice")}</Alert.Title><Alert.Description>{t(esim.job.notificationPending ? "ACTION_ESIM_NOTIFICATION_PENDING" : "ACTION_ESIM_INSTALLATION_UNCERTAIN")}</Alert.Description></Alert.Root>
+									{/if}
+								</Card.Content>
+							</Card.Root>
 							<section class="flex flex-col gap-4" aria-labelledby="esim-profiles-title">
 								<div><h2 id="esim-profiles-title" class="text-xl font-semibold">{t("esimProfiles")}</h2></div>
 								{#if esim.profiles.length === 0}
-									<Empty.Root><Empty.Header><Empty.Title>{t("esimEmpty")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" onclick={() => void runEsimAction("refresh")}>{t("esimRefresh")}</Button></Empty.Content></Empty.Root>
+									<Empty.Root><Empty.Header><Empty.Title>{t("esimEmpty")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" disabled={esimBusy} onclick={() => void runEsimAction("refresh")}>{t("esimRefresh")}</Button></Empty.Content></Empty.Root>
 								{:else}
 									<div class="grid gap-4 md:grid-cols-2">
 										{#each esim.profiles as profile, profileIndex (profile.handle)}
 											<Card.Root>
 												<Card.Header><div class="flex items-start justify-between gap-3"><div class="min-w-0"><Card.Title>{profile.nickname || t("esimProfileUnnamed")}</Card.Title><Card.Description>{t("esimProfileDisplayId")}: {profile.displayId}</Card.Description></div><Badge variant={profile.state === "enabled" ? "default" : "outline"}>{t(profile.state === "enabled" ? "esimProfileEnabled" : profile.state === "disabled" ? "esimProfileDisabled" : "esimProfileUnknown")}</Badge></div></Card.Header>
-												<Card.Content class="flex flex-col gap-4"><dl class="grid gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimNickname")}</dt><dd class="mt-1 font-medium">{profile.nickname || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProfileClass")}</dt><dd class="mt-1 font-medium">{t(profile.profileClass === "operational" ? "esimClassOperational" : profile.profileClass === "provisioning" ? "esimClassProvisioning" : "esimClassUnknown")}</dd></div></dl><form class="flex flex-col gap-3" onsubmit={(event) => { event.preventDefault(); void runEsimAction("nickname", profile, profile.nickname); }}><Field.Field><Field.Label for={`esim-nickname-${profile.handle}`}>{t("esimNickname")}</Field.Label><Input id={`esim-nickname-${profile.handle}`} maxlength={64} autocomplete="off" placeholder={t("esimNicknamePlaceholder")} bind:value={profile.nickname} /></Field.Field><Button type="submit" variant="outline" disabled={esimResult.state === "loading"}>{t("esimSaveNickname")}</Button></form></Card.Content>
-														<Card.Footer class="flex flex-wrap justify-end gap-2"><Button variant="outline" disabled={esimResult.state === "loading" || profile.state === "enabled"} onclick={() => void runEsimAction("enable", profile)}>{t("esimEnable")}</Button><Button variant="outline" disabled={esimResult.state === "loading" || profile.state !== "enabled"} onclick={() => void runEsimAction("disable", profile)}>{t("esimDisable")}</Button><Button variant="outline" disabled={esimResult.state === "loading"} onclick={() => void runEsimAction("switch", profile)}>{t("esimSwitch")}</Button><Button id={`esim-delete-${profileIndex}`} variant="destructive" disabled={esimResult.state === "loading"} onclick={() => askDelete(profile.handle, `esim-delete-${profileIndex}`)}>{t("esimDelete")}</Button></Card.Footer>
+												<Card.Content class="flex flex-col gap-4"><dl class="grid gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimNickname")}</dt><dd class="mt-1 font-medium">{profile.nickname || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProfileClass")}</dt><dd class="mt-1 font-medium">{t(profile.profileClass === "operational" ? "esimClassOperational" : profile.profileClass === "provisioning" ? "esimClassProvisioning" : "esimClassUnknown")}</dd></div></dl><form class="flex flex-col gap-3" onsubmit={(event) => { event.preventDefault(); void runEsimAction("nickname", profile, profile.nickname); }}><Field.Field><Field.Label for={`esim-nickname-${profile.handle}`}>{t("esimNickname")}</Field.Label><Input id={`esim-nickname-${profile.handle}`} maxlength={64} autocomplete="off" placeholder={t("esimNicknamePlaceholder")} bind:value={profile.nickname} /></Field.Field><Button type="submit" variant="outline" disabled={esimBusy}>{t("esimSaveNickname")}</Button></form></Card.Content>
+														<Card.Footer class="flex flex-wrap justify-end gap-2"><Button variant="outline" disabled={esimBusy || profile.state === "enabled"} onclick={() => void runEsimAction("enable", profile)}>{t("esimEnable")}</Button><Button variant="outline" disabled={esimBusy || profile.state !== "enabled"} onclick={() => void runEsimAction("disable", profile)}>{t("esimDisable")}</Button><Button variant="outline" disabled={esimBusy} onclick={() => void runEsimAction("switch", profile)}>{t("esimSwitch")}</Button><Button id={`esim-delete-${profileIndex}`} variant="destructive" disabled={esimBusy} onclick={() => askDelete(profile.handle, `esim-delete-${profileIndex}`)}>{t("esimDelete")}</Button></Card.Footer>
 											</Card.Root>
 										{/each}
 									</div>

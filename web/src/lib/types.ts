@@ -153,6 +153,11 @@ export type EsimStatus = {
 		action: string;
 		success: boolean;
 		code: string;
+		stage: "" | "validating" | "recovering_notifications" | "authenticating" | "awaiting_confirmation" | "preparing" | "downloading" | "notifying" | "completed";
+		confirmationRequired: boolean;
+		notificationPending: boolean;
+		profileName: string;
+		providerName: string;
 	};
 };
 

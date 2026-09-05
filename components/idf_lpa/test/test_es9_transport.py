@@ -736,7 +736,11 @@ static std::vector<std::uint8_t> valid_bpp()
 {
     const auto init = bpp_tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = bpp_tlv({0xA0U}, bpp_tlv({0x87U}, {0x02U}));
-    const auto metadata = bpp_tlv({0xA1U}, bpp_tlv({0x88U}, {0x03U}));
+    auto metadata_payload = bpp_tlv({0xBF,0x25}, {
+        0x5A,10,0x98,0x88,0x12,0x32,0x54,0x76,0x98,0x10,0x32,0xF4,
+        0x91,7,'C','a','r','r','i','e','r',0x92,6,'T','r','a','v','e','l'});
+    metadata_payload.insert(metadata_payload.end(), {0xAA,0xBB,0xCC,0xDD,1,2,3,4});
+    const auto metadata = bpp_tlv({0xA1U}, bpp_tlv({0x88U}, metadata_payload));
     const auto second = bpp_tlv({0xA2U}, bpp_tlv({0x87U}, {0x04U}));
     const auto profile = bpp_tlv({0xA3U}, bpp_tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
@@ -772,6 +776,8 @@ static std::string bpp_response(std::string_view encoded)
            std::string(encoded) + "\"}";
 }
 
+static LpaRspProfileMetadata expected_metadata() { return {"Carrier", "Travel", false}; }
+
 static void assert_bpp_rejected(Scenario scenario,
                                 std::string_view body,
                                 IdfLpaEs9TransportError expected,
@@ -782,7 +788,7 @@ static void assert_bpp_rejected(Scenario scenario,
     std::string message = "response sentinel";
     IdfLpaEs9TransportError error = IdfLpaEs9TransportError::none;
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == expected);
     assert(pir.empty());
     assert(message.find("sentinel") == std::string::npos);
@@ -808,7 +814,7 @@ static void assert_bpp_pir_alias(std::size_t offset, std::size_t length,
     std::string message = "alias sentinel";
     IdfLpaEs9TransportError error = IdfLpaEs9TransportError::none;
     assert(!idf_lpa_es9_get_bound_profile_package(
-        host, request, transaction, pir, message, error));
+        host, request, transaction, expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::invalid_request);
     assert(pir.empty() && message.empty() && g.init_calls == 0);
 }
@@ -823,7 +829,7 @@ static void test_bpp_transport()
 
     reset_bpp(body);
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::none);
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}));
     assert(message.empty());
@@ -846,11 +852,26 @@ static void test_bpp_transport()
            fake_card.close_calls == fake_card.begin_calls);
 
     reset_bpp(body);
+    auto consent = expected_metadata();
+    consent.profile_name = "Different";
+    assert(!idf_lpa_es9_get_bound_profile_package("edge.example", R"({"request":true})",
+        "001122", consent, pir, message, error));
+    assert(error == IdfLpaEs9TransportError::response_body && pir.empty());
+    assert(fake_card.begin_calls == 2 && fake_card.close_calls == 2);
+    reset_bpp(body);
+    consent = expected_metadata();
+    consent.has_policy_rules = true;
+    assert(!idf_lpa_es9_get_bound_profile_package("edge.example", R"({"request":true})",
+        "001122", consent, pir, message, error));
+    assert(error == IdfLpaEs9TransportError::invalid_request && pir.empty());
+    assert(g.init_calls == 0 && fake_card.begin_calls == 0);
+
+    reset_bpp(body);
     const std::string oversized_request(IDF_LPA_ES9_MAX_JSON_BYTES + 1U, 'x');
     pir = {0xA5U};
     message = "request limit sentinel";
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", oversized_request, "001122", pir, message, error));
+        "edge.example", oversized_request, "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::invalid_request && pir.empty());
     assert(g.init_calls == 0 && fake_card.begin_calls == 0);
 
@@ -865,7 +886,7 @@ static void test_bpp_transport()
         pir = {0xA5U};
         message = "chunk sentinel";
         assert(idf_lpa_es9_get_bound_profile_package(
-            "edge.example", R"({"request":true})", "001122", pir, message, error));
+            "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
         assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}));
         assert(message.empty());
         assert(g.request == R"({"request":true})");
@@ -899,14 +920,14 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message = "exact cap sentinel";
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::response_body && g.perform_calls == 1);
     assert(pir.empty() && message.find("sentinel") == std::string::npos);
     reset_bpp("x", Scenario::success, "gsma/rsp/v2.6.0", exact_cap + 1);
     pir = {0xA5U};
     message = "wire cap sentinel";
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::response_too_large && g.perform_calls == 1);
     assert(pir.empty() && message.find("sentinel") == std::string::npos &&
            g.body_event_calls == 0 && fake_card.begin_calls == 0);
@@ -915,13 +936,13 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message.clear();
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}) && g.delay_calls >= 1);
     reset_bpp(body, Scenario::fetch_eagain);
     pir = {0xA5U};
     message.clear();
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}) &&
            g.perform_calls == 6 && g.delay_calls >= 5 && g.write_calls == 1);
     assert_bpp_rejected(Scenario::response_eagain_forever, body,
@@ -935,13 +956,13 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message.clear();
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}) && g.perform_calls == 3);
     reset_bpp(body, Scenario::open_eagain_long);
     pir = {0xA5U};
     message.clear();
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}) &&
            g.perform_calls == 6 && g.delay_calls >= 5);
 
@@ -950,7 +971,7 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message = "deadline sentinel";
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::timeout && pir.empty());
 
     std::string truncated = body.substr(0, body.size() - 1U);
@@ -965,7 +986,7 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message = "card sentinel";
     assert(!idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(error == IdfLpaEs9TransportError::response_body && pir.empty());
     assert(message.find("sentinel") == std::string::npos);
     assert(g.perform_calls == 1 && g.body_event_calls > 0 &&
@@ -982,7 +1003,7 @@ static void test_bpp_transport()
     pir = {0xA5U};
     message.clear();
     assert(idf_lpa_es9_get_bound_profile_package(
-        "edge.example", R"({"request":true})", "001122", pir, message, error));
+        "edge.example", R"({"request":true})", "001122", expected_metadata(), pir, message, error));
     assert(pir == std::vector<std::uint8_t>({0x90U, 0x00U}));
     assert(g.open_calls == 0 && g.perform_calls == 2 && g.write_calls == 1 &&
            g.response_offset == body.size() && g.request == R"({"request":true})");
@@ -990,6 +1011,18 @@ static void test_bpp_transport()
 
 int main()
 {
+    reset(Scenario::success);
+    std::string cancelled;
+    IdfLpaEs9TransportError cancel_error = IdfLpaEs9TransportError::unknown;
+    assert(idf_lpa_es9_post_json(IdfLpaEs9Operation::cancel_session,
+        "edge.example", R"({"transactionId":"0102","cancelSessionResponse":"vwEA"})",
+        cancelled, cancel_error));
+    assert(g.url == "https://edge.example/gsma/rsp2/es9plus/cancelSession" &&
+        cancelled == R"({"ok":true})" && cancel_error == IdfLpaEs9TransportError::none);
+    assert(g.request == R"({"transactionId":"0102","cancelSessionResponse":"vwEA"})");
+    assert_rejected(Scenario::notify_success, IdfLpaEs9Operation::cancel_session,
+        IdfLpaEs9TransportError::response_status);
+
     reset(Scenario::success);
     std::string response;
     IdfLpaEs9TransportError error = IdfLpaEs9TransportError::unknown;
@@ -1187,13 +1220,25 @@ class Es9TransportTest(unittest.TestCase):
             harness = Path(temp_dir) / "es9_transport_fixture.cpp"
             binary = Path(temp_dir) / "es9_transport_fixture"
             harness.write_text(FAKE_CPP)
+            # Use the real RSP parser; only its host crypto backend is built without ESP_PLATFORM.
+            rsp_object = Path(temp_dir) / "rsp.o"
+            subprocess.run([
+                "g++", "-std=c++17", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra",
+                "-Werror", "-pedantic", "-I", str(COMPONENT / "include"),
+                "-I", str(COMPONENT.parent / "idf_esim" / "include"),
+                "-c", str(COMPONENT / "idf_lpa_rsp.cpp"), "-o", str(rsp_object),
+            ], check=True, capture_output=True, text=True, timeout=30)
             result = subprocess.run(
                 [
                     "g++", "-std=c++17", "-DESP_PLATFORM", "-fno-exceptions", "-fno-rtti",
                     "-Wall", "-Wextra", "-Werror", "-pedantic",
                     "-DIDF_LPA_BPP_TESTING",
                     "-I", str(include), "-I", str(COMPONENT / "include"),
-                    str(SOURCE), str(BPP_SOURCE), str(harness), "-o", str(binary),
+                    "-I", str(COMPONENT.parent / "idf_esim" / "include"),
+                    str(SOURCE), str(BPP_SOURCE), str(rsp_object),
+                    str(COMPONENT / "idf_lpa_activation_code.cpp"),
+                    str(COMPONENT.parent / "idf_esim" / "idf_esim_codec.cpp"),
+                    str(harness), "-lcrypto", "-o", str(binary),
                 ],
                 check=False, capture_output=True, text=True, timeout=30,
             )

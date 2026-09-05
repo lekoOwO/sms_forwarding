@@ -512,6 +512,8 @@ int main()
 
 
 def run_esim_status_json_seam(source: str, mutate_body=None):
+    job_start = source.index("struct WebAsyncJob {")
+    job_struct = source[job_start:source.index("\n};", job_start) + 3]
     json_prop = function_body(source, "json_prop")
     modern_state = function_body(source, "modern_esim_state")
     modern_class = function_body(source, "modern_esim_class")
@@ -532,14 +534,7 @@ def run_esim_status_json_seam(source: str, mutate_body=None):
 
 #include "idf_util.h"
 
-struct WebAsyncJob {{
-    unsigned id = 0;
-    bool running = false;
-    bool done = false;
-    bool success = false;
-    bool queued = false;
-    std::string action;
-}};
+{job_struct}
 
 struct IdfEsimProfile {{
     std::string state;

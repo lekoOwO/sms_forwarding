@@ -35,6 +35,8 @@
 #include "idf_config.h"
 #include "config_schema_generated.h"
 #include "idf_esim.h"
+#include "idf_lpa_activation_code.h"
+#include "idf_lpa_install.h"
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
@@ -146,6 +148,14 @@ struct WebAsyncJob {
     bool queued = false;
     std::string action;
     std::string message;
+    std::string stage;
+    bool confirmationRequired = false;
+    bool notificationPending = false;
+    bool installationUncertain = false;
+    bool postponed = false;
+    bool cancellationFailed = false;
+    std::string profileName;
+    std::string providerName;
 };
 
 struct EsimWebCache {
@@ -161,6 +171,10 @@ static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
 static EsimWebCache s_esim_cache;
 static uint32_t s_next_esim_job_id = 1;
+static std::string s_esim_confirmation_code;
+static int64_t s_esim_confirmation_deadline_us = 0;
+static bool s_esim_confirmation_received = false;
+static bool s_esim_confirmation_accepted = false;
 static bool s_modem_apply_running = false;
 static bool s_web_modem_action_running = false;
 
@@ -3942,6 +3956,9 @@ struct EsimTaskArg {
     std::string action;
     std::string identifier;
     std::string nickname;
+    std::string activation_code;
+    uint32_t job_id = 0;
+    ~EsimTaskArg() { idf_web_secure_clear(activation_code); }
 };
 
 static std::string esim_action_label(const std::string& action)
@@ -3953,6 +3970,7 @@ static std::string esim_action_label(const std::string& action)
     if (action == "delete") return "Delete eSIM profile";
     if (action == "nickname") return "Update eSIM nickname";
     if (action == "switch") return "Switch eSIM profile";
+    if (action == "install") return "Install eSIM profile";
     return "eSIM action";
 }
 
@@ -4042,12 +4060,106 @@ static void append_modern_esim_profile_json(std::string& body,
     body += "}";
 }
 
+static void esim_install_progress(void* context, IdfLpaInstallStage stage)
+{
+    const char* value = "";
+    switch (stage) {
+    case IdfLpaInstallStage::validating: value = "validating"; break;
+    case IdfLpaInstallStage::recovering_notifications: value = "recovering_notifications"; break;
+    case IdfLpaInstallStage::authenticating: value = "authenticating"; break;
+    case IdfLpaInstallStage::awaiting_confirmation: value = "awaiting_confirmation"; break;
+    case IdfLpaInstallStage::preparing: value = "preparing"; break;
+    case IdfLpaInstallStage::downloading: value = "downloading"; break;
+    case IdfLpaInstallStage::notifying: value = "notifying"; break;
+    case IdfLpaInstallStage::completed: value = "completed"; break;
+    }
+    if (cell_job_lock(portMAX_DELAY)) {
+        if (s_esim_job.id == *static_cast<uint32_t*>(context)) s_esim_job.stage = value;
+        cell_job_unlock();
+    }
+}
+
+static esp_err_t esim_install_confirmation(void* context, const LpaRspProfileMetadata& metadata,
+                                           bool code_required, uint32_t timeout_ms,
+                                           bool& accepted, std::string& out)
+{
+    accepted = false;
+    idf_web_secure_clear(out);
+    const uint32_t job_id = *static_cast<uint32_t*>(context);
+    const int64_t deadline = esp_timer_get_time() + static_cast<int64_t>(
+        std::min(timeout_ms, IDF_LPA_INSTALL_CONFIRMATION_TIMEOUT_MS)) * 1000;
+    if (!cell_job_lock(pdMS_TO_TICKS(25))) return ESP_ERR_TIMEOUT;
+    if (s_esim_job.id != job_id || !s_esim_job.running || timeout_ms == 0) {
+        cell_job_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    idf_web_secure_clear(s_esim_confirmation_code);
+    s_esim_confirmation_deadline_us = deadline;
+    s_esim_confirmation_received = false;
+    s_esim_confirmation_accepted = false;
+    s_esim_job.confirmationRequired = code_required;
+    s_esim_job.profileName = metadata.profile_name;
+    s_esim_job.providerName = metadata.service_provider_name;
+    s_esim_job.stage = "awaiting_confirmation";
+    cell_job_unlock();
+    for (;;) {
+        if (cell_job_lock(pdMS_TO_TICKS(25))) {
+            const bool expired = esp_timer_get_time() >= deadline;
+            if (s_esim_job.id != job_id || expired || s_esim_confirmation_received) {
+                const bool received = !expired && s_esim_job.id == job_id && s_esim_confirmation_received;
+                if (received) {
+                    accepted = s_esim_confirmation_accepted;
+                    out = s_esim_confirmation_code;
+                }
+                idf_web_secure_clear(s_esim_confirmation_code);
+                s_esim_confirmation_deadline_us = 0;
+                s_esim_confirmation_received = false;
+                s_esim_confirmation_accepted = false;
+                s_esim_job.confirmationRequired = false;
+                s_esim_job.profileName.clear();
+                s_esim_job.providerName.clear();
+                if (!received || !accepted) s_esim_job.stage.clear();
+                cell_job_unlock();
+                return received ? ESP_OK : ESP_ERR_TIMEOUT;
+            }
+            cell_job_unlock();
+        }
+        const int64_t remaining_ms = (deadline - esp_timer_get_time()) / 1000;
+        if (remaining_ms > 0) vTaskDelay(pdMS_TO_TICKS(std::min<int64_t>(25, remaining_ms)));
+    }
+}
+
+static esp_err_t submit_esim_confirmation(uint32_t job_id, bool consent, const std::string* code)
+{
+    if (!cell_job_lock()) return ESP_ERR_INVALID_STATE;
+    const bool pending = s_esim_job.id == job_id && s_esim_job.running &&
+        s_esim_job.action == "install" && s_esim_job.stage == "awaiting_confirmation" &&
+        !s_esim_confirmation_received && esp_timer_get_time() < s_esim_confirmation_deadline_us;
+    esp_err_t result = ESP_ERR_INVALID_STATE;
+    if (pending) {
+        const bool needs_code = consent && s_esim_job.confirmationRequired;
+        if (needs_code != (code != nullptr)) {
+            result = ESP_ERR_INVALID_ARG;
+        } else {
+            if (code) s_esim_confirmation_code = *code;
+            s_esim_confirmation_received = true;
+            s_esim_confirmation_accepted = consent;
+            s_esim_job.stage = consent ? "preparing" : "";
+            result = ESP_OK;
+        }
+    }
+    cell_job_unlock();
+    return result;
+}
+
 static void esim_task(void* arg_raw)
 {
     EsimTaskArg* arg = static_cast<EsimTaskArg*>(arg_raw);
     std::string action = arg->action;
     std::string identifier = arg->identifier;
     std::string nickname = arg->nickname;
+    std::string activation_code = arg->activation_code;
+    uint32_t job_id = arg->job_id;
     delete arg;
 
     if (cell_job_lock()) {
@@ -4062,7 +4174,8 @@ static void esim_task(void* arg_raw)
     std::vector<IdfEsimProfile> profiles;
     esp_err_t err = ESP_ERR_INVALID_ARG;
     bool cache_eid_only = false;
-    if (action != "refresh" && action != "info") {
+    IdfLpaInstallResult install_result;
+    if (action != "refresh" && action != "info" && action != "install") {
         // Re-read the list before every opaque-handle mutation. A cached index
         // is not sufficient after profile deletion or remote profile changes.
         std::vector<IdfEsimProfile> current;
@@ -4083,7 +4196,11 @@ static void esim_task(void* arg_raw)
             err = ESP_ERR_NOT_FOUND;
         }
     }
-    if (err == ESP_ERR_INVALID_ARG && action == "refresh") {
+    if (err == ESP_ERR_INVALID_ARG && action == "install") {
+        err = idf_lpa_install_profile(activation_code, esim_install_confirmation,
+                                      esim_install_progress, &job_id, install_result);
+        idf_web_secure_clear(activation_code);
+    } else if (err == ESP_ERR_INVALID_ARG && action == "refresh") {
         err = idf_esim_list_profiles(profiles, eid, message);
     } else if (err == ESP_ERR_INVALID_ARG && action == "info") {
         err = idf_esim_get_eid(eid, message);
@@ -4102,7 +4219,7 @@ static void esim_task(void* arg_raw)
         message = "Unknown eSIM action";
     }
 
-    bool ok = (err == ESP_OK);
+    bool ok = action == "install" ? install_result.installed : err == ESP_OK;
     // Enable, switch, and disable change the active card; reload the number, ICCID, and operator to avoid stale overview data.
     bool sim_changed = ok && (action == "enable" || action == "switch" || action == "disable");
     esp_err_t transition_refresh_err = ESP_OK;
@@ -4124,7 +4241,7 @@ static void esim_task(void* arg_raw)
     bool cache_ready = false;
     if (ok && sim_changed) {
         cache_ready = true;
-    } else if (ok && (action == "delete" || action == "nickname")) {
+    } else if (ok && (action == "delete" || action == "nickname" || action == "install")) {
         // For actions that do not affect the current UICC session, refresh the list cache immediately.
         std::string refresh_msg;
         std::vector<IdfEsimProfile> refreshed;
@@ -4167,6 +4284,18 @@ static void esim_task(void* arg_raw)
         s_esim_job.queued = false;
         s_esim_job.done = true;
         s_esim_job.success = ok;
+        s_esim_job.confirmationRequired = false;
+        s_esim_job.notificationPending = install_result.installed && install_result.notification_pending;
+        s_esim_job.installationUncertain = install_result.error == IdfLpaInstallError::installation_uncertain;
+        s_esim_job.postponed = install_result.error == IdfLpaInstallError::postponed;
+        s_esim_job.cancellationFailed = install_result.error == IdfLpaInstallError::cancellation_failed;
+        if (action == "install" && ok) s_esim_job.stage = "completed";
+        s_esim_confirmation_deadline_us = 0;
+        s_esim_confirmation_received = false;
+        s_esim_confirmation_accepted = false;
+        s_esim_job.profileName.clear();
+        s_esim_job.providerName.clear();
+        idf_web_secure_clear(s_esim_confirmation_code);
         s_esim_job.message = final_message;
         cell_job_unlock();
     }
@@ -4179,7 +4308,9 @@ static bool start_esim_job(const std::string& action,
                            const std::string& identifier,
                            const std::string& nickname,
                            std::string& message,
-                           bool& already_running)
+                           bool& already_running,
+                           const std::string& activation_code = {},
+                           uint32_t* accepted_id = nullptr)
 {
     already_running = false;
     if (!try_shared_admission(false)) {
@@ -4213,6 +4344,9 @@ static bool start_esim_job(const std::string& action,
     s_esim_job.done = false;
     s_esim_job.success = false;
     s_esim_job.action = action;
+    if (action == "install") s_esim_job.stage = "validating";
+    const uint32_t job_id = s_esim_job.id;
+    if (accepted_id) *accepted_id = job_id;
     s_esim_job.message = esim_action_label(action) + " queued";
     cell_job_unlock();
 
@@ -4232,6 +4366,8 @@ static bool start_esim_job(const std::string& action,
     arg->action = action;
     arg->identifier = identifier;
     arg->nickname = nickname;
+    arg->activation_code = activation_code;
+    arg->job_id = job_id;
     if (xTaskCreate(esim_task, "idf_esim", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
         if (cell_job_lock(portMAX_DELAY)) {
@@ -5030,6 +5166,10 @@ static const char* modern_esim_job_code(const WebAsyncJob& job)
 {
     if (job.id == 0) return "ACTION_ESIM_IDLE";
     if (job.queued || job.running) return "ACTION_ESIM_RUNNING";
+    if (job.success && job.notificationPending) return "ACTION_ESIM_NOTIFICATION_PENDING";
+    if (job.installationUncertain) return "ACTION_ESIM_INSTALLATION_UNCERTAIN";
+    if (job.postponed) return "ACTION_ESIM_POSTPONED";
+    if (job.cancellationFailed) return "ACTION_ESIM_CANCELLATION_FAILED";
     return job.success ? "ACTION_ESIM_COMPLETE" : "ACTION_ESIM_FAILED";
 }
 
@@ -5088,32 +5228,95 @@ static esp_err_t handle_api_esim(httpd_req_t* req)
         body += job.success ? "true" : "false";
         body += ",";
         json_prop(body, "code", modern_esim_job_code(job));
+        body += ",";
+        json_prop(body, "stage", job.stage);
+        body += ",";
+        json_prop(body, "profileName", job.profileName);
+        body += ",";
+        json_prop(body, "providerName", job.providerName);
+        body += ",\"confirmationRequired\":";
+        body += job.confirmationRequired ? "true" : "false";
+        body += ",\"notificationPending\":";
+        body += job.notificationPending ? "true" : "false";
         body += "}}";
         set_json_no_cache(req);
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
     if (req->content_len == 0) return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
-    std::string raw;
-    if (read_body(req, raw, 512) != ESP_OK) return ESP_OK;
-    const IdfWebFormDecodeResult decoded = idf_web_decode_form(raw, 3);
+    struct SensitiveForm {
+        std::string raw;
+        IdfWebFormDecodeResult decoded;
+        ~SensitiveForm() {
+            idf_web_secure_clear(raw);
+            clear_form_fields(decoded);
+        }
+    } form;
+    if (read_body(req, form.raw, 2048) != ESP_OK) return ESP_OK;
+    if (form.raw.empty() || form.raw.front() == '=' || form.raw.front() == '&' || form.raw.back() == '&' ||
+        form.raw.find("&=") != std::string::npos || form.raw.find("&&") != std::string::npos)
+        return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+    form.decoded = idf_web_decode_form(form.raw, 4);
+    const auto& decoded = form.decoded;
     if (!decoded.valid || decoded.fields.empty() || decoded.too_many_fields) {
         return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
     }
     std::string action;
     std::string handle;
     std::string nickname;
+    for (size_t i = 0; i < decoded.fields.size(); ++i) {
+        for (size_t j = 0; j < i; ++j) {
+            if (decoded.fields[i].first == decoded.fields[j].first)
+                return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+        }
+        if (decoded.fields[i].first == "action") action = decoded.fields[i].second;
+    }
+    const std::string* activation_code = nullptr;
+    const std::string* confirmation_code = nullptr;
+    const std::string* confirmation_job = nullptr;
+    const std::string* consent = nullptr;
     for (const auto& field : decoded.fields) {
-        if (field.first == "action" && action.empty()) action = field.second;
-        else if (field.first == "handle" && handle.empty()) handle = field.second;
-        else if (field.first == "nickname" && nickname.empty()) nickname = field.second;
+        if (field.first == "action") continue;
+        if (action == "install" && field.first == "activationCode") activation_code = &field.second;
+        else if (action == "confirm" && field.first == "confirmationCode") confirmation_code = &field.second;
+        else if (action == "confirm" && field.first == "jobId") confirmation_job = &field.second;
+        else if (action == "confirm" && field.first == "accepted") consent = &field.second;
+        else if (action != "install" && action != "confirm" && field.first == "handle") handle = field.second;
+        else if (action == "nickname" && field.first == "nickname") nickname = field.second;
         else return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
     }
+    if (action == "confirm") {
+        if (decoded.fields.size() < 3 || !confirmation_job || !consent || (*consent != "true" && *consent != "false") ||
+            confirmation_job->empty() || confirmation_job->size() > 10 || (*confirmation_job)[0] == '0' ||
+            !std::all_of(confirmation_job->begin(), confirmation_job->end(), [](char ch) { return ch >= '0' && ch <= '9'; }) ||
+            (confirmation_code && (confirmation_code->empty() || confirmation_code->size() > IDF_LPA_RSP_MAX_CONFIRMATION_BYTES ||
+            !std::all_of(confirmation_code->begin(), confirmation_code->end(), [](char ch) { return ch >= 0x20 && ch <= 0x7e; }))))
+            return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+        const unsigned long long parsed_job = strtoull(confirmation_job->c_str(), nullptr, 10);
+        if (parsed_job > UINT32_MAX)
+            return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "jobId");
+        const uint32_t job_id = static_cast<uint32_t>(parsed_job);
+        const esp_err_t submitted = submit_esim_confirmation(job_id, *consent == "true", confirmation_code);
+        if (submitted == ESP_ERR_INVALID_ARG)
+            return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "confirmationCode");
+        if (submitted != ESP_OK)
+            return send_modern_esim_error(req, "409 Conflict", "ACTION_ESIM_CONFIRMATION_STALE");
+        set_json_no_cache(req);
+        httpd_resp_set_status(req, "202 Accepted");
+        return httpd_resp_sendstr(req, action_result(true, "ACTION_JOB_ACCEPTED",
+            std::string("\"jobId\":") + std::to_string(job_id)).c_str());
+    }
+    if (action == "install") {
+        LpaActivationCode parsed;
+        if (decoded.fields.size() != 2 || !activation_code ||
+            !idf_lpa_parse_activation_code(*activation_code, parsed))
+            return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "activationCode");
+    }
     if (!(action == "refresh" || action == "info" || action == "enable" || action == "disable" ||
-          action == "delete" || action == "nickname" || action == "switch")) {
+          action == "delete" || action == "nickname" || action == "switch" || action == "install")) {
         return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "action");
     }
-    if ((action == "refresh" || action == "info") ? !handle.empty() || !nickname.empty()
+    if ((action == "refresh" || action == "info" || action == "install") ? !handle.empty() || !nickname.empty()
                                                     : handle.empty()) {
         return send_modern_esim_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "handle");
     }
@@ -5130,19 +5333,17 @@ static esp_err_t handle_api_esim(httpd_req_t* req)
     }
     std::string message;
     bool already_running = false;
-    const bool ok = start_esim_job(action, identifier, nickname, message, already_running);
+    const std::string empty_activation;
+    uint32_t accepted_id = 0;
+    const bool ok = start_esim_job(action, identifier, nickname, message, already_running,
+                                    activation_code ? *activation_code : empty_activation, &accepted_id);
     if (!ok) {
         return send_modern_esim_error(req, "409 Conflict", "ACTION_ESIM_BUSY");
-    }
-    WebAsyncJob job;
-    if (cell_job_lock()) {
-        job = s_esim_job;
-        cell_job_unlock();
     }
     set_json_no_cache(req);
     httpd_resp_set_status(req, "202 Accepted");
     return httpd_resp_sendstr(req, action_result(true, "ACTION_JOB_ACCEPTED",
-                                                   std::string("\"jobId\":") + std::to_string(job.id)).c_str());
+                                                   std::string("\"jobId\":") + std::to_string(accepted_id)).c_str());
 }
 
 static esp_err_t handle_keepalive(httpd_req_t* req)

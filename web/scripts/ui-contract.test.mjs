@@ -38,7 +38,16 @@ test("closing the eSIM delete dialog clears context and returns its originating 
 	});
 });
 
-test("demo eSIM switch makes the selected profile enabled", async () => {
+test("terminal profile refresh cannot report a different installation as this job's success", async () => {
+	const { refreshEsimAfterTerminal } = await loadUiContract();
+	const failed = { profiles: [], job: { id: 7, state: "failed", success: false, code: "ACTION_ESIM_INSTALLATION_UNCERTAIN" } };
+	const status = await refreshEsimAfterTerminal(async () => ({ profiles: [], job: { id: 8, state: "succeeded", success: true } }), failed);
+	assert.equal(status.job.id, 7);
+	assert.equal(status.job.success, false);
+	assert.equal(status.job.code, "ACTION_ESIM_INSTALLATION_UNCERTAIN");
+});
+
+async function withDemoApi(run) {
 	const previousMode = process.env.VITE_DEMO_MODE;
 	const previousCwd = process.cwd();
 	let server;
@@ -48,13 +57,7 @@ test("demo eSIM switch makes the selected profile enabled", async () => {
 		const { createServer } = await import("vite");
 		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
 		const api = await server.ssrLoadModule("/src/lib/api.ts");
-		const before = await api.loadEsim();
-		const target = before.profiles.find((profile) => profile.state === "disabled");
-		assert.ok(target);
-		assert.equal((await api.postEsimAction("switch", target.handle)).success, true);
-		const after = await api.loadEsim();
-		assert.equal(after.profiles.find((profile) => profile.handle === target.handle)?.state, "enabled");
-		assert.ok(after.profiles.filter((profile) => profile.handle !== target.handle).every((profile) => profile.state === "disabled"));
+		await run(api);
 	} finally {
 		try { await server?.close(); }
 		finally {
@@ -63,6 +66,45 @@ test("demo eSIM switch makes the selected profile enabled", async () => {
 			else process.env.VITE_DEMO_MODE = previousMode;
 		}
 	}
+}
+
+test("demo eSIM switch makes the selected profile enabled", async () => {
+	await withDemoApi(async (api) => {
+		const before = await api.loadEsim();
+		const target = before.profiles.find((profile) => profile.state === "disabled");
+		assert.ok(target);
+		assert.equal((await api.postEsimAction("switch", target.handle)).success, true);
+		const after = await api.loadEsim();
+		assert.equal(after.profiles.find((profile) => profile.handle === target.handle)?.state, "enabled");
+		assert.ok(after.profiles.filter((profile) => profile.handle !== target.handle).every((profile) => profile.state === "disabled"));
+	});
+});
+
+test("installation API waits for exact profile consent, installs disabled, and can postpone", async () => {
+	await withDemoApi(async (api) => {
+		const before = await api.loadEsim();
+		const accepted = await api.startEsimInstall("LPA:1$example.invalid$PRIVATE-ACTIVATION");
+		assert.equal(accepted.code, "ACTION_JOB_ACCEPTED");
+		const id = accepted.data.jobId;
+		const pending = await api.waitForEsimJob(id);
+		assert.equal(pending.job.stage, "awaiting_confirmation");
+		assert.equal(pending.job.profileName, "Installed profile");
+		assert.deepEqual(pending.profiles, before.profiles);
+		assert.equal((await api.confirmEsimInstall(id + 1, true, "private-code")).code, "ACTION_ESIM_CONFIRMATION_STALE");
+		assert.equal((await api.confirmEsimInstall(id, true, "")).code, "ACTION_INPUT_INVALID");
+		assert.equal((await api.confirmEsimInstall(id, true, "private-code")).code, "ACTION_JOB_ACCEPTED");
+		const installed = await api.waitForEsimJob(id);
+		assert.equal(installed.job.state, "succeeded");
+		assert.equal(installed.profiles.at(-1).state, "disabled");
+		assert.equal(installed.profiles.filter((profile) => profile.state === "enabled").length, 1);
+		assert.equal(JSON.stringify(installed).includes("private-"), false);
+		const next = await api.startEsimInstall("LPA:1$example.invalid$ANOTHER-ACTIVATION");
+		assert.equal((await api.confirmEsimInstall(next.data.jobId, false)).success, true);
+		const postponed = await api.waitForEsimJob(next.data.jobId);
+		assert.equal(postponed.job.code, "ACTION_ESIM_POSTPONED");
+		assert.deepEqual(postponed.profiles, installed.profiles);
+		await assert.rejects(api.waitForEsimJob(id), /no longer available/);
+	});
 });
 
 test("push provider fields expose only the fields used by each transport", async () => {

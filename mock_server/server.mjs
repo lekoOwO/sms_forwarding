@@ -570,6 +570,9 @@ const actionCodes = new Set([
 	"ACTION_OTA_SIGNATURE_INVALID", "ACTION_OTA_WRITE_FAILED", "ACTION_TOO_MANY_FIELDS"
 	, "ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED"
 	, "ACTION_ESIM_BUSY", "ACTION_ESIM_HANDLE_STALE"
+	, "ACTION_ESIM_CONFIRMATION_STALE", "ACTION_ESIM_NOTIFICATION_PENDING", "ACTION_ESIM_INSTALLATION_UNCERTAIN"
+	, "ACTION_ESIM_POSTPONED"
+	, "ACTION_ESIM_CANCELLATION_FAILED"
 	, "PUSH_CA_PROBE_READY", "PUSH_CA_PROBE_FAILED", "PUSH_CA_INSTALLED", "PUSH_CA_STALE"
 	, "PUSH_CA_REJECTED", "PUSH_CA_STORE_FAILED", "PUSH_CA_STATUS"
 ]);
@@ -666,6 +669,9 @@ export function createApp({
 	apLocalAddress = "192.168.1.1",
 	now = Date.now,
 	jobDelayMs = 0,
+	esimConfirmationRequired = false,
+	esimNotificationPending = false,
+	esimSchedule = (run, delay) => setTimeout(run, delay).unref(),
 	pushCaRejectCount = 0,
 	otaPublicKey = defaultOtaPublicKey,
 	otaAcceptedCounter = 0
@@ -695,9 +701,10 @@ export function createApp({
 			{ iccid: "8988212345678905678", isdpAid: "A0000005591010FFFFFFFF89000002", state: "disabled", nickname: "Backup", profileClass: "operational" }
 		],
 		handles: ["p1111111111111111", "p2222222222222222"],
-		job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE" },
+		job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE", stage: "", confirmationRequired: false, notificationPending: false, profileName: "", providerName: "" },
 		nextJobId: 1
 	};
+	let esimConfirmationDeadline = 0;
 	const esimStatus = () => ({
 		eid: { available: Boolean(esim.eid), state: esim.eid ? "available" : "unavailable", length: esim.eid.length },
 		profiles: esim.profiles.map((profile, index) => ({
@@ -709,13 +716,18 @@ export function createApp({
 	const finishEsimJob = (job, action, handle, nickname) => {
 		if (job.state !== "queued" && job.state !== "running") return;
 		const index = handle ? esim.handles.indexOf(handle) : -1;
-		if (action !== "refresh" && action !== "info" && index < 0) {
+		if (action !== "refresh" && action !== "info" && action !== "install" && index < 0) {
 			job.state = "failed";
 			job.success = false;
 			job.code = "ACTION_ESIM_HANDLE_STALE";
 			return;
 		}
-		if (action === "refresh") {
+		if (action === "install") {
+			esim.profiles.push({ state: "disabled", nickname: "Installed profile", profileClass: "operational" });
+			esim.handles = esim.profiles.map((_, profileIndex) => `p${(job.id * 32 + profileIndex + 1).toString(16).padStart(16, "0")}`);
+			job.stage = "completed";
+			job.notificationPending = esimNotificationPending;
+		} else if (action === "refresh") {
 			esim.handles = esim.profiles.map((_, profileIndex) => `p${(profileIndex + 1).toString(16).padStart(16, "0")}`);
 		} else if (action === "info") {
 			// The mock keeps the same structural EID state.
@@ -730,7 +742,23 @@ export function createApp({
 		}
 		job.state = "succeeded";
 		job.success = true;
-		job.code = "ACTION_ESIM_COMPLETE";
+		job.code = job.notificationPending ? "ACTION_ESIM_NOTIFICATION_PENDING" : "ACTION_ESIM_COMPLETE";
+	};
+	const startEsimInstall = (job) => {
+		job.state = "running";
+		job.stage = "awaiting_confirmation";
+		job.confirmationRequired = esimConfirmationRequired;
+		job.profileName = "Installed profile";
+		job.providerName = "Example carrier";
+		esimConfirmationDeadline = now() + 300000;
+		esimSchedule(() => {
+			if (esim.job !== job || job.stage !== "awaiting_confirmation") return;
+			job.confirmationRequired = false;
+			job.profileName = job.providerName = job.stage = "";
+			job.state = "failed";
+			job.code = "ACTION_ESIM_FAILED";
+			esimConfirmationDeadline = 0;
+		}, 300000);
 	};
 	const expireUpload = () => {
 		if (upload && now() - upload.lastActivity >= 120000) upload = undefined;
@@ -932,18 +960,46 @@ export function createApp({
 		return response.set("Cache-Control", "no-store, max-age=0").json(esimStatus());
 	});
 	app.post("/api/esim", (request, response) => {
-		if (!request.body || !Object.keys(request.body).length || Object.keys(request.body).length > 3)
+		response.once("finish", () => {
+			if (request.body) { delete request.body.activationCode; delete request.body.confirmationCode; }
+		});
+		if (Number(request.headers["content-length"] ?? 0) > 2048) return response.status(413).json(result(false, "ACTION_INPUT_TOO_LONG", {}, "body"));
+		if (!request.body || !Object.keys(request.body).length || Object.keys(request.body).length > 4)
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
 		if (Object.keys(request.query).length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "query"));
-		const allowed = new Set(["action", "handle", "nickname"]);
+		const action = request.body.action;
+		const allowed = new Set(action === "install" ? ["action", "activationCode"] : action === "confirm" ? ["action", "jobId", "accepted", "confirmationCode"] : ["action", "handle", "nickname"]);
 		if (Object.keys(request.body).some((key) => !allowed.has(key)) || typeof request.body.action !== "string")
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
-		const action = request.body.action;
-		if (!["refresh", "info", "enable", "disable", "delete", "nickname", "switch"].includes(action))
+		if (action === "confirm") {
+			const code = request.body.confirmationCode;
+			const jobIdText = request.body.jobId;
+			const consent = request.body.accepted;
+			if (Object.keys(request.body).length < 3 || !["true", "false"].includes(consent) || typeof jobIdText !== "string" || !/^[1-9][0-9]*$/.test(jobIdText) || Number(jobIdText) > 0xffffffff ||
+				(code !== undefined && (typeof code !== "string" || !/^[\x20-\x7e]{1,128}$/.test(code)))) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
+			const job = esim.job;
+			if (job.id !== Number(jobIdText) || job.stage !== "awaiting_confirmation" || now() >= esimConfirmationDeadline)
+				return response.status(409).json(result(false, "ACTION_ESIM_CONFIRMATION_STALE"));
+			if ((consent === "true" && job.confirmationRequired) !== (code !== undefined)) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "confirmationCode"));
+			job.confirmationRequired = false;
+			job.profileName = job.providerName = "";
+			esimConfirmationDeadline = 0;
+			if (consent === "true") {
+				job.stage = "preparing";
+				finishEsimJob(job, "install", "", "");
+			} else {
+				job.stage = ""; job.state = "failed"; job.code = "ACTION_ESIM_POSTPONED";
+			}
+			return response.status(202).json(result(true, "ACTION_JOB_ACCEPTED", { jobId: job.id }));
+		}
+		if (action === "install" && (Object.keys(request.body).length !== 2 || typeof request.body.activationCode !== "string" ||
+			!request.body.activationCode || byteLength(request.body.activationCode) > 516 || /[^\x20-\x7e]/.test(request.body.activationCode)))
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "activationCode"));
+		if (!["refresh", "info", "enable", "disable", "delete", "nickname", "switch", "install"].includes(action))
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "action"));
 		const handle = typeof request.body.handle === "string" ? request.body.handle : "";
 		const nickname = typeof request.body.nickname === "string" ? request.body.nickname : "";
-		if ((action === "refresh" || action === "info") ? handle || nickname : !handle)
+		if ((action === "refresh" || action === "info" || action === "install") ? handle || nickname : !handle)
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "handle"));
 		if (action !== "nickname" && nickname) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "nickname"));
 		if (byteLength(nickname) > 64 || /[\r\n\t]/.test(nickname)) return response.status(400).json(result(false, "ACTION_INPUT_TOO_LONG", {}, "nickname"));
@@ -951,8 +1007,8 @@ export function createApp({
 		if (handle && !esim.handles.includes(handle)) return response.status(409).json(result(false, "ACTION_ESIM_HANDLE_STALE"));
 		if (esim.job.state === "queued" || esim.job.state === "running" || deviceRestartPending || otaRestartPending || restoreRestartPending || upload || pushTestActive() ||
 			[...jobs.values()].some((job) => job.state === "queued" || job.state === "running")) return response.status(409).json(result(false, "ACTION_ESIM_BUSY"));
-		const job = esim.job = { id: esim.nextJobId++, state: "queued", action, success: false, code: "ACTION_ESIM_RUNNING" };
-		const finish = () => { job.state = "running"; finishEsimJob(job, action, handle, nickname); };
+		const job = esim.job = { id: esim.nextJobId++, state: "queued", action, success: false, code: "ACTION_ESIM_RUNNING", stage: action === "install" ? "validating" : "", confirmationRequired: false, notificationPending: false, profileName: "", providerName: "" };
+		const finish = () => { job.state = "running"; if (action === "install") startEsimInstall(job); else finishEsimJob(job, action, handle, nickname); };
 		if (jobDelayMs > 0) setTimeout(finish, jobDelayMs);
 		else finish();
 		return response.status(202).json(result(true, "ACTION_JOB_ACCEPTED", { jobId: job.id }));

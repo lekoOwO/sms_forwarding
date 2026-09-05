@@ -1,6 +1,7 @@
 #include "idf_lpa_bpp.h"
 
 #include "idf_esim_lpa.h"
+#include "idf_esim_codec.h"
 
 #include <algorithm>
 #include <array>
@@ -324,7 +325,15 @@ private:
 
 class BppDerStreamParser final {
 public:
-    BppDerStreamParser() = default;
+    explicit BppDerStreamParser(const LpaRspProfileMetadata& expected)
+    {
+        expected_metadata_valid_ = !expected.has_policy_rules &&
+            expected.profile_name.size() <= IDF_LPA_RSP_MAX_PROFILE_NAME_BYTES &&
+            expected.service_provider_name.size() <= IDF_LPA_RSP_MAX_PROVIDER_NAME_BYTES;
+        if (expected_metadata_valid_) expected_metadata_ = expected;
+    }
+
+    bool valid_expected_metadata() const noexcept { return expected_metadata_valid_; }
 
     esp_err_t feed(const std::uint8_t* data, std::size_t length, std::string& message)
     {
@@ -335,6 +344,8 @@ public:
         for (std::size_t i = 0U; i < length; ++i) {
             if (state_ == State::metadata_child && sequence_remaining_ == 0U) {
                 if (child_count_ == 0U) return reject(ESP_ERR_INVALID_RESPONSE, message);
+                const esp_err_t error = verify_and_replay_metadata(message);
+                if (error != ESP_OK) return error;
                 sequence_active_ = false;
                 state_ = State::second_sequence_or_profile;
             }
@@ -364,6 +375,8 @@ public:
     {
         if (state_ == State::metadata_child && sequence_remaining_ == 0U) {
             if (child_count_ == 0U) return reject(ESP_ERR_INVALID_RESPONSE, message);
+            const esp_err_t error = verify_and_replay_metadata(message);
+            if (error != ESP_OK) return error;
             sequence_active_ = false;
             state_ = State::second_sequence_or_profile;
         }
@@ -386,6 +399,13 @@ public:
     {
         writer_.close();
         secure_clear(installation_result_);
+        secure_clear(metadata_wire_);
+        secure_clear(metadata_plaintext_);
+        secure_clear(expected_metadata_.profile_name);
+        secure_clear(expected_metadata_.service_provider_name);
+        expected_metadata_.has_policy_rules = false;
+        expected_metadata_valid_ = false;
+        collecting_metadata_ = false;
         clear_pending_parent_header();
         header_.reset();
         value_remaining_ = 0U;
@@ -405,7 +425,9 @@ public:
                installation_result_.empty() && value_remaining_ == 0U &&
                outer_remaining_ == 0U && sequence_remaining_ == 0U && child_count_ == 0U &&
                decoded_bytes_ == 0U && segment_count_ == 0U && element_count_ == 0U &&
-               !sequence_active_;
+               !sequence_active_ && metadata_wire_.empty() && metadata_plaintext_.empty() &&
+               expected_metadata_.profile_name.empty() && expected_metadata_.service_provider_name.empty() &&
+               !expected_metadata_valid_ && !collecting_metadata_;
     }
 
 private:
@@ -450,14 +472,75 @@ private:
         if (!safe_add(decoded_bytes_, length, IDF_LPA_BPP_MAX_DECODED_BYTES)) {
             return reject(ESP_ERR_INVALID_SIZE, message);
         }
-        const esp_err_t error = writer_.write(data, length, message);
-        if (error != ESP_OK) {
-            return reject(error, message);
+        if (collecting_metadata_) {
+            if (!safe_add(metadata_wire_.size(), length, IDF_LPA_BPP_MAX_METADATA_WIRE_BYTES))
+                return reject(ESP_ERR_INVALID_SIZE, message);
+            metadata_wire_.insert(metadata_wire_.end(), data, data + length);
+        } else {
+            const esp_err_t error = writer_.write(data, length, message);
+            if (error != ESP_OK) return reject(error, message);
         }
         outer_remaining_ -= length;
         if (sequence_active_) sequence_remaining_ -= length;
         decoded_bytes_ += length;
         return ESP_OK;
+    }
+
+    esp_err_t verify_and_replay_metadata(std::string& message)
+    {
+        // SGP.22 v2.6 §2.5.4：88 為明文 StoreMetadata + SCP03t MAC。
+        // SGP.02 v4.0 §4.1.3.3 的 framing 將 8-byte MAC 放在每一片段尾端。
+        std::size_t position = 0;
+        idf_esim_internal::TlvSpan root;
+        if (!idf_esim_internal::parse_tlv_span(metadata_wire_, metadata_wire_.size(),
+                position, root, message) || position != metadata_wire_.size())
+            return reject(ESP_ERR_INVALID_RESPONSE, message);
+        metadata_plaintext_.reserve(std::min(metadata_wire_.size(), IDF_LPA_RSP_MAX_OBJECT_BYTES));
+        position = root.valueOffset;
+        while (position < metadata_wire_.size()) {
+            idf_esim_internal::TlvSpan fragment;
+            if (!idf_esim_internal::parse_tlv_span(metadata_wire_, metadata_wire_.size(),
+                    position, fragment, message) || fragment.valueLength <= 8U)
+                return reject(ESP_ERR_INVALID_RESPONSE, message);
+            const std::size_t plaintext_size = fragment.valueLength - 8U;
+            if (!safe_add(metadata_plaintext_.size(), plaintext_size, IDF_LPA_RSP_MAX_OBJECT_BYTES))
+                return reject(ESP_ERR_INVALID_SIZE, message);
+            metadata_plaintext_.insert(metadata_plaintext_.end(),
+                metadata_wire_.begin() + fragment.valueOffset,
+                metadata_wire_.begin() + fragment.valueOffset + plaintext_size);
+        }
+        LpaRspProfileMetadata actual;
+        LpaRspError error = LpaRspError::none;
+        const bool match = expected_metadata_valid_ &&
+            idf_lpa_rsp_parse_profile_metadata(metadata_plaintext_.data(), metadata_plaintext_.size(),
+                                                actual, error) &&
+            !actual.has_policy_rules && actual.profile_name == expected_metadata_.profile_name &&
+            actual.service_provider_name == expected_metadata_.service_provider_name;
+        secure_clear(metadata_plaintext_);
+        secure_clear(actual.profile_name);
+        secure_clear(actual.service_provider_name);
+        secure_clear(expected_metadata_.profile_name);
+        secure_clear(expected_metadata_.service_provider_name);
+        expected_metadata_valid_ = false;
+        if (!match) return reject(ESP_ERR_INVALID_RESPONSE, message);
+
+        // 此前沒有 A1/88 或 profile bytes 到達卡片；比對成功才逐段原樣送出。
+        collecting_metadata_ = false;
+        const auto replay = [&](std::size_t offset, std::size_t size) {
+            esp_err_t result = writer_.begin(message);
+            if (result == ESP_OK) result = writer_.write(metadata_wire_.data() + offset, size, message);
+            return result == ESP_OK ? finish_segment(message, false) : reject(result, message);
+        };
+        esp_err_t result = replay(0, root.valueOffset);
+        position = root.valueOffset;
+        while (result == ESP_OK && position < metadata_wire_.size()) {
+            idf_esim_internal::TlvSpan fragment;
+            if (!idf_esim_internal::parse_tlv_span(metadata_wire_, metadata_wire_.size(),
+                    position, fragment, message)) return reject(ESP_ERR_INVALID_RESPONSE, message);
+            result = replay(fragment.offset, fragment.encoded_length());
+        }
+        secure_clear(metadata_wire_);
+        return result;
     }
 
     esp_err_t finish_segment(std::string& message, bool final_segment)
@@ -634,20 +717,20 @@ private:
             if (!outer_tlv_fits(raw_size, length)) {
                 return reject(ESP_ERR_INVALID_RESPONSE, message);
             }
-            esp_err_t error = writer_.begin(message);
-            if (error != ESP_OK) return reject(error, message);
-            error = emit(raw, raw_size, message);
+            if (!safe_add(raw_size, length, IDF_LPA_BPP_MAX_METADATA_WIRE_BYTES))
+                return reject(ESP_ERR_INVALID_SIZE, message);
+            metadata_wire_.reserve(raw_size + length);
+            collecting_metadata_ = true;
+            const esp_err_t error = emit(raw, raw_size, message);
             if (error != ESP_OK) return error;
             sequence_remaining_ = length;
             sequence_active_ = true;
             child_count_ = 0U;
-            error = finish_segment(message, false);
-            if (error != ESP_OK) return error;
             state_ = State::metadata_child;
             return ESP_OK;
         }
         case State::metadata_child: {
-            if (!header_.one_byte_tag(0x88U) || length == 0U) {
+            if (!header_.one_byte_tag(0x88U) || length <= 8U) {
                 return reject(ESP_ERR_INVALID_RESPONSE, message);
             }
             if (!card_tlv_fits(raw_size, length)) {
@@ -656,9 +739,7 @@ private:
             if (!outer_tlv_fits(raw_size, length) || !sequence_tlv_fits(raw_size, length)) {
                 return reject(ESP_ERR_INVALID_RESPONSE, message);
             }
-            esp_err_t error = writer_.begin(message);
-            if (error != ESP_OK) return reject(error, message);
-            error = emit(raw, raw_size, message);
+            const esp_err_t error = emit(raw, raw_size, message);
             if (error != ESP_OK) return error;
             value_remaining_ = length;
             value_kind_ = ValueKind::metadata_child;
@@ -791,10 +872,6 @@ private:
             state_ = State::metadata_sequence_header;
             break;
         case ValueKind::metadata_child:
-            {
-                const esp_err_t finish_error = finish_segment(message, false);
-                if (finish_error != ESP_OK) return finish_error;
-            }
             ++child_count_;
             state_ = State::metadata_child;
             break;
@@ -832,6 +909,10 @@ private:
     std::size_t segment_count_ = 0U;
     std::size_t element_count_ = 0U;
     std::vector<std::uint8_t> installation_result_;
+    LpaRspProfileMetadata expected_metadata_;
+    std::vector<std::uint8_t> metadata_wire_, metadata_plaintext_;
+    bool expected_metadata_valid_ = false;
+    bool collecting_metadata_ = false;
     std::array<std::uint8_t, 7> pending_parent_header_ = {};
     std::size_t pending_parent_header_size_ = 0U;
     std::size_t pending_parent_length_ = 0U;
@@ -930,10 +1011,10 @@ private:
 
 class IdfLpaBppStream::Impl final {
 public:
-    explicit Impl(std::string_view expected_transaction_id) noexcept
-        : decoder_(der_)
+    Impl(std::string_view expected_transaction_id, const LpaRspProfileMetadata& expected_metadata) noexcept
+        : der_(expected_metadata), decoder_(der_)
     {
-        expected_valid_ = decode_transaction(expected_transaction_id,
+        expected_valid_ = der_.valid_expected_metadata() && decode_transaction(expected_transaction_id,
                                               expected_transaction_, expected_size_);
     }
 
@@ -1627,8 +1708,9 @@ private:
     bool cleanup_done_ = false;
 };
 
-IdfLpaBppStream::IdfLpaBppStream(std::string_view expected_transaction_id) noexcept
-    : impl_(new (std::nothrow) Impl(expected_transaction_id))
+IdfLpaBppStream::IdfLpaBppStream(std::string_view expected_transaction_id,
+                                 const LpaRspProfileMetadata& expected_metadata) noexcept
+    : impl_(new (std::nothrow) Impl(expected_transaction_id, expected_metadata))
 {
 }
 

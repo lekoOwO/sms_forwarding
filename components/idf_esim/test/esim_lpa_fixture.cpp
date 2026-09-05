@@ -252,6 +252,15 @@ void test_lpa_api()
     std::string message;
     std::vector<uint8_t> response;
 
+    reset_fake();
+    const std::vector<uint8_t> cancel = {0xBF,0x41,7,0x80,2,1,2,0x81,1,1};
+    assert(idf_esim_lpa_cancel_session(cancel, response, message) == ESP_OK);
+    assert(fake.commands.size() == 4U && fake.ccho_calls == 1U && fake.cchc_calls == 1U);
+    assert(fake.commands[2] == "AT+CGLA=1,30,\"81E291000ABF410780020102810101\"");
+    reset_fake();
+    assert(idf_esim_lpa_cancel_session({0xBF,0x21,0}, response, message) != ESP_OK);
+    assert(fake.commands.empty() && response.empty());
+
     reset_fake(ResponseMode::auth_material);
     std::vector<uint8_t> info1;
     std::array<uint8_t, 16> challenge = {};

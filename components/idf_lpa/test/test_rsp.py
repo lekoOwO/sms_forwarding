@@ -137,9 +137,253 @@ static void expect_der_kind(LpaRspDerObject kind,
     assert(error == Error::none);
 }
 
-int main()
+static void profile_metadata_consent_contract()
 {
     Error error = Error::unknown;
+    LpaRspProfileMetadata metadata;
+    const auto iccid = tlv({0x5A}, {0x98,0x88,0x12,0x32,0x54,0x76,0x98,0x10,0x32,0xF4});
+    const auto provider = tlv({0x91}, {'T','e','s','t',' ','M','o','b','i','l','e'});
+    const auto name = tlv({0x92}, {0xE6,0x97,0x85,0xE8,0xA1,0x8C}); // 旅行
+    const auto normal = tlv({0xBF, 0x25}, joined({iccid, provider, name}));
+    assert(idf_lpa_rsp_parse_profile_metadata(normal.data(), normal.size(), metadata, error));
+    assert(metadata.service_provider_name == "Test Mobile" && metadata.profile_name == "旅行" &&
+        !metadata.has_policy_rules && error == Error::none);
+    const auto with_policy = tlv({0xBF,0x25}, joined({iccid, provider, name,
+        tlv({0xB7}, tlv({0x80}, {0x42,0xF6,0x18})), tlv({0x99}, {0x06,0x40})}));
+    assert(idf_lpa_rsp_parse_profile_metadata(with_policy.data(), with_policy.size(), metadata, error));
+    assert(metadata.has_policy_rules && metadata.profile_name == "旅行");
+    for (const auto& malformed : {
+        tlv({0xBF,0x25}, joined({iccid, name})),
+        tlv({0xBF,0x25}, joined({iccid, name, provider})),
+        tlv({0xBF,0x25}, joined({iccid, provider, name, name})),
+        tlv({0xBF,0x25}, joined({iccid, provider, tlv({0x92}, {0xC0,0xAF})})),
+        tlv({0xBF,0x25}, joined({iccid, provider, tlv({0x92}, {'b',0,'d'})})),
+        tlv({0xBF,0x25}, joined({iccid, provider, tlv({0x92}, std::vector<uint8_t>(65,'x'))})),
+        tlv({0xBF,0x25}, joined({iccid, provider, name, tlv({0x94}, {1})})),
+        tlv({0xBF,0x25}, joined({iccid, provider, name, tlv({0x99}, {8,0x40})})),
+        tlv({0xBF,0x2F}, joined({iccid, provider, name}))}) {
+        metadata = {"stale", "stale", true};
+        assert(!idf_lpa_rsp_parse_profile_metadata(malformed.data(), malformed.size(), metadata, error));
+        assert(metadata.service_provider_name.empty() && metadata.profile_name.empty() &&
+            !metadata.has_policy_rules);
+    }
+    // UTF8String SIZE counts characters, not bytes (SGP.22 2.8.2).
+    std::vector<uint8_t> wide_name;
+    for (unsigned i = 0; i < 64; ++i) wide_name.insert(wide_name.end(), {0xE6,0x97,0x85});
+    const auto wide = tlv({0xBF,0x25}, joined({iccid, provider, tlv({0x92}, wide_name)}));
+    assert(idf_lpa_rsp_parse_profile_metadata(wide.data(), wide.size(), metadata, error));
+    assert(metadata.profile_name.size() == 192U);
+}
+
+static void cancel_session_wire_and_binding_contract()
+{
+    Error error = Error::unknown;
+    const std::array<uint8_t,2> transaction = {1,2};
+    std::vector<uint8_t> request;
+    assert(idf_lpa_rsp_build_cancel_session_request(transaction.data(), transaction.size(),
+        LpaRspCancelReason::postponed, request, error));
+    assert(request == (std::vector<uint8_t>{0xBF,0x41,7,0x80,2,1,2,0x81,1,1}));
+    const auto response = [&](std::vector<uint8_t> tx, std::vector<uint8_t> reason,
+                              std::vector<uint8_t> oid = {0x2B,0x06,0x01,0x04,0x01}) {
+        return tlv({0xBF,0x41}, tlv({0xA0}, joined({sequence({tlv({0x80},tx),
+            tlv({0x81},oid), tlv({0x82},reason)}), tlv({0x5F,0x37},{0xAA,0xBB})})));
+    };
+    const auto accepted = response({1,2},{1});
+    std::vector<uint8_t> forwarded;
+    assert(idf_lpa_rsp_parse_cancel_session_response(accepted.data(), accepted.size(),
+        transaction.data(), transaction.size(), LpaRspCancelReason::postponed, forwarded, error));
+    assert(forwarded == accepted && error == Error::none);
+    for (const auto& wrong : {response({1,3},{1}), response({1,2},{0}),
+                              response({1,2},{1},{0x80}),
+                              tlv({0xBF,0x41}, tlv({0x81},{5}))}) {
+        forwarded = {0xEE};
+        assert(!idf_lpa_rsp_parse_cancel_session_response(wrong.data(), wrong.size(),
+            transaction.data(), transaction.size(), LpaRspCancelReason::postponed, forwarded, error));
+        assert(forwarded.empty());
+    }
+    assert(!idf_lpa_rsp_build_cancel_session_request(transaction.data(), transaction.size(),
+        static_cast<LpaRspCancelReason>(6), request, error));
+    assert(request.empty());
+    assert(!idf_lpa_rsp_build_cancel_session_request(nullptr, 0,
+        LpaRspCancelReason::postponed, request, error));
+    assert(request.empty());
+    forwarded = accepted;
+    assert(!idf_lpa_rsp_parse_cancel_session_response(forwarded.data(), forwarded.size(),
+        transaction.data(), transaction.size(), LpaRspCancelReason::postponed, forwarded, error));
+    assert(forwarded.empty());
+}
+
+static void install_request_wire_and_binding_contract()
+{
+    Error error = Error::unknown;
+    const std::vector<uint8_t> transaction = {0x01, 0x02};
+    const std::vector<uint8_t> host = {'e','d','g','e','.','e','x','a','m','p','l','e'};
+    const std::vector<uint8_t> challenge(16U, 0xBBU);
+    const auto signed1 = sequence({tlv({0x80}, transaction),
+        tlv({0x81}, std::vector<uint8_t>(16U, 0xAAU)), tlv({0x83}, host),
+        tlv({0x84}, challenge)});
+    const auto signature = tlv({0x5F, 0x37}, {0xAA, 0xBB});
+    const auto key = tlv({0x04}, {0xCC});
+    // Structurally complete synthetic certificates; cryptography belongs to the card/server.
+    const auto certificate = sequence({tlv({0x02}, {0x01})});
+    const std::vector<uint8_t> capabilities = {0x30, 0x00};
+    // Independent SGP.22 4.2/5.7.13 wire oracle. IMEI check digit is HIGH, filler F LOW.
+    const std::vector<uint8_t> context = {
+        0xA0, 0x1B, 0x80, 0x05, 'T','O','K','E','N', 0xA1, 0x12,
+        0x80, 0x04, 0x68, 0x00, 0x00, 0x00, 0xA1, 0x00,
+        0x82, 0x08, 0x68, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F};
+    std::vector<uint8_t> request = {0xEE};
+    assert(idf_lpa_rsp_build_authenticate_server_request(signed1, signature, key,
+        certificate, "TOKEN", "860000000000001", capabilities, request, error));
+    assert(request == tlv({0xBF, 0x38}, joined({signed1, signature, key, certificate, context})));
+    const auto original_request = request;
+    const auto response = [&](const std::vector<uint8_t>& tx,
+                              const std::vector<uint8_t>& address,
+                              const std::vector<uint8_t>& nonce,
+                              const std::vector<uint8_t>& ctx) {
+        const auto euicc_signed1 = sequence({tlv({0x80}, tx), tlv({0x83}, address),
+            tlv({0x84}, nonce), tlv({0xBF, 0x22}, tlv({0x80}, {0x01})), ctx});
+        return tlv({0xBF, 0x38}, tlv({0xA0}, joined({euicc_signed1, signature,
+                                                     certificate, certificate})));
+    };
+    const auto accepted = response(transaction, host, challenge, context);
+    std::vector<uint8_t> extracted = {0xEE};
+    assert(idf_lpa_rsp_parse_authenticate_server_response(accepted.data(), accepted.size(),
+        request, extracted, error));
+    assert(extracted == accepted && error == Error::none);
+    const auto reject_response = [&](const std::vector<uint8_t>& changed, Error reason) {
+        extracted = {0xEE};
+        assert(!idf_lpa_rsp_parse_authenticate_server_response(changed.data(), changed.size(),
+            request, extracted, error));
+        assert(extracted.empty() && error == reason);
+    };
+    reject_response(response({0x01, 0x03}, host, challenge, context), Error::transaction_mismatch);
+    reject_response(response(transaction, {'e','v','i','l','.','e','x','a','m','p','l','e'},
+        challenge, context), Error::address_mismatch);
+    reject_response(response(transaction, host, std::vector<uint8_t>(16U, 0xBCU), context),
+        Error::challenge_mismatch);
+    auto changed_context = context;
+    changed_context.back() = 0x2F;
+    reject_response(response(transaction, host, challenge, changed_context), Error::der_malformed);
+    reject_response(tlv({0xBF, 0x38}, tlv({0xA1}, joined({tlv({0x80}, transaction),
+        tlv({0x02}, {0x02})}))), Error::server_error);
+    reject_response(tlv({0xBF, 0x38}, tlv({0xA1}, joined({tlv({0x80}, {0x03}),
+        tlv({0x02}, {0x02})}))), Error::transaction_mismatch);
+    assert(!idf_lpa_rsp_build_authenticate_server_request(signed1, signature, key,
+        certificate, "TOKEN", "86000000000000X", capabilities, request, error));
+    assert(request.empty());
+    assert(!idf_lpa_rsp_build_authenticate_server_request(signed1, signature, key,
+        {0x30, 0x00}, "TOKEN", "860000000000001", capabilities, request, error));
+    assert(request.empty());
+    const auto large_certificate = sequence({tlv({0x04}, std::vector<uint8_t>(8100U, 0xAAU))});
+    assert(!idf_lpa_rsp_build_authenticate_server_request(signed1, signature, key,
+        large_certificate, "TOKEN", "860000000000001", capabilities, request, error));
+    assert(request.empty() && error == Error::object_too_large);
+    auto alias = signed1;
+    assert(!idf_lpa_rsp_build_authenticate_server_request(alias, signature, key,
+        certificate, "TOKEN", "860000000000001", capabilities, alias, error));
+    assert(alias.empty());
+    extracted = accepted;
+    assert(!idf_lpa_rsp_parse_authenticate_server_response(extracted.data(), extracted.size(),
+        original_request, extracted, error));
+    assert(extracted.empty());
+
+    const auto signed2 = sequence({tlv({0x80}, transaction), tlv({0x01}, {0xFF})});
+    std::array<uint8_t, 32> hash_cc{};
+    hash_cc.fill(0xCC);
+    assert(idf_lpa_rsp_build_prepare_download_request(signed2, signature, certificate,
+        &hash_cc, request, error));
+    assert(request == tlv({0xBF, 0x21}, joined({signed2, signature,
+        tlv({0x04}, std::vector<uint8_t>(32U, 0xCC)), certificate})));
+    assert(!idf_lpa_rsp_build_prepare_download_request(signed2, signature, certificate,
+        nullptr, request, error));
+    assert(request.empty() && error == Error::confirmation_malformed);
+    const auto no_confirmation = sequence({tlv({0x80}, transaction), tlv({0x01}, {0x00})});
+    assert(idf_lpa_rsp_build_prepare_download_request(no_confirmation, signature, certificate,
+        nullptr, request, error));
+    assert(request == tlv({0xBF, 0x21}, joined({no_confirmation, signature, certificate})));
+    const auto malformed_signed2 = sequence({tlv({0x80}, transaction), tlv({0x01}, {0x01})});
+    assert(!idf_lpa_rsp_build_prepare_download_request(malformed_signed2, signature, certificate,
+        nullptr, request, error));
+    assert(request.empty());
+    const auto large_signature = tlv({0x5F, 0x37}, std::vector<uint8_t>(128U, 0xAAU));
+    assert(!idf_lpa_rsp_build_prepare_download_request(signed2, large_signature,
+        large_certificate, &hash_cc, request, error));
+    assert(request.empty() && error == Error::object_too_large);
+    alias = signed2;
+    assert(!idf_lpa_rsp_build_prepare_download_request(alias, signature, certificate,
+        &hash_cc, alias, error));
+    assert(alias.empty());
+}
+
+int main()
+{
+    profile_metadata_consent_contract();
+    install_request_wire_and_binding_contract();
+    {
+        Error retry_error = Error::unknown;
+        bool cc = true;
+        const std::vector<uint8_t> transaction = {1,2};
+        const auto otpk = tlv({0x5F,0x49}, std::vector<uint8_t>(65U, 0x04U));
+        const auto retry = sequence({tlv({0x80}, transaction), tlv({0x01}, {0}), otpk});
+        assert(idf_lpa_rsp_parse_smdp_signed2(retry.data(), retry.size(), transaction.data(),
+            transaction.size(), cc, retry_error));
+        assert(!cc && retry_error == Error::none);
+        const auto signature = tlv({0x5F,0x37}, {0xAA,0xBB});
+        const auto certificate = sequence({tlv({0x02},{1})});
+        std::vector<uint8_t> prepare;
+        assert(idf_lpa_rsp_build_prepare_download_request(retry, signature, certificate,
+            nullptr, prepare, retry_error));
+        assert(prepare == tlv({0xBF,0x21}, joined({retry, signature, certificate})));
+        for (const auto& bad : {
+            sequence({tlv({0x80}, transaction), tlv({0x01}, {0}), tlv({0x5F,0x49}, {})}),
+            sequence({tlv({0x80}, transaction), tlv({0x01}, {0}), otpk, otpk}),
+            sequence({tlv({0x80}, transaction), otpk, tlv({0x01}, {0})}),
+            sequence({tlv({0x80}, transaction), tlv({0x01}, {0}),
+                tlv({0x5F,0x49}, std::vector<uint8_t>(129U, 0x04U))})}) {
+            assert(!idf_lpa_rsp_parse_smdp_signed2(bad.data(), bad.size(), transaction.data(),
+                transaction.size(), cc, retry_error));
+            assert(!cc);
+        }
+    }
+    cancel_session_wire_and_binding_contract();
+    Error error = Error::unknown;
+    const auto failure_notification = profile_installation_result(
+        {0x01, 0x02}, notification_metadata(), pir_error_result());
+    bool installed = true;
+    uint32_t notification_sequence = 99;
+    std::string notification_host = "sentinel";
+    const std::array<uint8_t, 2> notification_transaction = {0x01, 0x02};
+    assert(idf_lpa_rsp_parse_profile_installation_notification(
+        failure_notification.data(), failure_notification.size(),
+        notification_transaction.data(), notification_transaction.size(), "edge.example",
+        installed, notification_sequence, notification_host, error));
+    assert(!installed && notification_sequence == 1 && notification_host == "edge.example");
+    const auto historical_success = profile_installation_result({0x76});
+    assert(idf_lpa_rsp_parse_pending_installation_notification(historical_success.data(),
+        historical_success.size(), "edge.example", installed, notification_sequence,
+        notification_host, error));
+    assert(installed && notification_sequence == 1 && notification_host == "edge.example");
+    // Pending recovery validates its historical transaction, not the current transaction.
+    const auto historical = profile_installation_result({0x77}, notification_metadata(),
+        pir_error_result());
+    assert(idf_lpa_rsp_parse_pending_installation_notification(historical.data(), historical.size(),
+        "EDGE.EXAMPLE", installed, notification_sequence, notification_host, error));
+    assert(!installed && notification_sequence == 1 && notification_host == "edge.example");
+    assert(!idf_lpa_rsp_parse_profile_installation_notification(historical.data(), historical.size(),
+        notification_transaction.data(), notification_transaction.size(), "edge.example",
+        installed, notification_sequence, notification_host, error));
+    assert(!installed && notification_sequence == 0 && notification_host.empty() &&
+        error == Error::transaction_mismatch);
+    assert(!idf_lpa_rsp_parse_pending_installation_notification(historical.data(), historical.size(),
+        "other.example", installed, notification_sequence, notification_host, error));
+    assert(!installed && notification_sequence == 0 && notification_host.empty() &&
+        error == Error::address_mismatch);
+    const auto no_transaction = profile_installation_result({});
+    assert(!idf_lpa_rsp_parse_pending_installation_notification(no_transaction.data(),
+        no_transaction.size(), "edge.example", installed, notification_sequence,
+        notification_host, error));
+    assert(!installed && notification_sequence == 0 && notification_host.empty());
     bool success = false;
     assert(idf_lpa_rsp_parse_status(
                R"({"header":{"functionExecutionStatus":{"status":"Executed-Success"}},"transactionId":"0102"})",
@@ -365,7 +609,11 @@ int main()
     expect_der_kind(LpaRspDerObject::authenticate_server_response,
                     tlv({0xBF, 0x38}, {}));
     expect_der_kind(LpaRspDerObject::prepare_download_response, tlv({0xBF, 0x21}, {}));
-    expect_der_kind(LpaRspDerObject::profile_metadata, tlv({0xBF, 0x2F}, {}));
+    expect_der_kind(LpaRspDerObject::profile_metadata, tlv({0xBF, 0x25}, {}));
+    const auto notification_not_profile = notification_metadata();
+    assert(!idf_lpa_rsp_validate_der_structure(notification_not_profile.data(),
+        notification_not_profile.size(), LpaRspDerObject::profile_metadata, error));
+    assert(error == Error::der_root);
     expect_der_kind(LpaRspDerObject::notification_metadata, tlv({0xBF, 0x2F}, {}));
     expect_der_kind(LpaRspDerObject::profile_installation_result, tlv({0xBF, 0x37}, {}));
     expect_der_kind(LpaRspDerObject::signature, tlv({0x5F, 0x37}, {0xAA}));

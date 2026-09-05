@@ -36,7 +36,7 @@ const demoEsim: EsimStatus = {
 		{ handle: "p1111111111111111", displayId: "••••", state: "enabled", nickname: "Primary", profileClass: "operational" },
 		{ handle: "p2222222222222222", displayId: "••••", state: "disabled", nickname: "Backup", profileClass: "operational" }
 	],
-	job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE" }
+	job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE", stage: "", confirmationRequired: false, notificationPending: false, profileName: "", providerName: "" }
 };
 
 const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
@@ -203,6 +203,23 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 		if (init?.method !== "POST") return structuredClone(demoEsim) as T;
 		const form = init.body instanceof URLSearchParams ? init.body : new URLSearchParams();
 		const action = form.get("action") ?? "";
+		if (action === "install") {
+			if (["queued", "running"].includes(demoEsim.job.state)) return { success: false, code: "ACTION_ESIM_BUSY", data: {}, detail: "" } as T;
+			if (!form.get("activationCode")) return { success: false, code: "ACTION_INPUT_INVALID", data: {}, detail: "" } as T;
+			demoEsim.job = { id: demoEsim.job.id + 1, state: "running", action: "install", success: false, code: "ACTION_ESIM_RUNNING", stage: "awaiting_confirmation", confirmationRequired: true, notificationPending: false, profileName: "Installed profile", providerName: "Example carrier" };
+			return { success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: demoEsim.job.id }, detail: "" } as T;
+		}
+		if (action === "confirm") {
+			if (Number(form.get("jobId")) !== demoEsim.job.id || demoEsim.job.stage !== "awaiting_confirmation") return { success: false, code: "ACTION_ESIM_CONFIRMATION_STALE", data: {}, detail: "" } as T;
+			if (form.get("accepted") === "false" && !form.has("confirmationCode")) {
+				demoEsim.job = { ...demoEsim.job, state: "failed", code: "ACTION_ESIM_POSTPONED", stage: "", confirmationRequired: false, profileName: "", providerName: "" };
+				return { success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: demoEsim.job.id }, detail: "" } as T;
+			}
+			if (form.get("accepted") !== "true" || !/^[\x20-\x7e]{1,128}$/.test(form.get("confirmationCode") ?? "")) return { success: false, code: "ACTION_INPUT_INVALID", data: {}, detail: "" } as T;
+			demoEsim.profiles.push({ handle: `p${(demoEsim.job.id + 32).toString(16).padStart(16, "0")}`, displayId: "••••", state: "disabled", nickname: "Installed profile", profileClass: "operational" });
+			demoEsim.job = { ...demoEsim.job, state: "succeeded", success: true, code: "ACTION_ESIM_COMPLETE", stage: "completed", confirmationRequired: false, profileName: "", providerName: "" };
+			return { success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: demoEsim.job.id }, detail: "" } as T;
+		}
 		const handle = form.get("handle") ?? "";
 		const profile = demoEsim.profiles.find((candidate) => candidate.handle === handle);
 		if (!["refresh", "info", "enable", "disable", "delete", "nickname", "switch"].includes(action)) {
@@ -218,8 +235,7 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 			candidate.state = candidate === profile ? "enabled" : "disabled";
 		});
 		if (profile && action === "delete") demoEsim.profiles = demoEsim.profiles.filter((candidate) => candidate !== profile);
-		if (action === "refresh") demoEsim.job = { id: demoEsim.job.id + 1, state: "succeeded", action, success: true, code: "ACTION_ESIM_COMPLETE" };
-		else demoEsim.job = { id: demoEsim.job.id + 1, state: "succeeded", action, success: true, code: "ACTION_ESIM_COMPLETE" };
+		demoEsim.job = { id: demoEsim.job.id + 1, state: "succeeded", action, success: true, code: "ACTION_ESIM_COMPLETE", stage: "", confirmationRequired: false, notificationPending: false, profileName: "", providerName: "" };
 		return { success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: demoEsim.job.id }, detail: "" } as T;
 	}
 	if (path.startsWith("/api/push/test?")) {
@@ -433,11 +449,20 @@ export function postEsimAction(action: string, handle?: string, nickname?: strin
 	});
 }
 
+export function startEsimInstall(activationCode: string): Promise<ActionResult> {
+	return postForm("/api/esim", { action: "install", activationCode });
+}
+
+export function confirmEsimInstall(jobId: number, accepted: boolean, confirmationCode?: string): Promise<ActionResult> {
+	return postForm("/api/esim", { action: "confirm", jobId: String(jobId), accepted: String(accepted), ...(confirmationCode === undefined ? {} : { confirmationCode }) });
+}
+
 export async function waitForEsimJob(id: number, timeoutMs = 90000): Promise<EsimStatus> {
 	const deadline = Date.now() + Math.max(1, timeoutMs);
 	for (;;) {
 		const status = await loadEsim();
-		if (status.job.id >= id && ["succeeded", "failed"].includes(status.job.state)) return status;
+		if (status.job.id !== id) throw new Error("eSIM job is no longer available.");
+		if (["succeeded", "failed"].includes(status.job.state) || status.job.stage === "awaiting_confirmation") return status;
 		if (Date.now() >= deadline) throw new Error("eSIM job polling timed out.");
 		await new Promise((resolve) => window.setTimeout(resolve, 750));
 	}

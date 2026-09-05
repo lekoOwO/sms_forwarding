@@ -1266,6 +1266,24 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
     return invoke_es10_raw(request, true, response, safe_message);
 }
 
+esp_err_t idf_esim_lpa_cancel_session(const std::vector<uint8_t>& request,
+                                       std::vector<uint8_t>& response,
+                                       std::string& safe_message)
+{
+    response.clear();
+    if (request.empty() || request.size() > APDU_RESPONSE_DATA_MAX) {
+        safe_message = "CancelSession data object size is invalid";
+        return ESP_ERR_INVALID_SIZE;
+    }
+    static constexpr uint8_t TAG_CANCEL_SESSION[] = {0xBF, 0x41};
+    Tlv request_tlv;
+    if (!parse_tlv(request, request_tlv, safe_message) || !tag_is(request_tlv, TAG_CANCEL_SESSION)) {
+        safe_message = "CancelSession data object tag is invalid";
+        return ESP_ERR_INVALID_ARG;
+    }
+    return invoke_es10_raw(request, true, response, safe_message);
+}
+
 esp_err_t idf_esim_lpa_retrieve_notifications(std::vector<uint8_t>& encoded_response,
                                               size_t& list_offset,
                                               size_t& list_length,

@@ -17,6 +17,7 @@ idf_component_register(
     app_update
     idf_config
     idf_esim
+    idf_lpa
     idf_inbox
     idf_logbuf
     idf_modem

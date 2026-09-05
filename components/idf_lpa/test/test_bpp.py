@@ -61,6 +61,7 @@ struct FakeCardState {
     std::vector<std::uint16_t> block_numbers;
     std::vector<std::size_t> block_lengths;
     std::vector<bool> last_flags;
+    std::vector<std::vector<std::uint8_t>> wire_segments;
 };
 
 extern FakeCardState fake_card;
@@ -90,6 +91,7 @@ static_assert(IDF_LPA_BPP_MAX_ELEMENTS == 4096U);
 esp_err_t IdfEsimLpaBppSession::begin_segment(std::string& message)
 {
     ++fake_card.begin_calls;
+    fake_card.wire_segments.emplace_back();
     if (fake_card.begin_failure) {
         message = "card body sentinel";
         return ESP_FAIL;
@@ -114,6 +116,7 @@ esp_err_t IdfEsimLpaBppSession::write_block(const std::uint8_t* data,
         return ESP_FAIL;
     }
     assert(data != nullptr && length <= IDF_LPA_BPP_BLOCK_BYTES);
+    fake_card.wire_segments.back().insert(fake_card.wire_segments.back().end(), data, data + length);
     response.clear();
     if (!last && fake_card.intermediate_response) response.push_back(0xEEU);
     if (last) {
@@ -155,11 +158,46 @@ static std::vector<std::uint8_t> tlv(std::initializer_list<std::uint8_t> tag,
     return result;
 }
 
+static LpaRspProfileMetadata expected_metadata() { return {"Carrier", "Travel", false}; }
+
+static std::vector<std::uint8_t> store_metadata(bool ppr = false, bool changed_name = false,
+                                                std::size_t icon_bytes = 0)
+{
+    std::vector<std::uint8_t> value = {
+        0x5A,10,0x98,0x88,0x12,0x32,0x54,0x76,0x98,0x10,0x32,0xF4,
+        0x91,7,'C','a','r','r','i','e','r',0x92,6,'T','r','a','v','e','l'};
+    if (changed_name) value.back() = 'X';
+    if (icon_bytes) {
+        const auto icon = tlv({0x94}, std::vector<std::uint8_t>(icon_bytes, 0xFF));
+        value.insert(value.end(), {0x93,1,0});
+        value.insert(value.end(), icon.begin(), icon.end());
+    }
+    if (ppr) value.insert(value.end(), {0xB7,5,0x80,3,0x42,0xF6,0x18,0x99,2,6,0x40});
+    return tlv({0xBF,0x25}, value);
+}
+
+static std::vector<std::uint8_t> metadata_sequence(
+    const std::vector<std::uint8_t>& clear, std::size_t fragments = 1)
+{
+    assert(fragments > 0 && fragments <= clear.size());
+    std::vector<std::uint8_t> wire;
+    for (std::size_t index = 0; index < fragments; ++index) {
+        const std::size_t begin = clear.size() * index / fragments;
+        const std::size_t end = clear.size() * (index + 1) / fragments;
+        std::vector<std::uint8_t> segment(clear.begin() + begin, clear.begin() + end);
+        // Synthetic 8-byte C-MAC trailer; actual MAC verification stays on the eUICC.
+        segment.insert(segment.end(), {0xAA,0xBB,0xCC,0xDD,0x11,0x22,0x33,0x44});
+        const auto encoded = tlv({0x88}, segment);
+        wire.insert(wire.end(), encoded.begin(), encoded.end());
+    }
+    return tlv({0xA1}, wire);
+}
+
 static std::vector<std::uint8_t> valid_bpp()
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto second = tlv({0xA2U}, tlv({0x87U}, {0x04U}));
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
@@ -177,13 +215,8 @@ static std::vector<std::uint8_t> valid_bpp_variant(bool include_second,
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    std::vector<std::uint8_t> metadata_content;
-    for (std::size_t i = 0U; i < metadata_count; ++i) {
-        const auto child = tlv({0x88U}, std::vector<std::uint8_t>(metadata_bytes,
-                                                                    static_cast<std::uint8_t>(i + 3U)));
-        metadata_content.insert(metadata_content.end(), child.begin(), child.end());
-    }
-    const auto metadata = tlv({0xA1U}, metadata_content);
+    const auto metadata = metadata_sequence(store_metadata(false, false,
+        metadata_bytes == 1U ? 0U : metadata_bytes), metadata_count);
     const auto second = tlv({0xA2U}, tlv({0x87U}, {0x04U}));
     std::vector<std::uint8_t> profile_content;
     for (std::size_t i = 0U; i < profile_count; ++i) {
@@ -206,7 +239,7 @@ static std::vector<std::uint8_t> bpp_with_wrong_order()
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, profile, metadata}) {
         content.insert(content.end(), part.begin(), part.end());
@@ -218,7 +251,7 @@ static std::vector<std::uint8_t> bpp_with_extra_outer_child()
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     const auto extra = tlv({0xBFU, 0x24U}, {0x06U});
     std::vector<std::uint8_t> content;
@@ -232,7 +265,7 @@ static std::vector<std::uint8_t> bpp_with_oversized_init()
 {
     const auto init = tlv({0xBFU, 0x23U}, std::vector<std::uint8_t>(30717U, 0x01U));
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -247,7 +280,7 @@ static std::vector<std::uint8_t> bpp_with_noncanonical_init_length()
     init[2] = 0x81U;
     init.insert(init.begin() + 3, 0x01U);
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -261,7 +294,7 @@ static std::vector<std::uint8_t> bpp_with_oversized_first_child()
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U},
                            tlv({0x87U}, std::vector<std::uint8_t>(30714U, 0x02U)));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -274,7 +307,7 @@ static std::vector<std::uint8_t> bpp_with_oversized_second_child()
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto second = tlv({0xA2U},
                             tlv({0x87U}, std::vector<std::uint8_t>(30714U, 0x04U)));
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
@@ -293,7 +326,7 @@ static std::vector<std::uint8_t> bpp_with_noncanonical_first_child_length()
     first[1] = 0x04U;
     first[3] = 0x81U;
     first.insert(first.begin() + 4, 0x01U);
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -306,7 +339,7 @@ static std::vector<std::uint8_t> bpp_with_sequence_child_overrun(bool optional_s
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     auto second = tlv({0xA2U}, tlv({0x87U}, {0x04U}));
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
@@ -334,18 +367,18 @@ static std::size_t valid_bpp_segment_count(bool include_second,
     return 4U + metadata_count + profile_count + (include_second ? 1U : 0U);
 }
 
-static std::vector<std::uint8_t> bpp_with_metadata_elements(std::size_t count)
+static std::vector<std::uint8_t> bpp_with_profile_elements(std::size_t count)
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    std::vector<std::uint8_t> metadata_content;
+    std::vector<std::uint8_t> profile_content;
     for (std::size_t i = 0U; i < count; ++i) {
-        metadata_content.push_back(0x88U);
-        metadata_content.push_back(0x01U);
-        metadata_content.push_back(static_cast<std::uint8_t>(i));
+        profile_content.push_back(0x86U);
+        profile_content.push_back(0x01U);
+        profile_content.push_back(static_cast<std::uint8_t>(i));
     }
-    const auto metadata = tlv({0xA1U}, metadata_content);
-    const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
+    const auto metadata = metadata_sequence(store_metadata());
+    const auto profile = tlv({0xA3U}, profile_content);
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
         content.insert(content.end(), part.begin(), part.end());
@@ -357,7 +390,7 @@ static std::vector<std::uint8_t> bpp_with_profile_bytes(std::size_t count)
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, tlv({0x86U}, std::vector<std::uint8_t>(count, 0xA5U)));
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -384,7 +417,7 @@ static std::vector<std::uint8_t> bpp_with_profile_segments(std::size_t count,
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     std::vector<std::uint8_t> profile_content;
     for (std::size_t i = 0U; i < count; ++i) {
         const auto child = tlv({0x86U}, std::vector<std::uint8_t>(bytes_each, 0xA5U));
@@ -415,7 +448,7 @@ static std::vector<std::uint8_t> bpp_with_empty_profile()
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata = tlv({0xA1U}, tlv({0x88U}, {0x03U}));
+    const auto metadata = metadata_sequence(store_metadata());
     const auto profile = tlv({0xA3U}, {});
     std::vector<std::uint8_t> content;
     for (const auto& part : {init, first, metadata, profile}) {
@@ -445,8 +478,7 @@ static std::vector<std::uint8_t> bpp_with_metadata_child_overrun()
 {
     const auto init = tlv({0xBFU, 0x23U}, {0x01U});
     const auto first = tlv({0xA0U}, tlv({0x87U}, {0x02U}));
-    const auto metadata_child = tlv({0x88U}, {0x03U});
-    auto metadata = tlv({0xA1U}, metadata_child);
+    auto metadata = metadata_sequence(store_metadata());
     --metadata[1];
     const auto profile = tlv({0xA3U}, tlv({0x86U}, {0x05U}));
     std::vector<std::uint8_t> content;
@@ -460,7 +492,7 @@ static std::vector<std::uint8_t> bpp_with_outer_truncated_before_metadata()
 {
     auto bpp = valid_bpp();
     // BF23 (4 bytes) and A0 (5 bytes) are complete; A1 has no enclosing bytes.
-    assert(bpp[2] == 24U && bpp[12] == 0xA1U);
+    assert(bpp[2] == 63U && bpp[12] == 0xA1U);
     bpp[2] = 9U;
     return bpp;
 }
@@ -469,15 +501,15 @@ static std::vector<std::uint8_t> bpp_with_outer_truncated_before_profile()
 {
     auto bpp = valid_bpp();
     // BF23, A0, A1, and A2 are complete; A3 has no enclosing bytes.
-    assert(bpp[2] == 24U && bpp[22] == 0xA3U);
-    bpp[2] = 19U;
+    assert(bpp[2] == 63U && bpp[61] == 0xA3U);
+    bpp[2] = 58U;
     return bpp;
 }
 
 static std::vector<std::uint8_t> bpp_with_metadata_parent_truncated_child()
 {
     auto bpp = valid_bpp();
-    assert(bpp[12] == 0xA1U && bpp[13] == 3U);
+    assert(bpp[12] == 0xA1U && bpp[13] == 42U);
     bpp[13] = 2U;
     return bpp;
 }
@@ -485,8 +517,8 @@ static std::vector<std::uint8_t> bpp_with_metadata_parent_truncated_child()
 static std::vector<std::uint8_t> bpp_with_profile_parent_truncated_child()
 {
     auto bpp = valid_bpp();
-    assert(bpp[22] == 0xA3U && bpp[23] == 3U);
-    bpp[23] = 2U;
+    assert(bpp[61] == 0xA3U && bpp[62] == 3U);
+    bpp[62] = 2U;
     return bpp;
 }
 
@@ -537,7 +569,7 @@ static esp_err_t execute(std::string_view json,
     fake_card.intermediate_response = intermediate_response;
     fake_card.fail_write_call = fail_write_call;
     fake_card.final_response_begin_call = final_response_begin_call;
-    IdfLpaBppStream parser(expected_transaction);
+    IdfLpaBppStream parser(expected_transaction, expected_metadata());
     esp_err_t error = ESP_OK;
     for (std::size_t offset = 0; offset < json.size(); offset += chunk_size) {
         const std::size_t length = std::min(chunk_size, json.size() - offset);
@@ -554,6 +586,62 @@ static esp_err_t execute(std::string_view json,
 
 int main()
 {
+    for (const bool ppr : {false, true}) {
+        const auto init = tlv({0xBF,0x23}, {1});
+        const auto first = tlv({0xA0}, tlv({0x87}, {2}));
+        const auto metadata = metadata_sequence(store_metadata(ppr, !ppr), 3);
+        const auto profile = tlv({0xA3}, tlv({0x86}, {5}));
+        std::vector<std::uint8_t> content;
+        for (const auto& part : {init, first, metadata, profile})
+            content.insert(content.end(), part.begin(), part.end());
+        std::vector<std::uint8_t> result;
+        std::string message;
+        assert(execute(response(base64(tlv({0xBF,0x36}, content))), "001122", result,
+            message, 1, false, 0, 8) != ESP_OK);
+        assert(result.empty() && fake_card.wire_segments.size() == 2);
+        assert(fake_card.wire_segments.back() == first);
+    }
+    for (const std::size_t fragments : {1U, 3U, 32U}) {
+        const auto init = tlv({0xBF,0x23}, {1});
+        const auto first = tlv({0xA0}, tlv({0x87}, {2}));
+        const auto metadata = metadata_sequence(store_metadata(), fragments);
+        const auto profile = tlv({0xA3}, tlv({0x86}, {5}));
+        std::vector<std::uint8_t> content;
+        for (const auto& part : {init, first, metadata, profile})
+            content.insert(content.end(), part.begin(), part.end());
+        const auto original = tlv({0xBF,0x36}, content);
+        std::vector<std::uint8_t> result, replayed;
+        std::string message;
+        assert(execute(response(base64(original)), "001122", result, message,
+            1, false, 0, 5 + fragments) == ESP_OK);
+        for (const auto& segment : fake_card.wire_segments)
+            replayed.insert(replayed.end(), segment.begin(), segment.end());
+        assert(replayed == original && result == (std::vector<std::uint8_t>{0x90,0}));
+    }
+    for (const bool missing_plaintext : {false, true}) {
+        auto payload = missing_plaintext ? std::vector<std::uint8_t>() : store_metadata();
+        payload.insert(payload.end(), missing_plaintext ? 8U : 7U, 0xAA);
+        const auto init = tlv({0xBF,0x23}, {1});
+        const auto first = tlv({0xA0}, tlv({0x87}, {2}));
+        const auto metadata = tlv({0xA1}, tlv({0x88}, payload));
+        const auto profile = tlv({0xA3}, tlv({0x86}, {5}));
+        std::vector<std::uint8_t> content, result;
+        for (const auto& part : {init, first, metadata, profile})
+            content.insert(content.end(), part.begin(), part.end());
+        std::string message;
+        assert(execute(response(base64(tlv({0xBF,0x36}, content))), "001122", result,
+            message, 1, false, 0, 6) != ESP_OK);
+        assert(result.empty() && fake_card.wire_segments.size() == 2);
+    }
+    {
+        reset_card();
+        auto unsupported = expected_metadata();
+        unsupported.has_policy_rules = true;
+        IdfLpaBppStream guarded("001122", unsupported);
+        std::string message;
+        assert(guarded.feed(response(base64(valid_bpp())), message) != ESP_OK);
+        assert(fake_card.begin_calls == 0 && guarded.test_sensitive_storage_is_zero());
+    }
     const std::string encoded = base64(valid_bpp());
     std::vector<std::uint8_t> result;
     std::string message;
@@ -725,8 +813,8 @@ int main()
     assert(fake_card.begin_calls == 5);
     assert(fake_card.write_calls == 5);
     expect_rejected(response(base64(bpp_with_metadata_parent_truncated_child())));
-    assert(fake_card.begin_calls == 3);
-    assert(fake_card.write_calls == 3);
+    assert(fake_card.begin_calls == 2);
+    assert(fake_card.write_calls == 2);
     expect_rejected(response(base64(bpp_with_profile_parent_truncated_child())));
     assert(fake_card.begin_calls == 6);
     assert(fake_card.write_calls == 6);
@@ -779,7 +867,7 @@ int main()
     // A nested decoder failure performs one observable card close and remains
     // safe when finish/abort are called again by the owner.
     reset_card();
-    IdfLpaBppStream nested_failure("001122");
+    IdfLpaBppStream nested_failure("001122", expected_metadata());
     std::string malformed_encoded = encoded;
     malformed_encoded[malformed_encoded.size() / 2U] = '?';
     result = {0xA5U};
@@ -800,7 +888,7 @@ int main()
 
     reset_card();
     fake_card.begin_failure = true;
-    IdfLpaBppStream begin_failed("001122");
+    IdfLpaBppStream begin_failed("001122", expected_metadata());
     result = {0xA5U};
     message = "begin sentinel";
     assert(begin_failed.feed(response(encoded), message) != ESP_OK);
@@ -810,7 +898,7 @@ int main()
     assert(fake_card.close_calls == 0);
 
     reset_card();
-    IdfLpaBppStream aborted("001122");
+    IdfLpaBppStream aborted("001122", expected_metadata());
     assert(aborted.feed(response(encoded).substr(0, 90), message) == ESP_OK);
     result = {0xA5U};
     aborted.abort();
@@ -818,7 +906,7 @@ int main()
     assert(aborted.finish(result, message) != ESP_OK);
     assert(result.empty());
 
-    const std::string too_many_elements = base64(bpp_with_metadata_elements(4097U));
+    const std::string too_many_elements = base64(bpp_with_profile_elements(4097U));
     result = {0xA5U};
     message = "element sentinel";
     assert(execute(response(too_many_elements), "001122", result, message, 13U, false, 0, 0) ==
@@ -857,8 +945,8 @@ int main()
     assert(execute(response(oversized_metadata), "001122", result, message, 31U) ==
            ESP_ERR_INVALID_SIZE);
     assert(result.empty());
-    assert(fake_card.begin_calls == 3);
-    assert(fake_card.write_calls == 3);
+    assert(fake_card.begin_calls == 2);
+    assert(fake_card.write_calls == 2);
     assert(fake_card.close_calls == fake_card.begin_calls);
 
     const std::string oversized_decoded = base64(bpp_with_profile_segments(35U, 30716U));
@@ -914,8 +1002,13 @@ class BppHostTest(unittest.TestCase):
                     str(stubs),
                     "-I",
                     str(COMPONENT / "include"),
+                    "-I", str(COMPONENT.parent / "idf_esim" / "include"),
                     str(SOURCE),
+                    str(COMPONENT / "idf_lpa_rsp.cpp"),
+                    str(COMPONENT / "idf_lpa_activation_code.cpp"),
+                    str(COMPONENT.parent / "idf_esim" / "idf_esim_codec.cpp"),
                     str(fixture),
+                    "-lcrypto",
                     "-o",
                     str(binary),
                 ],

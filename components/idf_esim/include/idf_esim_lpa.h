@@ -24,6 +24,11 @@ esp_err_t idf_esim_lpa_prepare_download(const std::vector<uint8_t>& request,
                                         std::vector<uint8_t>& response,
                                         std::string& safe_message);
 
+// 僅接受受控的 CancelSession BF41 物件；不開放任意 raw APDU。
+esp_err_t idf_esim_lpa_cancel_session(const std::vector<uint8_t>& request,
+                                       std::vector<uint8_t>& response,
+                                       std::string& safe_message);
+
 // 检索 eUICC 中的待发送通知，并返回 A0 列表的 value 范围。
 esp_err_t idf_esim_lpa_retrieve_notifications(std::vector<uint8_t>& encoded_response,
                                               size_t& list_offset,

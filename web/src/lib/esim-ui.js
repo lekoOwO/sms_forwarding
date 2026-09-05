@@ -5,7 +5,8 @@
  */
 export async function refreshEsimAfterTerminal(loadEsim, status) {
 	if (!status?.job || !["succeeded", "failed"].includes(status.job.state)) return status;
-	return loadEsim();
+	const fresh = await loadEsim();
+	return fresh.job.id === status.job.id ? fresh : status;
 }
 
 /**
