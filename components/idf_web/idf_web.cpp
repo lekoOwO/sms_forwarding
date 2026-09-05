@@ -1499,8 +1499,10 @@ static std::string run_modem_job(const std::string& action)
         ok = idf_modem_send_at("AT+COPS?", 5000, response) == ESP_OK;
         json_prop(data, "operator", first_line_containing(response, "+COPS:"));
     } else if (action == "imei") {
-        ok = idf_modem_send_at("AT+CGSN", 3000, response) == ESP_OK;
-        json_prop(data, "imei", first_digits(response));
+        std::string imei;
+        const esp_err_t err = idf_modem_get_imei(imei, 3000);
+        ok = err == ESP_OK;
+        json_prop(data, "imei", imei);
     } else {
         return action_result(false, "ACTION_UNKNOWN", {}, "action");
     }

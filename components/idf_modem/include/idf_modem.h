@@ -102,6 +102,7 @@ static constexpr uint32_t IDF_MODEM_USB_QUERY_CPOL_TIMEOUT_MS = 5000;
 
 esp_err_t idf_modem_start(const IdfConfig& config);
 esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::string& response);
+esp_err_t idf_modem_get_imei(std::string& out, uint32_t timeout_ms);
 esp_err_t idf_modem_send_at_until(const std::string& cmd, const char* token, uint32_t timeout_ms, std::string& response);
 esp_err_t idf_modem_send_pdu(const std::string& cmgs_cmd, const char* pdu, uint32_t timeout_ms, std::string& response);
 #if SMS_USB_RECOVERY

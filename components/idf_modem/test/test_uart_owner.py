@@ -221,6 +221,50 @@ class UartOwnerContractTest(unittest.TestCase):
                 },
             )
 
+    def test_imei_frame_and_fallback_fixture_is_executable(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the host IMEI fixture requires g++")
+        fixture = SOURCE.parent / "test" / "imei_fixture.cpp"
+        self.assertTrue(fixture.exists(), "missing executable IMEI fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / "imei_fixture"
+            source = SOURCE.read_text()
+            def definition(name):
+                match = re.search(rf"(?m)^(?:static )?[^\n;{{}}]*\b{name}\s*\([^;]*?\)\s*\{{", source)
+                self.assertIsNotNone(match, name)
+                return match.group() + function_body(source, name) + "}\n"
+
+            types = source[source.index("enum class OwnerCommandKind"):source.index("static void reset_owner_slot")]
+            status_header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
+            status = re.search(r"struct IdfModemStatus \{.*?\n\};", status_header, re.S).group()
+            (Path(directory) / "imei_types.inc").write_text(status + "\n" + types)
+            deadline = re.search(r"struct TickDeadline \{.*?\n\};", source, re.S).group()
+            names = [
+                "owner_uart_write_all", "at_final_result", "looks_like_pdu_line",
+                "preserve_uart_urc_line", "preserve_uart_urcs", "capture_pending_uart_locked",
+                "owner_send_at_deadline", "owner_send_at", "reset_owner_slot", "owner_request_bounded",
+                "submit_owner_command", "execute_owner_command", "owner_reclaim_expired_done_slots",
+                "owner_process_one_command", "owner_drain_priority_commands", "idf_modem_send_at",
+                "is_imei_text", "is_iccid_text", "is_imsi_text", "update_status", "idf_modem_get_imei", "send_ok",
+            ]
+            (Path(directory) / "imei_runtime.inc").write_text(
+                definition("timeout_ticks_ceil") + deadline + "\n" + "\n".join(map(definition, names)))
+            sampling = function_body(source, "sample_identity_once")
+            start = sampling.index("if (!is_imei_text(before.imei))")
+            end = sampling.index("if (before.iccid", start)
+            (Path(directory) / "imei_sampling.inc").write_text(
+                "static void sample_imei_slice(std::string& output) {\n"
+                "IdfModemStatus before, patch; std::string resp;\n" + sampling[start:end] +
+                "output = patch.imei;\n}\n")
+            compile_result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pthread",
+                 "-I", directory, "-I", str(SOURCE.parent / "include"), str(fixture), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            run_result = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
+
     def test_reset_cancels_queued_normal_owner_slot_before_uart(self):
         source = SOURCE.read_text()
         body = function_body(source, "owner_process_one_command")

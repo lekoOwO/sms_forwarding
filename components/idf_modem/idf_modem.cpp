@@ -20,6 +20,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "idf_log.h"
+#include "idf_modem_imei.h"
 #include "idf_modem_https_wire.h"
 #if SMS_USB_RECOVERY
 #include "idf_modem_cpol_summary.h"
@@ -81,6 +82,7 @@ struct OwnerCommand {
     std::string pdu;
     IdfModemHttpsPostRequest https_post_request;
     uint32_t timeout_ms = 0;
+    int64_t deadline_us = 0;
     TickType_t deadline_start = 0;
     TickType_t deadline_span = 0;
     bool filter_urcs = false;
@@ -310,15 +312,24 @@ static TickType_t timeout_ticks_ceil(uint32_t milliseconds)
 struct TickDeadline {
     TickType_t start;
     TickType_t span;
+    int64_t deadline_us = 0;
     explicit TickDeadline(uint32_t ms) : start(xTaskGetTickCount()), span(timeout_ticks_ceil(ms)) {}
     TickDeadline(TickType_t start_tick, TickType_t span_ticks)
         : start(start_tick), span(span_ticks) {}
     TickType_t remaining_ticks() const
     {
         const TickType_t elapsed = static_cast<TickType_t>(xTaskGetTickCount() - start);
-        return elapsed >= span ? 0 : static_cast<TickType_t>(span - elapsed);
+        if (elapsed >= span) return 0;
+        TickType_t remaining = span - elapsed;
+        if (deadline_us != 0) {
+            const int64_t remaining_us = deadline_us - esp_timer_get_time();
+            if (remaining_us <= 0) return 0;
+            remaining = std::min<TickType_t>(remaining,
+                remaining_us / (1000LL * portTICK_PERIOD_MS));
+        }
+        return remaining;
     }
-    bool expired() const { return static_cast<TickType_t>(xTaskGetTickCount() - start) >= span; }
+    bool expired() const { return remaining_ticks() == 0; }
     void restart(uint32_t ms) { start = xTaskGetTickCount(); span = timeout_ticks_ceil(ms); }
 };
 
@@ -454,10 +465,7 @@ static bool is_iccid_text(const std::string& value)
 
 static bool is_imei_text(const std::string& value)
 {
-    if (value.size() < 14 || value.size() > 17) return false;
-    return std::all_of(value.begin(), value.end(), [](char ch) {
-        return isdigit(static_cast<unsigned char>(ch));
-    });
+    return idf_modem_imei_digits(value);
 }
 
 static bool is_imsi_text(const std::string& value)
@@ -826,6 +834,10 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
 
     response.clear();
     response.reserve(512);
+    const bool imei_query = idf_modem_is_imei_command(cmd);
+    const bool imei_waiting_for_pdu = s_uart_wait_cmt_pdu &&
+                                    esp_timer_get_time() <= s_uart_wait_cmt_until_us;
+    if (imei_query) response = s_uart_line_carry;
     // Limit responses to 8 KB because AT+CMGL can exceed 10 KB with full storage.
     // Detect a truncated OK or ERROR in the overlap window. Later polling recovers omitted SMS.
     constexpr size_t MAX_RESPONSE = 8192;
@@ -836,7 +848,8 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
         std::min(response_limit, OWNER_AT_RESPONSE_LIMIT));
     esp_err_t ret = ESP_ERR_TIMEOUT;
     while (!deadline.expired()) {
-        int got = owner_uart_read(buf, sizeof(buf), pdMS_TO_TICKS(80));
+        int got = owner_uart_read(buf, sizeof(buf),
+                                  std::min(pdMS_TO_TICKS(80), deadline.remaining_ticks()));
         if (got > 0) {
             if (filter_urcs) {
                 query_filter.feed(reinterpret_cast<const char*>(buf), static_cast<size_t>(got));
@@ -864,7 +877,17 @@ static esp_err_t owner_send_at_deadline(const std::string& cmd, TickDeadline& de
                 if (room > 0) response.append(reinterpret_cast<const char*>(buf), std::min<size_t>(room, got));
                 scan.append(reinterpret_cast<const char*>(buf), got);
             }
-            int final_code = at_final_result(scan);
+            int final_code;
+            if (imei_query) {
+                bool complete = false;
+                std::string imei;
+                const bool valid = idf_modem_parse_imei_frame(
+                    response, cmd, imei, &complete, imei_waiting_for_pdu);
+                final_code = complete ? (valid ? 1 : -1) : 0;
+                if (complete) response = valid ? imei + "\r\nOK\r\n" : std::string();
+            } else {
+                final_code = at_final_result(scan);
+            }
             if (final_code != 0) {
                 if (filter_urcs) {
                     query_filter.flush_pending();
@@ -1035,6 +1058,56 @@ esp_err_t idf_modem_send_at(const std::string& cmd, uint32_t timeout_ms, std::st
         return result;
     }
     return submit_owner_command(request, &response, priority);
+}
+
+esp_err_t idf_modem_get_imei(std::string& out, uint32_t timeout_ms)
+{
+    out.clear();
+    static constexpr const char* commands[] = {
+        "AT+CGSN=1", "AT+GSN=1", "AT+CGSN", "AT+GSN",
+    };
+    const int64_t deadline_us =
+        esp_timer_get_time() + static_cast<int64_t>(timeout_ms) * 1000LL;
+    esp_err_t last_err = ESP_ERR_TIMEOUT;
+    for (const char* command : commands) {
+        const int64_t remaining_us = deadline_us - esp_timer_get_time();
+        if (remaining_us <= 0) break;
+        const uint32_t attempt_ms = static_cast<uint32_t>(
+            std::min<int64_t>(1000, remaining_us / 1000));
+        if (attempt_ms == 0) break;
+
+        OwnerCommand request;
+        request.command = command;
+        request.timeout_ms = attempt_ms;
+        request.deadline_us = std::min<int64_t>(deadline_us,
+            esp_timer_get_time() + static_cast<int64_t>(attempt_ms) * 1000LL);
+        std::string response;
+        esp_err_t err;
+        if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+            TickDeadline deadline(attempt_ms);
+            deadline.deadline_us = request.deadline_us;
+            err = owner_send_at_deadline(command, deadline, response, false, nullptr);
+        } else {
+            err = submit_owner_command(request, &response, false);
+        }
+        if (esp_timer_get_time() >= deadline_us) {
+            last_err = ESP_ERR_TIMEOUT;
+            break;
+        }
+        if (err == ESP_OK) {
+            std::string parsed;
+            if (idf_modem_parse_imei_frame(response, command, parsed)) {
+                out = std::move(parsed);
+                return ESP_OK;
+            }
+            last_err = ESP_FAIL;
+        } else {
+            last_err = err;
+            if (err == IDF_MODEM_ERR_BUSY || err == ESP_ERR_INVALID_STATE) break;
+        }
+    }
+    out.clear();
+    return last_err;
 }
 
 #if SMS_USB_RECOVERY
@@ -1257,7 +1330,9 @@ static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* 
         wait_margin_ms = HTTPS_CLEANUP_WAIT_MARGIN_MS;
     }
     uint32_t wait_ms = request.timeout_ms + wait_margin_ms;
+    if (request.deadline_us != 0) wait_ms = request.timeout_ms;
     TickDeadline deadline(wait_ms);
+    deadline.deadline_us = request.deadline_us;
     TickDeadline operation_deadline(deadline.start, timeout_ticks_ceil(request.timeout_ms));
     if (!priority) {
         if (!s_session_mutex ||
@@ -2220,6 +2295,12 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
     assert_owner_task();
     switch (slot.request.kind) {
         case OwnerCommandKind::at:
+            if (slot.request.deadline_us != 0) {
+                TickDeadline deadline(slot.request.timeout_ms);
+                deadline.deadline_us = slot.request.deadline_us;
+                return owner_send_at_deadline(slot.request.command, deadline, slot.response,
+                                              false, nullptr);
+            }
             return owner_send_at(slot.request.command, slot.request.timeout_ms, slot.response,
                                  slot.request.filter_urcs,
                                  slot.request.response_prefix.empty()
@@ -2359,13 +2440,12 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
-    if (before.imei.size() < 14) {
+    if (!is_imei_text(before.imei)) {
         const char* imei_cmds[] = {"AT+CGSN=1", "AT+GSN=1", "AT+CGSN", "AT+GSN"};
         for (const char* cmd : imei_cmds) {
             if (!patch.imei.empty()) break;
             if (send_ok(cmd, 1000, &resp)) {
-                patch.imei = first_digits_line(resp, 14, 17);
-                if (patch.imei.empty()) patch.imei = first_digit_run(resp, 14, 17);
+                idf_modem_parse_imei_frame(resp, cmd, patch.imei);
             }
             vTaskDelay(pdMS_TO_TICKS(80));
         }

@@ -93,6 +93,59 @@ def run_idf6_crypto_contract(source: str) -> bool:
     return True
 
 
+def run_imei_job_seam(source: str):
+    util = (ROOT / "components/idf_logbuf/idf_util.cpp").read_text()
+    harness = r'''
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <iostream>
+#include <string>
+using esp_err_t = int;
+constexpr int ESP_OK = 0;
+static bool available = true;
+static int getter_calls = 0;
+static int idf_modem_get_imei(std::string& out, uint32_t timeout) {
+    assert(timeout == 3000);
+    ++getter_calls;
+    out = available ? "860000000000001" : "";
+    return available ? ESP_OK : -1;
+}
+static int idf_modem_send_at(const std::string&, uint32_t, std::string& out) {
+    out = "private raw modem response";
+    return -1;
+}
+static int idf_modem_request_reset(bool) { return -1; }
+static bool parse_csq_line(const std::string&, int&, int&) { return false; }
+static std::string first_line_containing(const std::string&, const char*) { return {}; }
+'''
+    for declaration, text in (
+        ("void idf_util_json_escape_append(std::string& out, const std::string& value)", util),
+        ("static void json_prop(std::string& out, const char* key, const std::string& value)", source),
+        ("static std::string action_result(bool success, const char* code, const std::string& data = {}, const std::string& detail = {})", source),
+        ("static std::string run_modem_job(const std::string& action)", source),
+    ):
+        name = declaration.split("(", 1)[0].rsplit(" ", 1)[1]
+        harness += declaration + " {" + function_body(text.replace(" = {}", ""), name) + "}\n"
+    harness += r'''
+int main() {
+    std::cout << run_modem_job("imei") << '\n';
+    available = false;
+    std::cout << run_modem_job("imei") << '\n';
+    assert(getter_calls == 2);
+}
+'''
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "imei_job.cpp"
+        path.write_text(harness)
+        binary = Path(directory) / "imei_job"
+        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", str(path),
+                        "-o", str(binary)], check=True, capture_output=True, text=True)
+        result = subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        return [json.loads(line) for line in result.stdout.splitlines()]
+
+
 def run_guard_seam(source: str, mutate_idle=None, mutate_cellular=None):
     def guard_body(name):
         for declaration in (
@@ -868,6 +921,12 @@ int main() {
         "psa_key_derivation_abort(&operation)", "psa_key_derivation_setup(&operation, 0)", 1))
 
     source = (WEB / "idf_web.cpp").read_text()
+    assert run_imei_job_seam(source) == [
+        {"success": True, "code": "ACTION_MODEM_OK",
+         "data": {"imei": "860000000000001"}, "detail": ""},
+        {"success": False, "code": "ACTION_MODEM_FAILED",
+         "data": {"imei": ""}, "detail": ""},
+    ]
     assert run_guard_seam(source).returncode == 0
     mutated_ota_guard = run_guard_seam(source, mutate_cellular=lambda body: body.replace(
         "(!allow_current_ota && ota_busy)", "ota_busy", 1))
