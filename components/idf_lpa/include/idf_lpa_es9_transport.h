@@ -4,10 +4,14 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 constexpr std::size_t IDF_LPA_ES9_MAX_JSON_BYTES = 24U * 1024U;
 constexpr std::uint32_t IDF_LPA_ES9_IO_TIMEOUT_MS = 15000U;
 constexpr std::uint32_t IDF_LPA_ES9_TRANSACTION_TIMEOUT_MS = 60000U;
+constexpr std::uint32_t IDF_LPA_ES9_BPP_TRANSACTION_TIMEOUT_MS = 30U * 60U * 1000U;
+constexpr std::size_t IDF_LPA_ES9_BPP_MAX_WIRE_BYTES =
+    1536U * 1024U + 64U * 1024U;
 
 enum class IdfLpaEs9Operation : std::uint8_t {
     initiate_authentication,
@@ -43,3 +47,14 @@ bool idf_lpa_es9_post_json(IdfLpaEs9Operation operation,
                            std::string_view request_json,
                            std::string& response_body,
                            IdfLpaEs9TransportError& error);
+
+// 以固定 GetBoundProfilePackage 路徑串流 BPP response；不快取伺服器 body。
+// 只有 HTTP preflight 通過後才會將 body 餵給 BPP，成功只回傳單一 PIR，交由上層驗證。
+// 失敗時清除 PIR 與安全訊息，且不會通知、移除或啟用 profile。
+bool idf_lpa_es9_get_bound_profile_package(
+    std::string_view smdp_host,
+    std::string_view request_json,
+    std::string_view expected_transaction_id,
+    std::vector<std::uint8_t>& profile_installation_result,
+    std::string& safe_message,
+    IdfLpaEs9TransportError& error);
