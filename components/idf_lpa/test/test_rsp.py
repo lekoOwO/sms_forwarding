@@ -29,17 +29,104 @@ static std::vector<uint8_t> tlv(std::initializer_list<uint8_t> tag,
                                 const std::vector<uint8_t>& value)
 {
     std::vector<uint8_t> out(tag);
-    assert(value.size() < 128U);
-    out.push_back(static_cast<uint8_t>(value.size()));
+    if (value.size() < 128U) {
+        out.push_back(static_cast<uint8_t>(value.size()));
+    } else if (value.size() <= 0xFFU) {
+        out.push_back(0x81U);
+        out.push_back(static_cast<uint8_t>(value.size()));
+    } else {
+        assert(value.size() <= 0xFFFFU);
+        out.push_back(0x82U);
+        out.push_back(static_cast<uint8_t>(value.size() >> 8U));
+        out.push_back(static_cast<uint8_t>(value.size()));
+    }
     out.insert(out.end(), value.begin(), value.end());
+    return out;
+}
+
+static std::vector<uint8_t> joined(const std::vector<std::vector<uint8_t>>& parts)
+{
+    std::vector<uint8_t> out;
+    for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
     return out;
 }
 
 static std::vector<uint8_t> sequence(const std::vector<std::vector<uint8_t>>& children)
 {
-    std::vector<uint8_t> value;
-    for (const auto& child : children) value.insert(value.end(), child.begin(), child.end());
-    return tlv({0x30}, value);
+    return tlv({0x30}, joined(children));
+}
+
+static std::vector<uint8_t> prepare_download_success(
+    const std::vector<uint8_t>& transaction,
+    std::vector<uint8_t> hash_cc = std::vector<uint8_t>(32U, 0xCCU))
+{
+    const auto signed_data = sequence({
+        tlv({0x80}, transaction),
+        tlv({0x5F, 0x49}, {0x01, 0x02, 0x03}),
+        hash_cc.empty() ? std::vector<uint8_t>() : tlv({0x04}, hash_cc),
+    });
+    return tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+        signed_data,
+        tlv({0x5F, 0x37}, {0xAA, 0xBB}),
+    })));
+}
+
+static std::vector<uint8_t> prepare_download_error(const std::vector<uint8_t>& transaction,
+                                                   const std::vector<uint8_t>& code = {0x01})
+{
+    return tlv({0xBF, 0x21}, tlv({0xA1}, joined({
+        tlv({0x80}, transaction),
+        tlv({0x02}, code),
+    })));
+}
+
+static std::vector<uint8_t> notification_metadata(
+    std::vector<uint8_t> sequence = {0x01},
+    std::vector<uint8_t> operation = {0x07, 0x80},
+    std::vector<uint8_t> address = {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'},
+    std::vector<uint8_t> iccid = {0x98, 0x88, 0x12, 0x32, 0x54,
+                                  0x76, 0x98, 0x10, 0x32, 0xF4})
+{
+    std::vector<std::vector<uint8_t>> fields = {
+        tlv({0x80}, sequence),
+        tlv({0x81}, operation),
+        tlv({0x0C}, address),
+    };
+    if (!iccid.empty()) fields.push_back(tlv({0x5A}, iccid));
+    return tlv({0xBF, 0x2F}, joined(fields));
+}
+
+static std::vector<uint8_t> pir_error_result(uint8_t command_id = 0x05U,
+                                             uint8_t reason = 0x01U,
+                                             std::vector<uint8_t> sima_response = {})
+{
+    std::vector<std::vector<uint8_t>> fields = {
+        tlv({0x02}, {command_id}),
+        tlv({0x02}, {reason}),
+    };
+    if (!sima_response.empty()) fields.push_back(tlv({0x04}, sima_response));
+    return tlv({0xA2}, tlv({0xA1}, joined(fields)));
+}
+
+static std::vector<uint8_t> profile_installation_result(
+    const std::vector<uint8_t>& transaction,
+    std::vector<uint8_t> metadata = notification_metadata(),
+    std::vector<uint8_t> final_result = tlv({0xA2}, tlv({0xA0}, joined({
+        tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+        tlv({0x04}, {0x90, 0x00}),
+    }))),
+    std::vector<uint8_t> oid = {0x2B, 0x06, 0x01, 0x04, 0x01})
+{
+    const auto signed_data = tlv({0xBF, 0x27}, joined({
+        tlv({0x80}, transaction),
+        metadata,
+        tlv({0x06}, oid),
+        final_result,
+    }));
+    return tlv({0xBF, 0x37}, joined({
+        signed_data,
+        tlv({0x5F, 0x37}, {0xCC, 0xDD}),
+    }));
 }
 
 static void expect_der_kind(LpaRspDerObject kind,
@@ -281,6 +368,26 @@ int main()
     expect_der_kind(LpaRspDerObject::profile_metadata, tlv({0xBF, 0x2F}, {}));
     expect_der_kind(LpaRspDerObject::notification_metadata, tlv({0xBF, 0x2F}, {}));
     expect_der_kind(LpaRspDerObject::profile_installation_result, tlv({0xBF, 0x37}, {}));
+    expect_der_kind(LpaRspDerObject::signature, tlv({0x5F, 0x37}, {0xAA}));
+    expect_der_kind(LpaRspDerObject::ci_key, tlv({0x04}, {0x04, 0x05}));
+    const auto wrong_signature_root = tlv({0x04}, {0xAA});
+    assert(!idf_lpa_rsp_validate_der_structure(
+               wrong_signature_root.data(), wrong_signature_root.size(),
+               LpaRspDerObject::signature, error));
+    assert(error == Error::der_root);
+    const auto signature_trailing = joined({tlv({0x5F, 0x37}, {0xAA}), tlv({0x04}, {})});
+    assert(!idf_lpa_rsp_validate_der_structure(
+               signature_trailing.data(), signature_trailing.size(),
+               LpaRspDerObject::signature, error));
+    assert(error == Error::der_malformed);
+    const auto oversized_signature = tlv({0x5F, 0x37}, std::vector<uint8_t>(1019U, 0xAA));
+    assert(idf_lpa_rsp_validate_der_structure(
+               oversized_signature.data(), oversized_signature.size(),
+               LpaRspDerObject::signature, error));
+    const auto oversized_ci_key = tlv({0x04}, std::vector<uint8_t>(128U, 0xAA));
+    assert(!idf_lpa_rsp_validate_der_structure(
+               oversized_ci_key.data(), oversized_ci_key.size(), LpaRspDerObject::ci_key, error));
+    assert(error == Error::object_too_large);
     assert(!idf_lpa_rsp_validate_der_structure(
                signed1.data(), signed1.size(), LpaRspDerObject::prepare_download_response, error));
     assert(error == Error::der_root);
@@ -308,6 +415,493 @@ int main()
     assert(!idf_lpa_rsp_validate_der_structure(
                deep.data(), deep.size(), LpaRspDerObject::smdp_signed2, error));
     assert(error == Error::der_malformed);
+
+    const auto prepare = prepare_download_success(tx);
+    std::vector<uint8_t> get_bpp_response = {0x53, 0x45, 0x4E, 0x54, 0x49, 0x4E, 0x45, 0x4C};
+    assert(idf_lpa_rsp_parse_prepare_download_response(
+               prepare.data(), prepare.size(), transaction.data(), transaction.size(),
+               get_bpp_response, error));
+    assert(get_bpp_response == prepare && error == Error::none);
+    const auto prepare_error = prepare_download_error(tx);
+    get_bpp_response = {0x53, 0x45, 0x4E, 0x54, 0x49, 0x4E, 0x45, 0x4C};
+    assert(!idf_lpa_rsp_parse_prepare_download_response(
+               prepare_error.data(), prepare_error.size(), transaction.data(), transaction.size(),
+               get_bpp_response, error));
+    assert(error == Error::server_error);
+    assert(get_bpp_response.empty());
+    const auto pir = profile_installation_result(tx);
+    std::uint32_t sequence_number = 0xDEADBEEFU;
+    std::string notification_address = "secret-address";
+    assert(idf_lpa_rsp_parse_profile_installation_result(
+               pir.data(), pir.size(), transaction.data(), transaction.size(), "EDGE.EXAMPLE",
+               sequence_number, notification_address, error));
+    assert(sequence_number == 1U && notification_address == "edge.example" &&
+           error == Error::none);
+    const auto pir_failed = profile_installation_result(
+        tx, notification_metadata(), pir_error_result());
+    sequence_number = 0xDEADBEEFU;
+    notification_address = "secret-address";
+    assert(!idf_lpa_rsp_parse_profile_installation_result(
+               pir_failed.data(), pir_failed.size(), transaction.data(), transaction.size(),
+               "edge.example", sequence_number, notification_address, error));
+    assert(error == Error::server_error && sequence_number == 0U && notification_address.empty());
+
+    const auto prepare_without_hash = prepare_download_success(tx, {});
+    get_bpp_response = {0x53, 0x45, 0x4E, 0x54, 0x49, 0x4E, 0x45, 0x4C};
+    assert(idf_lpa_rsp_parse_prepare_download_response(
+               prepare_without_hash.data(), prepare_without_hash.size(), transaction.data(),
+               transaction.size(), get_bpp_response, error));
+    assert(get_bpp_response == prepare_without_hash && error == Error::none);
+
+    auto reject_prepare = [&](const std::vector<uint8_t>& value, Error expected) {
+        get_bpp_response = {0x53, 0x45, 0x4E, 0x54, 0x49, 0x4E, 0x45, 0x4C};
+        assert(!idf_lpa_rsp_parse_prepare_download_response(
+                   value.data(), value.size(), transaction.data(), transaction.size(),
+                   get_bpp_response, error));
+        assert(error == expected && get_bpp_response.empty());
+        assert(std::string(idf_lpa_rsp_error_name(error)).find("EDGE") == std::string::npos);
+    };
+    const auto prepare_signed_data = sequence({
+        tlv({0x80}, tx),
+        tlv({0x5F, 0x49}, {0x01, 0x02, 0x03}),
+    });
+    const auto prepare_success_child = tlv({0xA0}, joined({
+        prepare_signed_data,
+        tlv({0x5F, 0x37}, {0xAA, 0xBB}),
+    }));
+    const auto prepare_error_child = tlv({0xA1}, joined({
+        tlv({0x80}, tx),
+        tlv({0x02}, {0x01}),
+    }));
+    for (uint8_t code : {0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0x7FU}) {
+        get_bpp_response = {0x53, 0x45, 0x4E, 0x54, 0x49, 0x4E, 0x45, 0x4C};
+        const auto valid_error = prepare_download_error(tx, {code});
+        assert(!idf_lpa_rsp_parse_prepare_download_response(
+                   valid_error.data(), valid_error.size(), transaction.data(), transaction.size(),
+                   get_bpp_response, error));
+        assert(error == Error::server_error && get_bpp_response.empty());
+    }
+    for (const auto& code : {std::vector<uint8_t>{0x00U}, std::vector<uint8_t>{0x06U},
+                              std::vector<uint8_t>{0x7EU}, std::vector<uint8_t>{0x00U, 0x80U}}) {
+        reject_prepare(prepare_download_error(tx, code), Error::der_malformed);
+    }
+    reject_prepare(tlv({0xBF, 0x22}, {}), Error::der_root);
+    auto prepare_trailing = prepare;
+    prepare_trailing.push_back(0x00);
+    reject_prepare(prepare_trailing, Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, {}), Error::field_missing);
+    reject_prepare(tlv({0xBF, 0x21}, joined({prepare_success_child, prepare_success_child})),
+                   Error::der_duplicate);
+    reject_prepare(tlv({0xBF, 0x21}, joined({prepare_error_child, prepare_error_child})),
+                   Error::der_duplicate);
+    reject_prepare(tlv({0xBF, 0x21}, joined({prepare_success_child, prepare_error_child})),
+                   Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       prepare_signed_data,
+                   }))), Error::field_missing);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x80}, tx), tlv({0x5F, 0x49}, {0x01}),
+                                 tlv({0x04}, std::vector<uint8_t>(31U, 0xCC))}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x80}, tx), tlv({0x5F, 0x49}, {0x01}),
+                                 tlv({0x04}, {0xCC}), tlv({0x04}, {0xDD})}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::der_duplicate);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x80}, tx), tlv({0x04}, {0xCC}),
+                                 tlv({0x5F, 0x49}, {0x01})}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       prepare_signed_data,
+                       tlv({0x5F, 0x37}, {}),
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x80}, tx)}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::field_missing);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x5F, 0x49}, {0x01, 0x02, 0x03})}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::field_missing);
+    reject_prepare(tlv({0xBF, 0x21}, joined({
+                       prepare_success_child,
+                       tlv({0xBF, 0x22}, {}),
+                   })), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       prepare_signed_data,
+                       tlv({0x5F, 0x37}, {0xAA}),
+                       tlv({0x5F, 0x37}, {0xBB}),
+                   }))), Error::der_duplicate);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       tlv({0x5F, 0x37}, {0xAA}), prepare_signed_data,
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x5F, 0x49}, {0x01}), tlv({0x80}, tx),
+                                 tlv({0x82}, {0x01})}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::der_malformed);
+    auto wrong_prepare_transaction = prepare_download_success({0xFF, 0xEE});
+    reject_prepare(wrong_prepare_transaction, Error::transaction_mismatch);
+    reject_prepare(prepare_download_error({0xFF, 0xEE}), Error::transaction_mismatch);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA1}, tlv({0x80}, tx))),
+                   Error::field_missing);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA1}, tlv({0x02}, {0x01}))),
+                   Error::field_missing);
+    reject_prepare(prepare_download_error(tx, {0x00, 0x01}), Error::der_malformed);
+    reject_prepare(prepare_download_error(tx, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                   Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA1}, joined({
+                       tlv({0x02}, {0x01}), tlv({0x80}, tx),
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA1}, joined({
+                       tlv({0x80}, tx), tlv({0x02}, {0x01}), tlv({0x82}, {0x01}),
+                   }))), Error::der_malformed);
+    auto prepare_noncanonical_length = prepare;
+    const std::uint8_t prepare_root_length = prepare_noncanonical_length[2];
+    prepare_noncanonical_length[2] = 0x81;
+    prepare_noncanonical_length.insert(prepare_noncanonical_length.begin() + 3,
+                                       prepare_root_length);
+    reject_prepare(prepare_noncanonical_length, Error::der_malformed);
+    reject_prepare(std::vector<uint8_t>(8U * 1024U + 1U, 0x00), Error::object_too_large);
+    std::vector<uint8_t> prepare_deep = {0x04, 0x00};
+    for (std::size_t depth = 0U; depth < 10U; ++depth) prepare_deep = tlv({0x30}, prepare_deep);
+    reject_prepare(prepare_deep, Error::der_malformed);
+    const auto prepare_large = tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+        sequence({tlv({0x80}, tx), tlv({0x5F, 0x49}, std::vector<uint8_t>(128U, 0x01))}),
+        tlv({0x5F, 0x37}, std::vector<uint8_t>(130U, 0xAA)),
+    })));
+    get_bpp_response.clear();
+    assert(idf_lpa_rsp_parse_prepare_download_response(
+               prepare_large.data(), prepare_large.size(), transaction.data(), transaction.size(),
+               get_bpp_response, error));
+    assert(get_bpp_response == prepare_large);
+    const std::size_t prepare_success_capacity = get_bpp_response.capacity();
+    reject_prepare(tlv({0xBF, 0x21}, {}), Error::field_missing);
+    assert(prepare_success_capacity > 0U && get_bpp_response.capacity() == 0U);
+    get_bpp_response = prepare;
+    const std::size_t aliased_prepare_size = get_bpp_response.size();
+    assert(!idf_lpa_rsp_parse_prepare_download_response(
+               get_bpp_response.data(), aliased_prepare_size, transaction.data(),
+               transaction.size(), get_bpp_response, error));
+    assert(error == Error::der_malformed && get_bpp_response.empty() &&
+           get_bpp_response.capacity() == 0U);
+    get_bpp_response = tx;
+    assert(!idf_lpa_rsp_parse_prepare_download_response(
+               prepare.data(), prepare.size(), get_bpp_response.data(), tx.size(),
+               get_bpp_response, error));
+    assert(error == Error::der_malformed && get_bpp_response.empty() &&
+           get_bpp_response.capacity() == 0U);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x5F, 0x49}, std::vector<uint8_t>(129U, 0x01)),
+                                 tlv({0x80}, tx)}),
+                       tlv({0x5F, 0x37}, {0xAA}),
+                   }))), Error::der_malformed);
+    reject_prepare(tlv({0xBF, 0x21}, tlv({0xA0}, joined({
+                       sequence({tlv({0x5F, 0x49}, {0x01}), tlv({0x80}, tx)}),
+                       tlv({0x5F, 0x37}, std::vector<uint8_t>(1025U, 0xAA)),
+                   }))), Error::der_malformed);
+
+    auto reject_pir = [&](const std::vector<uint8_t>& value, Error expected) {
+        sequence_number = 0xDEADBEEFU;
+        notification_address = "notification-secret";
+        assert(!idf_lpa_rsp_parse_profile_installation_result(
+                   value.data(), value.size(), transaction.data(), transaction.size(),
+                   "EDGE.EXAMPLE", sequence_number, notification_address, error));
+        assert(error == expected && sequence_number == 0U && notification_address.empty());
+        assert(std::string(idf_lpa_rsp_error_name(error)).find("EDGE") == std::string::npos);
+    };
+    reject_pir(tlv({0xBF, 0x36}, {}), Error::der_root);
+    auto pir_trailing = pir;
+    pir_trailing.push_back(0x00);
+    reject_pir(pir_trailing, Error::der_malformed);
+    reject_pir(tlv({0xBF, 0x37}, {}), Error::field_missing);
+    reject_pir(tlv({0xBF, 0x37}, joined({
+                  tlv({0xBF, 0x27}, {}), tlv({0x5F, 0x37}, {0xAA}),
+                  tlv({0x5F, 0x37}, {0xBB}),
+              })), Error::der_duplicate);
+    reject_pir(tlv({0xBF, 0x37}, joined({
+                  tlv({0xBF, 0x27}, {}), tlv({0x5F, 0x37}, {0xAA}),
+                  tlv({0xBF, 0x26}, {}),
+              })), Error::der_malformed);
+    reject_pir(tlv({0xBF, 0x37}, tlv({0x5F, 0x37}, {0xAA})), Error::field_missing);
+    const auto pir_data = tlv({0xBF, 0x27}, joined({
+        tlv({0x80}, tx),
+        notification_metadata(),
+        tlv({0x06}, {0x2B, 0x06, 0x01, 0x04, 0x01}),
+        tlv({0xA2}, tlv({0xA0}, joined({
+            tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+            tlv({0x04}, {0x90, 0x00}),
+        }))),
+    }));
+    const auto pir_signature = tlv({0x5F, 0x37}, {0xCC});
+    const auto pir_error_valid = profile_installation_result(
+        tx, notification_metadata(), pir_error_result(0x05U, 0x01U));
+    assert(!idf_lpa_rsp_parse_profile_installation_result(
+               pir_error_valid.data(), pir_error_valid.size(),
+               transaction.data(), transaction.size(), "edge.example", sequence_number,
+               notification_address, error));
+    assert(error == Error::server_error && sequence_number == 0U && notification_address.empty());
+    const auto pir_error_with_response = profile_installation_result(
+        tx, notification_metadata(), pir_error_result(0x05U, 0x01U, {0x90U, 0x00U}));
+    assert(!idf_lpa_rsp_parse_profile_installation_result(
+               pir_error_with_response.data(), pir_error_with_response.size(), transaction.data(),
+               transaction.size(), "edge.example", sequence_number, notification_address, error));
+    assert(error == Error::server_error && sequence_number == 0U && notification_address.empty());
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA1}, {}))), Error::field_missing);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA1}, tlv({0x02}, {0x05})))),
+               Error::field_missing);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA1}, joined({
+                                               tlv({0x02}, {0x05}), tlv({0x02}, {0x01}),
+                                               tlv({0x02}, {0x02}),
+                                           })))), Error::der_duplicate);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA1}, joined({
+                                               tlv({0x02}, {0x05}), tlv({0x82}, {0x01}),
+                                               tlv({0x02}, {0x01}),
+                                           })))), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA1}, joined({
+                                               tlv({0x02}, {0x0D}), tlv({0x02}, {0x00}),
+                                           })))), Error::der_malformed);
+    for (uint8_t command_id : {0x00U, 0x01U, 0x02U, 0x03U, 0x04U, 0x05U}) {
+        const auto valid_error = profile_installation_result(
+            tx, notification_metadata(), pir_error_result(command_id, 0x01U));
+        assert(!idf_lpa_rsp_parse_profile_installation_result(
+                   valid_error.data(), valid_error.size(), transaction.data(), transaction.size(),
+                   "edge.example", sequence_number, notification_address, error));
+        assert(error == Error::server_error);
+    }
+    for (uint8_t reason : {0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0x06U, 0x07U, 0x08U,
+                           0x09U, 0x0AU, 0x0BU, 0x0CU, 0x0DU, 0x0EU, 0x0FU, 0x7FU}) {
+        const auto valid_error = profile_installation_result(
+            tx, notification_metadata(), pir_error_result(0x05U, reason));
+        assert(!idf_lpa_rsp_parse_profile_installation_result(
+                   valid_error.data(), valid_error.size(), transaction.data(), transaction.size(),
+                   "edge.example", sequence_number, notification_address, error));
+        assert(error == Error::server_error);
+    }
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           pir_error_result(0x06U, 0x01U)), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           pir_error_result(0x05U, 0x00U)), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           pir_error_result(0x05U, 0x10U)), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           pir_error_result(0x05U, 0x80U)), Error::der_malformed);
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_data, pir_signature, pir_data})),
+               Error::der_duplicate);
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_data, pir_signature, tlv({0x5F, 0x36}, {0x01})})),
+               Error::der_malformed);
+    reject_pir(profile_installation_result({0xFF, 0xEE}), Error::transaction_mismatch);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x00, 0x01})),
+               Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01, 0x00, 0x00, 0x00, 0x01})),
+               Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01}, {0x06, 0x40})),
+               Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01}, {0x07, 0x81})),
+               Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01}, {0x07, 0x80},
+                                                                      {'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'n', 'e', 't'})),
+               Error::address_mismatch);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01}, {0x07, 0x80},
+                                                                      {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x01})),
+               Error::address_mismatch);
+    reject_pir(profile_installation_result(tx, notification_metadata({0x01}, {0x07, 0x80},
+                                                                      {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'}),
+                                           tlv({0xA2}, tlv({0xA1}, {}))), Error::field_missing);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA3}, {0x01}))), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, joined({tlv({0xA0}, {}), tlv({0xA1}, {})}))),
+               Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05})))),
+               Error::field_missing);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, tlv({0x04}, {0x90, 0x00})))),
+               Error::field_missing);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                                               tlv({0x04}, {0x90, 0x00}), tlv({0x82}, {0x01}),
+                                           })))), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                                               tlv({0x4F}, {0x06, 0x07, 0x08, 0x09, 0x0A}),
+                                               tlv({0x04}, {0x90, 0x00}),
+                                           })))), Error::der_duplicate);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                                               tlv({0x04}, {0x90, 0x00}), tlv({0x04}, {0x91, 0x00}),
+                                           })))), Error::der_duplicate);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, {0x01, 0x02, 0x03, 0x04}),
+                                               tlv({0x04}, {0x90, 0x00}),
+                                           })))), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, std::vector<uint8_t>(17U, 0x01)),
+                                               tlv({0x04}, {0x90, 0x00}),
+                                           })))), Error::der_malformed);
+    reject_pir(profile_installation_result(tx, notification_metadata(),
+                                           tlv({0xA2}, tlv({0xA0}, joined({
+                                               tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                                               tlv({0x04}, {}),
+                                           })))), Error::der_malformed);
+    const auto pir_oversized_oid_data = tlv({0xBF, 0x27}, joined({
+        tlv({0x80}, tx), notification_metadata(),
+        tlv({0x06}, std::vector<uint8_t>(65U, 0x2B)),
+        tlv({0xA2}, tlv({0xA0}, joined({
+            tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}), tlv({0x04}, {0x90}),
+        }))),
+    }));
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_oversized_oid_data, pir_signature})),
+               Error::der_malformed);
+    const auto pir_oversized_signature = tlv({0xBF, 0x37}, joined({
+        pir_data, tlv({0x5F, 0x37}, std::vector<uint8_t>(1025U, 0xCC)),
+    }));
+    reject_pir(pir_oversized_signature, Error::der_malformed);
+    const auto pir_data_extra = tlv({0xBF, 0x27}, joined({
+        tlv({0x80}, tx), notification_metadata(), tlv({0x06}, {0x2B}),
+        tlv({0xA2}, tlv({0xA0}, joined({
+            tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}), tlv({0x04}, {0x90}),
+        }))), tlv({0x82}, {0x01}),
+    }));
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_data_extra, pir_signature})),
+               Error::der_malformed);
+    const auto metadata_with_extra = tlv({0xBF, 0x2F}, joined({
+        tlv({0x80}, {0x01}), tlv({0x81}, {0x07, 0x80}),
+        tlv({0x0C}, {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'}),
+        tlv({0x82}, {0x01}),
+    }));
+    reject_pir(profile_installation_result(tx, metadata_with_extra), Error::der_malformed);
+    const std::vector<uint8_t> iccid_20 = {
+        0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54};
+    const auto pir_iccid_20 = profile_installation_result(
+        tx, notification_metadata({0x01}, {0x07, 0x80},
+                                   {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'},
+                                   iccid_20));
+    assert(idf_lpa_rsp_parse_profile_installation_result(
+               pir_iccid_20.data(), pir_iccid_20.size(),
+               transaction.data(), transaction.size(), "edge.example", sequence_number,
+               notification_address, error));
+    assert(sequence_number == 1U && notification_address == "edge.example" &&
+           error == Error::none);
+    const auto pir_long = profile_installation_result(
+        tx, notification_metadata({0x01}, {0x07, 0x80},
+                                   {'v', 'e', 'r', 'y', '-', 'l', 'o', 'n', 'g', '.', 'e', 'x',
+                                    'a', 'm', 'p', 'l', 'e'}));
+    assert(idf_lpa_rsp_parse_profile_installation_result(
+               pir_long.data(), pir_long.size(), transaction.data(), transaction.size(),
+               "very-long.example", sequence_number, notification_address, error));
+    const std::size_t pir_success_capacity = notification_address.capacity();
+    assert(notification_address == "very-long.example");
+    reject_pir(tlv({0xBF, 0x37}, {}), Error::field_missing);
+    assert(pir_success_capacity > notification_address.capacity());
+    notification_address = "edge.example";
+    const std::string_view aliased_host(notification_address);
+    assert(!idf_lpa_rsp_parse_profile_installation_result(
+               pir.data(), pir.size(), transaction.data(), transaction.size(), aliased_host,
+               sequence_number, notification_address, error));
+    assert(error == Error::der_malformed && sequence_number == 0U &&
+           notification_address.empty());
+    const auto pir_without_iccid = profile_installation_result(
+        tx, notification_metadata({0x01}, {0x07, 0x80},
+                                   {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'},
+                                   {}));
+    assert(idf_lpa_rsp_parse_profile_installation_result(
+               pir_without_iccid.data(), pir_without_iccid.size(),
+               transaction.data(), transaction.size(), "edge.example", sequence_number,
+               notification_address, error));
+    const auto metadata_iccid_before_address = tlv({0xBF, 0x2F}, joined({
+        tlv({0x80}, {0x01}), tlv({0x81}, {0x07, 0x80}),
+        tlv({0x5A}, {0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0xF4}),
+        tlv({0x0C}, {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'}),
+    }));
+    reject_pir(profile_installation_result(tx, metadata_iccid_before_address),
+               Error::der_malformed);
+    for (const auto& bad_iccid : {
+             std::vector<uint8_t>{0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32},
+             std::vector<uint8_t>{0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54,
+                                  0x76},
+             std::vector<uint8_t>{0xF8, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0xF4},
+             std::vector<uint8_t>{0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0xFF},
+         }) {
+        reject_pir(profile_installation_result(
+                       tx, notification_metadata({0x01}, {0x07, 0x80},
+                                                  {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm',
+                                                   'p', 'l', 'e'},
+                                                  bad_iccid)),
+                   Error::der_malformed);
+    }
+    for (const auto& bad_oid : {
+             std::vector<uint8_t>{}, std::vector<uint8_t>{0x2B, 0x86},
+             std::vector<uint8_t>{0x2B, 0x80, 0x00},
+             std::vector<uint8_t>{0x2B, 0x86, 0x80},
+             std::vector<uint8_t>{0x2B, 0x82, 0xFF, 0xFF, 0xFF, 0xFF,
+                                  0xFF, 0xFF, 0xFF, 0xFF, 0x7F},
+         }) {
+        reject_pir(profile_installation_result(tx, notification_metadata(),
+                                               tlv({0xA2}, tlv({0xA0}, joined({
+                                                   tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+                                                   tlv({0x04}, {0x90, 0x00}),
+                                               }))),
+                                               bad_oid),
+                   Error::der_malformed);
+    }
+    const auto pir_root_out_of_order = tlv({0xBF, 0x37}, joined({
+        pir_signature, pir_data,
+    }));
+    reject_pir(pir_root_out_of_order, Error::der_malformed);
+    const auto pir_data_out_of_order = tlv({0xBF, 0x27}, joined({
+        notification_metadata(), tlv({0x80}, tx), tlv({0x06}, {0x2B, 0x06, 0x01, 0x04, 0x01}),
+        tlv({0xA2}, tlv({0xA0}, joined({
+            tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}), tlv({0x04}, {0x90, 0x00}),
+        }))),
+    }));
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_data_out_of_order, pir_signature})),
+               Error::der_malformed);
+    const auto pir_success_out_of_order = tlv({0xBF, 0x27}, joined({
+        tlv({0x80}, tx), notification_metadata(), tlv({0x06}, {0x2B, 0x06, 0x01, 0x04, 0x01}),
+        tlv({0xA2}, tlv({0xA0}, joined({
+            tlv({0x04}, {0x90, 0x00}), tlv({0x4F}, {0x01, 0x02, 0x03, 0x04, 0x05}),
+        }))),
+    }));
+    reject_pir(tlv({0xBF, 0x37}, joined({pir_success_out_of_order, pir_signature})),
+               Error::der_malformed);
+    const auto metadata_duplicate = tlv({0xBF, 0x2F}, joined({
+        tlv({0x80}, {0x01}), tlv({0x80}, {0x02}), tlv({0x81}, {0x07, 0x80}),
+        tlv({0x0C}, {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'}),
+    }));
+    reject_pir(profile_installation_result(tx, metadata_duplicate), Error::der_duplicate);
+    const auto metadata_iccid_duplicate = tlv({0xBF, 0x2F}, joined({
+        tlv({0x80}, {0x01}), tlv({0x81}, {0x07, 0x80}),
+        tlv({0x0C}, {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'}),
+        tlv({0x5A}, {0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0xF4}),
+        tlv({0x5A}, {0x98, 0x88, 0x12, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0xF4}),
+    }));
+    reject_pir(profile_installation_result(tx, metadata_iccid_duplicate), Error::der_duplicate);
+    auto pir_noncanonical_length = pir;
+    const std::uint8_t pir_root_length = pir_noncanonical_length[2];
+    pir_noncanonical_length[2] = 0x81;
+    pir_noncanonical_length.insert(pir_noncanonical_length.begin() + 3, pir_root_length);
+    reject_pir(pir_noncanonical_length, Error::der_malformed);
+    std::vector<uint8_t> pir_deep = {0x04, 0x00};
+    for (std::size_t depth = 0U; depth < 10U; ++depth) pir_deep = tlv({0x30}, pir_deep);
+    reject_pir(pir_deep, Error::der_malformed);
+    auto pir_signature_empty = pir;
+    pir_signature_empty[pir_signature_empty.size() - 3U] = 0U;
+    reject_pir(pir_signature_empty, Error::der_malformed);
 
     std::array<uint8_t, 32> hash = {};
     assert(idf_lpa_rsp_compute_hash_cc("1234", transaction.data(), 4U, hash, error));

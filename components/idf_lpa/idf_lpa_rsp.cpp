@@ -24,6 +24,10 @@ namespace {
 constexpr std::size_t kMaxJsonKeys = 32U;
 constexpr std::size_t kMaxJsonDepth = 8U;
 constexpr std::size_t kMaxTransactionBytes = 16U;
+constexpr std::size_t kMaxSignatureBytes = 1024U;
+constexpr std::size_t kMaxCiKeyBytes = 128U;
+constexpr std::size_t kMaxOtpkBytes = 128U;
+constexpr std::size_t kMaxOidBytes = 64U;
 constexpr std::size_t kHashBytes = 32U;
 constexpr std::size_t kMaxBase64EncodedBytes =
     ((IDF_LPA_RSP_MAX_OBJECT_BYTES + 2U) / 3U) * 4U;
@@ -40,14 +44,19 @@ void secure_zero(void* address, std::size_t size) noexcept
 
 void clear_string(std::string& value) noexcept
 {
-    if (!value.empty()) secure_zero(value.data(), value.size());
+    const std::size_t capacity = value.capacity();
+    if (capacity > value.size()) value.resize(capacity, '\0');
+    if (capacity != 0U) secure_zero(value.data(), capacity);
     value.clear();
+    std::string().swap(value);
 }
 
 void clear_bytes(std::vector<std::uint8_t>& value) noexcept
 {
-    if (!value.empty()) secure_zero(value.data(), value.size());
+    const std::size_t capacity = value.capacity();
+    if (capacity != 0U) secure_zero(value.data(), capacity);
     value.clear();
+    std::vector<std::uint8_t>().swap(value);
 }
 
 bool fail(LpaRspError& error, LpaRspError value) noexcept
@@ -564,6 +573,143 @@ bool printable_ascii(const std::vector<std::uint8_t>& value) noexcept
     return true;
 }
 
+bool ranges_overlap(const void* left,
+                    std::size_t left_size,
+                    const void* right,
+                    std::size_t right_size) noexcept
+{
+    if (!left || !right || left_size == 0U || right_size == 0U) return false;
+    const std::uintptr_t left_begin = reinterpret_cast<std::uintptr_t>(left);
+    const std::uintptr_t right_begin = reinterpret_cast<std::uintptr_t>(right);
+    const std::uintptr_t max_address = std::numeric_limits<std::uintptr_t>::max();
+    if (left_size > max_address - left_begin || right_size > max_address - right_begin) {
+        return true;
+    }
+    const std::uintptr_t left_end = left_begin + left_size;
+    const std::uintptr_t right_end = right_begin + right_size;
+    return left_begin < right_end && right_begin < left_end;
+}
+
+bool valid_smdp_host(std::string_view value) noexcept
+{
+    if (value.empty() || value.size() > 253U) return false;
+
+    std::size_t label_start = 0U;
+    std::size_t label_count = 0U;
+    bool all_numeric_labels = true;
+    while (label_start <= value.size()) {
+        const std::size_t dot = value.find('.', label_start);
+        const std::size_t label_end = dot == std::string_view::npos ? value.size() : dot;
+        const std::size_t label_size = label_end - label_start;
+        if (label_size == 0U || label_size > 63U || value[label_start] == '-' ||
+            value[label_end - 1U] == '-') {
+            return false;
+        }
+        bool numeric_label = true;
+        for (std::size_t index = label_start; index < label_end; ++index) {
+            const unsigned char byte = static_cast<unsigned char>(value[index]);
+            const bool letter = (byte >= static_cast<unsigned char>('A') &&
+                                 byte <= static_cast<unsigned char>('Z')) ||
+                                (byte >= static_cast<unsigned char>('a') &&
+                                 byte <= static_cast<unsigned char>('z'));
+            const bool digit = byte >= static_cast<unsigned char>('0') &&
+                               byte <= static_cast<unsigned char>('9');
+            if (!letter && !digit && byte != static_cast<unsigned char>('-')) return false;
+            if (!digit) numeric_label = false;
+        }
+        ++label_count;
+        all_numeric_labels = all_numeric_labels && numeric_label;
+        if (dot == std::string_view::npos) break;
+        label_start = dot + 1U;
+    }
+    return label_count >= 2U && !all_numeric_labels;
+}
+
+bool canonical_nonnegative_integer(const std::vector<std::uint8_t>& value,
+                                   std::size_t max_bytes,
+                                   std::uint32_t& output) noexcept
+{
+    output = 0U;
+    if (value.empty() || value.size() > max_bytes) return false;
+    if ((value.front() & 0x80U) != 0U) return false;
+    if (value.size() > 1U && value.front() == 0U &&
+        (value[1U] & 0x80U) == 0U) {
+        return false;
+    }
+    for (const std::uint8_t byte : value) {
+        output = (output << 8U) | static_cast<std::uint32_t>(byte);
+    }
+    return true;
+}
+
+bool valid_oid(const std::vector<std::uint8_t>& value) noexcept
+{
+    if (value.empty() || value.size() > kMaxOidBytes) return false;
+    std::size_t position = 0U;
+    bool first_subidentifier = true;
+    std::uint64_t arc = 0U;
+    std::size_t arc_bytes = 0U;
+    while (position < value.size()) {
+        const std::uint8_t byte = value[position++];
+        const std::uint8_t group = byte & 0x7FU;
+        if (arc_bytes == 0U && (byte & 0x80U) != 0U && group == 0U) return false;
+        if (arc > (std::numeric_limits<std::uint64_t>::max() - group) / 128U) return false;
+        arc = arc * 128U + group;
+        ++arc_bytes;
+        if ((byte & 0x80U) != 0U) continue;
+        if (first_subidentifier) first_subidentifier = false;
+        arc = 0U;
+        arc_bytes = 0U;
+    }
+    return !first_subidentifier && arc_bytes == 0U;
+}
+
+bool valid_iccid(const std::vector<std::uint8_t>& value) noexcept
+{
+    if (value.size() != 10U) return false;
+    for (std::size_t index = 0U; index < value.size(); ++index) {
+        const std::uint8_t low = value[index] & 0x0FU;
+        const std::uint8_t high = (value[index] >> 4U) & 0x0FU;
+        if (low > 9U) return false;
+        if (index + 1U < value.size() && high > 9U) return false;
+        if (index + 1U == value.size() && high != 0x0FU && high > 9U) return false;
+    }
+    return true;
+}
+
+bool valid_download_error_code(std::uint32_t value) noexcept
+{
+    return (value >= 1U && value <= 5U) || value == 127U;
+}
+
+bool valid_bpp_command_id(std::uint32_t value) noexcept
+{
+    return value <= 5U;
+}
+
+bool valid_error_reason(std::uint32_t value) noexcept
+{
+    return (value >= 1U && value <= 15U) || value == 127U;
+}
+
+bool prepare_fail(std::vector<std::uint8_t>& output,
+                  LpaRspError& error,
+                  LpaRspError value) noexcept
+{
+    clear_bytes(output);
+    return fail(error, value);
+}
+
+bool pir_fail(std::uint32_t& sequence_number,
+              std::string& notification_address,
+              LpaRspError& error,
+              LpaRspError value) noexcept
+{
+    sequence_number = 0U;
+    clear_string(notification_address);
+    return fail(error, value);
+}
+
 const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) noexcept
 {
     static constexpr std::uint8_t kSequence[] = {0x30U};
@@ -571,6 +717,8 @@ const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) n
     static constexpr std::uint8_t kPrepareDownloadResponse[] = {0xBFU, 0x21U};
     static constexpr std::uint8_t kProfileMetadata[] = {0xBFU, 0x2FU};
     static constexpr std::uint8_t kProfileInstallationResult[] = {0xBFU, 0x37U};
+    static constexpr std::uint8_t kSignature[] = {0x5FU, 0x37U};
+    static constexpr std::uint8_t kCiKey[] = {0x04U};
     switch (kind) {
     case LpaRspDerObject::server_signed1:
     case LpaRspDerObject::smdp_signed2:
@@ -589,9 +737,34 @@ const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) n
     case LpaRspDerObject::profile_installation_result:
         size = sizeof(kProfileInstallationResult);
         return kProfileInstallationResult;
+    case LpaRspDerObject::signature:
+        size = sizeof(kSignature);
+        return kSignature;
+    case LpaRspDerObject::ci_key:
+        size = sizeof(kCiKey);
+        return kCiKey;
     }
     size = 0U;
     return nullptr;
+}
+
+std::size_t expected_root_limit(LpaRspDerObject kind) noexcept
+{
+    switch (kind) {
+    case LpaRspDerObject::signature:
+        return kMaxSignatureBytes;
+    case LpaRspDerObject::ci_key:
+        return kMaxCiKeyBytes;
+    case LpaRspDerObject::server_signed1:
+    case LpaRspDerObject::smdp_signed2:
+    case LpaRspDerObject::authenticate_server_response:
+    case LpaRspDerObject::prepare_download_response:
+    case LpaRspDerObject::profile_metadata:
+    case LpaRspDerObject::notification_metadata:
+    case LpaRspDerObject::profile_installation_result:
+        return IDF_LPA_RSP_MAX_OBJECT_BYTES;
+    }
+    return 0U;
 }
 
 int base64_value(unsigned char value) noexcept
@@ -888,6 +1061,9 @@ bool idf_lpa_rsp_validate_der_structure(const std::uint8_t* object,
                                         LpaRspError& error)
 {
     error = LpaRspError::none;
+    if (object_size > expected_root_limit(kind)) {
+        return fail(error, LpaRspError::object_too_large);
+    }
     SensitiveTlv holder;
     if (!parse_der_root(object, object_size, holder, error)) return false;
     std::size_t tag_size = 0U;
@@ -1052,5 +1228,491 @@ bool idf_lpa_rsp_compute_hash_cc(std::string_view confirmation_code,
         secure_zero(hash_cc.data(), hash_cc.size());
         return fail(error, LpaRspError::crypto_failure);
     }
+    return true;
+}
+
+bool idf_lpa_rsp_parse_prepare_download_response(
+    const std::uint8_t* object,
+    std::size_t object_size,
+    const std::uint8_t* expected_transaction,
+    std::size_t expected_transaction_size,
+    std::vector<std::uint8_t>& get_bpp_response,
+    LpaRspError& error)
+{
+    error = LpaRspError::none;
+    const bool output_alias =
+        ranges_overlap(object, object_size, get_bpp_response.data(), get_bpp_response.capacity()) ||
+        ranges_overlap(expected_transaction, expected_transaction_size, get_bpp_response.data(),
+                       get_bpp_response.capacity());
+    if (output_alias) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (!expected_transaction || expected_transaction_size == 0U ||
+        expected_transaction_size > kMaxTransactionBytes) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::transaction_mismatch);
+    }
+
+    SensitiveTlv holder;
+    if (!parse_der_root(object, object_size, holder, error)) {
+        return prepare_fail(get_bpp_response, error, error);
+    }
+    static constexpr std::uint8_t kPrepareDownload[] = {0xBFU, 0x21U};
+    static constexpr std::uint8_t kSuccess[] = {0xA0U};
+    static constexpr std::uint8_t kError[] = {0xA1U};
+    static constexpr std::uint8_t kSequence[] = {0x30U};
+    static constexpr std::uint8_t kSignature[] = {0x5FU, 0x37U};
+    static constexpr std::uint8_t kOtpk[] = {0x5FU, 0x49U};
+    static constexpr std::uint8_t kHashCc[] = {0x04U};
+    static constexpr std::uint8_t kTransaction[] = {0x80U};
+    static constexpr std::uint8_t kInteger[] = {0x02U};
+
+    if (!tag_matches(holder.value, kPrepareDownload, sizeof(kPrepareDownload))) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_root);
+    }
+    bool duplicate_success = false;
+    bool duplicate_error = false;
+    const idf_esim_internal::Tlv* success_choice = unique_child(
+        holder.value, kSuccess, sizeof(kSuccess), duplicate_success);
+    const idf_esim_internal::Tlv* error_choice = unique_child(
+        holder.value, kError, sizeof(kError), duplicate_error);
+    if (duplicate_success || duplicate_error) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : holder.value.children) {
+        if (!tag_matches(child, kSuccess, sizeof(kSuccess)) &&
+            !tag_matches(child, kError, sizeof(kError))) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+        }
+    }
+    if (success_choice && error_choice) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (error_choice) {
+        bool duplicate_transaction = false;
+        bool duplicate_code = false;
+        const idf_esim_internal::Tlv* transaction = unique_child(
+            *error_choice, kTransaction, sizeof(kTransaction), duplicate_transaction);
+        const idf_esim_internal::Tlv* code = unique_child(
+            *error_choice, kInteger, sizeof(kInteger), duplicate_code);
+        if (duplicate_transaction || duplicate_code) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_duplicate);
+        }
+        for (const idf_esim_internal::Tlv& child : error_choice->children) {
+            if (!tag_matches(child, kTransaction, sizeof(kTransaction)) &&
+                !tag_matches(child, kInteger, sizeof(kInteger))) {
+                return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+            }
+        }
+        if (!transaction || !code) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::field_missing);
+        }
+        if (error_choice->children.size() != 2U ||
+            !tag_matches(error_choice->children[0], kTransaction, sizeof(kTransaction)) ||
+            !tag_matches(error_choice->children[1], kInteger, sizeof(kInteger))) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+        }
+        if (transaction->value.size() != expected_transaction_size ||
+            std::memcmp(transaction->value.data(), expected_transaction,
+                        expected_transaction_size) != 0) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::transaction_mismatch);
+        }
+        std::uint32_t ignored_code = 0U;
+        if (!canonical_nonnegative_integer(code->value, 4U, ignored_code) ||
+            !valid_download_error_code(ignored_code)) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+        }
+        // 不回傳或複製 eUICC 拒絕細節。
+        return prepare_fail(get_bpp_response, error, LpaRspError::server_error);
+    }
+    if (!success_choice) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::field_missing);
+    }
+
+    bool duplicate_signed_data = false;
+    bool duplicate_signature = false;
+    const idf_esim_internal::Tlv* signed_data = unique_child(
+        *success_choice, kSequence, sizeof(kSequence), duplicate_signed_data);
+    const idf_esim_internal::Tlv* signature = unique_child(
+        *success_choice, kSignature, sizeof(kSignature), duplicate_signature);
+    if (duplicate_signed_data || duplicate_signature) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : success_choice->children) {
+        if (!tag_matches(child, kSequence, sizeof(kSequence)) &&
+            !tag_matches(child, kSignature, sizeof(kSignature))) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+        }
+    }
+    if (!signed_data || !signature) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::field_missing);
+    }
+    if (success_choice->children.size() != 2U ||
+        !tag_matches(success_choice->children[0], kSequence, sizeof(kSequence)) ||
+        !tag_matches(success_choice->children[1], kSignature, sizeof(kSignature))) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (signature->value.empty() || signature->value.size() > kMaxSignatureBytes) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    bool duplicate_otpk = false;
+    bool duplicate_transaction = false;
+    bool duplicate_hash_cc = false;
+    const idf_esim_internal::Tlv* otpk = unique_child(
+        *signed_data, kOtpk, sizeof(kOtpk), duplicate_otpk);
+    const idf_esim_internal::Tlv* transaction = unique_child(
+        *signed_data, kTransaction, sizeof(kTransaction), duplicate_transaction);
+    const idf_esim_internal::Tlv* hash_cc = unique_child(
+        *signed_data, kHashCc, sizeof(kHashCc), duplicate_hash_cc);
+    if (duplicate_otpk || duplicate_transaction || duplicate_hash_cc) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : signed_data->children) {
+        if (!tag_matches(child, kOtpk, sizeof(kOtpk)) &&
+            !tag_matches(child, kTransaction, sizeof(kTransaction)) &&
+            !tag_matches(child, kHashCc, sizeof(kHashCc))) {
+            return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+        }
+    }
+    if (!otpk || !transaction) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::field_missing);
+    }
+    if (signed_data->children.size() < 2U || signed_data->children.size() > 3U ||
+        !tag_matches(signed_data->children[0], kTransaction, sizeof(kTransaction)) ||
+        !tag_matches(signed_data->children[1], kOtpk, sizeof(kOtpk)) ||
+        (signed_data->children.size() == 3U &&
+         !tag_matches(signed_data->children[2], kHashCc, sizeof(kHashCc)))) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (otpk->value.empty() || otpk->value.size() > kMaxOtpkBytes) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (hash_cc && hash_cc->value.size() != kHashBytes) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::der_malformed);
+    }
+    if (transaction->value.size() != expected_transaction_size ||
+        std::memcmp(transaction->value.data(), expected_transaction,
+                    expected_transaction_size) != 0) {
+        return prepare_fail(get_bpp_response, error, LpaRspError::transaction_mismatch);
+    }
+
+    // 僅保留已驗證的有界物件；錯誤分支與 parser 內部資料不會外洩給 GetBPP。
+    std::vector<std::uint8_t> copy(object, object + object_size);
+    clear_bytes(get_bpp_response);
+    get_bpp_response = std::move(copy);
+    error = LpaRspError::none;
+    return true;
+}
+
+bool idf_lpa_rsp_parse_profile_installation_result(
+    const std::uint8_t* object,
+    std::size_t object_size,
+    const std::uint8_t* expected_transaction,
+    std::size_t expected_transaction_size,
+    std::string_view expected_activation_host,
+    std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspError& error)
+{
+    error = LpaRspError::none;
+    const bool output_alias =
+        ranges_overlap(object, object_size, notification_address.data(),
+                       notification_address.capacity()) ||
+        ranges_overlap(expected_transaction, expected_transaction_size,
+                       notification_address.data(), notification_address.capacity()) ||
+        ranges_overlap(expected_activation_host.data(), expected_activation_host.size(),
+                       notification_address.data(), notification_address.capacity());
+    if (output_alias) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    sequence_number = 0U;
+    clear_string(notification_address);
+    if (!expected_transaction || expected_transaction_size == 0U ||
+        expected_transaction_size > kMaxTransactionBytes) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::transaction_mismatch);
+    }
+    if (!valid_smdp_host(expected_activation_host)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::address_mismatch);
+    }
+
+    SensitiveTlv holder;
+    if (!parse_der_root(object, object_size, holder, error)) {
+        return pir_fail(sequence_number, notification_address, error, error);
+    }
+    static constexpr std::uint8_t kPir[] = {0xBFU, 0x37U};
+    static constexpr std::uint8_t kData[] = {0xBFU, 0x27U};
+    static constexpr std::uint8_t kMetadata[] = {0xBFU, 0x2FU};
+    static constexpr std::uint8_t kSignature[] = {0x5FU, 0x37U};
+    static constexpr std::uint8_t kTransaction[] = {0x80U};
+    static constexpr std::uint8_t kOid[] = {0x06U};
+    static constexpr std::uint8_t kFinalResult[] = {0xA2U};
+    static constexpr std::uint8_t kSuccess[] = {0xA0U};
+    static constexpr std::uint8_t kError[] = {0xA1U};
+    static constexpr std::uint8_t kSequence[] = {0x80U};
+    static constexpr std::uint8_t kOperation[] = {0x81U};
+    static constexpr std::uint8_t kAddress[] = {0x0CU};
+    static constexpr std::uint8_t kIccid[] = {0x5AU};
+    static constexpr std::uint8_t kAid[] = {0x4FU};
+    static constexpr std::uint8_t kSimaResponse[] = {0x04U};
+    static constexpr std::uint8_t kInteger[] = {0x02U};
+
+    if (!tag_matches(holder.value, kPir, sizeof(kPir))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_root);
+    }
+    bool duplicate_data = false;
+    bool duplicate_signature = false;
+    const idf_esim_internal::Tlv* data = unique_child(
+        holder.value, kData, sizeof(kData), duplicate_data);
+    const idf_esim_internal::Tlv* signature = unique_child(
+        holder.value, kSignature, sizeof(kSignature), duplicate_signature);
+    if (duplicate_data || duplicate_signature) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : holder.value.children) {
+        if (!tag_matches(child, kData, sizeof(kData)) &&
+            !tag_matches(child, kSignature, sizeof(kSignature))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (!data || !signature) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::field_missing);
+    }
+    if (holder.value.children.size() != 2U ||
+        !tag_matches(holder.value.children[0], kData, sizeof(kData)) ||
+        !tag_matches(holder.value.children[1], kSignature, sizeof(kSignature))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (signature->value.empty() || signature->value.size() > kMaxSignatureBytes) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+
+    bool duplicate_transaction = false;
+    bool duplicate_metadata = false;
+    bool duplicate_oid = false;
+    bool duplicate_final_result = false;
+    const idf_esim_internal::Tlv* transaction = unique_child(
+        *data, kTransaction, sizeof(kTransaction), duplicate_transaction);
+    const idf_esim_internal::Tlv* metadata = unique_child(
+        *data, kMetadata, sizeof(kMetadata), duplicate_metadata);
+    const idf_esim_internal::Tlv* oid = unique_child(
+        *data, kOid, sizeof(kOid), duplicate_oid);
+    const idf_esim_internal::Tlv* final_result = unique_child(
+        *data, kFinalResult, sizeof(kFinalResult), duplicate_final_result);
+    if (duplicate_transaction || duplicate_metadata || duplicate_oid ||
+        duplicate_final_result) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : data->children) {
+        if (!tag_matches(child, kTransaction, sizeof(kTransaction)) &&
+            !tag_matches(child, kMetadata, sizeof(kMetadata)) &&
+            !tag_matches(child, kOid, sizeof(kOid)) &&
+            !tag_matches(child, kFinalResult, sizeof(kFinalResult))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (!transaction || !metadata || !oid || !final_result) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::field_missing);
+    }
+    if (data->children.size() != 4U ||
+        !tag_matches(data->children[0], kTransaction, sizeof(kTransaction)) ||
+        !tag_matches(data->children[1], kMetadata, sizeof(kMetadata)) ||
+        !tag_matches(data->children[2], kOid, sizeof(kOid)) ||
+        !tag_matches(data->children[3], kFinalResult, sizeof(kFinalResult))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (transaction->value.size() != expected_transaction_size ||
+        std::memcmp(transaction->value.data(), expected_transaction,
+                    expected_transaction_size) != 0) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::transaction_mismatch);
+    }
+    if (!valid_oid(oid->value)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+
+    bool duplicate_sequence = false;
+    bool duplicate_operation = false;
+    bool duplicate_address = false;
+    bool duplicate_iccid = false;
+    const idf_esim_internal::Tlv* sequence = unique_child(
+        *metadata, kSequence, sizeof(kSequence), duplicate_sequence);
+    const idf_esim_internal::Tlv* operation = unique_child(
+        *metadata, kOperation, sizeof(kOperation), duplicate_operation);
+    const idf_esim_internal::Tlv* address = unique_child(
+        *metadata, kAddress, sizeof(kAddress), duplicate_address);
+    const idf_esim_internal::Tlv* iccid = unique_child(
+        *metadata, kIccid, sizeof(kIccid), duplicate_iccid);
+    if (duplicate_sequence || duplicate_operation || duplicate_address || duplicate_iccid) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : metadata->children) {
+        if (!tag_matches(child, kSequence, sizeof(kSequence)) &&
+            !tag_matches(child, kOperation, sizeof(kOperation)) &&
+            !tag_matches(child, kAddress, sizeof(kAddress)) &&
+            !tag_matches(child, kIccid, sizeof(kIccid))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (!sequence || !operation || !address) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::field_missing);
+    }
+    if (metadata->children.size() < 3U || metadata->children.size() > 4U ||
+        !tag_matches(metadata->children[0], kSequence, sizeof(kSequence)) ||
+        !tag_matches(metadata->children[1], kOperation, sizeof(kOperation)) ||
+        !tag_matches(metadata->children[2], kAddress, sizeof(kAddress)) ||
+        (metadata->children.size() == 4U &&
+         !tag_matches(metadata->children[3], kIccid, sizeof(kIccid))) ||
+        (iccid && !valid_iccid(iccid->value))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    std::uint32_t parsed_sequence = 0U;
+    if (!canonical_nonnegative_integer(sequence->value, 4U, parsed_sequence)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (operation->value.size() != 2U ||
+        (static_cast<std::uint16_t>(operation->value[0]) << 8U |
+         operation->value[1]) != 0x0780U) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (address->value.empty() || address->value.size() > 253U ||
+        !printable_ascii(address->value)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::address_mismatch);
+    }
+    const std::string_view parsed_address(
+        reinterpret_cast<const char*>(address->value.data()), address->value.size());
+    if (!valid_smdp_host(parsed_address) ||
+        !equal_ascii_ci(address->value, expected_activation_host)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::address_mismatch);
+    }
+
+    bool duplicate_success = false;
+    bool duplicate_error = false;
+    const idf_esim_internal::Tlv* success = unique_child(
+        *final_result, kSuccess, sizeof(kSuccess), duplicate_success);
+    const idf_esim_internal::Tlv* result_error = unique_child(
+        *final_result, kError, sizeof(kError), duplicate_error);
+    if (duplicate_success || duplicate_error) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : final_result->children) {
+        if (!tag_matches(child, kSuccess, sizeof(kSuccess)) &&
+            !tag_matches(child, kError, sizeof(kError))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (success && result_error) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (result_error) {
+        const std::vector<idf_esim_internal::Tlv>& fields = result_error->children;
+        if (fields.size() < 2U) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::field_missing);
+        }
+        if (!tag_matches(fields[0], kInteger, sizeof(kInteger)) ||
+            !tag_matches(fields[1], kInteger, sizeof(kInteger))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+        if (fields.size() > 2U &&
+            tag_matches(fields[2], kInteger, sizeof(kInteger))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_duplicate);
+        }
+        if (fields.size() > 2U &&
+            !tag_matches(fields[2], kSimaResponse, sizeof(kSimaResponse))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+        if (fields.size() > 3U &&
+            tag_matches(fields[3], kSimaResponse, sizeof(kSimaResponse))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_duplicate);
+        }
+        if (fields.size() > 3U) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+        std::uint32_t command_id = 0U;
+        std::uint32_t reason = 0U;
+        if (!canonical_nonnegative_integer(fields[0].value, 1U, command_id) ||
+            !canonical_nonnegative_integer(fields[1].value, 1U, reason) ||
+            !valid_bpp_command_id(command_id) || !valid_error_reason(reason)) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+        if (fields.size() > 2U && fields[2].value.empty()) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+        // 不回傳或複製 eUICC 錯誤細節。
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::server_error);
+    }
+    if (!success) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::field_missing);
+    }
+
+    bool duplicate_aid = false;
+    bool duplicate_sima_response = false;
+    const idf_esim_internal::Tlv* aid = unique_child(
+        *success, kAid, sizeof(kAid), duplicate_aid);
+    const idf_esim_internal::Tlv* sima_response = unique_child(
+        *success, kSimaResponse, sizeof(kSimaResponse), duplicate_sima_response);
+    if (duplicate_aid || duplicate_sima_response) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_duplicate);
+    }
+    for (const idf_esim_internal::Tlv& child : success->children) {
+        if (!tag_matches(child, kAid, sizeof(kAid)) &&
+            !tag_matches(child, kSimaResponse, sizeof(kSimaResponse))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (!aid || !sima_response) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::field_missing);
+    }
+    if (success->children.size() != 2U ||
+        !tag_matches(success->children[0], kAid, sizeof(kAid)) ||
+        !tag_matches(success->children[1], kSimaResponse, sizeof(kSimaResponse))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (aid->value.size() < 5U || aid->value.size() > 16U ||
+        sima_response->value.empty()) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+
+    sequence_number = parsed_sequence;
+    notification_address.assign(parsed_address.data(), parsed_address.size());
+    error = LpaRspError::none;
     return true;
 }

@@ -78,6 +78,10 @@ enum class LpaRspDerObject {
     profile_metadata,
     notification_metadata,
     profile_installation_result,
+    signature,
+    ci_key,
+    server_signature1 = signature,
+    ci_key_id = ci_key,
 };
 
 // Validates only one bounded, canonical DER root and its expected tag.  It
@@ -108,3 +112,25 @@ bool idf_lpa_rsp_compute_hash_cc(std::string_view confirmation_code,
                                  std::size_t transaction_size,
                                  std::array<std::uint8_t, 32>& hash_cc,
                                  LpaRspError& error);
+
+// 驗證 PrepareDownloadResponse，僅回傳後續 GetBPP 所需的有界 response body；
+// 不驗證密碼簽章，也不宣稱可證明實際 eUICC 行為。
+bool idf_lpa_rsp_parse_prepare_download_response(
+    const std::uint8_t* object,
+    std::size_t object_size,
+    const std::uint8_t* expected_transaction,
+    std::size_t expected_transaction_size,
+    std::vector<std::uint8_t>& get_bpp_response,
+    LpaRspError& error);
+
+// 驗證 ProfileInstallationResult，僅回傳移除待處理通知所需的 metadata；
+// 不驗證密碼簽章，也不宣稱可證明實際 eUICC 行為。
+bool idf_lpa_rsp_parse_profile_installation_result(
+    const std::uint8_t* object,
+    std::size_t object_size,
+    const std::uint8_t* expected_transaction,
+    std::size_t expected_transaction_size,
+    std::string_view expected_activation_host,
+    std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspError& error);
