@@ -79,8 +79,19 @@ for requirement in (
 ):
     assert requirement in PUSH
 
-assert "AT+MSSLLIST=1" in MODEM
-assert "AT+MSSLCERTWR" in MODEM
-assert "AT+MSSLCERTRD" in MODEM
-assert 'ignoreverify\\\",1,0' in MODEM
-assert "gts_root" not in MODEM
+for requirement in (
+    "mbedtls_x509_crt_parse_der",
+    "mbedtls_ssl_conf_ca_chain",
+    "mbedtls_ssl_set_hostname",
+    "MBEDTLS_SSL_VERIFY_REQUIRED",
+):
+    assert requirement in MODEM
+
+for forbidden in (
+    "AT+MSSLLIST=",
+    "AT+MSSLCERTWR",
+    "AT+MSSLCERTRD",
+    'AT+MSSLCFG=\"cert\"',
+    'AT+MSSLCFG=\"ignoreverify\"',
+):
+    assert forbidden not in MODEM
