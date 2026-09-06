@@ -642,13 +642,17 @@ public:
             return finish(IdfModemHttpsRunResult::response_failed);
         }
         if (!idf_modem_https_status_success(result_.httpStatus)) {
-            result_.message = "HTTPS POST returned a non-2xx status";
+            result_.message = request_.method == IdfModemHttpsMethod::Get
+                                  ? "HTTPS GET returned a non-2xx status"
+                                  : "HTTPS POST returned a non-2xx status";
             record_failure_stage(IdfHttpsFailureStage::http);
             return fail(HttpsFailureStage::response_read,
                         IdfModemHttpsRunResult::response_failed);
         }
         result_.ok = true;
-        result_.message = "HTTPS POST succeeded";
+        result_.message = request_.method == IdfModemHttpsMethod::Get
+                              ? "HTTPS GET succeeded"
+                              : "HTTPS POST succeeded";
         return finish(IdfModemHttpsRunResult::ok);
     }
 
@@ -1196,13 +1200,18 @@ private:
         std::string host = target_.host;
         if (host.find(':') != std::string::npos) host = "[" + host + "]";
         if (target_.port != 443) host += ":" + std::to_string(target_.port);
-        std::string wire = "POST " + target_.path + " HTTP/1.1\r\nHost: " + host +
-                           "\r\nContent-Type: " + request_.contentType +
-                           "\r\nContent-Length: " + std::to_string(request_.body.size()) +
-                           "\r\nConnection: close\r\n";
+        const bool is_get = request_.method == IdfModemHttpsMethod::Get;
+        std::string wire = std::string(is_get ? "GET " : "POST ") + target_.path +
+                           " HTTP/1.1\r\nHost: " + host + "\r\n";
+        if (!is_get) {
+            wire += "Content-Type: " + request_.contentType +
+                    "\r\nContent-Length: " + std::to_string(request_.body.size()) +
+                    "\r\n";
+        }
+        wire += "Connection: close\r\n";
         if (!request_.headerName.empty()) wire += request_.headerName + ": " + request_.headerValue + "\r\n";
         wire += "\r\n";
-        wire += request_.body;
+        if (!is_get) wire += request_.body;
         return wire;
     }
 };
@@ -1212,10 +1221,16 @@ private:
 bool idf_modem_https_parse_url(std::string_view raw_url, IdfModemHttpsTarget& target,
                                std::string& error)
 {
+    return idf_modem_https_parse_url(raw_url, target, error, IDF_MODEM_HTTPS_POST_MAX_URL);
+}
+
+bool idf_modem_https_parse_url(std::string_view raw_url, IdfModemHttpsTarget& target,
+                               std::string& error, size_t max_url)
+{
     target = {};
     error.clear();
     std::string owned(trim_spaces(raw_url));
-    if (owned.empty() || owned.size() > IDF_MODEM_HTTPS_POST_MAX_URL ||
+    if (owned.empty() || owned.size() > max_url ||
         !starts_with(owned, kHttpsPrefix)) {
         error = owned.empty() ? "HTTPS URL is empty or too long" : "HTTPS URL must use https://";
         return false;
@@ -1292,15 +1307,38 @@ bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,
         error = "HTTPS pinned certificate is invalid";
         return false;
     }
+    size_t max_url = 0;
+    switch (request.method) {
+        case IdfModemHttpsMethod::Post:
+            max_url = IDF_MODEM_HTTPS_POST_MAX_URL;
+            break;
+        case IdfModemHttpsMethod::Get:
+            max_url = IDF_MODEM_HTTPS_GET_MAX_URL;
+            break;
+        default:
+            error = "HTTPS method is invalid";
+            return false;
+    }
     IdfModemHttpsTarget target;
-    if (!idf_modem_https_parse_url(request.url, target, error)) return false;
-    if (request.body.empty() || request.body.size() > IDF_MODEM_HTTPS_POST_MAX_BODY) {
+    if (!idf_modem_https_parse_url(request.url, target, error, max_url)) return false;
+    if (request.method == IdfModemHttpsMethod::Post &&
+        (request.body.empty() || request.body.size() > IDF_MODEM_HTTPS_POST_MAX_BODY)) {
         error = request.body.empty() ? "HTTPS POST body is empty" : "HTTPS POST body is too large";
         return false;
     }
-    if (request.contentType.empty() || request.contentType.size() > IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE ||
-        forbidden_header_byte(request.contentType)) {
+    if (request.method == IdfModemHttpsMethod::Get && !request.body.empty()) {
+        error = "HTTPS GET body is not allowed";
+        return false;
+    }
+    if (request.method == IdfModemHttpsMethod::Post &&
+        (request.contentType.empty() ||
+         request.contentType.size() > IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE ||
+         forbidden_header_byte(request.contentType))) {
         error = "HTTPS Content-Type is invalid";
+        return false;
+    }
+    if (request.method == IdfModemHttpsMethod::Get && !request.contentType.empty()) {
+        error = "HTTPS GET Content-Type is not allowed";
         return false;
     }
     if (request.headerName.size() > IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME ||
@@ -1345,7 +1383,10 @@ IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& 
         request.rootCertificateDer.size() > IDF_MODEM_HTTPS_ROOT_DER_MAX ||
         std::all_of(request.rootCertificateSha256.begin(), request.rootCertificateSha256.end(),
                     [](uint8_t byte) { return byte == 0; });
-    if (!idf_modem_https_parse_url(request.url, target, error)) {
+    const size_t max_url = request.method == IdfModemHttpsMethod::Get
+                               ? IDF_MODEM_HTTPS_GET_MAX_URL
+                               : IDF_MODEM_HTTPS_POST_MAX_URL;
+    if (!idf_modem_https_parse_url(request.url, target, error, max_url)) {
         result.message = error;
         result.failureStage = IdfHttpsFailureStage::target;
         return IdfModemHttpsRunResult::invalid_request;

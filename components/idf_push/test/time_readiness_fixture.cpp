@@ -189,8 +189,10 @@ static void test_cellular_target_and_invalid_configuration()
     reset();
     notify_config.networkMode = NETWORK_MODE_4G_ONLY;
     enqueue(channel(PUSH_TYPE_GET, "https://example.invalid/get"));
-    assert(process_push_one() && push_sends == 0 && !s_push_jobs[0].used);
-    assert(not_forwarded == std::vector<uint32_t>{42});
+    assert(!process_push_one() && push_sends == 0 && s_push_jobs[0].used);
+    epoch = 1700000000; send_success = true; now_us += 5000000;
+    assert(process_push_one() && push_sends == 1 && !s_push_jobs[0].used);
+    assert(forwarded == std::vector<uint32_t>{42});
 }
 
 static void test_smtp_wait_and_disabled_cleanup()

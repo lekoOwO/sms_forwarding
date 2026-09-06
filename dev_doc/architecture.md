@@ -87,7 +87,8 @@ SMTP 僅使用 WiFi。推送在 4G-only 模式選擇 cellular 路徑。
 
 Cellular 推送要求通道啟用 cellular 並使用 HTTPS 目標。
 CA 必須綁定目標 origin，且 hash 相符。
-GET 推送僅使用 WiFi。ntfy 的 POST 推送可使用符合上述條件的 cellular 路徑。
+GET 與 POST 推送都可使用符合上述條件的 cellular 路徑。
+cellular GET 只接受 HTTPS、空 request body 與固定 GET method，rendered URL 上限為 4096 bytes；POST URL 上限維持 240 bytes，body 上限維持 4096 bytes。
 模組、home registration 與 PDP 前置檢查仍須通過，資料與漫遊限制不因選擇路徑而放寬。
 
 目前 `idf_modem_https` 使用 modem 的 MIP socket 提供 TCP。

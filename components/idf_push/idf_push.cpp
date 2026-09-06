@@ -564,8 +564,11 @@ static esp_err_t http_request(const std::string& url, const char* method,
             }
         }
         esp_http_client_set_post_field(client, body.c_str(), body.size());
-    } else {
+    } else if (strcmp(method, "GET") == 0) {
         esp_http_client_set_method(client, HTTP_METHOD_GET);
+    } else {
+        esp_http_client_cleanup(client);
+        return ESP_ERR_INVALID_ARG;
     }
 
     esp_err_t err = esp_http_client_perform(client);
@@ -1201,6 +1204,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
             break;
         case PUSH_TYPE_GET:
             method = "GET";
+            content_type = nullptr;
             url = channel.url + (channel.url.find('?') == std::string::npos ? "?" : "&") +
                   "sender=" + url_encode(sender) + "&message=" + url_encode(text) +
                   "&timestamp=" + url_encode(timestamp) + "&title=" + url_encode(title) +
@@ -1733,12 +1737,6 @@ static bool process_push_one()
         s_busy.store(false, std::memory_order_relaxed);
         return true;
     }
-    if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
-        fail_push_job_without_retry(job, "GET-only provider is not supported over cellular; task stopped");
-        s_busy.store(false, std::memory_order_relaxed);
-        return true;
-    }
-
     bool permanent_failure = false;
     bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
                               job.timestamp.c_str(), cfg, wifi, network, job.notify,
@@ -1987,9 +1985,6 @@ static bool process_test_one()
     if (!channel_valid(channel)) {
         result = "Channel configuration changed or is disabled; test canceled";
         transport.failureStage = IdfHttpsFailureStage::target;
-    } else if (network == IdfPushNetworkDecision::Cellular && channel.type == PUSH_TYPE_GET) {
-        result = "GET-only provider is not supported over cellular; test canceled";
-        transport.failureStage = IdfHttpsFailureStage::request;
     } else {
         s_busy.store(true, std::memory_order_relaxed);
         std::string ts = format_local_time(cfg.tzOffsetMin);
@@ -2264,11 +2259,6 @@ bool idf_push_enqueue_test(uint8_t channel, std::string& message)
     }
     if (network == IdfPushNetworkDecision::Defer) {
         message = "WiFi is disconnected; test push is unavailable";
-        return false;
-    }
-    if (network == IdfPushNetworkDecision::Cellular &&
-        cfg.pushChannels[channel].type == PUSH_TYPE_GET) {
-        message = "GET-only provider is not supported over cellular; test was not queued";
         return false;
     }
     bool valid = channel_valid(cfg.pushChannels[channel]);

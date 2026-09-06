@@ -128,7 +128,10 @@ static IdfHttpsFailureStage https_request_failure_stage(
     if (https_certificate_material_invalid(request)) return IdfHttpsFailureStage::ca;
     IdfModemHttpsTarget target;
     std::string error;
-    if (!idf_modem_https_parse_url(request.url, target, error)) {
+    const size_t max_url = request.method == IdfModemHttpsMethod::Get
+                               ? IDF_MODEM_HTTPS_GET_MAX_URL
+                               : IDF_MODEM_HTTPS_POST_MAX_URL;
+    if (!idf_modem_https_parse_url(request.url, target, error, max_url)) {
         return IdfHttpsFailureStage::target;
     }
     return IdfHttpsFailureStage::request;
@@ -1277,9 +1280,21 @@ static bool owner_request_bounded(const OwnerCommand& request)
         return false;
     }
     if (request.kind != OwnerCommandKind::https_post) return true;
-    return request.https_post_request.url.size() <= IDF_MODEM_HTTPS_POST_MAX_URL &&
-           request.https_post_request.body.size() <= IDF_MODEM_HTTPS_POST_MAX_BODY &&
-           request.https_post_request.contentType.size() <= IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE &&
+    const bool post = request.https_post_request.method == IdfModemHttpsMethod::Post;
+    const bool get = request.https_post_request.method == IdfModemHttpsMethod::Get;
+    const bool body_bounded = post
+                                  ? !request.https_post_request.body.empty() &&
+                                        request.https_post_request.body.size() <= IDF_MODEM_HTTPS_POST_MAX_BODY
+                                  : get && request.https_post_request.body.empty();
+    const bool content_type_bounded = post
+                                          ? !request.https_post_request.contentType.empty() &&
+                                                request.https_post_request.contentType.size() <=
+                                                    IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE
+                                          : get && request.https_post_request.contentType.empty();
+    return (post || get) &&
+           request.https_post_request.url.size() <=
+               (get ? IDF_MODEM_HTTPS_GET_MAX_URL : IDF_MODEM_HTTPS_POST_MAX_URL) &&
+           body_bounded && content_type_bounded &&
            request.https_post_request.headerName.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME &&
            request.https_post_request.headerValue.size() <= IDF_MODEM_HTTPS_POST_MAX_HEADER_VALUE &&
            !request.https_post_request.rootCertificateDer.empty() &&
@@ -2409,7 +2424,9 @@ esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
     const esp_err_t err = submit_owner_command(owner_request, nullptr, false, nullptr, &result);
     if (err == IDF_MODEM_ERR_BUSY) result.message = "Modem command queue is full";
     else if (err == ESP_ERR_TIMEOUT && result.message.empty()) {
-        result.message = "Modem HTTPS POST timed out";
+        result.message = request.method == IdfModemHttpsMethod::Get
+                             ? "Modem HTTPS GET timed out"
+                             : "Modem HTTPS POST timed out";
     }
     else if (err == ESP_ERR_INVALID_STATE && result.message.empty()) result.message = "Modem is not started";
     if (err != ESP_OK && result.failureStage == IdfHttpsFailureStage::none) {

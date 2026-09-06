@@ -9,6 +9,7 @@
 
 // Keep modem-native HTTPS requests small enough for one owner slot and one UART transaction.
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_URL = 240;
+static constexpr size_t IDF_MODEM_HTTPS_GET_MAX_URL = 4096;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_BODY = 4096;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE = 96;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_HEADER_NAME = 64;
@@ -17,6 +18,11 @@ static constexpr uint32_t IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS = 30000;
 static constexpr uint32_t IDF_MODEM_HTTPS_POST_MAX_TIMEOUT_MS = 90000;
 static constexpr size_t IDF_MODEM_HTTPS_ROOT_DER_MAX = 8192;
 static constexpr size_t IDF_MODEM_HTTPS_CERT_NAME_MAX = 64;
+
+enum class IdfModemHttpsMethod : uint8_t {
+    Post,
+    Get,
+};
 
 struct IdfModemHttpsPostRequest {
     std::string url;
@@ -29,6 +35,7 @@ struct IdfModemHttpsPostRequest {
     std::array<uint8_t, 32> rootCertificateSha256{};
     bool dataEnabled = false;
     uint32_t timeoutMs = IDF_MODEM_HTTPS_POST_DEFAULT_TIMEOUT_MS;
+    IdfModemHttpsMethod method = IdfModemHttpsMethod::Post;
 };
 
 enum class IdfModemHttpsDiagnosticReason : uint8_t {
@@ -330,6 +337,8 @@ bool idf_modem_https_model_allowed(std::string_view model);
 bool idf_modem_https_status_success(int httpStatus);
 bool idf_modem_https_parse_url(std::string_view url, IdfModemHttpsTarget& target,
                                std::string& error);
+bool idf_modem_https_parse_url(std::string_view url, IdfModemHttpsTarget& target,
+                               std::string& error, size_t max_url);
 IdfModemHttpsRunResult idf_modem_https_run_post(const IdfModemHttpsPostRequest& request,
                                                 const IdfModemHttpsCallbacks& callbacks,
                                                 IdfModemHttpsPostResult& result);

@@ -41,7 +41,7 @@ bool idf_push_prepare_cellular_target(const IdfPushChannel& channel,
                                       IdfPushCellularTarget& target)
 {
     target = {};
-    if (!channel.enabled || !channel.cellularEnabled || channel.type == PUSH_TYPE_GET) return false;
+    if (!channel.enabled || !channel.cellularEnabled) return false;
     target.effectiveUrl = channel.cellularUrl.empty() ? inherited_url(channel)
                                                        : channel.cellularUrl;
     if (!canonical_https_origin(target.effectiveUrl, target.canonicalOrigin)) {

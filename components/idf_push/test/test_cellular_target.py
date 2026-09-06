@@ -43,7 +43,9 @@ int main() {
     assert(idf_push_prepare_cellular_target(channel, target));
     assert(target.canonicalOrigin == "https://api.telegram.org");
     channel.type = PUSH_TYPE_GET;
-    assert(!idf_push_prepare_cellular_target(channel, target));
+    channel.url = "https://get.example/notify";
+    assert(idf_push_prepare_cellular_target(channel, target));
+    assert(target.canonicalOrigin == "https://get.example");
 }
 '''
     with tempfile.TemporaryDirectory() as directory:

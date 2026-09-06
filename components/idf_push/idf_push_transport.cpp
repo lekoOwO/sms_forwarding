@@ -52,6 +52,21 @@ bool http_status_valid(int status)
     return status >= 100 && status <= 599;
 }
 
+bool cellular_request_bounded(const IdfPushHttpRequest& request)
+{
+    if (request.method == "POST") {
+        return request.url.size() <= IDF_MODEM_HTTPS_POST_MAX_URL &&
+               !request.body.empty() && request.body.size() <= IDF_MODEM_HTTPS_POST_MAX_BODY &&
+               !request.contentType.empty() &&
+               request.contentType.size() <= IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE;
+    }
+    if (request.method == "GET") {
+        return request.url.size() <= IDF_MODEM_HTTPS_GET_MAX_URL &&
+               request.body.empty() && request.contentType.empty();
+    }
+    return false;
+}
+
 }  // namespace
 
 bool idf_push_build_gotify_request(const IdfPushChannel& channel,
@@ -78,6 +93,11 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     result = IdfPushTransportResult();
     if (network == IdfPushNetworkDecision::Wifi) {
         result.transportPath = IdfPushTransportPath::Wifi;
+        if (request.method != "POST" && request.method != "GET") {
+            result.message = "WiFi HTTPS request is invalid";
+            result.failureStage = IdfHttpsFailureStage::request;
+            return false;
+        }
         if (!wifi_request) {
             result.failureStage = IdfHttpsFailureStage::preflight;
             return false;
@@ -101,7 +121,8 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
         return false;
     }
     result.transportPath = IdfPushTransportPath::Cellular;
-    if (request.method != "POST") {
+    if (!cellular_request_bounded(request)) {
+        result.message = "Cellular HTTPS request is invalid";
         result.failureStage = IdfHttpsFailureStage::request;
         return false;
     }
@@ -111,6 +132,8 @@ bool idf_push_dispatch_request(const IdfPushHttpRequest& request,
     }
 
     IdfModemHttpsPostRequest cellular_request;
+    cellular_request.method = request.method == "GET" ? IdfModemHttpsMethod::Get
+                                                        : IdfModemHttpsMethod::Post;
     cellular_request.url = request.url;
     cellular_request.body = request.body;
     cellular_request.contentType = request.contentType;

@@ -67,6 +67,27 @@ bool is_upper_hex(std::string_view value)
     });
 }
 
+uint8_t hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
+    if (ch >= 'A' && ch <= 'F') return static_cast<uint8_t>(ch - 'A' + 10);
+    return 0xff;
+}
+
+std::string decode_hex(std::string_view value)
+{
+    assert(value.size() % 2 == 0);
+    std::string output;
+    output.reserve(value.size() / 2);
+    for (size_t index = 0; index < value.size(); index += 2) {
+        const uint8_t high = hex_value(value[index]);
+        const uint8_t low = hex_value(value[index + 1]);
+        assert(high != 0xff && low != 0xff);
+        output.push_back(static_cast<char>((high << 4) | low));
+    }
+    return output;
+}
+
 void assert_failure_message(std::string_view actual, std::string_view expected)
 {
     assert(actual == expected);
@@ -978,6 +999,7 @@ struct RemoteCloseTranscript {
     std::string current_profile = "1,\"IPV4V6\",\"fixture\",,0,0,,,,";
     std::vector<std::string> cleanup_commands;
     std::vector<std::string_view> cleanup_steps;
+    std::string sent_wire;
     MipOpenLatch open_latch;
 
     bool cleanup_fails(CleanupFailure failure) const
@@ -1325,6 +1347,13 @@ struct RemoteCloseTranscript {
                 !parse_decimal(command.substr(send_prefix.size(), comma - send_prefix.size()), sent)) {
                 return IdfModemHttpsCommandResult::failed;
             }
+            const size_t first_quote = command.find('"', comma);
+            const size_t last_quote = command.rfind('"');
+            if (first_quote == std::string_view::npos || last_quote <= first_quote) {
+                return IdfModemHttpsCommandResult::failed;
+            }
+            transcript.sent_wire += decode_hex(command.substr(first_quote + 1,
+                                                              last_quote - first_quote - 1));
             response = frame(command, "+MIPSEND: 0," + std::to_string(sent));
             return IdfModemHttpsCommandResult::ok;
         }
@@ -1438,11 +1467,17 @@ struct RemoteCloseTranscript {
 };
 
 IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transcript,
-                                                   IdfModemHttpsPostResult& result)
+                                                   IdfModemHttpsPostResult& result,
+                                                   bool get_request = false)
 {
     IdfModemHttpsPostRequest request;
     request.url = "https://fixture.example/notify";
     request.body = "{}";
+    if (get_request) {
+        request.method = IdfModemHttpsMethod::Get;
+        request.body.clear();
+        request.contentType.clear();
+    }
     if (transcript.cleanup_failure == CleanupFailure::pdp_profile) {
         request.apn = "request-apn";
     }
@@ -1519,6 +1554,12 @@ void check_remote_close_transcripts()
            delivered.close_was_cleanup);
     assert(delivered.encoding_send == 0 && delivered.encoding_receive == 0 &&
            delivered.autofree == 0);
+
+    RemoteCloseTranscript get_request{RemoteCloseMode::data_then_disconnect};
+    result = {};
+    assert(run_remote_close_transcript(get_request, result, true) == IdfModemHttpsRunResult::ok);
+    assert(result.ok && get_request.sent_wire ==
+           "GET /notify HTTP/1.1\r\nHost: fixture.example\r\nConnection: close\r\n\r\n");
 
     fixture_vtask_delay_calls = 0;
     RemoteCloseTranscript no_data_then_data{RemoteCloseMode::response_read_no_data_then_data};
@@ -2128,6 +2169,27 @@ void check_invalid_request_stages()
     assert(idf_modem_https_run_post(request, callbacks, result) ==
            IdfModemHttpsRunResult::invalid_request);
     assert(result.failureStage == IdfHttpsFailureStage::modem);
+
+    std::string error;
+    request.method = IdfModemHttpsMethod::Get;
+    request.body.clear();
+    request.contentType.clear();
+    request.url = "https://a/";
+    request.url.append(IDF_MODEM_HTTPS_GET_MAX_URL - request.url.size(), 'p');
+    assert(request.url.size() == IDF_MODEM_HTTPS_GET_MAX_URL);
+    assert(idf_modem_https_validate_request(request, error));
+    request.url.push_back('p');
+    assert(!idf_modem_https_validate_request(request, error));
+
+    request.method = IdfModemHttpsMethod::Post;
+    request.body = "{}";
+    request.contentType = "application/json";
+    request.url = "https://a/";
+    request.url.append(IDF_MODEM_HTTPS_POST_MAX_URL - request.url.size(), 'p');
+    assert(request.url.size() == IDF_MODEM_HTTPS_POST_MAX_URL);
+    assert(idf_modem_https_validate_request(request, error));
+    request.url.push_back('p');
+    assert(!idf_modem_https_validate_request(request, error));
 }
 
 }  // namespace

@@ -460,10 +460,11 @@ CI compile 不會證明 UART 時序、SIM、PDU、SMTP、推送服務或 OTA rol
 ### Cellular 推送路徑與證據
 
 目前 4G-only 推送選擇 cellular 路徑。混合模式優先使用已連線的 WiFi，否則選擇 cellular。
-SMTP 與 GET 推送僅使用 WiFi。ntfy 的 POST 推送可使用 cellular。
+SMTP 僅使用 WiFi。GET 與 POST 推送可使用 cellular。
 
 Cellular 推送要求通道啟用 cellular 並使用 HTTPS 目標。
 CA 必須綁定目標 origin，且 hash 相符。
+cellular GET 僅使用固定 GET method、空 request body，rendered URL 上限為 4096 bytes；POST URL 上限為 240 bytes，body 上限為 4096 bytes。未知 method 與超過上限的 URL 會在 owner queue 前拒絕。
 模組、home registration 與 PDP 前置檢查仍須通過，資料與漫遊限制不因選擇路徑而放寬。
 `idf_modem_https` 以 modem 的 MIP socket 提供 TCP，由 ESP32 上的 Mbed TLS 執行 CA 與 hostname 驗證。
 

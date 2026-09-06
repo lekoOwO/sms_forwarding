@@ -295,15 +295,41 @@ int main() {
     assert(transport.cleanupParseReason == IdfModemHttpsParseReason::none);
 
     request.method = "GET";
+    request.body.clear();
+    request.contentType.clear();
     const int calls_before_get = modem_calls;
+    assert(idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                     nullptr, fake_modem_post, transport));
+    assert(modem_calls == calls_before_get + 1);
+    assert(captured_request.method == IdfModemHttpsMethod::Get);
+    assert(captured_request.body.empty());
+    assert(captured_request.contentType.empty());
+    assert(transport.transportPath == IdfPushTransportPath::Cellular);
+    assert(transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::none);
+
+    request.method = "PATCH";
+    const int calls_before_unknown_method = modem_calls;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
                                       nullptr, fake_modem_post, transport));
-    assert(modem_calls == calls_before_get);
-    assert(transport.transportPath == IdfPushTransportPath::Cellular);
+    assert(modem_calls == calls_before_unknown_method);
+    assert(!transport.dispatchAttempted);
+    assert(transport.failureStage == IdfHttpsFailureStage::request);
+
+    request.method = "GET";
+    request.url.assign(IDF_MODEM_HTTPS_GET_MAX_URL + 1, 'x');
+    request.url.replace(0, 8, "https://");
+    const int calls_before_oversize_url = modem_calls;
+    assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
+                                      nullptr, fake_modem_post, transport));
+    assert(modem_calls == calls_before_oversize_url);
     assert(!transport.dispatchAttempted);
     assert(transport.failureStage == IdfHttpsFailureStage::request);
 
     request.method = "POST";
+    request.url = "https://gotify.example/base/message?token=tok+en%2F%2B";
+    request.body = "{\"title\":\"Alert \\\"1\\\"\",\"message\":\"line\\nbody\",\"priority\":5}";
+    request.contentType = "application/json";
     request.rootCertificateDer.clear();
     const int calls_before_missing_ca = modem_calls;
     assert(!idf_push_dispatch_request(request, IdfPushNetworkDecision::Cellular, config,
