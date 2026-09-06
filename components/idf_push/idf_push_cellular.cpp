@@ -30,7 +30,7 @@ std::string inherited_url(const IdfPushChannel& channel)
 {
     if (!channel.url.empty()) return channel.url;
     if (channel.type == PUSH_TYPE_PUSHPLUS) return "https://www.pushplus.plus/send";
-    if (channel.type == PUSH_TYPE_SERVERCHAN) return "https://sctapi.ftqq.com/";
+    if (channel.type == PUSH_TYPE_SERVERCHAN) return "https://sctapi.ftqq.com/" + channel.key1 + ".send";
     if (channel.type == PUSH_TYPE_TELEGRAM) return "https://api.telegram.org";
     return {};
 }

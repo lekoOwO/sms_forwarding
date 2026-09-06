@@ -323,9 +323,15 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 		if (forwardRules !== null && !forwardRulesValid(forwardRules)) return {
 			success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "forwardRules"
 		} as T;
+		const smtpPort = form.get("smtpPort");
+		const parsedSmtpPort = smtpPort === null ? 0 : Number(smtpPort);
+		if (smtpPort !== null && (!/^[0-9]+$/.test(smtpPort) || !Number.isInteger(parsedSmtpPort) || parsedSmtpPort < 1 || parsedSmtpPort > 65535)) return {
+			success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "smtpPort"
+		} as T;
 		for (const [key, value] of init.body) {
-			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "emailEnabled", "pushEnabled", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
+			if (key in demoConfig && !["webAccounts", "pushChannels", "wifiProfiles", "emailEnabled", "pushEnabled", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "smtpPort"].includes(key)) (demoConfig as unknown as Record<string, unknown>)[key] = value;
 		}
+		if (smtpPort !== null) demoConfig.smtpPort = parsedSmtpPort;
 		if (form.has("emailEnabled")) demoConfig.emailEnabled = form.get("emailEnabled") === "1";
 		if (form.has("pushEnabled")) demoConfig.pushEnabled = form.get("pushEnabled") === "1";
 		if (init.body.has("networkMode")) demoConfig.networkMode = Number(init.body.get("networkMode"));

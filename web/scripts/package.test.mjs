@@ -123,6 +123,38 @@ test("demo API rejects invalid forwarding regex and tests only configured push c
 	}
 });
 
+test("demo API validates and preserves numeric SMTP port", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	let server;
+	try {
+		process.env.VITE_DEMO_MODE = "1";
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({
+			server: { middlewareMode: true },
+			appType: "custom",
+			logLevel: "silent"
+		});
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const rejected = await api.postForm("/save", { smtpPort: "65536" });
+		assert.deepEqual([rejected.success, rejected.code, rejected.detail],
+			[false, "ACTION_CONFIG_INVALID", "smtpPort"]);
+		const saved = await api.postForm("/save", { smtpPort: "587" });
+		assert.equal(saved.success, true);
+		const snapshot = await api.loadSnapshot();
+		assert.equal(snapshot.config.smtpPort, 587);
+		assert.equal(typeof snapshot.config.smtpPort, "number");
+	} finally {
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
+	}
+});
+
 test("real push test helper accepts 409 status bodies, polls, and aborts stalled requests", async () => {
 	const previousMode = process.env.VITE_DEMO_MODE;
 	const previousCwd = process.cwd();

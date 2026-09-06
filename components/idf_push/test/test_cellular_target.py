@@ -25,6 +25,7 @@ int main() {
 
     channel.cellularUrl = "https://Cell.Example:8443/relay";
     assert(idf_push_prepare_cellular_target(channel, target));
+    assert(target.effectiveUrl == channel.cellularUrl);
     assert(target.canonicalOrigin == "https://cell.example:8443");
 
     channel.cellularEnabled = false;
@@ -42,6 +43,11 @@ int main() {
     channel.type = PUSH_TYPE_TELEGRAM;
     assert(idf_push_prepare_cellular_target(channel, target));
     assert(target.canonicalOrigin == "https://api.telegram.org");
+    channel.type = PUSH_TYPE_SERVERCHAN;
+    channel.key1 = "send-key";
+    assert(idf_push_prepare_cellular_target(channel, target));
+    assert(target.effectiveUrl == "https://sctapi.ftqq.com/send-key.send");
+    assert(target.canonicalOrigin == "https://sctapi.ftqq.com");
     channel.type = PUSH_TYPE_GET;
     channel.url = "https://get.example/notify";
     assert(idf_push_prepare_cellular_target(channel, target));
