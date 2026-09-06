@@ -1197,7 +1197,7 @@
 				"maxItems": 5,
 				"items": { "$ref": "#/components/schemas/WifiProfile" }
 			  },
-			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback. Cellular delivery requires an enabled per-channel cellular target and an installed device-validated CA. ML307Y cellular transport is disabled, GET channels are WiFi-only, and roaming fails closed." },
+			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback. Cellular delivery requires an enabled per-channel cellular target and an installed device-validated CA. Cellular GET uses the same HTTPS, CA, clock, home-registration, cleanup, and 2xx gates as POST; it accepts no body, keeps the fixed GET method, limits rendered URLs to 4096 bytes, keeps POST URLs at 240 bytes and POST bodies at 4096 bytes, rejects HTTP downgrade, and preserves existing response-parser limits. ML307Y cellular transport is disabled and roaming fails closed." },
 			  "heartbeatEnable": { "type": "boolean" },
 			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
 			  "kaEnabled": { "type": "boolean" },
