@@ -1,4 +1,4 @@
-import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureResponseReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
+import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, OtaState, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureResponseReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
@@ -37,6 +37,15 @@ const demoEsim: EsimStatus = {
 		{ handle: "p2222222222222222", displayId: "••••", state: "disabled", nickname: "Backup", profileClass: "operational" }
 	],
 	job: { id: 0, state: "idle", action: "", success: false, code: "ACTION_ESIM_IDLE", stage: "", confirmationRequired: false, notificationPending: false, profileName: "", providerName: "" }
+};
+const demoOtaState: OtaState = {
+	activeOffset: 2031616,
+	imageState: "valid",
+	pendingVerify: false,
+	accepted: 11,
+	pending: 0,
+	pendingAddress: 0,
+	publicKeySha256: "a".repeat(64)
 };
 
 const pushTestDiagnosticReasons: readonly PushTestDiagnosticReason[] = [
@@ -197,8 +206,32 @@ function isPushTestStatus(value: unknown): value is PushTestStatus {
 	return true;
 }
 
+const otaStateKeys = new Set([
+	"activeOffset", "imageState", "pendingVerify", "accepted",
+	"pending", "pendingAddress", "publicKeySha256"
+]);
+
+function isOtaState(value: unknown): value is OtaState {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	if (Object.keys(state).length !== otaStateKeys.size || Object.keys(state).some((key) => !otaStateKeys.has(key))) return false;
+	const activeOffset = state.activeOffset;
+	const imageState = state.imageState;
+	const pendingVerify = state.pendingVerify;
+	const accepted = state.accepted;
+	const pending = state.pending;
+	const pendingAddress = state.pendingAddress;
+	return typeof activeOffset === "number" && Number.isInteger(activeOffset) && [65536, 2031616].includes(activeOffset) &&
+		typeof imageState === "string" && ["other", "pending-verify", "valid"].includes(imageState) &&
+		typeof pendingVerify === "boolean" && pendingVerify === (imageState === "pending-verify") &&
+		[accepted, pending].every((counter) => typeof counter === "number" && Number.isInteger(counter) && counter >= 0 && counter <= 0xffffffff) &&
+		typeof pendingAddress === "number" && Number.isInteger(pendingAddress) && [0, 65536, 2031616].includes(pendingAddress) &&
+		typeof state.publicKeySha256 === "string" && /^[0-9a-f]{64}$/.test(state.publicKeySha256);
+}
+
 function demoResponse<T>(path: string, init?: RequestInit): T {
 	if (path === "/api/config") return demoSnapshot() as T;
+	if (path === "/api/ota/state") return structuredClone(demoOtaState) as T;
 	if (path === "/api/esim") {
 		if (init?.method !== "POST") return structuredClone(demoEsim) as T;
 		const form = init.body instanceof URLSearchParams ? init.body : new URLSearchParams();
@@ -372,6 +405,12 @@ export async function loadSnapshot(): Promise<DeviceSnapshot> {
 	csrfToken = snapshot.csrfToken;
 	snapshot.config?.pushChannels.forEach((channel) => channel.cellularUrl = "");
 	return snapshot;
+}
+
+export async function loadOtaState(): Promise<OtaState> {
+	const state = await requestJson<unknown>("/api/ota/state");
+	if (!isOtaState(state)) throw new Error("Invalid OTA state response.");
+	return state;
 }
 
 function decodeBase64(value: string) {

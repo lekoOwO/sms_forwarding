@@ -80,6 +80,55 @@ test("demo eSIM switch makes the selected profile enabled", async () => {
 	});
 });
 
+test("demo OTA state exposes only the bounded rollout snapshot", async () => {
+	await withDemoApi(async (api) => {
+		const state = await api.loadOtaState();
+		assert.deepEqual(Object.keys(state).sort(), [
+			"accepted", "activeOffset", "imageState", "pending", "pendingAddress",
+			"pendingVerify", "publicKeySha256"
+		]);
+		assert.deepEqual([state.activeOffset, state.imageState, state.pendingVerify], [2031616, "valid", false]);
+		assert.match(state.publicKeySha256, /^[0-9a-f]{64}$/);
+		assert.doesNotMatch(JSON.stringify(state), /nvs|password|private|secret/i);
+	});
+});
+
+test("OTA state rejects malformed real responses without exposing the response body", async () => {
+	const previousMode = process.env.VITE_DEMO_MODE;
+	const previousCwd = process.cwd();
+	const previousFetch = globalThis.fetch;
+	let server;
+	try {
+		delete process.env.VITE_DEMO_MODE;
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const calls = [];
+		globalThis.fetch = async (path, init = {}) => {
+			calls.push([path, init]);
+			return new Response(JSON.stringify({
+				activeOffset: 65536, imageState: "valid", pendingVerify: false,
+				accepted: 1, pending: 0, pendingAddress: 0,
+				publicKeySha256: "bad-secret-response"
+			}), { status: 200, headers: { "Content-Type": "application/json" } });
+		};
+		await assert.rejects(api.loadOtaState(), /Invalid OTA state response/);
+		assert.equal(calls.length, 1);
+		assert.equal(calls[0][0], "/api/ota/state");
+		assert.equal(calls[0][1].method ?? "GET", "GET");
+		assert.equal(calls[0][1].body, undefined);
+	} finally {
+		globalThis.fetch = previousFetch;
+		try { await server?.close(); }
+		finally {
+			process.chdir(previousCwd);
+			if (previousMode === undefined) delete process.env.VITE_DEMO_MODE;
+			else process.env.VITE_DEMO_MODE = previousMode;
+		}
+	}
+});
+
 test("installation API waits for exact profile consent, installs disabled, and can postpone", async () => {
 	await withDemoApi(async (api) => {
 		const before = await api.loadEsim();
@@ -147,6 +196,21 @@ test("dark sidebar selection uses neutral semantic tokens", () => {
 	assert.match(darkVars, /--sidebar-primary:\s*oklch\([^;]*\s0\)/);
 	assert.doesNotMatch(darkVars, /264\.376/);
 	assert.match(layoutSource, /\.sidebar-link\[data-active="true"\]\s*\{[\s\S]*background:\s*var\(--sidebar-(?:primary|accent)\)/);
+});
+
+test("security destination surfaces the authenticated OTA trust snapshot", () => {
+	assert.match(pageSource, /data-security-updates/);
+	assert.match(pageSource, /loadOtaState/);
+	for (const key of [
+		"otaStateTitle", "otaStateDescription", "otaStateUnsupported", "otaStateUnavailable",
+		"otaStateRefresh", "otaStateSlot", "otaStateImage", "otaStateAccepted",
+		"otaStatePending", "otaStateTarget", "otaStateKey", "otaStateKeyHint",
+		"otaStateOther", "otaStatePendingVerify", "otaStateValid", "otaStateNoPending"
+	]) {
+		for (const [locale, messages] of localeSources) assert.equal(typeof messages[key], "string", `${locale}.${key}`);
+	}
+	assert.match(pageSource, /break-all[^\n]*otaState\.publicKeySha256/);
+	assert.doesNotMatch(pageSource, /shortOtaKey/);
 });
 
 test("forwarding-rule tips use the accessible Dialog primitive and document parser behavior", () => {

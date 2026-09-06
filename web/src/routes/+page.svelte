@@ -22,13 +22,13 @@
 	import { Switch } from "$lib/components/ui/switch";
 	import * as Tabs from "$lib/components/ui/tabs";
 	import { Textarea } from "$lib/components/ui/textarea";
-	import { confirmEsimInstall, demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, startEsimInstall, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
+	import { confirmEsimInstall, demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadOtaState, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, startEsimInstall, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
 	import { DEVICE_SUBPAGES, parseDeviceHash } from "$lib/device-navigation.js";
 	import { pushProviderKeyFields, pushSecretRequired, switchProviderDraft } from "$lib/push-template-defaults.js";
 	import { closeEsimDeleteDialog, refreshEsimAfterTerminal } from "$lib/esim-ui.js";
-	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, PushCaStatus, PushChannel, PushTestStatus, UiResult } from "$lib/types";
+	import type { DeviceSnapshot, EsimProfile, EsimStatus, Locale, OtaState, PushCaStatus, PushChannel, PushTestStatus, UiResult } from "$lib/types";
 
 	type MainTab = "overview" | "notifications" | "messaging" | "cellular" | "device" | "security";
 	type DeviceSubpage = "connection" | "diagnostics" | "maintenance" | "advanced";
@@ -133,6 +133,9 @@
 	let deleteDialog: HTMLDialogElement;
 	let configFileResult = $state(idle());
 	let otaResult = $state(idle());
+	let otaState = $state<OtaState | null>(null);
+	let otaStateLoading = $state(false);
+	let otaStateError = $state<"unsupported" | "unavailable" | "">("");
 	let phone = $state("");
 	let message = $state("");
 	let command = $state("");
@@ -190,6 +193,7 @@
 		document.documentElement.classList.toggle("dark", theme === "dark");
 		void refreshSnapshot().then(() => void scrollToDeviceSubpage(parseDeviceHash(location.hash)));
 		void refreshEsim();
+		void refreshOtaState();
 		return () => {
 			window.removeEventListener("hashchange", applyHash);
 			window.removeEventListener("popstate", applyHash);
@@ -228,6 +232,31 @@
 		} finally {
 			loading = false;
 		}
+	}
+
+	async function refreshOtaState() {
+		otaStateLoading = true;
+		otaStateError = "";
+		try {
+			otaState = await loadOtaState();
+		} catch (error) {
+			otaState = null;
+			otaStateError = error instanceof Error && error.message === "HTTP 404" ? "unsupported" : "unavailable";
+		} finally {
+			otaStateLoading = false;
+		}
+	}
+
+	function otaSlotLabel(offset: OtaState["activeOffset"] | OtaState["pendingAddress"]) {
+		if (offset === 65536) return t("otaStateSlot0");
+		if (offset === 2031616) return t("otaStateSlot1");
+		return t("otaStateNoPending");
+	}
+
+	function otaImageLabel(state: OtaState["imageState"]) {
+		if (state === "pending-verify") return t("otaStatePendingVerify");
+		if (state === "valid") return t("otaStateValid");
+		return t("otaStateOther");
 	}
 
 	function openMobileNavigation() {
@@ -1081,6 +1110,38 @@
 					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("securityTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("securityDescription")}</p></div>
 					<Alert.Root><Alert.Title>{t("securityWarningTitle")}</Alert.Title><Alert.Description>{t("securityWarningBody")}</Alert.Description></Alert.Root>
+					<Card.Root data-security-updates>
+						<Card.Header>
+							<div class="flex flex-wrap items-start justify-between gap-3">
+								<div class="min-w-0">
+									<Card.Title>{t("otaStateTitle")}</Card.Title>
+									<Card.Description>{t("otaStateDescription")}</Card.Description>
+								</div>
+								<Button variant="outline" size="sm" onclick={() => void refreshOtaState()} disabled={otaStateLoading}>
+									{#if otaStateLoading}<Spinner data-icon="inline-start" />{/if}{t("otaStateRefresh")}
+								</Button>
+							</div>
+						</Card.Header>
+						<Card.Content>
+							{#if otaStateError === "unsupported"}
+								<Alert.Root><Alert.Description>{t("otaStateUnsupported")}</Alert.Description></Alert.Root>
+							{:else if otaStateError === "unavailable"}
+								<Alert.Root variant="destructive"><Alert.Description>{t("otaStateUnavailable")}</Alert.Description></Alert.Root>
+							{:else if otaState}
+								<dl class="grid min-w-0 gap-4 sm:grid-cols-2">
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateSlot")}</dt><dd class="mt-1 font-medium">{otaSlotLabel(otaState.activeOffset)}</dd></div>
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateImage")}</dt><dd class="mt-1"><Badge variant={otaState.imageState === "valid" ? "default" : "secondary"}>{otaImageLabel(otaState.imageState)}</Badge></dd></div>
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateAccepted")}</dt><dd class="mt-1 font-medium">{otaState.accepted}</dd></div>
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStatePending")}</dt><dd class="mt-1 font-medium">{otaState.pending}</dd></div>
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateTarget")}</dt><dd class="mt-1 font-medium">{otaState.pendingAddress === 0 ? t("otaStateNoPending") : otaSlotLabel(otaState.pendingAddress)}</dd></div>
+									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateKey")}</dt><dd class="mt-1 break-all font-mono text-sm" aria-label={t("otaStateKey")}>{otaState.publicKeySha256}</dd></div>
+								</dl>
+								<p class="mt-4 text-sm text-muted-foreground">{t("otaStateKeyHint")}</p>
+							{:else if otaStateLoading}
+								<div aria-live="polite"><Skeleton class="h-20 w-full" /></div>
+							{/if}
+						</Card.Content>
+					</Card.Root>
 					<section class="flex flex-col gap-5"><div><h2 class="font-semibold">{t("accountTitle")}</h2><p class="text-sm text-muted-foreground">{t("accountDescription")}</p></div><form id="security-form" onsubmit={(event) => { event.preventDefault(); void save((value) => securityResult = value, accountValues()); }}><Accordion.Root type="single" value="0">{#each snapshot.config.webAccounts as account, index (index)}<Accordion.Item value={String(index)}><Accordion.Trigger><span class="flex min-w-0 flex-1 items-center gap-3"><span class="shrink-0">{t("account")} {index + 1}</span><span class="min-w-0 flex-1 truncate text-sm font-normal text-muted-foreground">{account.username || t("commonDisabled")}</span><Badge variant={account.username ? "default" : "outline"}>{account.username ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger><Accordion.Content class="pt-3"><Field.Group><Field.Field><Field.Label for={`account-user-${index}`}>{t("username")}</Field.Label><Input id={`account-user-${index}`} autocomplete="username" bind:value={account.username} /></Field.Field><Field.Field><Field.Label for={`account-pass-${index}`}>{t("password")}</Field.Label><Input id={`account-pass-${index}`} type="password" autocomplete="new-password" bind:value={account.password} /><Field.Description>{t("passwordHint")}</Field.Description></Field.Field></Field.Group></Accordion.Content></Accordion.Item>{/each}</Accordion.Root></form><div class="flex justify-end"><Button type="submit" form="security-form" disabled={securityResult.state === "loading"}>{securityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={securityResult} title={t("resultTitle")} {locale} /></section>
 				</section>
 			{/if}

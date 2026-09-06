@@ -132,6 +132,16 @@ export type PushTestStatus = PushTestActive | PushTestTerminal;
 
 export type PushCaStatus = { configured: boolean; sha256: string };
 
+export type OtaState = {
+	activeOffset: 65536 | 2031616;
+	imageState: "other" | "pending-verify" | "valid";
+	pendingVerify: boolean;
+	accepted: number;
+	pending: number;
+	pendingAddress: 0 | 65536 | 2031616;
+	publicKeySha256: string;
+};
+
 export type EsimProfile = {
 	handle: string;
 	displayId: string;
