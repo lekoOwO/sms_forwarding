@@ -23,6 +23,8 @@ CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 # 证书包用完整 CA 集：flash 尚有 30%+ 余量，避免小众推送服务因 CA 缺失握手失败
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# 憑證有效期驗證使用系統時間；尚未校時時保持驗證失敗，不跳過日期檢查。
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
 # 本固件只用 IPv4(推送/SMTP/NTP/captive DNS 均为 v4)，关 IPv6 省 flash+RAM
 CONFIG_LWIP_IPV6=n
 # 无终端应用，不需要 termios

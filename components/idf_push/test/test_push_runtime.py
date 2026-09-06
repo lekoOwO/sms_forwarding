@@ -434,9 +434,9 @@ int main() {
         "for (size_t i = 0; i < s_push_jobs.size(); ++i)", 1
     )[1].split("xSemaphoreGive(s_mutex)", 1)[0]
     assert "cfg.pushChannels[s_push_jobs[i].channel]" in locked_selection
-    assert "channel_waits_for_time(channel)" in locked_selection
+    assert "channel_waits_for_time(channel, network)" in locked_selection
     assert "s_push_jobs[i].nextUs = now + 5000000LL" in locked_selection
-    assert locked_selection.index("channel_waits_for_time(channel)") < locked_selection.index(
+    assert locked_selection.index("channel_waits_for_time(channel, network)") < locked_selection.index(
         "job = s_push_jobs[i]"
     )
     post_pop = push_worker.split("xSemaphoreGive(s_mutex)", 1)[1]
@@ -446,7 +446,7 @@ int main() {
         "static bool process_startup_notification()", 1
     )[0]
     assert 'fail_pending_tests("Cellular push is not supported; test stopped")' in tests
-    assert "channel_waits_for_time(cfg.pushChannels[i])" in tests
+    assert "channel_waits_for_time(cfg.pushChannels[i], network)" in tests
     assert "s_test_jobs[i].nextUs = now + 5000000LL" in tests
     assert "network, false, &result" in tests
     assert "std::string cleanup_result" in tests

@@ -37,11 +37,31 @@ ALLOWED_CJK_LINES = {
 }
 
 
+CPP_TOKENS = re.compile(
+    r'R(?:\\\r?\n)*"(?P<delimiter>[^\s()\\]{0,16})\([\s\S]*?\)(?P=delimiter)"'
+    r'|"(?:\\[\s\S]|[^"\\])*"'
+    r"|\b[0-9][\w.']*"
+    r"|'(?:\\[\s\S]|[^'\\\n])*'"
+    r'|(?P<comment>/(?:\\\r?\n)*/(?:\\\r?\n|[^\n])*'
+    r'|/(?:\\\r?\n)*\*[\s\S]*?\*(?:\\\r?\n)*/)'
+)
+
+
+def mask_cpp_comments(source: str) -> str:
+    # 先辨認原始字串與跳脫字元，避免把 runtime 文字中的註解符號當成註解。
+    # 保留換行與 token 間距，讓原始行號和精確本地化白名單仍然有效。
+    return CPP_TOKENS.sub(
+        lambda match: re.sub(r"[^\n]", " ", match.group())
+        if match.group("comment") is not None else match.group(),
+        source,
+    )
+
+
 def source_language_errors(relative: Path, source: str) -> list[str]:
     expected = ALLOWED_CJK_LINES.get(relative, Counter())
     seen = Counter()
     errors = []
-    for line_number, line in enumerate(source.splitlines(), 1):
+    for line_number, line in enumerate(mask_cpp_comments(source).splitlines(), 1):
         if not CJK.search(line):
             continue
         text = line.strip()
@@ -55,6 +75,55 @@ def source_language_errors(relative: Path, source: str) -> list[str]:
 
 
 class FirmwareLanguageTest(unittest.TestCase):
+    def test_chinese_comments_are_allowed_without_hiding_runtime_tokens(self) -> None:
+        source = (
+            '// 獨立註解\n'
+            'int value = 1; // 行尾註解\n'
+            '/* 多行註解\n第二行 */\n'
+            'int other = 2; /* 區塊註解 */\n'
+        )
+        relative = Path("sample.cpp")
+        self.assertEqual([], source_language_errors(relative, source))
+        self.assertEqual([], source_language_errors(
+            relative, "auto first = 1'000; /* 註解 */ auto second = 2'000;"
+        ))
+        self.assertEqual([], source_language_errors(relative, '/\\\n/ 延續註解\n'))
+        self.assertEqual(
+            ['sample.cpp:6: int 不允許 = 0;'],
+            source_language_errors(relative, source + 'int 不允許 = 0;\n'),
+        )
+
+    def test_comment_markers_in_literals_do_not_hide_unlisted_cjk(self) -> None:
+        for source in (
+            'const char* value = "https://不允許.invalid";',
+            'const char* value = "/* 不允許 */";',
+            r'const char* value = "\" // 不允許";',
+            'const char* value = R"(// 不允許)";',
+            'const char* value = u8R"END(" // 不允許\n)END";',
+            'const char* value = R"END(" /* 不允許 */)END";',
+            'const char* value = R\\\n"END(" // 不允許\n)END";',
+            '/* 註解 *\\\n/ int 不允許 = 0; /* tail */',
+            'const char* value = "//"; int 不允許 = 0;',
+            "auto value = U'不';",
+            "auto value = '/'; int 不允許 = 0;",
+        ):
+            with self.subTest(source=source):
+                errors = source_language_errors(Path("sample.cpp"), source)
+                self.assertEqual(1, len(errors))
+                self.assertIn("不", errors[0])
+
+    def test_comments_cannot_satisfy_or_expand_localized_line_allowlist(self) -> None:
+        relative = Path("idf_push/idf_push.cpp")
+        lines = list(ALLOWED_CJK_LINES[relative].elements())
+        source = '\n'.join(lines)
+        self.assertEqual([], source_language_errors(relative, source + ' // 行尾註解'))
+        hidden = '// ' + lines[0] + '\n' + '\n'.join(lines[1:])
+        self.assertIn("missing localized line", source_language_errors(relative, hidden)[0])
+        duplicate = source + '\n' + lines[0]
+        self.assertEqual(1, len(source_language_errors(relative, duplicate)))
+        modified = source.replace('短信转发器已启动', '未核准文字')
+        self.assertEqual(2, len(source_language_errors(relative, modified)))
+
     def test_unlisted_cjk_is_rejected(self) -> None:
         relative = Path("idf_push/idf_push.cpp")
         source = '\n'.join(ALLOWED_CJK_LINES[relative].elements()) + '\nidf_log_line("不允许");\n'

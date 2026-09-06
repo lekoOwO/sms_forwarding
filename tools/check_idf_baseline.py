@@ -168,8 +168,18 @@ def check_rollback_config(build_dir: Path) -> None:
         fail(f"OTA build rollback is not enabled in generated sdkconfig.h: {header}")
 
 
+def check_certificate_date_config(build_dir: Path) -> None:
+    sdkconfig = generated_sdkconfig_path(build_dir)
+    header = build_dir / "config" / "sdkconfig.h"
+    if not config_line_enabled(sdkconfig, "CONFIG_MBEDTLS_HAVE_TIME_DATE=y"):
+        fail(f"TLS certificate date verification is not enabled in generated sdkconfig: {sdkconfig}")
+    if not header.exists() or not config_line_enabled(header, "#define CONFIG_MBEDTLS_HAVE_TIME_DATE 1"):
+        fail(f"TLS certificate date verification is not enabled in generated sdkconfig.h: {header}")
+
+
 def check_app_size(build_dir: Path) -> None:
     check_rollback_config(build_dir)
+    check_certificate_date_config(build_dir)
     image = build_dir / "sms_forwarding_idf.bin"
     if not image.exists():
         fail(f"firmware image not found: {image}")
@@ -192,6 +202,8 @@ def main() -> int:
     check_idf_pins()
     check_esptool_commands()
     check_license_notice()
+    if not config_line_enabled(ROOT / "sdkconfig.defaults", "CONFIG_MBEDTLS_HAVE_TIME_DATE=y"):
+        fail("TLS certificate date verification is not enabled in sdkconfig.defaults")
     if args.build_dir:
         check_app_size(args.build_dir)
     print("ESP-IDF baseline checks passed")

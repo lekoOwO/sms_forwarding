@@ -82,18 +82,20 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 `idf_push` 支援 SMTP 與 12 種推送 provider。Provider enum 由 `dev_doc/config-schema/v6.json` 的
 `x-enumMapping` 定義，並由 `tools/generate-config-schema.py` 產生。
 
-目前通知傳送只使用 WiFi。4G-only 模式會回傳 unsupported，混合模式在 WiFi 中斷時會 defer。
+SMTP 僅使用 WiFi。推送在 4G-only 模式選擇 cellular 路徑。
+混合模式優先使用已連線的 WiFi，否則選擇 cellular。WiFi-only 模式斷線時延後傳送。
 
-4G push 目前不支援。TLS 或網路註冊未經驗證時，4G push 會 fail closed。
-GET 與 ntfy 僅支援 WiFi，漫遊傳送與資料啟用維持 fail closed。
-現有實機證據沒有證明 4G data delivery 可用。
+Cellular 推送要求通道啟用 cellular 並使用 HTTPS 目標。
+CA 必須綁定目標 origin，且 hash 相符。
+GET 推送僅使用 WiFi。ntfy 的 POST 推送可使用符合上述條件的 cellular 路徑。
+模組、home registration 與 PDP 前置檢查仍須通過，資料與漫遊限制不因選擇路徑而放寬。
 
-`idf_modem_https` 依 OneMO ML307A 的 SSL context 語意使用 context 1。每次建立 MHTTP
-instance 前，先刪除殘留的 `MHTTP` instance，再完成憑證、auth、version 等設定，並在
-`AT+MHTTPCREATE` 前依序送出：`AT+MSSLCFG="ciphersuite",1,0`（使用全部支援的
-cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache）。這讓
-共用 context 1 在不同 host 間不沿用未明載的設定。這是 OneMO 指令語意與 host transcript
-所證明的 wire 設定，不是 provider push 成功證據。
+目前 `idf_modem_https` 使用 modem 的 MIP socket 提供 TCP。
+ESP32 上的 Mbed TLS 執行 CA 與 hostname 驗證，並傳送 HTTPS。
+此路徑與下方 Arduino 歷史紀錄中的 MHTTP 路徑不同。
+
+[Counter42 R15](hardware-counter37.md#counter42-r15-successful-cellular-evidence) 記錄一次 cellular HTTP 200 與已確認的 cleanup。
+該次 application-level success 仍為 `unknown`，不能推廣為其他目標或網路條件的成功保證。
 
 心跳間隔可設定為 1 至 240 小時。時間未完成 NTP 同步時，scheduler 不會開始心跳計時。
 
@@ -113,7 +115,7 @@ cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache�
 
 文件不記錄 operator、ICCID、IMSI、IMEI、address、APN 或 credential 值。
 此次操作沒有使用 write AT、manual `COPS`，也沒有執行 `CFUN`、`CGATT`、`CGACT` 或 PDP 狀態變更。
-這份紀錄不證明 Internet、TLS 或 provider delivery 可用。4G push 維持 fail closed。
+這份紀錄不證明 Internet、TLS 或 provider delivery 可用。
 
 ### 2026-08-22 ML307A 未註冊歷史紀錄
 
@@ -128,7 +130,7 @@ cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache�
 - 識別資料已去識別化保存。
 
 這次結果表示 SIM 與 RF 路徑有回應，但尚未完成標準網路註冊與資料啟用。
-它不證明 4G 可用；韌體因此不會把 4G push、roaming 或 data activation 視為已成功。
+這個未註冊、RLOS-only 狀態不證明 4G push、roaming 或 data activation 已成功。
 
 ### 2026-08-16 Arduino 歷史 TLS 紀錄
 
@@ -138,7 +140,7 @@ cipher suites）與 `AT+MSSLCFG="session",1,0`（停用 TLS session reuse/cache�
 - 結果：伺服器端確認正向 server-auth handshake 完成。
 - 證據邊界：wrong-certificate、hostname mismatch 與 expired-certificate rejection 都沒有可信的負向證據。
 
-此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。4G push 維持 fail closed。
+此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。
 
 ## 設定與備份
 

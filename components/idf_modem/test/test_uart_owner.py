@@ -279,6 +279,106 @@ class UartOwnerContractTest(unittest.TestCase):
             body.index("slot.state = OwnerCommandState::running"),
         )
 
+    def test_sim_identity_and_background_recovery_fixture(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the host SIM fixture requires g++")
+        source = SOURCE.read_text()
+
+        def definition(name):
+            match = re.search(rf"(?m)^(?:static )?[A-Za-z_][^\n;{{}}]*\b{name}\s*\([^;]*?\)\s*\{{", source)
+            self.assertIsNotNone(match, name)
+            return match.group() + function_body(source[match.start():], name) + "}\n"
+
+        status_header = (SOURCE.parent / "include" / "idf_modem.h").read_text()
+        config_header = (REPO_ROOT / "components/idf_config/include/idf_config.h").read_text()
+        types = re.search(r"struct IdfModemStatus \{.*?\n\};", status_header, re.S).group()
+        for name in ("IdfSimCredential", "IdfSimUnlockView"):
+            types += "\n" + re.search(rf"struct {name} \{{.*?\n\}};", config_header, re.S).group()
+        constants = source[source.index("static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS"):
+                           source.index("static constexpr size_t URC_BUFFER_MAX")]
+        names = ["at_final_result", "line_is_payload", "first_payload_line", "first_digit_run", "is_iccid_text",
+                 "is_imei_text", "is_imsi_text", "update_status", "idf_modem_get_status",
+                 "send_ok", "parse_iccid_response"]
+        if "static std::string parse_iccid_crsm_response" in source:
+            names.append("parse_iccid_crsm_response")
+        if "static bool single_at_frame_payload" in source:
+            names.append("single_at_frame_payload")
+        names += ["query_current_iccid", "query_sim_state", "set_sim_status",
+                  "sim_unlock_allowed", "try_unlock_sim"]
+        if "static constexpr uint32_t modem_retry_delay_ms" in source:
+            names.append("modem_retry_delay_ms")
+        sampling = function_body(source, "sample_identity_once")
+        iccid = sampling[sampling.index("if (before.iccid"):sampling.index("if (before.imsi")]
+        owner = function_body(source, "modem_task")
+        fields = owner[owner.index("TickType_t last_signal ="):owner.index("while (true) {")]
+        iteration = owner[owner.index("run_pending_reinit_if_recovered();") +
+                          len("run_pending_reinit_if_recovered();"):
+                          owner.index("const int64_t sim_check_now_us")]
+        iteration = iteration.replace("continue;", "return;")
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "sim_types.inc").write_text(types + "\n" + constants)
+            (Path(directory) / "sim_runtime.inc").write_text("\n".join(map(definition, names)))
+            (Path(directory) / "sim_sampling.inc").write_text(
+                "static std::string sample_iccid_slice() {\n"
+                "IdfModemStatus before = idf_modem_get_status(), patch; std::string resp;\n" +
+                iccid + "return patch.iccid;\n}\n")
+            (Path(directory) / "sim_iteration.inc").write_text(
+                "struct OwnerIteration {\n"
+                "bool sim_ready = false, registered = false, post_register_done = false;\n" +
+                fields + "void step(bool reset_handled = false) {\n" + iteration + "}\n};\n")
+            binary = Path(directory) / "sim_identity_fixture"
+            compile_result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                 "-I", directory, "-I", str(SOURCE.parent / "include"),
+                 str(SOURCE.parent / "test" / "sim_identity_fixture.cpp"), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            for scenario in ("vendor", "iccid", "retry"):
+                with self.subTest(scenario=scenario):
+                    result = subprocess.run([str(binary), scenario], check=False,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_clock_bootstrap_uses_owner_and_preserves_existing_time(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the host clock fixture requires g++")
+        source = SOURCE.read_text()
+
+        def definition(name):
+            match = re.search(rf"(?m)^(?:static )?[A-Za-z_][^\n;{{}}]*\b{name}\s*\([^;]*?\)\s*\{{", source)
+            self.assertIsNotNone(match, name)
+            return match.group() + function_body(source[match.start():], name) + "}\n"
+
+        owner = function_body(source, "modem_task")
+        initial = owner[owner.index("bool registered = (stat == 1 || stat == 5);"):
+                        owner.index("TickType_t last_signal =")]
+        periodic = owner[owner.index("if (!sim_ready) s_status_sample_requests.store"):
+                         owner.index("// A manual refresh bypasses the interval.")]
+        names = ["at_final_result", "send_ok"]
+        for name in ("single_at_frame_payload", "parse_modem_clock", "bootstrap_clock_once"):
+            if re.search(rf"(?m)^static [^\n]*\b{name}\(", source):
+                names.append(name)
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "clock_runtime.inc").write_text("\n".join(map(definition, names)))
+            (Path(directory) / "clock_owner.inc").write_text(
+                "static void initial_owner_pass(int stat) { bool sim_ready = true;\n" + initial + "}\n"
+                "static void periodic_owner_pass() { bool sim_ready = true;\n" +
+                periodic.replace("continue;", "return;") + "}\n")
+            binary = Path(directory) / "clock_fixture"
+            result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                 "-I", directory, "-I", str(SOURCE.parent / "include"),
+                 str(SOURCE.parent / "test" / "clock_fixture.cpp"), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for scenario in ("valid", "invalid", "gates", "race"):
+                with self.subTest(scenario=scenario):
+                    result = subprocess.run([str(binary), scenario], check=False,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_identity_change_logs_are_masked(self):
         source = SOURCE.read_text()
         self.assertIn("mask_identity", source)

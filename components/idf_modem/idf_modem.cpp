@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <time.h>
 
 #include <algorithm>
@@ -61,8 +62,11 @@ static constexpr uint32_t HTTPS_CLEANUP_COMMANDS_MAX =
 static constexpr uint32_t HTTPS_CLEANUP_WAIT_MARGIN_MS =
     HTTPS_CLEANUP_COMMANDS_MAX * (HTTPS_CLEANUP_TIMEOUT_MS + HTTPS_UART_DRAIN_MAX_MS) + 1000UL;
 static constexpr uint32_t IDENTITY_RETRY_INTERVAL_MS = 600000UL;
-// Sample display identity and signal data only after an explicit overview refresh.
-// at_channel_idle prevents sampling from competing for the AT channel.
+static constexpr uint32_t MODEM_RETRY_DELAYS_MS[] = {
+    30000UL, 60000UL, 120000UL, 300000UL, IDENTITY_RETRY_INTERVAL_MS,
+};
+static constexpr size_t MODEM_RETRY_DELAY_COUNT =
+    sizeof(MODEM_RETRY_DELAYS_MS) / sizeof(MODEM_RETRY_DELAYS_MS[0]);
 static constexpr uint32_t SIGNAL_INTERVAL_WEB_MS = 10000UL;
 static constexpr uint32_t SIGNAL_DETAIL_INTERVAL_WEB_MS = 30000UL;
 static constexpr uint32_t SIM_CHECK_INTERVAL_MS = 15000UL;  // SIM hot-swap poll interval
@@ -1515,16 +1519,135 @@ static std::string parse_iccid_response(const std::string& raw)
     return first_digit_run(raw, 15, 22);
 }
 
-static std::string query_current_iccid(void)
+static std::string parse_iccid_crsm_response(const std::string& line)
+{
+    if (line.rfind("+CRSM:", 0) != 0) return {};
+    const size_t first = line.find(',', 6);
+    const size_t second = first == std::string::npos ? first : line.find(',', first + 1);
+    if (second == std::string::npos) return {};
+    const std::string sw1 = idf_util_trim_copy(line.substr(6, first - 6));
+    const std::string sw2 = idf_util_trim_copy(line.substr(first + 1, second - first - 1));
+    const std::string encoded = idf_util_trim_copy(line.substr(second + 1));
+    if ((sw1 != "144" && sw1 != "145") || sw2 != "0" ||
+        encoded.size() != 22 || encoded.front() != '"' || encoded.back() != '"') return {};
+    std::string iccid;
+    for (size_t i = 1; i < 21; i += 2) {
+        iccid += static_cast<char>(toupper(static_cast<unsigned char>(encoded[i + 1])));
+        iccid += static_cast<char>(toupper(static_cast<unsigned char>(encoded[i])));
+    }
+    if (iccid.back() == 'F') iccid.pop_back();
+    if (!std::all_of(iccid.begin(), iccid.end(), [](char ch) {
+            return ch >= '0' && ch <= '9';
+        })) return {};
+    return iccid;
+}
+
+static bool single_at_frame_payload(const std::string& raw, const char* command, std::string& payload)
+{
+    payload.clear();
+    bool echo_seen = false, terminal_seen = false, waiting_for_pdu = false;
+    size_t position = 0;
+    while (position < raw.size()) {
+        size_t end = raw.find_first_of("\r\n", position);
+        if (end == std::string::npos) end = raw.size();
+        const std::string line = idf_util_trim_copy(raw.substr(position, end - position));
+        position = end + 1;
+        if (line.empty()) continue;
+        if (waiting_for_pdu && idf_modem_imei_pdu_line(line)) {
+            waiting_for_pdu = false;
+            continue;
+        }
+        if (idf_modem_imei_known_urc(line)) {
+            if (line.rfind("+CMT:", 0) == 0) waiting_for_pdu = true;
+            continue;
+        }
+        if (terminal_seen) return false;
+        if (line == command) {
+            if (echo_seen || !payload.empty()) return false;
+            echo_seen = true;
+        } else if (line == "OK") {
+            if (payload.empty()) return false;
+            terminal_seen = true;
+        } else {
+            if (!payload.empty() || line.rfind("AT", 0) == 0 || line == "ERROR" ||
+                line.rfind("+CME ERROR", 0) == 0 || line.rfind("+CMS ERROR", 0) == 0) return false;
+            payload = line;
+        }
+    }
+    return terminal_seen && !payload.empty();
+}
+
+static std::string query_current_iccid(uint32_t retry_delay_ms = 0)
 {
     const char* commands[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
     std::string resp;
     for (const char* cmd : commands) {
-        if (!send_ok(cmd, 1500, &resp)) continue;
-        std::string iccid = parse_iccid_response(resp);
+        std::string iccid, payload;
+        if (send_ok(cmd, 1500, &resp) && single_at_frame_payload(resp, cmd, payload)) {
+            iccid = parse_iccid_response(payload);
+        }
+        if (retry_delay_ms) vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
         if (!iccid.empty()) return iccid;
     }
+    const char* crsm = "AT+CRSM=176,12258,0,0,10";
+    std::string payload;
+    if (send_ok(crsm, 2000, &resp) && single_at_frame_payload(resp, crsm, payload)) {
+        return parse_iccid_crsm_response(payload);
+    }
     return {};
+}
+
+static bool parse_modem_clock(const std::string& response, time_t& epoch)
+{
+    std::string payload;
+    if (!single_at_frame_payload(response, "AT+CCLK?", payload) ||
+        payload.rfind("+CCLK:", 0) != 0) return false;
+    const std::string value = idf_util_trim_copy(payload.substr(6));
+    if (value.size() != 22 || value[0] != '"' || value[21] != '"' ||
+        value[3] != '/' || value[6] != '/' || value[9] != ',' ||
+        value[12] != ':' || value[15] != ':' ||
+        (value[18] != '+' && value[18] != '-')) return false;
+    for (size_t i : {1U, 2U, 4U, 5U, 7U, 8U, 10U, 11U, 13U, 14U, 16U, 17U, 19U, 20U}) {
+        if (value[i] < '0' || value[i] > '9') return false;
+    }
+    const auto two_digits = [&](size_t pos) {
+        return (value[pos] - '0') * 10 + value[pos + 1] - '0';
+    };
+    int year = two_digits(1);
+    year += year >= 70 ? 1900 : 2000;
+    const int month = two_digits(4), day = two_digits(7);
+    const int hour = two_digits(10), minute = two_digits(13), second = two_digits(16);
+    int zone = two_digits(19);
+    if (month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 ||
+        second > 59 || zone > 96) return false;
+    const auto leap = [](int y) { return y % 4 == 0 && (y % 100 != 0 || y % 400 == 0); };
+    int month_days[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    if (leap(year)) month_days[1] = 29;
+    if (day > month_days[month - 1]) return false;
+    int64_t days = day - 1;
+    for (int y = 1970; y < year; ++y) days += leap(y) ? 366 : 365;
+    for (int m = 1; m < month; ++m) days += month_days[m - 1];
+    if (value[18] == '-') zone = -zone;
+    epoch = static_cast<time_t>(days * 86400 + hour * 3600 + minute * 60 + second - zone * 900);
+    return true;
+}
+
+static void bootstrap_clock_once()
+{
+    constexpr time_t minimum_epoch = 1700000000;
+    static int64_t next_attempt_us = 0;
+    const int64_t now = esp_timer_get_time();
+    if (time(nullptr) >= minimum_epoch || now < next_attempt_us ||
+        idf_modem_get_status().ceregStat != 1 || !at_channel_idle_now() ||
+        (s_uart_wait_cmt_pdu && now <= s_uart_wait_cmt_until_us)) return;
+    next_attempt_us = now + 60LL * 1000LL * 1000LL;
+    std::string response;
+    time_t epoch = 0;
+    if (!send_ok("AT+CCLK?", 1000, &response) || !parse_modem_clock(response, epoch) ||
+        epoch < minimum_epoch) return;
+    timeval value{};
+    value.tv_sec = epoch;
+    if (time(nullptr) < minimum_epoch) settimeofday(&value, nullptr);
 }
 
 static std::string query_sim_state(void)
@@ -1646,6 +1769,11 @@ static bool try_unlock_sim(bool allow_puk)
                    (submit_err == ESP_FAIL ? " was rejected by the modem. Attempts stopped" : " submission timed out. Attempt count unchanged"), iccid);
     idf_log_line(puk ? "SIM PUK unlock failed. Attempts stopped" : "SIM PIN unlock failed. Attempts stopped");
     return false;
+}
+
+static constexpr uint32_t modem_retry_delay_ms(uint8_t level)
+{
+    return MODEM_RETRY_DELAYS_MS[std::min<size_t>(level, MODEM_RETRY_DELAY_COUNT - 1)];
 }
 
 static bool parse_csq(const std::string& resp, int& csq, int& ber)
@@ -2453,12 +2581,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
     }
 
     if (before.iccid.size() < 15) {
-        const char* iccid_cmds[] = {"AT+MCCID", "AT+ICCID", "AT+CCID"};
-        for (const char* cmd : iccid_cmds) {
-            if (!patch.iccid.empty()) break;
-            if (send_ok(cmd, 1500, &resp)) patch.iccid = parse_iccid_response(resp);
-            vTaskDelay(pdMS_TO_TICKS(80));
-        }
+        patch.iccid = query_current_iccid(80);
         vTaskDelay(pdMS_TO_TICKS(150));
     }
 
@@ -2945,11 +3068,10 @@ static void modem_task(void*)
     }
     bool registered = (stat == 1 || stat == 5);
     bool post_register_done = false;
-    if (!sim_ready) {
-        // try_unlock_sim records locked or absent state until hot swap or credential update.
-    } else if (!registered) {
+    if (sim_ready && !registered) {
         set_phase("registering");
-    } else {
+    } else if (registered) {
+        bootstrap_clock_once();
         retry_sms_storage_if_pending();
         apply_startup_data_mode(stat);
         IdfSimSettingsView cfg = idf_config_get_sim_settings_view();
@@ -2964,7 +3086,10 @@ static void modem_task(void*)
     }
 
     TickType_t last_signal = 0;
-    TickType_t last_identity = 0;
+    TickType_t last_identity = xTaskGetTickCount();
+    uint8_t identity_retry_level = 0;
+    TickType_t last_sim_unlock_check = xTaskGetTickCount();
+    uint8_t sim_unlock_retry_level = 0;
     TickType_t last_detail = 0;
     TickType_t last_health = 0;
     int health_fail_count = 0;
@@ -2982,9 +3107,10 @@ static void modem_task(void*)
         if (owner_process_one_command(false)) continue;
         bool reset_handled = handle_reset_request_if_any();
         run_pending_reinit_if_recovered();
-        if (!sim_ready && idf_modem_get_status().simState == "ready") sim_ready = true;
+        const bool sim_recovered = !sim_ready && idf_modem_get_status().simState == "ready";
+        if (sim_recovered) sim_ready = true;
         TickType_t now = xTaskGetTickCount();
-        if (reset_handled) {
+        if (reset_handled || sim_recovered) {
             sim_ready = idf_modem_get_status().simState == "ready";
             // Clear local registration state after an in-service reset so recovery
             // uses the fast probe interval instead of the 60-second registered interval.
@@ -2994,42 +3120,67 @@ static void modem_task(void*)
             dereg_count = 0;
             rlos_only_seen = false;
             last_health = 0;
+            last_identity = now;
+            identity_retry_level = 0;
+            last_sim_unlock_check = now;
+            sim_unlock_retry_level = 0;
             last_sim_check = now;  // Allow one full SIM initialization interval.
             sim_check_not_before_us = esp_timer_get_time() + 30LL * 1000LL * 1000LL;
             sim_present = -1;
             sms_reconfigure_pending = true;
         }
         int unlock_request = s_sim_unlock_request.exchange(0, std::memory_order_relaxed);
+        bool sim_unlock_checked = false;
         if (unlock_request != 0) {
             if (!at_channel_idle_now()) {
                 s_sim_unlock_request.store(unlock_request, std::memory_order_relaxed);
             } else {
                 if (unlock_request == 1) s_last_pin_attempt_key.clear();
                 sim_ready = try_unlock_sim(unlock_request == 2);
+                sim_unlock_checked = true;
+                last_sim_unlock_check = xTaskGetTickCount();
+                sim_unlock_retry_level = 0;
             }
-            if (sim_ready && at_channel_idle_now()) {
-                invalidate_registration_state("registering", true);
-                configure_sms_and_registration();
-                set_phase("registering");
-                // Data setup waits for a valid CEREG result after SIM unlock.
-                registered = false;
-                post_register_done = false;
-                sms_reconfigure_pending = true;
-                last_health = 0;
+        }
+        const bool sim_unlock_retry_due = !sim_ready &&
+            now - last_sim_unlock_check >= pdMS_TO_TICKS(modem_retry_delay_ms(sim_unlock_retry_level));
+        if (!sim_unlock_checked && sim_unlock_retry_due && at_channel_idle_now()) {
+            sim_ready = try_unlock_sim(false);
+            sim_unlock_checked = true;
+            last_sim_unlock_check = xTaskGetTickCount();
+            if (sim_ready) {
+                sim_unlock_retry_level = 0;
+            } else if (sim_unlock_retry_level + 1U < MODEM_RETRY_DELAY_COUNT) {
+                ++sim_unlock_retry_level;
             }
+        }
+        if (sim_unlock_checked && sim_ready) {
+            invalidate_registration_state("registering", true);
+            if (at_channel_idle_now()) configure_sms_and_registration();
+            set_phase("registering");
+            registered = false;
+            post_register_done = false;
+            last_identity = xTaskGetTickCount();
+            identity_retry_level = 0;
+            sms_reconfigure_pending = true;
+            last_health = 0;
         }
         if (!sim_ready) s_status_sample_requests.store(0, std::memory_order_relaxed);
         if (process_data_mode_retry()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
+        bootstrap_clock_once();
         // A manual refresh bypasses the interval. Retain the request while AT is busy.
         bool force_sample = s_status_sample_requests.load(std::memory_order_relaxed) > 0;
         bool web_active = force_sample ||
                           (esp_timer_get_time() -
                            s_last_web_poll_us.load(std::memory_order_relaxed)) < WEB_POLL_ACTIVE_WINDOW_US;
         bool startup_sampling = registered && !post_register_done;
-        if (sim_ready && (web_active || startup_sampling) && at_channel_idle_now()) {
+        const bool identity_retry_due = !startup_info_complete() &&
+            idf_modem_identity_sampling_allowed(idf_modem_get_status().ceregStat) &&
+            now - last_identity >= pdMS_TO_TICKS(modem_retry_delay_ms(identity_retry_level));
+        if (sim_ready && (web_active || startup_sampling || identity_retry_due) && at_channel_idle_now()) {
             if (force_sample) {
                 s_status_sample_requests.store(0, std::memory_order_relaxed);
             }
@@ -3043,11 +3194,14 @@ static void modem_task(void*)
                 sample_signal_detail_once();
                 last_detail = now;
             }
-            if ((startup_sampling || force_sample || !startup_info_complete()) &&
-                (startup_sampling || force_sample || last_identity == 0 ||
-                 now - last_identity > pdMS_TO_TICKS(IDENTITY_RETRY_INTERVAL_MS))) {
-                sample_identity_once(false, true);
-                last_identity = now;
+            if (startup_sampling || force_sample || identity_retry_due) {
+                const bool identity_changed = sample_identity_once(false, true);
+                last_identity = xTaskGetTickCount();
+                if (startup_sampling || force_sample || identity_changed || startup_info_complete()) {
+                    identity_retry_level = 0;
+                } else if (identity_retry_level + 1U < MODEM_RETRY_DELAY_COUNT) {
+                    ++identity_retry_level;
+                }
             }
             if (startup_sampling && startup_sampling_done()) {
                 set_phase("ready");
@@ -3103,6 +3257,8 @@ static void modem_task(void*)
                         sample_signal_once();
                         sample_signal_detail_once();
                         sample_identity_once(false, true);
+                        last_identity = xTaskGetTickCount();
+                        identity_retry_level = 0;
                         post_register_done = startup_sampling_done();
                         set_phase(post_register_done ? "ready" : "sampling");
                     }

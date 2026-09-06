@@ -21,6 +21,7 @@
 #include "idf_inbox.h"
 #include "idf_log.h"
 #include "idf_modem.h"
+#include "idf_modem_query_filter.h"
 #include "idf_push.h"
 #include "idf_util.h"
 #include "pdulib.h"
@@ -684,22 +685,129 @@ static void expire_concat_slots()
 }
 
 // ===== Call notifications =====
-// RING and +CLIP can repeat for one call. Notify once per call window.
-static int64_t s_call_window_us = 0;   // Latest RING or +CLIP time
-static bool s_call_notified = false;   // Notification sent for this call
-static bool s_call_saw_ring = false;   // RING received for unknown-number fallback
-static std::string s_call_number;      // Current number from +CLIP
-static constexpr int64_t CALL_GAP_US = 30LL * 1000 * 1000;          // New-call gap
-static constexpr int64_t CALL_UNKNOWN_DELAY_US = 3LL * 1000 * 1000; // Wait for +CLIP after RING
+static int64_t s_call_last_urc_us = 0;
+static int64_t s_call_first_ring_us = 0;
+static bool s_call_active = false;
+static bool s_call_notified = false;
+static bool s_call_saw_ring = false;
+static bool s_call_recovery_attempted = false;
+static std::string s_call_number;
+static constexpr int64_t CALL_GAP_US = 30LL * 1000 * 1000;
+static constexpr int64_t CALL_CLCC_DELAY_US = 3LL * 1000 * 1000;
 
-// Extract the first quoted number from +CLIP.
+static void process_urc_text(const std::string& text);
+
+static void skip_call_spaces(const std::string& line, size_t& pos)
+{
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+}
+
+static bool read_call_uint(const std::string& line, size_t& pos, int& value)
+{
+    skip_call_spaces(line, pos);
+    const size_t start = pos;
+    while (pos < line.size() && line[pos] >= '0' && line[pos] <= '9') ++pos;
+    if (!parse_sms_index_token(line.data() + start, pos - start, value)) return false;
+    skip_call_spaces(line, pos);
+    return true;
+}
+
+static bool read_call_number(const std::string& line, size_t& pos, std::string& number)
+{
+    skip_call_spaces(line, pos);
+    if (pos == line.size() || line[pos++] != '"') return false;
+    const size_t end = line.find('"', pos);
+    if (end == std::string::npos) return false;
+    number = line.substr(pos, end - pos);
+    if (!number.empty() && !is_valid_phone_number(number)) return false;
+    pos = end + 1;
+    skip_call_spaces(line, pos);
+    if (pos == line.size() || line[pos++] != ',') return false;
+    int type = 0;
+    return read_call_uint(line, pos, type) && type <= 255;
+}
+
 static std::string parse_clip_number(const std::string& line)
 {
-    size_t q1 = line.find('"');
-    if (q1 == std::string::npos) return {};
-    size_t q2 = line.find('"', q1 + 1);
-    if (q2 == std::string::npos) return {};
-    return line.substr(q1 + 1, q2 - q1 - 1);
+    if (!starts_with(line, "+CLIP:")) return {};
+    size_t pos = 6;
+    std::string number;
+    if (!read_call_number(line, pos, number) ||
+        (pos != line.size() && line[pos] != ',')) return {};
+    return number;
+}
+
+static bool parse_clcc_line(const std::string& line, bool& incoming, std::string& number)
+{
+    size_t pos = 6;
+    int fields[5] = {};
+    for (size_t i = 0; i < 5; ++i) {
+        if (!read_call_uint(line, pos, fields[i])) return false;
+        if (i != 4 && (pos == line.size() || line[pos++] != ',')) return false;
+    }
+    if (fields[0] == 0 || fields[1] > 1 || fields[2] > 5 ||
+        fields[3] > 2 || fields[4] > 1) return false;
+    incoming = fields[1] == 1 && (fields[2] == 4 || fields[2] == 5);
+    if (pos == line.size()) return true;
+    if (line[pos++] != ',' || !read_call_number(line, pos, number)) return false;
+    if (pos == line.size()) return true;
+    if (line[pos++] != ',') return false;
+    skip_call_spaces(line, pos);
+    if (pos == line.size() || line[pos++] != '"') return false;
+    const size_t end = line.find('"', pos);
+    if (end == std::string::npos) return false;
+    for (; pos < end; ++pos) {
+        const unsigned char ch = static_cast<unsigned char>(line[pos]);
+        if (ch < 0x20 || ch == 0x7F) return false;
+    }
+    pos = end + 1;
+    skip_call_spaces(line, pos);
+    return pos == line.size();
+}
+
+static std::string query_clcc_number()
+{
+    std::string response;
+    if (idf_modem_send_at("AT+CLCC", 1500, response) != ESP_OK) return {};
+    bool terminal = false, echo_seen = false, row_seen = false, waiting_for_pdu = false;
+    unsigned incoming_count = 0;
+    std::string number;
+    size_t pos = 0;
+    while (pos < response.size()) {
+        size_t end = response.find_first_of("\r\n", pos);
+        if (end == std::string::npos) end = response.size();
+        const std::string line = idf_util_trim_copy(response.substr(pos, end - pos));
+        pos = end + 1;
+        if (line.empty()) continue;
+        if (idf_modem_is_standalone_urc_line(line)) continue;
+        if (starts_with(line, "+CMT:")) {
+            waiting_for_pdu = true;
+            continue;
+        }
+        if (waiting_for_pdu && line.size() >= 32 && is_hex_string(line)) {
+            waiting_for_pdu = false;
+            continue;
+        }
+        if (terminal || waiting_for_pdu) return {};
+        if (line == "AT+CLCC") {
+            if (echo_seen || row_seen) return {};
+            echo_seen = true;
+        } else if (line == "OK") {
+            terminal = true;
+        } else if (starts_with(line, "+CLCC:")) {
+            row_seen = true;
+            bool incoming = false;
+            std::string candidate;
+            if (!parse_clcc_line(line, incoming, candidate)) return {};
+            if (incoming) {
+                if (++incoming_count != 1) return {};
+                number = candidate;
+            }
+        } else {
+            return {};
+        }
+    }
+    return terminal ? number : std::string();
 }
 
 static void notify_incoming_call(const std::string& number)
@@ -724,36 +832,51 @@ static void notify_incoming_call(const std::string& number)
     }
 }
 
-// Handle RING and +CLIP outside SMS processing and notify once per call.
 static void handle_call_urc_line(const std::string& line)
 {
     int64_t now = esp_timer_get_time();
-    if (now - s_call_window_us > CALL_GAP_US) {  // Reset deduplication for a new call.
+    if (!s_call_active || now - s_call_last_urc_us > CALL_GAP_US) {
+        s_call_active = true;
         s_call_notified = false;
         s_call_saw_ring = false;
+        s_call_recovery_attempted = false;
         s_call_number.clear();
     }
-    s_call_window_us = now;
+    s_call_last_urc_us = now;
     if (starts_with(line, "+CLIP:")) {
         std::string num = parse_clip_number(line);
         if (!num.empty()) s_call_number = num;
-        if (!s_call_notified) {
+        if (!s_call_notified && !s_call_number.empty()) {
             s_call_notified = true;
             notify_incoming_call(s_call_number);
         }
-    } else {  // RING can precede +CLIP. Flush later if the number remains unknown.
+    } else if (!s_call_saw_ring) {
+        s_call_first_ring_us = now;
         s_call_saw_ring = true;
     }
 }
 
-// Notify once with an unknown number if +CLIP does not follow RING.
 static void flush_pending_call_notify(void)
 {
-    if (s_call_saw_ring && !s_call_notified &&
-        esp_timer_get_time() - s_call_window_us > CALL_UNKNOWN_DELAY_US) {
+    const int64_t now = esp_timer_get_time();
+    if (!s_call_saw_ring || s_call_notified ||
+        now - s_call_first_ring_us < CALL_CLCC_DELAY_US) return;
+    if (!idf_config_call_notify_enabled() || now - s_call_last_urc_us > CALL_GAP_US) {
         s_call_notified = true;
         notify_incoming_call(std::string());
+        return;
     }
+    if (s_wait_pdu || idf_modem_esim_operation_active() || s_call_recovery_attempted) return;
+
+    s_call_recovery_attempted = true;
+    const int64_t first_ring = s_call_first_ring_us;
+    const std::string recovered = query_clcc_number();
+    std::string urc;
+    if (idf_modem_take_urc(urc)) process_urc_text(urc);
+    if (s_call_notified || !s_call_saw_ring || s_call_first_ring_us != first_ring) return;
+    s_call_number = recovered;
+    s_call_notified = true;
+    notify_incoming_call(s_call_number);
 }
 
 static void process_urc_line(const std::string& raw)

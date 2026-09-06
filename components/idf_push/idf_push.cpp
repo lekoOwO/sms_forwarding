@@ -10,6 +10,7 @@
 #include <regex.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <time.h>
@@ -1635,11 +1636,22 @@ static bool low_heap_defer()
     return true;
 }
 
-static bool channel_waits_for_time(const IdfPushChannel& channel)
+static bool channel_waits_for_time(const IdfPushChannel& channel, IdfPushNetworkDecision network)
 {
-    return !channel.key1.empty() &&
-           (channel.type == PUSH_TYPE_DINGTALK || channel.type == PUSH_TYPE_FEISHU) &&
-           time(nullptr) < 1700000000;
+    if (time(nullptr) >= 1700000000 || !channel_valid(channel)) return false;
+    IdfPushCellularTarget target;
+    if (network == IdfPushNetworkDecision::Cellular) {
+        return idf_push_prepare_cellular_target(channel, target);
+    }
+    if (network != IdfPushNetworkDecision::Wifi) return false;
+    if (!channel.key1.empty() &&
+        (channel.type == PUSH_TYPE_DINGTALK || channel.type == PUSH_TYPE_FEISHU)) return true;
+    if (!channel.url.empty()) return strncasecmp(channel.url.c_str(), "https://", 8) == 0;
+    IdfPushChannel defaults;
+    defaults.enabled = true;
+    defaults.cellularEnabled = true;
+    defaults.type = channel.type;
+    return idf_push_prepare_cellular_target(defaults, target);
 }
 
 static void fail_push_job_without_retry(const PushJob& job, const char* reason)
@@ -1694,7 +1706,7 @@ static bool process_push_one()
         if (!s_push_jobs[i].used || s_push_jobs[i].nextUs > now) continue;
         if (channel_cooling(s_push_jobs[i].channel, now)) continue;
         const IdfPushChannel& channel = cfg.pushChannels[s_push_jobs[i].channel];
-        if (channel_valid(channel) && channel_waits_for_time(channel)) {
+        if (channel_waits_for_time(channel, network)) {
             s_push_jobs[i].nextUs = now + 5000000LL;
             continue;
         }
@@ -1790,7 +1802,7 @@ static bool process_email_one()
         }
         return false;
     }
-    if (low_heap_defer()) return false;
+    if (time(nullptr) < 1700000000 || low_heap_defer()) return false;
 
     int picked = -1;
     EmailJob job;
@@ -1931,7 +1943,7 @@ static bool process_test_one()
     if (!s_mutex || xSemaphoreTake(s_mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
     for (uint8_t i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
         if (!s_test_jobs[i].pending || s_test_jobs[i].nextUs > now) continue;
-        if (channel_waits_for_time(cfg.pushChannels[i])) {
+        if (channel_waits_for_time(cfg.pushChannels[i], network)) {
             s_test_jobs[i].nextUs = now + 5000000LL;
             s_test_jobs[i].message = "Waiting for time synchronization before sending the test push";
             continue;

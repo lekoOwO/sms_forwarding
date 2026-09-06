@@ -100,7 +100,8 @@ if [[ "$idf_version" != *"$expected_idf_version"* ]]; then
 fi
 
 refresh_sdkconfig() {
-  if [[ -f "$sdkconfig" ]] && grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' "$sdkconfig"; then
+  if [[ -f "$sdkconfig" ]] && grep -q '^CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y$' "$sdkconfig" \
+    && grep -q '^CONFIG_MBEDTLS_HAVE_TIME_DATE=y$' "$sdkconfig"; then
     return
   fi
   echo "Regenerating ${sdkconfig} from ESP-IDF defaults (old file is preserved as .old)" >&2
