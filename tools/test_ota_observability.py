@@ -21,6 +21,19 @@ import device  # noqa: E402
 import usb_recovery  # noqa: E402
 
 
+class _FakeWebStateClient:
+    response = device.WebResponse(200, {"content-type": "application/json"}, b"{}")
+    calls = []
+    credentials = None
+
+    def __init__(self, host, user, password):
+        type(self).credentials = (host, user, password)
+
+    def request(self, method, path, **kwargs):
+        type(self).calls.append((method, path, kwargs))
+        return type(self).response
+
+
 class OtaFlashProfileTest(unittest.TestCase):
     def test_ota_test_image_requires_verified_profile_cache(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -182,6 +195,91 @@ class OtaStateProtocolTest(unittest.TestCase):
             "public_key_sha256": fingerprint,
         })
         self.assertFalse(result["pending_verify"])
+
+
+class OtaWebStateTest(unittest.TestCase):
+    def setUp(self):
+        _FakeWebStateClient.calls = []
+        _FakeWebStateClient.credentials = None
+        _FakeWebStateClient.response = device.WebResponse(
+            200, {"content-type": "application/json"}, json.dumps({
+                "activeOffset": usb_recovery.APP1_OFFSET,
+                "imageState": "valid",
+                "pendingVerify": False,
+                "accepted": 11,
+                "pending": 0,
+                "pendingAddress": 0,
+                "publicKeySha256": "a" * 64,
+            }).encode("ascii"),
+        )
+
+    def test_ota_state_web_mode_is_bounded_get_without_csrf_and_matches_usb_shape(self):
+        output = io.StringIO()
+        with mock.patch.object(device, "WebClient", _FakeWebStateClient), \
+                mock.patch.dict(os.environ, {"SMS_WEB_PASSWORD": "web-secret"}, clear=True), \
+                contextlib.redirect_stdout(output):
+            result = device.main([
+                "ota-state", "--host", "http://operator.example", "--user", "alice",
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {
+            "accepted": 11,
+            "active_offset": usb_recovery.APP1_OFFSET,
+            "image_state": "valid",
+            "pending": 0,
+            "pending_address": 0,
+            "pending_verify": False,
+            "public_key_sha256": "a" * 64,
+        })
+        self.assertEqual(_FakeWebStateClient.credentials, (
+            "http://operator.example", "alice", "web-secret",
+        ))
+        self.assertEqual(len(_FakeWebStateClient.calls), 1)
+        method, path, kwargs = _FakeWebStateClient.calls[0]
+        self.assertEqual((method, path), ("GET", "/api/ota/state"))
+        self.assertLessEqual(kwargs["max_bytes"], 1024)
+        self.assertIsNone(kwargs.get("headers"))
+        self.assertNotIn("web-secret", output.getvalue())
+
+    def test_ota_state_web_mode_is_mutually_exclusive_with_usb_and_masks_errors(self):
+        output = io.StringIO()
+        error = io.StringIO()
+        with mock.patch.object(device, "WebClient", side_effect=AssertionError("network")), \
+                mock.patch.object(device, "resolve_serial_device", side_effect=AssertionError("usb")), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            result = device.main([
+                "ota-state", "--host", "http://operator.example",
+                "--device", "/dev/serial/by-id/private-device",
+            ])
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue().strip(), "ota-state Web and USB modes are mutually exclusive")
+        self.assertNotIn("private-device", error.getvalue())
+
+        _FakeWebStateClient.response = device.WebResponse(
+            401, {"content-type": "application/json"},
+            b'{"detail":"password-secret","password":"password-secret"}',
+        )
+        error = io.StringIO()
+        with mock.patch.object(device, "WebClient", _FakeWebStateClient), \
+                mock.patch.dict(os.environ, {"SMS_WEB_PASSWORD": "password-secret"}, clear=True), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            result = device.main(["ota-state", "--host", "http://operator.example"])
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue().strip(), "OTA state returned unexpected HTTP status")
+        self.assertNotIn("password-secret", output.getvalue() + error.getvalue())
+
+        _FakeWebStateClient.response = device.WebResponse(
+            200, {"content-type": "application/json"},
+            b'{"activeOffset":65536,"imageState":"valid","pendingVerify":false}',
+        )
+        error = io.StringIO()
+        with mock.patch.object(device, "WebClient", _FakeWebStateClient), \
+                mock.patch.dict(os.environ, {"SMS_WEB_PASSWORD": "password-secret"}, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(error):
+            result = device.main(["ota-state", "--host", "http://operator.example"])
+        self.assertEqual(result, 1)
+        self.assertEqual(error.getvalue().strip(), "OTA state returned invalid state")
+
 
 
 class OtaFailHealthProfileTest(unittest.TestCase):

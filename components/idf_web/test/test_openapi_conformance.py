@@ -36,6 +36,14 @@ def main() -> None:
     assert set(SPEC["paths"]["/api/ota/finish"]["post"]["responses"]) == {
         "202", "401", "403", "409", "413", "429"
     }
+    ota_state = SPEC["paths"]["/api/ota/state"]
+    assert set(ota_state) == {"get"}
+    assert "parameters" not in ota_state["get"]
+    assert "requestBody" not in ota_state["get"]
+    assert ota_state["get"]["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/OtaState"
+    }
+    assert set(ota_state["get"]["responses"]) == {"200", "400", "401", "405", "413", "500"}
     restart = SPEC["paths"]["/api/device/restart"]
     assert set(restart) == {"post"}
     assert restart["post"]["parameters"] == [{"$ref": "#/components/parameters/CsrfToken"}]
@@ -64,6 +72,7 @@ def main() -> None:
         "GET /api/config/export", "POST /api/config/export",
         "POST /api/config/restore/start", "POST /api/config/restore/chunk",
         "POST /api/config/restore/finish", "GET /api/push/test", "POST /api/push/test",
+        "GET /api/ota/state",
     } <= registered
     assert {"GET /tools", "GET /sms"} <= registered
     csrf_methods = {

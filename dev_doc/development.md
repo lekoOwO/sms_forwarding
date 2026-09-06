@@ -178,6 +178,8 @@ SMS_CONFIG_PASSPHRASE='<local-passphrase>' \
 python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30
 python3 tools/device.py ota-upload /path/to/release.smsota --host 192.168.20.30 \
   --live --confirm-host 192.168.20.30
+SMS_WEB_PASSWORD='<local-secret>' \
+  python3 tools/device.py ota-state --host 192.168.20.30
 ```
 
 `backup-config --dry-run` 只檢查輸出目標。設定備份必須使用不存在的新路徑。
@@ -199,6 +201,9 @@ child environment 不包含 `SMS_CONFIG_PASSPHRASE`、`SMS_WEB_PASSWORD` 或 `NO
 OTA live 會先取得 CSRF token，再以 8,192-byte chunk 上傳並輪詢有界 job。
 只有 terminal `ACTION_OTA_READY` 才算成功。工具不會手動 reset。
 這些命令不會輸出 credential、passphrase、signature、plaintext 或 image body。
+`ota-state --host` 是純唯讀的 authenticated `GET /api/ota/state`，不取得或送出 CSRF token，
+並以與 USB `ota-state` 相同的固定欄位輸出；`--host` 與 `--device` 互斥。
+Web 回應若有未知欄位、未知 slot/state、counter 或 key fingerprint 型別錯誤，工具會停止且不輸出原始回應。
 
 WiFi 配網會送出帶有非敏感 nonce 的版本化非同步請求。USB 先回覆已接受，
 再由單一受控工作執行 NVS 寫入與連線啟動；USB CLI 只送出一次，之後以

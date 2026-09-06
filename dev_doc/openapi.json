@@ -554,6 +554,21 @@
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }],
         "responses": { "202": { "$ref": "#/components/responses/JobAccepted", "description": "Validation is asynchronous; hash, image, metadata, and boot-selection failures are returned by GET /api/jobs." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "description": "The CSRF token is invalid." }, "409": { "description": "The upload session is invalid or incomplete." }, "413": { "description": "The request body is too large." }, "429": { "description": "The bounded job queue is full." } }
       }
+    },
+    "/api/ota/state": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Read non-secret signed OTA state",
+        "description": "Returns the running app slot and image validity, accepted and pending replay metadata, and the SHA-256 identity of the embedded OTA public key. The route is read-only, requires Basic Auth, does not require CSRF, rejects a non-empty request body, and never returns firmware, NVS contents, credentials, or private key material.",
+        "responses": {
+          "200": { "description": "The bounded OTA state snapshot.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OtaState" } } } },
+          "400": { "description": "The GET request included a body.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "500": { "description": "The running image or OTA metadata could not be read.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } }
+        }
+      }
     }
   },
   "components": {
@@ -731,6 +746,7 @@
 			  "ACTION_OTA_SESSION_INVALID",
 			  "ACTION_OTA_SIGNATURE_INVALID",
 			  "ACTION_OTA_WRITE_FAILED",
+			  "ACTION_OTA_STATE_UNAVAILABLE",
 			  "ACTION_TOO_MANY_FIELDS"
             ]
           },
@@ -801,6 +817,20 @@
           },
           "configured": { "type": "boolean" },
           "sha256": { "type": "string", "pattern": "^(?:|[0-9a-f]{64})$" }
+        }
+      },
+      "OtaState": {
+        "type": "object",
+        "required": ["activeOffset", "imageState", "pendingVerify", "accepted", "pending", "pendingAddress", "publicKeySha256"],
+        "additionalProperties": false,
+        "properties": {
+          "activeOffset": { "type": "integer", "enum": [65536, 2031616] },
+          "imageState": { "type": "string", "enum": ["other", "pending-verify", "valid"] },
+          "pendingVerify": { "type": "boolean" },
+          "accepted": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "pending": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "pendingAddress": { "type": "integer", "enum": [0, 65536, 2031616] },
+          "publicKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
         }
       },
       "EsimAction": {

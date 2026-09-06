@@ -85,7 +85,7 @@ WEB_ACTION_CODES = frozenset((
 ))
 WEB_REQUEST_STAGES = frozenset((
     "Web request", "config snapshot", "config export", "OTA start", "OTA chunk",
-    "OTA finish", "job status", "configuration download",
+    "OTA finish", "OTA state", "job status", "configuration download",
 ))
 WEB_REQUEST_TIMEOUT = 10.0
 JOB_TIMEOUT = 45.0
@@ -767,6 +767,62 @@ def _csrf(client: WebClient) -> str:
 def _post_form(client: WebClient, path: str, token: str, values: dict[str, object], stage: str, status: int) -> dict[str, object]:
     encoded = urllib.parse.urlencode({key: str(value) for key, value in values.items()}).encode("ascii")
     return _action(client.request("POST", path, body=encoded, headers={"X-CSRF-Token": token, "Content-Type": "application/x-www-form-urlencoded"}, max_bytes=4096, stage=stage), stage, status)
+
+
+def _parse_web_ota_state(response: WebResponse) -> dict[str, object]:
+    value = _json_object(response, "OTA state", 200)
+    if set(value) != {
+        "activeOffset", "imageState", "pendingVerify", "accepted",
+        "pending", "pendingAddress", "publicKeySha256",
+    }:
+        raise DeviceTransferError("OTA state returned invalid state")
+    active_offset = value["activeOffset"]
+    image_state = value["imageState"]
+    pending_verify = value["pendingVerify"]
+    accepted = value["accepted"]
+    pending = value["pending"]
+    pending_address = value["pendingAddress"]
+    public_key_sha256 = value["publicKeySha256"]
+    if (
+        not isinstance(active_offset, int) or isinstance(active_offset, bool)
+        or active_offset not in APP_SLOT_OFFSETS.values()
+        or not isinstance(image_state, str)
+        or image_state not in {"other", "pending-verify", "valid"}
+        or not isinstance(pending_verify, bool)
+        or pending_verify != (image_state == "pending-verify")
+        or not all(
+            isinstance(counter, int) and not isinstance(counter, bool)
+            and 0 <= counter <= 0xFFFFFFFF
+            for counter in (accepted, pending)
+        )
+        or not isinstance(pending_address, int)
+        or isinstance(pending_address, bool)
+        or pending_address not in {0, *APP_SLOT_OFFSETS.values()}
+        or not isinstance(public_key_sha256, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", public_key_sha256)
+    ):
+        raise DeviceTransferError("OTA state returned invalid state")
+    return {
+        "accepted": accepted,
+        "active_offset": active_offset,
+        "image_state": image_state,
+        "pending": pending,
+        "pending_address": pending_address,
+        "pending_verify": pending_verify,
+        "public_key_sha256": public_key_sha256,
+    }
+
+
+def _ota_state_web_command(args: argparse.Namespace) -> int:
+    if args.device is not None:
+        raise DeviceTransferError("ota-state Web and USB modes are mutually exclusive")
+    password = _read_secret("SMS_WEB_PASSWORD", args.password_file, "password file")
+    client = WebClient(args.host, args.user, password)
+    state = _parse_web_ota_state(
+        client.request("GET", "/api/ota/state", max_bytes=1024, stage="OTA state")
+    )
+    print(json.dumps(state, sort_keys=True))
+    return 0
 
 
 def _job(client: WebClient, job_id: int, token: str, timeout: float | None = None) -> dict[str, object]:
@@ -3010,7 +3066,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = commands.add_parser("doctor", help="check read-only host device readiness")
 
-    commands.add_parser("ota-state", help="read safe signed OTA state")
+    ota_state = commands.add_parser("ota-state", help="read safe signed OTA state")
+    ota_state.add_argument(
+        "--host", default=None,
+        help="read the authenticated Web OTA state route instead of USB",
+    )
+    ota_state.add_argument("--user", default=DEFAULT_WEB_USER)
+    ota_state.add_argument("--password-file", default=None)
 
     diag = commands.add_parser("diag", help="run fixed read-only modem diagnostics")
     diag.add_argument("query_name", nargs="?", choices=(*QUERY_NAMES, "all"))
@@ -3115,6 +3177,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(state, sort_keys=True))
             return 0
         if args.command == "ota-state":
+            if args.host is not None:
+                return _ota_state_web_command(args)
             deadline = time.monotonic() + CONTAINER_LIFECYCLE_TIMEOUT
             state = _ota_state(resolve_serial_device(args.device), deadline=deadline)
             print(json.dumps(state, sort_keys=True))

@@ -956,6 +956,7 @@ int main() {
     assert "colon == decoded_text" in source
     assert 'register_handler(s_server, "/api/config", HTTP_GET, handle_api_config)' in source
     assert 'register_handler(s_server, "/api/esim", HTTP_ANY, handle_api_esim)' in source
+    assert 'register_handler(s_server, "/api/ota/state", HTTP_GET, handle_ota_state)' in source
     assert 'register_handler(s_server, "/query", HTTP_GET, handle_query)' in source
     assert 'register_handler(s_server, "/tools", HTTP_GET, handle_root)' in source
     assert 'register_handler(s_server, "/sms", HTTP_GET, handle_root)' in source
@@ -974,7 +975,7 @@ int main() {
         "/wifiscan", "/wificonfig", "/apstatus", "/log", "/at", "/ping", "/flight",
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
-        "/api/ota/chunk", "/api/ota/finish", "/api/push/test", "/api/device/restart", "/*",
+        "/api/ota/chunk", "/api/ota/finish", "/api/ota/state", "/api/push/test", "/api/device/restart", "/*",
         "/api/push/ca/probe", "/api/push/ca/install", "/api/push/ca/status",
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
@@ -1072,6 +1073,25 @@ int main() {
     ):
         body = function_body(source, handler)
         assert body.index("check_auth(req)") < body.index("check_csrf(req)")
+    ota_state = function_body(source, "handle_ota_state")
+    assert ota_state.index("reject_oversized_body(req)") < ota_state.index("check_auth(req)")
+    assert "check_csrf(req)" not in ota_state
+    assert ota_state.index("check_auth(req)") < ota_state.index("req->content_len != 0")
+    assert "idf_web_ota_get_state(&state)" in ota_state
+    assert "idf_web_ota_get_public_key_sha256(public_key_sha256)" in ota_state
+    assert "state.active_offset != 0x10000U && state.active_offset != 0x1F0000U" in ota_state
+    for offset_check in (
+        "state.pending_address != 0",
+        "state.pending_address != 0x10000U",
+        "state.pending_address != 0x1F0000U",
+    ):
+        assert offset_check in ota_state
+    assert "state.pending_verify != (state.image_state == IdfWebOtaImageState::PendingVerify)" in ota_state
+    for field in (
+        "activeOffset", "imageState", "pendingVerify", "accepted",
+        "pending", "pendingAddress", "publicKeySha256",
+    ):
+        assert f'\\"{field}\\"' in ota_state
     assert "crypto_job ? 8192 : 6144" in source
     assert "uxTaskGetStackHighWaterMark(nullptr)" in source
     assert "uint8_t chunk[8192]" not in source

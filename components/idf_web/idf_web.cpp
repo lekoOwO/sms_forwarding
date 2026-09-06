@@ -2112,6 +2112,69 @@ static esp_err_t send_ota_result(httpd_req_t* req, const char* status, bool succ
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+static esp_err_t send_ota_state_error(httpd_req_t* req, const char* status,
+                                      const char* code, const char* detail)
+{
+    set_json_no_cache(req);
+    httpd_resp_set_status(req, status);
+    const std::string body = action_result(false, code, {}, detail ? detail : "");
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static const char* ota_image_state_name(IdfWebOtaImageState state)
+{
+    switch (state) {
+        case IdfWebOtaImageState::PendingVerify: return "pending-verify";
+        case IdfWebOtaImageState::Valid: return "valid";
+        default: return "other";
+    }
+}
+
+static esp_err_t handle_ota_state(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth(req)) return ESP_OK;
+    if (req->method != HTTP_GET) {
+        set_json_no_cache(req);
+        httpd_resp_set_status(req, "405 Method Not Allowed");
+        httpd_resp_set_hdr(req, "Allow", "GET");
+        const std::string body = action_result(false, "ACTION_INPUT_INVALID", {}, "method");
+        return httpd_resp_send(req, body.c_str(), body.size());
+    }
+    if (req->content_len != 0) {
+        return send_ota_state_error(req, "400 Bad Request", "ACTION_INPUT_INVALID", "body");
+    }
+
+    IdfWebOtaState state;
+    if (idf_web_ota_get_state(&state) != ESP_OK) {
+        return send_ota_state_error(req, "500 Internal Server Error", "ACTION_OTA_STATE_UNAVAILABLE", "");
+    }
+    if ((state.active_offset != 0x10000U && state.active_offset != 0x1F0000U) ||
+        (state.pending_address != 0 && state.pending_address != 0x10000U &&
+         state.pending_address != 0x1F0000U) ||
+        state.pending_verify != (state.image_state == IdfWebOtaImageState::PendingVerify)) {
+        return send_ota_state_error(req, "500 Internal Server Error", "ACTION_OTA_STATE_UNAVAILABLE", "metadata");
+    }
+    uint8_t public_key_sha256[32] = {};
+    if (idf_web_ota_get_public_key_sha256(public_key_sha256) != ESP_OK) {
+        return send_ota_state_error(req, "500 Internal Server Error", "ACTION_OTA_STATE_UNAVAILABLE", "");
+    }
+    std::string body = "{\"activeOffset\":" + std::to_string(state.active_offset) +
+                       ",\"imageState\":\"" + ota_image_state_name(state.image_state) +
+                       "\",\"pendingVerify\":" + (state.pending_verify ? "true" : "false") +
+                       ",\"accepted\":" + std::to_string(state.accepted) +
+                       ",\"pending\":" + std::to_string(state.pending) +
+                       ",\"pendingAddress\":" + std::to_string(state.pending_address) +
+                       ",\"publicKeySha256\":\"" +
+                       hex_bytes(public_key_sha256, sizeof(public_key_sha256)) + "\"}";
+    memset(public_key_sha256, 0, sizeof(public_key_sha256));
+    if (body.size() > 512) {
+        return send_ota_state_error(req, "500 Internal Server Error", "ACTION_OTA_STATE_UNAVAILABLE", "response");
+    }
+    set_json_no_cache(req);
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
 static bool decode_lower_hex_signature(const std::string& text, uint8_t output[72], size_t& size)
 {
     if (text.size() < 16 || text.size() > 144 || (text.size() & 1U)) return false;
@@ -5786,6 +5849,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/ota/start", register_handler(s_server, "/api/ota/start", HTTP_POST, handle_ota_start));
     IDF_WEB_TRY_REGISTER("/api/ota/chunk", register_handler(s_server, "/api/ota/chunk", HTTP_POST, handle_ota_chunk));
     IDF_WEB_TRY_REGISTER("/api/ota/finish", register_handler(s_server, "/api/ota/finish", HTTP_POST, handle_ota_finish));
+    IDF_WEB_TRY_REGISTER("/api/ota/state", register_handler(s_server, "/api/ota/state", HTTP_GET, handle_ota_state));
     IDF_WEB_TRY_REGISTER("/api/device/restart", register_handler(s_server, "/api/device/restart", HTTP_ANY, handle_reboot));
     IDF_WEB_TRY_REGISTER("/api/push/test", register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push));
     IDF_WEB_TRY_REGISTER("/api/push/ca/probe", register_handler(s_server, "/api/push/ca/probe", HTTP_ANY, handle_push_ca_probe));
