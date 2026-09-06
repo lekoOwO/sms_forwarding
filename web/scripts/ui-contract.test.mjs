@@ -265,6 +265,44 @@ test("user-facing copy omits internal opaque-handle and modem implementation wor
 	}
 });
 
+test("network mode copy describes per-channel cellular eligibility", () => {
+	const requiredTerms = new Map([
+		["en", [/4G delivery.*enabled/i, /WiFi only/i, /roaming/i]],
+		["zh-CN", [/启用 4G 传送/, /仅使用 WiFi/, /漫游/]],
+		["zh-TW", [/啟用 4G 傳送/, /僅使用 WiFi/, /漫遊/]]
+	]);
+	for (const [locale, messages] of localeSources) {
+		assert.doesNotMatch(messages.networkModeWarningDescription, /GET.*(?:only|僅|只能).*WiFi/i, locale);
+		assert.doesNotMatch(messages.networkModeWarningDescription, /ntfy.*(?:only|僅|只能).*WiFi/i, locale);
+		for (const term of requiredTerms.get(locale)) assert.match(messages.networkModeWarningDescription, term, locale);
+	}
+});
+
+test("demo cellular GET push follows the configured cellular path", async () => {
+	await withDemoApi(async (api) => {
+		const saved = await api.postForm("/save", {
+			networkMode: 1,
+			push0en: true,
+			push0type: 3,
+			push0name: "Cellular GET",
+			push0url: "https://get.example/notify"
+		});
+		assert.equal(saved.success, true);
+		const notReady = await api.runPushTest(0);
+		assert.deepEqual([notReady.done, notReady.success, notReady.message], [true, false, "Secure certificate setup is incomplete; test push was not queued"]);
+		assert.equal((await api.provisionPushCa(0)).success, true);
+		const snapshot = await api.loadSnapshot();
+		assert.equal(snapshot.config.networkMode, 1);
+		assert.equal(snapshot.config.pushChannels[0].type, 3);
+		assert.equal(snapshot.config.pushChannels[0].cellularEnabled, true);
+		const status = await api.runPushTest(0);
+		assert.deepEqual([status.done, status.success, status.message], [true, true, "Test push sent"]);
+		await api.postForm("/save", { push0en: true, push0cellularEnabled: "0" });
+		const disabled = await api.runPushTest(0);
+		assert.deepEqual([disabled.done, disabled.success, disabled.message], [true, false, "4G delivery is disabled for this channel; test push was not queued"]);
+	});
+});
+
 test("device workspace uses four canonical deep-link subpages with safe fallback", async () => {
 	const navigation = await import("../src/lib/device-navigation.js");
 	assert.deepEqual(navigation.parseDeviceHash(""), {

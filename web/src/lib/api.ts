@@ -281,8 +281,9 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 			const complete = (["url", "key1", "key2", "customBody"] as const)
 				.every((field) => !pushSecretRequired(configured, field));
 			const message = !demoConfig.pushEnabled ? "Push is disabled; test push is unavailable"
-				: demoConfig.networkMode === 1 ? "Cellular push is not supported; test was not queued"
 				: !configured.enabled || !complete ? "Channel is disabled or incomplete; save its configuration first"
+				: demoConfig.networkMode === 1 && !configured.cellularEnabled ? "4G delivery is disabled for this channel; test push was not queued"
+				: demoConfig.networkMode === 1 && !demoPushCa[channel].configured ? "Secure certificate setup is incomplete; test push was not queued"
 				: "Test push sent";
 			demoPushTests[channel] = {
 				queued: false, running: false, done: true,
