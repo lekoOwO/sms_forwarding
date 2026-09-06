@@ -293,6 +293,30 @@ raw modem、電話、SSID、IMEI、EID、ICCID、憑證或其他設定內容。c
 `response_invalid/modem_read` 與 counter44 的 HTTP 200 是兩筆不同輸入的觀察；前者
 仍不能推論 parser bug，後者也不保證其他 provider、網路條件或 modem variant。
 
+## Counter45 rollout evidence
+
+這是一筆單次、去識別化的 counter45 TEST-key OTA 觀察，來源是 current HEAD
+`d4ba19f`。該 HEAD 同時修正 ServerChan cellular inherited endpoint 與 demo
+`smtpPort` numeric persistence。
+
+| 項目 | 值 |
+| --- | --- |
+| manifest | format 1；target `esp32c3`；counter 45；version `1.1.4-dev-test` |
+| package bytes/SHA-256 | `1542303` / `715ff60b7574ae8b914a00b085189232706858210ddeeaf00c4357d17d4322ad` |
+| image bytes/SHA-256 | `1542048` / `f24af3441271d6011760a99235fc30fb79b184153093ce73e8b4698b2d1ef462` |
+| TEST key | recovered key matched before upload and remained unchanged after boot |
+| root gzip asset | exact current `WEB_INDEX_DATA` match；`162111` bytes；SHA-256 `d6821d00edf3397c3824afbd011eb587985902ab4ec77c2f49ce749d37e07e90` |
+
+authenticated Web OTA was sent exactly once from app1 to app0 and returned
+`ACTION_OTA_READY`. Final authenticated Web state was app0 `valid`, accepted counter
+45, pending 0, pending address 0, and unchanged TEST key identity. The sanitized config
+gates remained network mode 0, AP mode false, and modem ready. No upload retry, reset,
+config write, or push test was performed. No USB cross-check was available, so this record makes
+no USB state claim.
+
+This section does not preserve or restate an IP address, credential, provider URL, key
+material, token, device identifier, raw response, raw modem line, or raw configuration.
+
 ## Encrypted backup evidence
 
 OTA 前完成一次 encrypted configuration backup export；只記錄 artifact metadata：
