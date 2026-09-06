@@ -917,12 +917,15 @@
       "PushTestParseShape": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Bounded parser structure with no response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; lineClass distinguishes missing, unexpected, duplicate, and extra lines; singleFieldClass is classified only for one CSV field.",
-        "required": ["fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"],
+        "description": "Bounded parser structural metadata with no payload or raw response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; responseTraceMask bits are echo=1, OK=2, valid rtcp=4, MIPRD prefix=8, valid disconnect=16, OK-before-rtcp=32, and rtcp-before-OK=64; rtcp lengths are bounded to 65536 and meaningful only when valid rtcp is present; lineClass distinguishes missing, unexpected, duplicate, and extra lines; singleFieldClass is classified only for one CSV field.",
+        "required": ["fieldCount", "quoteMask", "presenceMask", "responseTraceMask", "rtcpRecvLength", "rtcpTotalLength", "stateClass", "lineClass", "singleFieldClass"],
         "properties": {
           "fieldCount": { "type": "integer", "minimum": 0, "maximum": 8 },
           "quoteMask": { "type": "integer", "minimum": 0, "maximum": 255 },
           "presenceMask": { "type": "integer", "minimum": 0, "maximum": 31 },
+          "responseTraceMask": { "type": "integer", "minimum": 0, "maximum": 127 },
+          "rtcpRecvLength": { "type": "integer", "minimum": 0, "maximum": 65536 },
+          "rtcpTotalLength": { "type": "integer", "minimum": 0, "maximum": 65536 },
           "stateClass": {
             "type": "string",
             "enum": ["none", "initial", "closed", "connected", "connecting", "unknown"]

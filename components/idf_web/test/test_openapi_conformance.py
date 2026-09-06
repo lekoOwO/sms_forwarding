@@ -177,12 +177,15 @@ def main() -> None:
     assert parse_shape["additionalProperties"] is False
     assert set(parse_shape["required"]) == {
         "fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass",
-        "singleFieldClass",
+        "singleFieldClass", "responseTraceMask", "rtcpRecvLength", "rtcpTotalLength",
     }
     assert parse_shape["properties"] == {
         "fieldCount": {"type": "integer", "minimum": 0, "maximum": 8},
         "quoteMask": {"type": "integer", "minimum": 0, "maximum": 255},
         "presenceMask": {"type": "integer", "minimum": 0, "maximum": 31},
+        "responseTraceMask": {"type": "integer", "minimum": 0, "maximum": 127},
+        "rtcpRecvLength": {"type": "integer", "minimum": 0, "maximum": 65536},
+        "rtcpTotalLength": {"type": "integer", "minimum": 0, "maximum": 65536},
         "stateClass": {
             "type": "string",
             "enum": ["none", "initial", "closed", "connected", "connecting", "unknown"],

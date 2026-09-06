@@ -220,8 +220,13 @@ static bool parse_shape_valid(const IdfModemHttpsParseShape& shape)
 {
     const bool single_field_class_present =
         shape.singleFieldClass != IdfModemHttpsParseSingleFieldClass::none;
+    const bool rtcp_seen = (shape.responseTraceMask & (1U << 2)) != 0;
     return shape.available && shape.fieldCount <= 8 &&
            (shape.presenceMask & static_cast<uint8_t>(~IdfModemHttpsParsePresence::all)) == 0 &&
+           shape.responseTraceMask <= 127 && shape.rtcpRecvLength <= 65536 &&
+           shape.rtcpTotalLength <= 65536 &&
+           (rtcp_seen || (shape.rtcpRecvLength == 0 && shape.rtcpTotalLength == 0)) &&
+           (!rtcp_seen || shape.rtcpRecvLength <= shape.rtcpTotalLength) &&
            !idf_modem_https_parse_state_class_name(shape.stateClass).empty() &&
            !idf_modem_https_parse_line_class_name(shape.lineClass).empty() &&
            !idf_modem_https_parse_single_field_class_name(shape.singleFieldClass).empty() &&
@@ -241,6 +246,12 @@ static void append_parse_shape(std::string& out, const char* key,
     out += std::to_string(shape.quoteMask);
     out += ",\"presenceMask\":";
     out += std::to_string(shape.presenceMask);
+    out += ",\"responseTraceMask\":";
+    out += std::to_string(shape.responseTraceMask);
+    out += ",\"rtcpRecvLength\":";
+    out += std::to_string(shape.rtcpRecvLength);
+    out += ",\"rtcpTotalLength\":";
+    out += std::to_string(shape.rtcpTotalLength);
     out += ",\"stateClass\":\"";
     out += idf_modem_https_parse_state_class_name(shape.stateClass);
     out += "\",\"lineClass\":\"";

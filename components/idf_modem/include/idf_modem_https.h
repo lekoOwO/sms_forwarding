@@ -191,16 +191,23 @@ struct IdfModemHttpsParsePresence {
     static constexpr uint8_t all = mipstate | mipopen | mipclose | mipurc | other;
 };
 
-// A fixed snapshot of parser structure.  It contains no response values.
+// A fixed snapshot of parser structure. It contains no payload or raw response
+// values; rtcp lengths are bounded structural metadata only.
 // fieldCount is zero when no CSV line was inspected and eight means eight or
 // more fields.  quoteMask bits 0..7 indicate quoted CSV fields in that line;
-// presenceMask uses the constants above.  The availability flag is internal
-// and is never serialized.
+// presenceMask uses the constants above. responseTraceMask uses bits 0..6 for
+// command echo, OK, valid rtcp, MIPRD prefix, valid disconnect, OK-before-rtcp,
+// and rtcp-before-OK. rtcp lengths are bounded to 65536 and are meaningful
+// only when the valid-rtcp bit is set. The availability flag is internal and
+// is never serialized.
 struct IdfModemHttpsParseShape {
     bool available;
     uint8_t fieldCount;
     uint8_t quoteMask;
     uint8_t presenceMask;
+    uint32_t responseTraceMask;
+    uint32_t rtcpRecvLength;
+    uint32_t rtcpTotalLength;
     IdfModemHttpsParseStateClass stateClass;
     IdfModemHttpsParseLineClass lineClass;
     IdfModemHttpsParseSingleFieldClass singleFieldClass;

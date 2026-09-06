@@ -120,9 +120,13 @@ int main() {
     primary_reason.failureParseShape.fieldCount = 5;
     primary_reason.failureParseShape.presenceMask = IdfModemHttpsParsePresence::mipstate;
     primary_reason.failureParseShape.stateClass = IdfModemHttpsParseStateClass::unknown;
+    primary_reason.failureParseShape.responseTraceMask = (1U << 0) | (1U << 1);
     const std::string primary_shape_json = idf_push_serialize_test_status(primary_reason, true);
     assert(primary_shape_json.find("\"failureParseShape\":") != std::string::npos);
     assert(primary_shape_json.find("\"stateClass\":\"unknown\"") != std::string::npos);
+    assert(primary_shape_json.find("\"responseTraceMask\":3") != std::string::npos);
+    assert(primary_shape_json.find("\"rtcpRecvLength\":0") != std::string::npos);
+    assert(primary_shape_json.find("\"rtcpTotalLength\":0") != std::string::npos);
     assert(primary_shape_json.find("\"singleFieldClass\":\"none\"") != std::string::npos);
     primary_reason.failureParseShape.singleFieldClass =
         IdfModemHttpsParseSingleFieldClass::nonzero;

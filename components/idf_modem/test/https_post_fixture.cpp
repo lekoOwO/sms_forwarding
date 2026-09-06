@@ -529,6 +529,52 @@ void check_parse_read_reasons()
              ParseReason::prefix, IdfModemHttpsParseLineClass::missing);
     rejected("+MIPURC: \"rtcp\",0,0,0", ParseReason::prefix,
              IdfModemHttpsParseLineClass::missing);
+
+    const std::string ok_then_rtcp = "\r\n" + read_command +
+                                     "\r\nOK\r\n+MIPURC: \"rtcp\",0,0,0\r\n";
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    no_data = true;
+    assert(!parse_read(ok_then_rtcp, read_command, 0, unread, data, remote_closed,
+                       &reason, &shape, &no_data));
+    assert(reason == ParseReason::prefix &&
+           shape.responseTraceMask == ((1U << 0) | (1U << 1) | (1U << 2) | (1U << 5)) &&
+           shape.rtcpRecvLength == 0 && shape.rtcpTotalLength == 0);
+
+    const std::string rtcp_then_ok = "\r\n" + read_command +
+                                     "\r\n+MIPURC: \"rtcp\",0,0,0\r\nOK\r\n";
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    no_data = true;
+    assert(!parse_read(rtcp_then_ok, read_command, 0, unread, data, remote_closed,
+                       &reason, &shape, &no_data));
+    assert(reason == ParseReason::prefix &&
+           shape.responseTraceMask == ((1U << 0) | (1U << 1) | (1U << 2) | (1U << 6)) &&
+           shape.rtcpRecvLength == 0 && shape.rtcpTotalLength == 0);
+
+    reason = ParseReason::none;
+    shape = {};
+    unread = 123;
+    data = {0xbe, 0xef};
+    remote_closed = true;
+    no_data = true;
+    assert(parse_read(frame(read_command,
+                            "+MIPURC: \"rtcp\",0,3,3\r\n"
+                            "+MIPRD: 0,0,3,414243"),
+                      read_command, 0, unread, data, remote_closed, &reason, &shape,
+                      &no_data));
+    assert(reason == ParseReason::none && unread == 0 &&
+           data == std::vector<uint8_t>({'A', 'B', 'C'}) && !remote_closed && !no_data &&
+           shape.responseTraceMask == ((1U << 0) | (1U << 1) | (1U << 2) | (1U << 3) |
+                                       (1U << 6)) &&
+           shape.rtcpRecvLength == 3 && shape.rtcpTotalLength == 3);
+
     rejected("+OTHER: 0", ParseReason::prefix, IdfModemHttpsParseLineClass::unexpected);
     rejected("+MIPRD: 0,0,1,41\r\n+MIPRD: 0,0,1,41",
              ParseReason::prefix, IdfModemHttpsParseLineClass::duplicate);

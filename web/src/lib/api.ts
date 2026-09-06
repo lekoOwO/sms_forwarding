@@ -103,10 +103,12 @@ function isPushTestParseShape(value: unknown): value is PushTestParseShape {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const shape = value as Record<string, unknown>;
 	if (Object.keys(shape).some((key) => ![
-		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"
+		"fieldCount", "quoteMask", "presenceMask", "responseTraceMask", "rtcpRecvLength",
+		"rtcpTotalLength", "stateClass", "lineClass", "singleFieldClass"
 	].includes(key))) return false;
 	if (![
-		"fieldCount", "quoteMask", "presenceMask", "stateClass", "lineClass", "singleFieldClass"
+		"fieldCount", "quoteMask", "presenceMask", "responseTraceMask", "rtcpRecvLength",
+		"rtcpTotalLength", "stateClass", "lineClass", "singleFieldClass"
 	].every((key) => Object.hasOwn(shape, key))) return false;
 	return typeof shape.fieldCount === "number" && Number.isInteger(shape.fieldCount) &&
 		shape.fieldCount >= 0 && shape.fieldCount <= 8 &&
@@ -114,6 +116,15 @@ function isPushTestParseShape(value: unknown): value is PushTestParseShape {
 		shape.quoteMask >= 0 && shape.quoteMask <= 255 &&
 		typeof shape.presenceMask === "number" && Number.isInteger(shape.presenceMask) &&
 		shape.presenceMask >= 0 && shape.presenceMask <= 31 &&
+		typeof shape.responseTraceMask === "number" && Number.isInteger(shape.responseTraceMask) &&
+		shape.responseTraceMask >= 0 && shape.responseTraceMask <= 127 &&
+		typeof shape.rtcpRecvLength === "number" && Number.isInteger(shape.rtcpRecvLength) &&
+		shape.rtcpRecvLength >= 0 && shape.rtcpRecvLength <= 65536 &&
+		typeof shape.rtcpTotalLength === "number" && Number.isInteger(shape.rtcpTotalLength) &&
+		shape.rtcpTotalLength >= 0 && shape.rtcpTotalLength <= 65536 &&
+		((shape.responseTraceMask & (1 << 2)) !== 0
+			? shape.rtcpRecvLength <= shape.rtcpTotalLength
+			: shape.rtcpRecvLength === 0 && shape.rtcpTotalLength === 0) &&
 		typeof shape.stateClass === "string" &&
 		pushTestParseStateClasses.includes(shape.stateClass as PushTestParseShape["stateClass"]) &&
 		typeof shape.lineClass === "string" &&

@@ -211,11 +211,13 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			failureParseReason: "field_count", cleanupReason: "response_invalid",
 			cleanupParseReason: "quote",
 			failureParseShape: {
-				fieldCount: 5, quoteMask: 16, presenceMask: 1,
+				fieldCount: 5, quoteMask: 16, presenceMask: 1, responseTraceMask: 3,
+				rtcpRecvLength: 0, rtcpTotalLength: 0,
 				stateClass: "connecting", lineClass: "none", singleFieldClass: "none"
 			},
 			cleanupParseShape: {
-				fieldCount: 0, quoteMask: 0, presenceMask: 4,
+				fieldCount: 0, quoteMask: 0, presenceMask: 4, responseTraceMask: 3,
+				rtcpRecvLength: 0, rtcpTotalLength: 0,
 				stateClass: "none", lineClass: "missing", singleFieldClass: "none"
 			}
 		};
@@ -233,7 +235,8 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			...responseInvalid,
 			failureParseReason: "read_data",
 			failureParseShape: {
-				fieldCount: 4, quoteMask: 0, presenceMask: 16,
+				fieldCount: 4, quoteMask: 0, presenceMask: 16, responseTraceMask: 3,
+				rtcpRecvLength: 0, rtcpTotalLength: 0,
 				stateClass: "none", lineClass: "none", singleFieldClass: "none"
 			}
 		};
@@ -244,6 +247,21 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 		const readData = await api.runPushTest(0, undefined, 1000);
 		assert.equal(readData.failureParseReason, "read_data");
 		assert.equal(readData.failureParseShape.fieldCount, 4);
+		const telemetryResponse = {
+			...responseInvalid,
+			failureParseShape: {
+				...responseInvalid.failureParseShape,
+				responseTraceMask: 0x67, rtcpRecvLength: 3, rtcpTotalLength: 3
+			}
+		};
+		globalThis.fetch = async (path) => new Response(JSON.stringify(
+			path === "/api/config" ? { csrfToken: "csrf" } : telemetryResponse
+		), { status: 200, headers: { "Content-Type": "application/json" } });
+		await api.loadSnapshot();
+		const telemetry = await api.runPushTest(0, undefined, 1000);
+		assert.equal(telemetry.failureParseShape.responseTraceMask, 0x67);
+		assert.equal(telemetry.failureParseShape.rtcpRecvLength, 3);
+		assert.equal(telemetry.failureParseShape.rtcpTotalLength, 3);
 		const responseRead = {
 			...responseInvalid,
 			transportPath: "cellular", dispatchAttempted: true, failureStage: "response",
@@ -271,6 +289,7 @@ test("push test validator keeps cleanup reasons disjoint from primary reasons", 
 			const singleFieldResponse = {
 				...responseInvalid,
 				failureParseShape: { fieldCount: 1, quoteMask: 0, presenceMask: 4,
+					responseTraceMask: 3, rtcpRecvLength: 0, rtcpTotalLength: 0,
 					stateClass: "none", lineClass: "none", singleFieldClass }
 			};
 			globalThis.fetch = async (path) => new Response(JSON.stringify(

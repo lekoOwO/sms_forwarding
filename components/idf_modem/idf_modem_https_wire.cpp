@@ -11,6 +11,14 @@ namespace {
 using ParseReason = IdfModemHttpsParseReason;
 using ParseShape = IdfModemHttpsParseShape;
 
+constexpr uint32_t kTraceEcho = 1U << 0;
+constexpr uint32_t kTraceOk = 1U << 1;
+constexpr uint32_t kTraceRtcp = 1U << 2;
+constexpr uint32_t kTraceMiprd = 1U << 3;
+constexpr uint32_t kTraceDisconnect = 1U << 4;
+constexpr uint32_t kTraceOkBeforeRtcp = 1U << 5;
+constexpr uint32_t kTraceRtcpBeforeOk = 1U << 6;
+
 void clear_parse_reason(ParseReason* reason)
 {
     if (reason) *reason = ParseReason::none;
@@ -31,6 +39,17 @@ void set_line_class(ParseShape* shape, IdfModemHttpsParseLineClass line)
     if (shape && shape->lineClass == IdfModemHttpsParseLineClass::none) {
         shape->lineClass = line;
     }
+}
+
+void mark_response_trace(ParseShape* shape, uint32_t event)
+{
+    if (!shape) return;
+    if (event == kTraceOk && (shape->responseTraceMask & kTraceRtcp) != 0) {
+        shape->responseTraceMask |= kTraceRtcpBeforeOk;
+    } else if (event == kTraceRtcp && (shape->responseTraceMask & kTraceOk) != 0) {
+        shape->responseTraceMask |= kTraceOkBeforeRtcp;
+    }
+    shape->responseTraceMask |= event;
 }
 
 bool starts_with(std::string_view value, std::string_view prefix)
@@ -230,11 +249,13 @@ bool scan_frame(std::string_view response, std::string_view command,
         if (!line.empty()) {
             if (line == command) {
                 if (command_echo_count && *command_echo_count < 2) ++*command_echo_count;
+                mark_response_trace(shape, kTraceEcho);
             } else if (line == "OK") {
                 if (++terminal_count != 1) {
                     set_parse_reason(reason, ParseReason::terminal);
                     return false;
                 }
+                mark_response_trace(shape, kTraceOk);
             } else if (line == "ERROR" || starts_with(line, "+CME ERROR") ||
                        starts_with(line, "+CMS ERROR")) {
                 return false;
@@ -245,6 +266,17 @@ bool scan_frame(std::string_view response, std::string_view command,
                 if (ignored_auxiliary_seen) *ignored_auxiliary_seen = true;
                 waiting_for_cmt_pdu = false;
             } else if (!is_known_urc(line)) {
+                if (starts_with(line, "+MIPURC:")) {
+                    uint32_t received = 0;
+                    uint32_t total = 0;
+                    uint8_t state = 0;
+                    bool disconnected = false;
+                    if (parse_mip_urc(line, received, total, state, disconnected)) {
+                        mark_response_trace(shape, disconnected ? kTraceDisconnect : kTraceRtcp);
+                    }
+                } else if (starts_with(line, "+MIPRD:")) {
+                    mark_response_trace(shape, kTraceMiprd);
+                }
                 mark_presence(shape, line);
                 body.push_back(line);
                 waiting_for_cmt_pdu = false;
@@ -915,6 +947,7 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
     }
     std::string_view read_line;
     bool saw_remote_closed = false;
+    bool rtcp_lengths_seen = false;
     for (std::string_view line : body) {
         if (starts_with(line, "+MIPURC:")) {
             uint32_t received = 0;
@@ -928,6 +961,11 @@ bool parse_read(std::string_view response, std::string_view command, uint8_t cid
                                          : IdfModemHttpsParseLineClass::unexpected);
                 set_parse_reason(reason, ParseReason::urc);
                 return false;
+            }
+            if (!disconnected && shape && !rtcp_lengths_seen) {
+                shape->rtcpRecvLength = received;
+                shape->rtcpTotalLength = total;
+                rtcp_lengths_seen = true;
             }
             saw_remote_closed = saw_remote_closed || disconnected;
         } else if (starts_with(line, "+MIPRD:") && read_line.empty()) {
