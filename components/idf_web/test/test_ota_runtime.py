@@ -97,6 +97,10 @@ int mbedtls_sha256(const uint8_t* input, size_t input_size,
     return 0;
 }}
 
+bool sha256(const uint8_t* input, size_t input_size, uint8_t output[32]) {{
+    return mbedtls_sha256(input, input_size, output, 0) == 0;
+}}
+
 {decode}
 {fingerprint}
 
@@ -126,8 +130,8 @@ int main() {{
             subprocess.run([str(binary)], check=True)
             if der == fixtures[0][0]:
                 mutation = harness.replace(
-                    "const int hash_error = mbedtls_sha256(key_der, key_size, output, 0);",
-                    "std::memcpy(output, kWrongDigest, 32); const int hash_error = 0;",
+                    "const bool hash_ok = sha256(key_der, key_size, output);",
+                    "std::memcpy(output, kWrongDigest, 32); const bool hash_ok = true;",
                     1,
                 )
                 assert mutation != harness
