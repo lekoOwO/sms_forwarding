@@ -98,7 +98,8 @@ public:
 
     esp_err_t begin(std::string& message)
     {
-        close();
+        if (active_) close();
+        reset_segment_state();
         std::string card_message;
         const esp_err_t error = session_.begin_segment(card_message);
         secure_clear(card_message);
@@ -159,7 +160,7 @@ public:
             return error;
         }
         response = std::move(last_response_);
-        close();
+        reset_segment_state();
         return ESP_OK;
     }
 
@@ -169,11 +170,7 @@ public:
             session_.close();
             session_open_ = false;
         }
-        active_ = false;
-        secure_zero(pending_.data(), pending_.size());
-        pending_size_ = 0U;
-        segment_bytes_ = 0U;
-        block_number_ = 0U;
+        reset_segment_state();
         secure_clear(last_response_);
     }
 
@@ -189,6 +186,15 @@ public:
     std::size_t segment_bytes() const noexcept { return segment_bytes_; }
 
 private:
+    void reset_segment_state() noexcept
+    {
+        active_ = false;
+        secure_zero(pending_.data(), pending_.size());
+        pending_size_ = 0U;
+        segment_bytes_ = 0U;
+        block_number_ = 0U;
+    }
+
     esp_err_t flush(bool last, std::string& message)
     {
         if (pending_size_ == 0U || block_number_ > 0xFFU) {

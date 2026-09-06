@@ -330,6 +330,11 @@ static void reset_bpp(std::string body,
     fake_card = {};
 }
 
+static void assert_session_closed_once()
+{
+    assert(fake_card.close_calls == (fake_card.begin_calls == 0 ? 0 : 1));
+}
+
 static esp_err_t emit(int id, void* data = nullptr, int length = 0,
                       char* key = nullptr, char* value = nullptr)
 {
@@ -795,7 +800,7 @@ static void assert_bpp_rejected(Scenario scenario,
     assert(std::string(idf_lpa_es9_transport_error_name(error)).find("sentinel") ==
            std::string::npos);
     assert(g.close_calls == 1 && g.cleanup_calls == 1);
-    assert(fake_card.close_calls == fake_card.begin_calls);
+    assert_session_closed_once();
 }
 
 static void assert_bpp_pir_alias(std::size_t offset, std::size_t length,
@@ -849,7 +854,7 @@ static void test_bpp_transport()
     assert(g.open_calls == 0 && g.perform_calls == 1 && g.write_calls == 1 &&
            g.read_calls == 0 && g.close_calls == 1 && g.cleanup_calls == 1 &&
            g.body_event_calls > 0 && g.body_event_bytes == body.size() &&
-           fake_card.close_calls == fake_card.begin_calls);
+           fake_card.close_calls == 1);
 
     reset_bpp(body);
     auto consent = expected_metadata();
@@ -857,7 +862,7 @@ static void test_bpp_transport()
     assert(!idf_lpa_es9_get_bound_profile_package("edge.example", R"({"request":true})",
         "001122", consent, pir, message, error));
     assert(error == IdfLpaEs9TransportError::response_body && pir.empty());
-    assert(fake_card.begin_calls == 2 && fake_card.close_calls == 2);
+    assert(fake_card.begin_calls == 2 && fake_card.close_calls == 1);
     reset_bpp(body);
     consent = expected_metadata();
     consent.has_policy_rules = true;
@@ -991,7 +996,7 @@ static void test_bpp_transport()
     assert(message.find("sentinel") == std::string::npos);
     assert(g.perform_calls == 1 && g.body_event_calls > 0 &&
            g.close_body_event_calls == g.body_event_calls &&
-           fake_card.close_calls == fake_card.begin_calls);
+           fake_card.close_calls == 1);
 
     assert_bpp_rejected(Scenario::eof_truncated, body,
                         IdfLpaEs9TransportError::response_body);

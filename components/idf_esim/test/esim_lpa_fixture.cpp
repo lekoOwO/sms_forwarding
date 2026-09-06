@@ -407,6 +407,17 @@ void test_bpp_bounds()
     assert(fake.cchc_calls == 1U);
     assert(fake.owner_begin_calls == 1U && fake.owner_end_calls == 1U);
 
+    reset_fake();
+    IdfEsimLpaBppSession reused;
+    assert(reused.begin_segment(message) == ESP_OK);
+    assert(reused.write_block(block.data(), 120U, true, 0U, response, message) == ESP_OK);
+    assert(reused.begin_segment(message) == ESP_OK);
+    assert(reused.write_block(block.data(), 120U, true, 0U, response, message) == ESP_OK);
+    assert(fake.ccho_calls == 1U && fake.cchc_calls == 0U);
+    reused.close();
+    assert(fake.cchc_calls == 1U);
+    assert(fake.owner_begin_calls == 1U && fake.owner_end_calls == 1U);
+
     for (const ResponseMode mode : {ResponseMode::bad_sw,
                                     ResponseMode::chain_overflow_nonempty,
                                     ResponseMode::get_response_failure}) {

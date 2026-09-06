@@ -556,6 +556,11 @@ static void reset_card()
     fake_card = FakeCardState();
 }
 
+static void assert_session_closed_once()
+{
+    assert(fake_card.close_calls == (fake_card.begin_calls == 0 ? 0 : 1));
+}
+
 static esp_err_t execute(std::string_view json,
                          std::string_view expected_transaction,
                          std::vector<std::uint8_t>& result,
@@ -653,7 +658,7 @@ int main()
         assert(result == std::vector<std::uint8_t>({0x90U, 0x00U}));
         assert(message.empty());
         assert(fake_card.begin_calls != 0);
-        assert(fake_card.close_calls == fake_card.begin_calls);
+        assert_session_closed_once();
         assert(!fake_card.last_flags.empty() && fake_card.last_flags.back());
         for (std::size_t i = 0U; i < fake_card.block_lengths.size(); ++i) {
             assert(fake_card.block_lengths[i] <= IDF_LPA_BPP_BLOCK_BYTES);
@@ -671,7 +676,7 @@ int main()
                        final_response_begin_call) == ESP_OK);
         assert(result == std::vector<std::uint8_t>({0x90U, 0x00U}));
         assert(message.empty());
-        assert(fake_card.close_calls == fake_card.begin_calls);
+        assert_session_closed_once();
     };
 
     // A2 is optional; repeated 88 and 86 children are valid.
@@ -737,7 +742,7 @@ int main()
         assert(error != ESP_OK);
         assert(result.empty());
         assert(message.find("sentinel") == std::string::npos);
-        assert(fake_card.close_calls == fake_card.begin_calls);
+        assert_session_closed_once();
     };
 
     expect_rejected(std::string("{\"boundProfilePackage\":\"") + encoded +
@@ -875,7 +880,7 @@ int main()
     assert(nested_failure.feed(response(malformed_encoded), message) != ESP_OK);
     assert(fake_card.begin_calls != 0);
     const int nested_close_calls = fake_card.close_calls;
-    assert(nested_close_calls == fake_card.begin_calls);
+    assert(nested_close_calls == 1);
     assert(nested_failure.test_cleanup_count() == 1U);
     result = {0xA5U};
     assert(nested_failure.finish(result, message) != ESP_OK);
@@ -912,7 +917,7 @@ int main()
     assert(execute(response(too_many_elements), "001122", result, message, 13U, false, 0, 0) ==
            ESP_ERR_INVALID_SIZE);
     assert(result.empty());
-    assert(fake_card.close_calls == fake_card.begin_calls);
+    assert_session_closed_once();
     assert(fake_card.begin_calls <= 4096);
 
     const std::string too_many_blocks = base64(bpp_with_profile_bytes(30720U));
@@ -921,7 +926,7 @@ int main()
     assert(execute(response(too_many_blocks), "001122", result, message, 31U) ==
            ESP_ERR_INVALID_SIZE);
     assert(result.empty());
-    assert(fake_card.close_calls == fake_card.begin_calls);
+    assert_session_closed_once();
     // The five preceding DER segments are complete; the oversized 86 TLV is
     // rejected from its header before its segment opens or writes a card block.
     assert(fake_card.begin_calls == 5);
@@ -947,7 +952,7 @@ int main()
     assert(result.empty());
     assert(fake_card.begin_calls == 2);
     assert(fake_card.write_calls == 2);
-    assert(fake_card.close_calls == fake_card.begin_calls);
+    assert_session_closed_once();
 
     const std::string oversized_decoded = base64(bpp_with_profile_segments(35U, 30716U));
     result = {0xA5U};
@@ -964,7 +969,7 @@ int main()
     assert(execute(response(oversized_b64), "001122", result, message, 4096U) != ESP_OK);
     assert(result.empty());
     assert(message.find("sentinel") == std::string::npos);
-    assert(fake_card.close_calls == fake_card.begin_calls);
+    assert_session_closed_once();
 
     return 0;
 }
