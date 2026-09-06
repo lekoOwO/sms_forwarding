@@ -475,6 +475,8 @@ cellular GET 僅使用固定 GET method、空 request body，rendered URL 上限
 
 [Counter42 R15](hardware-counter37.md#counter42-r15-successful-cellular-evidence) 記錄一次 cellular HTTP 200 與已確認的 cleanup。
 該次 application-level success 仍為 `unknown`，不能推廣為其他目標或網路條件的成功保證。
+[Counter43](hardware-counter37.md#counter43-reversible-cellular-failure) 記錄一次在收到 HTTP bytes 前的 `response_invalid`/`modem_read`，cleanup clean 且 mode restored。
+[Counter44](hardware-counter37.md#counter44-final-reversible-cellular-gotify-evidence) 記錄一次 Web-only cellular Gotify HTTP 200/provider acceptance 與 mode/config/CA restore。
 下方歷史紀錄各自保留原本的觀察與證據限制。
 
 ### 2026-08-24 ML307A 已註冊紀錄

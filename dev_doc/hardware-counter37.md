@@ -205,6 +205,104 @@ HTTP、raw modem 或設定內容。它證明這一次 counter42 輸入在該硬�
 cellular push 與安全 cleanup；它不保證其他 endpoint、訊息、網路條件或 modem
 variant，也不把 R13/R14 的 parser shape 提升為通用 wire grammar。
 
+## Counter43 reversible cellular failure
+
+這是一筆單次、去識別化的 counter43 硬體觀察。輸入是 TEST-key OTA 後的
+ESP-IDF firmware，暫時選擇 cellular path，對既有 Gotify 通道執行 exactly one
+可逆測試，之後恢復 network mode。板型、exact modem variant、firmware build
+identity、endpoint、provider token 與裝置識別資料不在本節保存。
+
+- transport path `cellular`，dispatch attempted `true`。
+- terminal failure 是 response stage、`failureReason=response_invalid`，且
+  `failureResponseReason=modem_read`；在收到任何 HTTP bytes 前停止，因此沒有
+  HTTP status，也沒有 provider acceptance 證據。
+- cleanup clean；沒有 cleanup failure、沒有 reset required，最後 network mode
+  恢復為 0。這筆失敗不能判定 provider 收到通知，也不能推論 modem wire grammar。
+
+本節不保存或重述 raw response、payload、raw modem line、URL、host、token、CA
+內容、時間序列或設定內容。
+
+## Official manual evidence boundary
+
+本次查閱的 [OneMO TCP/IP User Manual V5.0.0](https://github.com/RomaWan/ML307/blob/main/14_TCP_IP%E7%94%A8%E6%88%B6%E6%89%8B%E5%86%8A_V5.0.0.pdf)
+官方手冊材料只足以保留兩個窄邊界：MIPRD 的 documented no-data 結果是 terminal
+`OK`（§3.6，pp.29–30），而 `+MIPURC: "rtcp"` 是 asynchronous indication
+（§3.14，pp.47–48）；§3.3 與 §4.4 也只作為 command/流程背景。
+材料沒有證明 ML307Y 的 zero-length frame、`OK` 與 `rtcp` 的先後順序，亦沒有提供
+本專案可重現的 wire fixture。因此目前 parser 仍對未知與不完整 frame fail closed；
+沒有把 URC-only 或 zero-length ordering 提升為 protocol fact，也沒有放寬 runtime
+acceptance。未保存手冊全文或長引文。
+
+## Counter44 diagnostic telemetry and OTA evidence
+
+counter44 package 由 commit `6f58aae72b8a32363288285247d934d7e81815a5` 的官方
+offline TEST-key profile 建立；profile flags 是 non-release、USB recovery、TEST
+key、fail-health 0。package 與 image 的 bounded metadata 如下：
+
+| 項目 | 值 |
+| --- | --- |
+| package | `dist/sms-forwarder-dev-test-counter44-6f58aae.smsota` |
+| package mode/bytes | `0644` / `1542174` |
+| package SHA-256 | `57c51c3e76bf19bb06ff9b24e35157017115c739adf76e583ed4ab5e25cfaac6` |
+| manifest | format 1；target `esp32c3`；counter 44；version `1.1.4-dev-test` |
+| image bytes/SHA-256 | `1541920` / `8f01ba0eb17a2d567ce93596969e26582b9dc6f616be2a195e4d6154119db9dc` |
+| TEST public-key SHA-256 | `8a10937f712f0948aef8c59e22b244f61f7411722575f32f688a690c5edc7b9f` |
+
+離線簽章驗證使用 recovered TEST public key；live OTA 前後 public-key fingerprint
+一致。OTA 將 app0 更新後啟動為 app1，USB 與 authenticated Web state 一致回報
+image `valid`、accepted counter 44、pending 0、pending address 0、pending verify
+false。之後的一次 USB recovery read-only probe 只得到未分類 transport error；Web
+state 仍健康，因此這筆 probe 不能被解讀為 OTA state invalid，也沒有執行 USB retry、
+reset 或其他寫入。
+
+counter43 package 亦完成 recovered TEST-key 驗證與 app1→app0 OTA：
+
+| 項目 | 值 |
+| --- | --- |
+| package | `dist/sms-forwarder-dev-test-counter43-d52d082.smsota` |
+| package mode/bytes | `0644` / `1541245` |
+| package SHA-256 | `ee209c3d7ef0b8c1fc76c1e350e9a3f9e8d7b94fa8e314eda1fef726d9c46ec2` |
+| manifest/image | format 1；target `esp32c3`；counter 43；version `1.1.4-dev-test`；image `1540992` bytes |
+| image SHA-256 | `3025b514d9e0ef24ac3cb83631286b02f64e984324447337757e922f7ec7ec0b` |
+| key/live match | TEST public-key fingerprint match；USB/Web OTA state agreement |
+
+counter43 OTA 後 app1→app0 為 valid、accepted counter 43、無 pending；authenticated
+root UI 回應與 built current gzip asset byte/hash 相同。這些結果是 bounded hardware
+observations，不是 production signing-key ownership 或 release authorization。
+
+## Counter44 final reversible cellular Gotify evidence
+
+在 counter44 app1 健康狀態下，使用 authenticated Web-only preflight；USB gate 沒有
+被重試或用來替代 Web state。preflight 確認 mode 0、modem ready、home registration、
+not roaming、channel0 Gotify/cellular/required fields、CA configured 與 push idle。
+
+只送出一次 `networkMode=1` save job，確認非 mode config projection 與 CA 未改變；
+接著只送出一次 channel0 `detail=1` push test。terminal evidence 是：
+
+- transport path `cellular`；dispatch attempted `true`；HTTP status `200`；
+  terminal success `true`；failure stage `none`；provider acceptance confirmed。
+- 沒有 retry、第二個 notification、reset、OTA 或其他 config write；確認產生一個
+  external Gotify notification。
+- failure parser 未被使用，因此本次成功 terminal 沒有 `failureParseShape`、
+  `responseTraceMask` 或 rtcp length 欄位；這不構成對失敗 frame 的 shape 證據。
+- finally 只送出 `networkMode=0`；restore job 成功，最終 mode 0、非 mode config
+  projection unchanged、CA unchanged、push idle。
+
+本節只記錄 bounded result，不保存或重述 URL、host、token、custom body、raw HTTP、
+raw modem、電話、SSID、IMEI、EID、ICCID、憑證或其他設定內容。counter43 的
+`response_invalid/modem_read` 與 counter44 的 HTTP 200 是兩筆不同輸入的觀察；前者
+仍不能推論 parser bug，後者也不保證其他 provider、網路條件或 modem variant。
+
+## Encrypted backup evidence
+
+OTA 前完成一次 encrypted configuration backup export；只記錄 artifact metadata：
+
+- path category `.secrets/backups/ota-preflash-d52d082.smscfg`；mode `0600`；
+  `863` bytes；SHA-256
+  `65871bc01fc4d3ccb86468b5788e0b8afb56a1bd0b10f031d12655ad5c31c00a`。
+- 沒有解密、還原、列印內容或保存 passphrase。此 backup 是保留的 recovery artifact，
+  不代表 configuration field semantics 已被公開。
+
 ## Acceptance promotion path for parser candidates
 
 要把這些候選行為提升為目前 runtime 的可接受行為，必須同時完成：

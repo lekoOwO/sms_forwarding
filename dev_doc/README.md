@@ -6,7 +6,7 @@
 
 - [development.md](development.md)：環境、建置、燒錄、發佈、硬體證據與驗證命令。
 - [architecture.md](architecture.md)：ESP-IDF 元件、啟動順序、資料流、flash 安全邊界與 OTA 流程。
-- [hardware-counter37.md](hardware-counter37.md)：counter36–42 的去識別化 ML307 parser 與 cellular 硬體觀察及證據邊界。
+- [hardware-counter37.md](hardware-counter37.md)：counter36–44 的去識別化 ML307 parser 與 cellular 硬體觀察及證據邊界。
 - [openapi.json](openapi.json)：管理 API 的 machine-readable request 與 response contract。
 - [config-schema/README.md](config-schema/README.md)：版本化設定格式、加密備份與產生器。
 - [document-languages.json](document-languages.json)：文件語言與三語等價群組。
