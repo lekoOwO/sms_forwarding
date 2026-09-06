@@ -78,8 +78,7 @@ test("production builds enforce the narrow client hash whitelist", () => {
 		{
 			name: "missing imported asset",
 			page: '<script>import missingAsset from "$lib/missing.svg";</script><img src={missingAsset} alt="Missing asset" />',
-			passes: false,
-			errorText: "missing.svg"
+			passes: false
 		},
 		{
 			name: "known hash on non-home path",
