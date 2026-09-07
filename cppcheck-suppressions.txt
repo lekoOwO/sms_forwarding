@@ -1,26 +1,63 @@
-arithOperationsOnVoidPointer:code/config.cpp:234
-arithOperationsOnVoidPointer:code/config.cpp:278
-arithOperationsOnVoidPointer:code/config.cpp:286
-uninitvar:code/config.cpp:407
-unreadVariable:code/config.cpp:434
-duplicateCondition:code/config_backup.cpp:96
-constParameterReference:code/config_backup.cpp:137
-arithOperationsOnVoidPointer:code/config_backup.cpp:444
-variableScope:code/push.cpp:224
-variableScope:code/sms_process.cpp:219
-noExplicitConstructor:code/src/pdulib/pdulib.h:90
-unusedStructMember:code/config_types.h:9
-unusedStructMember:code/config_types.h:10
-unusedStructMember:code/config_types.h:36
-unusedStructMember:code/config_types.h:45
-unusedStructMember:code/config_types.h:46
-unusedStructMember:code/config_types.h:47
-unusedStructMember:code/config_types.h:61
-unusedStructMember:code/config_types.h:67
-unusedStructMember:code/config_types.h:68
-unusedStructMember:code/config_types.h:71
-unusedStructMember:code/config_types.h:72
-unusedStructMember:code/config_types.h:73
-cstyleCast:code/web_handlers.cpp:159
-cstyleCast:code/web_handlers.cpp:160
-useStlAlgorithm:code/web_handlers.cpp:136
+# cppcheck analyzes each translation unit independently. Public DTO/config
+# members are consumed by sibling components, so unusedStructMember is not
+# actionable here.
+unusedStructMember
+
+# These are advisory refactors, not correctness findings. Existing firmware
+# keeps explicit loops for bounded buffers and lock/transport state machines.
+variableScope
+constParameterReference
+constVariablePointer
+
+# The analyzer cannot model FreeRTOS/linker contracts and reports known false
+# positives for guarded fallback paths in the current runtime.
+knownConditionTrueFalse
+
+# These assertions execute transcript/request helpers as part of the fixture;
+# keep the exception limited to those host-only test files.
+assertWithSideEffect:components/idf_modem/test/https_post_fixture.cpp
+assertWithSideEffect:components/idf_web/test/esim_install_fixture.cpp
+
+# cppcheck cannot see the mbedTLS callback edges into these private methods.
+# Keep the exceptions at the two callback targets, not for the whole file.
+unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:419
+unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:436
+
+# These loops are deliberate bounded parsing, validation, or state-machine
+# loops. Keep useStlAlgorithm exceptions line-specific so new loops remain
+# visible to lint.
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:345
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:352
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:425
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:432
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:436
+useStlAlgorithm:components/idf_config/idf_config_ca_store.cpp:441
+useStlAlgorithm:components/idf_config/idf_config_storage.cpp:426
+useStlAlgorithm:components/idf_esim/idf_esim_codec.cpp:195
+useStlAlgorithm:components/idf_esim/include/idf_esim_codec.h:52
+useStlAlgorithm:components/idf_lpa/idf_lpa_activation_code.cpp:25
+useStlAlgorithm:components/idf_lpa/idf_lpa_activation_code.cpp:67
+useStlAlgorithm:components/idf_lpa/idf_lpa_bpp.cpp:179
+useStlAlgorithm:components/idf_lpa/idf_lpa_bpp.cpp:317
+useStlAlgorithm:components/idf_lpa/idf_lpa_install.cpp:90
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:571
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:605
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:620
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:681
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1169
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1253
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1322
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1587
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1711
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1730
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1770
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1800
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1908
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1949
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1998
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:2053
+useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:2126
+useStlAlgorithm:components/idf_modem/idf_modem.cpp:1625
+useStlAlgorithm:components/idf_modem/idf_modem_https_wire.cpp:688
+useStlAlgorithm:components/idf_modem/test/imei_fixture.cpp:138
+useStlAlgorithm:components/idf_web/idf_web.cpp:3890

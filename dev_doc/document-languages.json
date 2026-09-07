@@ -6,6 +6,10 @@
       "language": "en"
     },
     {
+      "path": "CLAUDE.md",
+      "language": "en"
+    },
+    {
       "path": "README.md",
       "language": "zh-TW",
       "equivalenceGroup": "project-readme"
@@ -21,7 +25,7 @@
       "equivalenceGroup": "project-readme"
     },
     {
-      "path": "code/AGENTS.md",
+      "path": "THIRD_PARTY_NOTICES.md",
       "language": "en"
     },
     {
@@ -37,7 +41,15 @@
       "language": "zh-TW"
     },
     {
+      "path": "dev_doc/config-schema/README.md",
+      "language": "en"
+    },
+    {
       "path": "dev_doc/development.md",
+      "language": "zh-TW"
+    },
+    {
+      "path": "dev_doc/hardware-counter37.md",
       "language": "zh-TW"
     },
     {
@@ -51,15 +63,15 @@
   ],
   "excluded": [
     {
-      "path": "cppcheck-suppressions.txt",
-      "reason": "Machine-readable lint baseline; not prose documentation."
-    },
-    {
       "path": "LICENSE",
       "reason": "Project license text; preserve it verbatim."
     },
     {
-      "path": "code/src/pdulib/LICENSE.txt",
+      "path": "cppcheck-suppressions.txt",
+      "reason": "Machine-readable lint baseline; not prose documentation."
+    },
+    {
+      "path": "components/idf_pdu/LICENSE",
       "reason": "Vendored dependency license text; preserve it verbatim."
     }
   ]

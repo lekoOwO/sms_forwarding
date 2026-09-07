@@ -1,0 +1,345 @@
+#include "idf_push_core.h"
+
+#include <algorithm>
+#include <array>
+#include <utility>
+
+#include "idf_util.h"
+
+static size_t utf8_char_length(const unsigned char* data, size_t remaining)
+{
+    if (remaining == 0) return 0;
+    const unsigned char first = data[0];
+    if (first < 0x80) return 1;
+    if (first >= 0xC2 && first <= 0xDF) {
+        return remaining >= 2 && data[1] >= 0x80 && data[1] <= 0xBF ? 2 : 0;
+    }
+    if (first >= 0xE0 && first <= 0xEF) {
+        if (remaining < 3 || data[2] < 0x80 || data[2] > 0xBF) return 0;
+        if (first == 0xE0) return data[1] >= 0xA0 && data[1] <= 0xBF ? 3 : 0;
+        if (first == 0xED) return data[1] >= 0x80 && data[1] <= 0x9F ? 3 : 0;
+        return data[1] >= 0x80 && data[1] <= 0xBF ? 3 : 0;
+    }
+    if (first >= 0xF0 && first <= 0xF4) {
+        if (remaining < 4 || data[2] < 0x80 || data[2] > 0xBF ||
+            data[3] < 0x80 || data[3] > 0xBF) return 0;
+        if (first == 0xF0) return data[1] >= 0x90 && data[1] <= 0xBF ? 4 : 0;
+        if (first == 0xF4) return data[1] >= 0x80 && data[1] <= 0x8F ? 4 : 0;
+        return data[1] >= 0x80 && data[1] <= 0xBF ? 4 : 0;
+    }
+    return 0;
+}
+
+bool idf_push_utf8_valid(const std::string& value)
+{
+    size_t pos = 0;
+    while (pos < value.size()) {
+        size_t length = utf8_char_length(
+            reinterpret_cast<const unsigned char*>(value.data() + pos), value.size() - pos);
+        if (length == 0) return false;
+        pos += length;
+    }
+    return true;
+}
+
+bool idf_push_render_template(const std::string& source, const IdfPushTemplateValues& values,
+                              size_t max_bytes, bool header, std::string& output)
+{
+    const std::array<std::pair<const char*, const std::string*>, 10> replacements = {{
+        {"{sender}", &values.sender},
+        {"{message}", &values.message},
+        {"{timestamp}", &values.timestamp},
+        {"{device}", &values.device},
+        {"{localNumber}", &values.localNumber},
+        {"{ip}", &values.ip},
+        {"{hostname}", &values.hostname},
+        {"{wifi}", &values.wifi},
+        {"{receiver}", &values.localNumber},
+        {"{local_number}", &values.localNumber},
+    }};
+    if (!idf_push_utf8_valid(source)) return false;
+    if (!std::all_of(replacements.begin(), replacements.end(), [](const auto& replacement) {
+            return idf_push_utf8_valid(*replacement.second);
+        })) return false;
+
+    output.clear();
+    output.reserve(source.size() < max_bytes ? source.size() : max_bytes);
+    for (size_t pos = 0; pos < source.size();) {
+        const std::string* value = nullptr;
+        size_t token_length = 0;
+        if (source[pos] == '{') {
+            for (const auto& replacement : replacements) {
+                token_length = std::char_traits<char>::length(replacement.first);
+                if (source.compare(pos, token_length, replacement.first) == 0) {
+                    value = replacement.second;
+                    break;
+                }
+            }
+        }
+        if (value) {
+            if (value->size() > max_bytes - output.size()) return false;
+            output += *value;
+            pos += token_length;
+        } else {
+            if (output.size() == max_bytes) return false;
+            output += source[pos++];
+        }
+    }
+    if (!idf_push_utf8_valid(output)) return false;
+    if (header) {
+        if (std::any_of(output.begin(), output.end(), [](unsigned char ch) {
+                return ch < 0x20 || ch == 0x7F;
+            })) return false;
+    }
+    return true;
+}
+
+bool idf_push_render_sms_notification(const std::string& locale,
+                                      const std::string& title_template,
+                                      const std::string& body_template,
+                                      const IdfPushTemplateValues& values,
+                                      std::string& title, std::string& body)
+{
+    const char* default_title = "來自 {sender} 的簡訊";
+    const char* default_body = "裝置：{device}\n寄件者：{sender}\n時間：{timestamp}\n內容：{message}";
+    if (locale == NOTIFICATION_LOCALE_EN) {
+        default_title = "SMS from {sender}";
+        default_body = "Device: {device}\nSender: {sender}\nTime: {timestamp}\nMessage: {message}";
+    } else if (locale == NOTIFICATION_LOCALE_ZH_CN) {
+        default_title = "来自 {sender} 的短信";
+        default_body = "设备：{device}\n发件人：{sender}\n时间：{timestamp}\n内容：{message}";
+    }
+    const std::string& title_source = title_template.empty() ? std::string(default_title) : title_template;
+    const std::string& body_source = body_template.empty() ? std::string(default_body) : body_template;
+    return idf_push_render_template(title_source, values, MAX_RENDERED_TITLE_BYTES, true, title) &&
+           idf_push_render_template(body_source, values, MAX_RENDERED_BODY_BYTES, false, body);
+}
+
+bool idf_push_network_uses_wifi(NetworkMode mode, bool wifi_connected)
+{
+    return idf_push_select_network(mode, wifi_connected) == IdfPushNetworkDecision::Wifi;
+}
+
+IdfPushNetworkDecision idf_push_select_network(NetworkMode mode, bool wifi_connected)
+{
+    if (mode == NETWORK_MODE_4G_ONLY) return IdfPushNetworkDecision::Cellular;
+    if (mode == NETWORK_MODE_WIFI_ONLY) {
+        return wifi_connected ? IdfPushNetworkDecision::Wifi : IdfPushNetworkDecision::Defer;
+    }
+    if (mode == NETWORK_MODE_MIX) {
+        return wifi_connected ? IdfPushNetworkDecision::Wifi : IdfPushNetworkDecision::Cellular;
+    }
+    return IdfPushNetworkDecision::Unsupported;
+}
+
+size_t idf_push_utf8_codepoint_count(const std::string& value, size_t limit)
+{
+    size_t pos = 0;
+    size_t count = 0;
+    while (pos < value.size()) {
+        size_t length = utf8_char_length(
+            reinterpret_cast<const unsigned char*>(value.data() + pos), value.size() - pos);
+        if (length == 0 || ++count > limit) return limit + 1;
+        pos += length;
+    }
+    return count;
+}
+
+static const char* transport_path_name(IdfPushTransportPath path)
+{
+    switch (path) {
+        case IdfPushTransportPath::None: return "none";
+        case IdfPushTransportPath::Wifi: return "wifi";
+        case IdfPushTransportPath::Cellular: return "cellular";
+    }
+    return nullptr;
+}
+
+static bool http_status_valid(int status)
+{
+    return status >= 100 && status <= 599;
+}
+
+void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
+                                std::string message, const std::string& cleanup_message,
+                                IdfModemHttpsDiagnosticReason failure_reason,
+                                IdfModemHttpsDiagnosticReason cleanup_reason,
+                                bool reset_needed,
+                                IdfPushTransportPath transport_path,
+                                bool dispatch_attempted,
+                                IdfHttpsFailureStage failure_stage,
+                                int http_status,
+                                IdfModemHttpsParseReason failure_parse_reason,
+                                IdfModemHttpsParseReason cleanup_parse_reason,
+                                IdfModemHttpsParseShape failure_parse_shape,
+                                IdfModemHttpsParseShape cleanup_parse_shape,
+                                IdfModemHttpsFailureResponseReason failure_response_reason,
+                                bool failure_response_reason_available)
+{
+    if (success) message = "Test push sent";
+    else if (message.empty()) message = "Test push failed; see the log";
+    job.pending = false;
+    job.running = false;
+    job.done = true;
+    job.success = success;
+    job.nextUs = 0;
+    job.deadlineUs = 0;
+    job.message = std::move(message);
+    job.cleanupMessage.assign(
+        cleanup_message.data(),
+        std::min(cleanup_message.size(), IdfPushTestJobState::MAX_CLEANUP_MESSAGE - 1));
+    job.failureReason = failure_reason;
+    job.cleanupReason = cleanup_reason;
+    job.failureResponseReason = failure_response_reason;
+    job.failureResponseReasonAvailable = failure_response_reason_available;
+    job.failureParseReason = failure_parse_reason;
+    job.cleanupParseReason = cleanup_parse_reason;
+    job.failureParseShape = failure_reason == IdfModemHttpsDiagnosticReason::response_invalid
+                                ? failure_parse_shape
+                                : IdfModemHttpsParseShape();
+    job.cleanupParseShape = cleanup_reason == IdfModemHttpsDiagnosticReason::response_invalid
+                                ? cleanup_parse_shape
+                                : IdfModemHttpsParseShape();
+    job.resetNeeded = reset_needed || cleanup_reason != IdfModemHttpsDiagnosticReason::none;
+    job.transportPath = transport_path;
+    job.dispatchAttempted = dispatch_attempted;
+    job.failureStage = failure_stage;
+    job.httpStatus = http_status;
+}
+
+static void append_json_string(std::string& out, const char* key, const std::string& value)
+{
+    out += "\"";
+    out += key;
+    out += "\":\"";
+    idf_util_json_escape_append(out, value);
+    out += "\"";
+}
+
+static bool parse_shape_valid(const IdfModemHttpsParseShape& shape)
+{
+    const bool single_field_class_present =
+        shape.singleFieldClass != IdfModemHttpsParseSingleFieldClass::none;
+    const bool rtcp_seen = (shape.responseTraceMask & (1U << 2)) != 0;
+    return shape.available && shape.fieldCount <= 8 &&
+           (shape.presenceMask & static_cast<uint8_t>(~IdfModemHttpsParsePresence::all)) == 0 &&
+           shape.responseTraceMask <= 127 && shape.rtcpRecvLength <= 65536 &&
+           shape.rtcpTotalLength <= 65536 &&
+           (rtcp_seen || (shape.rtcpRecvLength == 0 && shape.rtcpTotalLength == 0)) &&
+           (!rtcp_seen || shape.rtcpRecvLength <= shape.rtcpTotalLength) &&
+           !idf_modem_https_parse_state_class_name(shape.stateClass).empty() &&
+           !idf_modem_https_parse_line_class_name(shape.lineClass).empty() &&
+           !idf_modem_https_parse_single_field_class_name(shape.singleFieldClass).empty() &&
+           ((shape.fieldCount == 1 && single_field_class_present) ||
+            (shape.fieldCount != 1 && !single_field_class_present));
+}
+
+static void append_parse_shape(std::string& out, const char* key,
+                               const IdfModemHttpsParseShape& shape)
+{
+    out += ",\"";
+    out += key;
+    out += "\":{";
+    out += "\"fieldCount\":";
+    out += std::to_string(shape.fieldCount);
+    out += ",\"quoteMask\":";
+    out += std::to_string(shape.quoteMask);
+    out += ",\"presenceMask\":";
+    out += std::to_string(shape.presenceMask);
+    out += ",\"responseTraceMask\":";
+    out += std::to_string(shape.responseTraceMask);
+    out += ",\"rtcpRecvLength\":";
+    out += std::to_string(shape.rtcpRecvLength);
+    out += ",\"rtcpTotalLength\":";
+    out += std::to_string(shape.rtcpTotalLength);
+    out += ",\"stateClass\":\"";
+    out += idf_modem_https_parse_state_class_name(shape.stateClass);
+    out += "\",\"lineClass\":\"";
+    out += idf_modem_https_parse_line_class_name(shape.lineClass);
+    out += "\",\"singleFieldClass\":\"";
+    out += idf_modem_https_parse_single_field_class_name(shape.singleFieldClass);
+    out += "\"}";
+}
+
+std::string idf_push_serialize_test_status(const IdfPushTestJobState& job,
+                                           bool include_cleanup)
+{
+    const std::string message = job.message.empty() ? "Test not started" : job.message;
+    std::string out = "{";
+    out += "\"queued\":"; out += job.pending ? "true" : "false"; out += ",";
+    out += "\"running\":"; out += job.running ? "true" : "false"; out += ",";
+    out += "\"done\":"; out += job.done ? "true" : "false"; out += ",";
+    out += "\"success\":"; out += job.success ? "true" : "false"; out += ",";
+    append_json_string(out, "message", message);
+    if (include_cleanup && job.done) {
+        const char* path = transport_path_name(job.transportPath);
+        const std::string_view stage = idf_https_failure_stage_name(job.failureStage);
+        const bool has_diagnostic = path != nullptr &&
+                                    (job.transportPath != IdfPushTransportPath::None ||
+                                     job.dispatchAttempted ||
+                                     job.failureStage != IdfHttpsFailureStage::none ||
+                                     http_status_valid(job.httpStatus));
+        if (has_diagnostic && !stage.empty()) {
+            out += ",\"transportPath\":\"";
+            out += path;
+            out += "\",\"dispatchAttempted\":";
+            out += job.dispatchAttempted ? "true" : "false";
+            out += ",\"failureStage\":\"";
+            out += stage;
+            out += "\"";
+            if (http_status_valid(job.httpStatus)) {
+                out += ",\"httpStatus\":";
+                out += std::to_string(job.httpStatus);
+            }
+        }
+    }
+    if (include_cleanup && job.done && !job.cleanupMessage.empty()) {
+        out += ",";
+        append_json_string(out, "cleanupMessage", job.cleanupMessage);
+    }
+    if (include_cleanup && job.done &&
+        job.failureReason != IdfModemHttpsDiagnosticReason::none) {
+        out += ",";
+        append_json_string(
+            out, "failureReason",
+            std::string(idf_modem_https_diagnostic_reason_name(job.failureReason)));
+        if (job.failureReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+            job.failureParseReason != IdfModemHttpsParseReason::none) {
+            out += ",";
+            append_json_string(
+                out, "failureParseReason",
+                std::string(idf_modem_https_parse_reason_name(job.failureParseReason)));
+            if (parse_shape_valid(job.failureParseShape)) {
+                append_parse_shape(out, "failureParseShape", job.failureParseShape);
+            }
+        }
+    }
+    if (include_cleanup && job.done && !job.success &&
+        job.failureStage == IdfHttpsFailureStage::response &&
+        job.failureResponseReasonAvailable) {
+        out += ",\"failureResponseReason\":\"";
+        out += idf_modem_https_failure_response_reason_name(job.failureResponseReason);
+        out += "\"";
+    }
+    if (include_cleanup && job.done &&
+        job.cleanupReason != IdfModemHttpsDiagnosticReason::none) {
+        out += ",";
+        append_json_string(
+            out, "cleanupReason",
+            std::string(idf_modem_https_cleanup_reason_name(job.cleanupReason)));
+        out += ",\"resetNeeded\":";
+        out += job.resetNeeded ? "true" : "false";
+        if (job.cleanupReason == IdfModemHttpsDiagnosticReason::response_invalid &&
+            job.cleanupParseReason != IdfModemHttpsParseReason::none) {
+            out += ",";
+            append_json_string(
+                out, "cleanupParseReason",
+                std::string(idf_modem_https_parse_reason_name(job.cleanupParseReason)));
+            if (parse_shape_valid(job.cleanupParseShape)) {
+                append_parse_shape(out, "cleanupParseShape", job.cleanupParseShape);
+            }
+        }
+    }
+    out += "}";
+    return out;
+}

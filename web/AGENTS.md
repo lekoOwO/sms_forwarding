@@ -9,9 +9,9 @@ This file applies to `web/`. The root `AGENTS.md` also applies.
   Chinese, and English. Keep all three files on the same key set.
 - `src/lib/api.ts` owns calls to the authenticated firmware routes. Never render
   device responses as raw HTML.
-- `scripts/package.mjs` creates the bounded gzip file consumed by firmware.
-- Generated output lives in `web/build/` and `code/data/index.html.gz`; do not
-  hand-edit either artifact.
+- `scripts/package.mjs` creates the bounded gzip arrays consumed by ESP-IDF.
+- Generated output lives in `web/build/` and `code/web_assets.{h,cpp}`; do not
+  hand-edit those artifacts.
 
 Use existing shadcn-svelte components and semantic theme tokens. Keep the page
 fully static, dependency-free at runtime, keyboard usable, and functional on a
@@ -29,7 +29,7 @@ Run in the persistent container:
 
 ```sh
 docker compose exec dev sh -lc 'cd web && npm run check && npm run build'
-python3 -m unittest tests/test_web_bundle.py
+node --test scripts/package.test.mjs
 ```
 
 Then run the firmware compile from `../dev_doc/development.md`.

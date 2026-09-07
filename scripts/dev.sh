@@ -7,73 +7,49 @@ cd "$repo_root"
 
 usage() {
 	cat <<'EOF'
-Usage:
-  scripts/dev.sh start mock-server
-  scripts/dev.sh stop mock-server
-  scripts/dev.sh restart mock-server
-  scripts/dev.sh build frontend
-  scripts/dev.sh build firmware
-  scripts/dev.sh lint all
+Usage: scripts/dev.sh COMMAND
+
+Commands:
+  dev-start        Start the persistent ESP-IDF container
+  dev-shell        Open an ESP-IDF shell
+  dev-stop         Stop the ESP-IDF container
+  dev-logs         Follow ESP-IDF container logs
+  web-install      Install the locked Web dependencies
+  web-check        Run the Web type and source checks
+  web-build        Build the current Web assets
+  firmware-build   Build firmware in the ESP-IDF container
+  lint             Run the repository lint entry point
+  mock-start       Build and start the mock server
+  mock-stop        Stop the mock server
+  mock-logs        Follow mock server logs
+  mock-test        Run the in-process mock API tests
 EOF
 }
 
-build_frontend() {
-	docker compose up -d dev
-	docker compose exec -T dev sh -lc 'cd web && npm ci && npm run check && npm run build'
-}
-
-build_firmware() {
-	python3 scripts/generate-firmware-version.py --check
-	docker compose up -d dev
-	docker compose exec -T dev scripts/apply-esp32-webserver-3.3.10-patch.sh
-	docker compose exec -T dev arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs ./code
-}
-
-lint_all() {
-	docker compose up -d --build dev
-	docker compose exec -T dev python3 tests/lint_gate_smoke.py
-	docker compose exec -T dev npm run lint --prefix web
-	docker compose exec -T dev ruff check --no-cache --config ruff.toml scripts tests
-	docker compose exec -T dev sh -lc "find scripts -type f -name '*.sh' -print0 | xargs -0 shellcheck"
-	docker compose exec -T dev sh -lc "find code -maxdepth 1 -type f \
-		\( -name '*.ino' -o -name '*.cpp' -o -name '*.h' \) \
-		! -name web_bundle.h ! -name config_schema_generated.h \
-		! -name firmware_version_generated.h -print0 | xargs -0 cppcheck --quiet --error-exitcode=1 \
-		--enable=warning,style,performance,portability --check-level=exhaustive \
-		--std=c++11 --language=c++ --inline-suppr --suppress=missingIncludeSystem \
-		--suppressions-list=cppcheck-suppressions.txt"
-}
-
-verb="${1:-}"
-target="${2:-}"
-if [ "$#" -ne 2 ]; then
+if [ "$#" -ne 1 ]; then
 	usage
 	exit 2
 fi
 
-case "$verb:$target" in
-	build:frontend)
-		build_frontend
+case "$1" in
+	dev-start) exec docker compose up -d dev ;;
+	dev-shell)
+		docker compose up -d dev
+		exec docker compose exec dev bash -lc '. "$IDF_PATH/export.sh" >/dev/null && exec bash -i'
 		;;
-	build:firmware)
-		build_firmware
+	dev-stop) exec docker compose stop dev ;;
+	dev-logs) exec docker compose logs --follow dev ;;
+	web-install) exec npm ci --prefix web ;;
+	web-check) exec npm --prefix web run check ;;
+	web-build) exec npm --prefix web run build ;;
+	firmware-build)
+		docker compose up -d dev
+		exec docker compose exec dev python3 tools/device.py build
 		;;
-	lint:all)
-		lint_all
-		;;
-	start:mock-server)
-		build_frontend
-		docker compose up -d --build mock-server
-		;;
-	restart:mock-server)
-		build_frontend
-		docker compose up -d --build --force-recreate mock-server
-		;;
-	stop:mock-server)
-		docker compose stop mock-server
-		;;
-	*)
-		usage
-		exit 2
-		;;
+	lint) exec python3 tools/run_lint.py ;;
+	mock-start) exec docker compose up -d --build mock-server ;;
+	mock-stop) exec docker compose stop mock-server ;;
+	mock-logs) exec docker compose logs --follow mock-server ;;
+	mock-test) exec npm --prefix mock_server test ;;
+	*) usage; exit 2 ;;
 esac

@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# 4MiB flash：两个 1.875MiB OTA 槽位，末尾保留配置与 coredump 分区。
+# appcfg 仅用于应用配置；短信收件箱不使用持久化分区。
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,
+app1,     app,  ota_1,   0x1F0000,0x1E0000,
+appcfg,   data, nvs,     0x3D0000,0x20000,
+coredump, data, coredump,0x3F0000,0x10000,

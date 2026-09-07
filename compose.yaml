@@ -2,35 +2,50 @@ name: sms-forwarding
 
 services:
   dev:
-    container_name: sms-forwarding-dev
-    build:
-      context: .
-      network: host
-      args:
-        USER_ID: "${USER_ID:-1000}"
-        GROUP_ID: "${GROUP_ID:-1000}"
-    working_dir: /workspace
-    volumes:
-      - .:/workspace
-    ports:
-      - "5174:5173"
+    image: espressif/idf@sha256:e3d941cb983e028aad1e2f5ecb2837254e467f2b71f3e0af67e7337bd27ae177
+    command:
+      - sleep
+      - infinity
     init: true
-    stdin_open: true
-    tty: true
-    command: ["sleep", "infinity"]
+    network_mode: none
+    working_dir: /workspace
+    environment:
+      CCACHE_DIR: /tmp/ccache
+      CCACHE_MAXSIZE: 128M
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=256m
+    volumes:
+      - type: bind
+        source: .
+        target: /workspace
 
   mock-server:
-    container_name: sms-forwarding-mock-server
     build:
       context: ./mock_server
     environment:
-      PORT: "3000"
       AUTH_REQUIRED: "false"
-      WEB_ROOT: /web/build
       OPENAPI_PATH: /spec/openapi.json
-    volumes:
-      - ./web:/web:ro
-      - ./dev_doc/openapi.json:/spec/openapi.json:ro
-    ports:
-      - "4174:3000"
+      PORT: "3000"
+      WEB_ROOT: /web/build
     init: true
+    ports:
+      - target: 3000
+        published: "4174"
+        protocol: tcp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: ./web/build
+        target: /web/build
+        read_only: true
+      - type: bind
+        source: ./dev_doc/openapi.json
+        target: /spec/openapi.json
+        read_only: true

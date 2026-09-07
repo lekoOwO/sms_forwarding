@@ -1,7 +1,4 @@
-name: Build Arduino Firmware
-
-permissions:
-  contents: read
+name: Build ESP-IDF Firmware
 
 on:
   push:
@@ -10,172 +7,372 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  lint:
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v6
-      with:
-        persist-credentials: false
-        fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-    - name: Lint source
-      run: scripts/dev.sh lint all
+      - name: Build pinned lint image
+        run: docker build --file tools/lint/Dockerfile --tag sms-forwarding-lint .
 
-    - name: Verify firmware version source
-      run: python3 scripts/generate-firmware-version.py --check
+      - name: Test lint gate
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint \
+            python3 tools/test_lint_gate.py
+          docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint \
+            python3 tests/lint_gate_smoke.py
 
-    - name: Verify Dev build increased
-      if: github.ref == 'refs/heads/develop' || (github.event_name == 'pull_request' && github.base_ref == 'develop')
-      env:
-        BEFORE: ${{ github.event.before }}
-      run: |
-        current_build=$(jq -r .devBuild firmware-version.json)
-        if [[ -n "$GITHUB_BASE_REF" ]]; then previous_ref="origin/$GITHUB_BASE_REF"; else previous_ref="$BEFORE"; fi
-        previous_build=0
-        if previous_json=$(git show "${previous_ref}:firmware-version.json" 2>/dev/null); then
-          previous_build=$(jq -r .devBuild <<<"$previous_json")
-        fi
-        test "$current_build" -gt "$previous_build"
+      - name: Lint source
+        run: docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" sms-forwarding-lint python3 tools/run_lint.py
 
-    - name: Verify release tag
-      if: startsWith(github.ref, 'refs/tags/v')
-      run: |
-        test "$GITHUB_REF_NAME" = "v$(jq -r .releaseVersion firmware-version.json)"
-        git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+  mock:
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v6
-      with:
-        node-version: '22'
-        cache: npm
-        cache-dependency-path: web/package-lock.json
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
-    - name: Build Web UI
-      run: |
-        npm ci --prefix web
-        npm run check --prefix web
-        npm run build --prefix web
-        python3 -m unittest discover -s tests
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.14.0'
+          cache: npm
+          cache-dependency-path: |
+            mock_server/package-lock.json
+            web/package-lock.json
 
-    - name: Test API contract and production UI
-      run: |
-        docker compose up -d --build mock-server
-        docker compose exec -T mock-server npm test
-    
-    - name: Setup Arduino CLI
-      uses: arduino/setup-arduino-cli@v2
-    
-    - name: Install ESP32 platform
-      run: |
-        arduino-cli config init
-        arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
-        arduino-cli core update-index
-        arduino-cli core install esp32:esp32@3.3.10
-    
-    - name: Install dependencies
-      run: |
-        arduino-cli lib install "ReadyMail@0.4.2"
-        arduino-cli lib install "ArduinoJson@7.4.3"
-    
-    - name: Compile firmware
-      run: |
-        scripts/apply-esp32-webserver-3.3.10-patch.sh "$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.10"
-        release_build=0
-        if [[ "$GITHUB_REF" == refs/tags/v* ]]; then release_build=1; fi
-        arduino-cli compile --fqbn esp32:esp32:esp32c3:PartitionScheme=min_spiffs \
-          --build-property "build.extra_flags=-DFIRMWARE_IS_RELEASE=${release_build}" \
-          --output-dir build/firmware ./code
+      - name: Install Web UI dependencies
+        run: npm ci --prefix web
 
-    - name: Stage release input
-      if: github.ref == 'refs/heads/develop' || startsWith(github.ref, 'refs/tags/v')
-      uses: actions/upload-artifact@v4
-      with:
-        name: release-input
-        path: |
-          build/firmware/code.ino.bin
-          build/firmware/code.ino.merged.bin
-          firmware-version.json
-          scripts/sign-ota-release.py
+      - name: Build Web UI for mock tests
+        working-directory: web
+        run: npm exec -- vite build
+
+      - name: Install mock server dependencies
+        run: npm ci --prefix mock_server
+
+      - name: Test mock API
+        run: npm --prefix mock_server test
+
+      - name: Test mock development stack
+        run: |
+          python3 tools/test_mock_dev_stack.py
+          bash -n scripts/dev.sh
+          docker compose -f compose.yaml config --quiet
+
+  build:
+    permissions:
+      contents: read
+    needs: [lint, mock]
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      dev_build: ${{ steps.version.outputs.dev_build }}
+      ota_runtime_ready: ${{ steps.ota_runtime.outputs.ready }}
+    runs-on: ubuntu-latest
+    container: espressif/idf@sha256:e3d941cb983e028aad1e2f5ecb2837254e467f2b71f3e0af67e7337bd27ae177
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Trust container checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify firmware version source
+        run: python3 scripts/generate-firmware-version.py --check
+
+      - name: Test firmware release policy
+        run: python3 -m unittest tools/test_firmware_release.py
+
+      - name: Verify Dev build increased
+        if: >-
+          (github.event_name == 'push' &&
+            (github.ref == 'refs/heads/develop' || github.ref == 'refs/heads/master')) ||
+          (github.event_name == 'pull_request' &&
+            (github.base_ref == 'develop' || github.base_ref == 'master'))
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          current_build=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
+          if [[ -n "$BASE_SHA" ]]; then
+            previous_ref="$BASE_SHA"
+          else
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              echo "Push event has no valid previous commit" >&2
+              exit 1
+            fi
+            previous_ref="$BEFORE"
+          fi
+          if ! git rev-parse --verify "${previous_ref}^{commit}" >/dev/null 2>&1; then
+            if [[ -z "$BASE_SHA" ]]; then
+              echo "Previous commit is not available: $previous_ref" >&2
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+          if ! git rev-parse --verify "${previous_ref}^{commit}" >/dev/null 2>&1; then
+            echo "Previous commit is not available: $previous_ref" >&2
+            exit 1
+          fi
+          if ! previous_json=$(git show "${previous_ref}:firmware-version.json" 2>/dev/null); then
+            echo "Previous commit has no firmware-version.json: $previous_ref" >&2
+            exit 1
+          fi
+          if ! previous_build=$(python3 scripts/generate-firmware-version.py --print-dev-build <<<"$previous_json"); then
+            echo "Previous firmware-version.json is invalid: $previous_ref" >&2
+            exit 1
+          fi
+          if (( current_build <= previous_build )); then
+            echo "devBuild $current_build must exceed previous build $previous_build" >&2
+            exit 1
+          fi
+
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          test "$GITHUB_REF_NAME" = "v$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["releaseVersion"])')"
+          test "$GITHUB_SHA" = "$(git rev-parse origin/master)"
+          current_build=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
+          previous_stable_max=0
+          while IFS= read -r tag; do
+            [[ "$tag" == "$GITHUB_REF_NAME" ]] && continue
+            if ! metadata=$(git show "${tag}:firmware-version.json" 2>/dev/null); then
+              echo "Release tag $tag has no firmware-version.json" >&2
+              exit 1
+            fi
+            if ! previous_build=$(python3 scripts/generate-firmware-version.py --validate-tag "$tag" <<<"$metadata"); then
+              echo "Release tag $tag has invalid firmware version metadata" >&2
+              exit 1
+            fi
+            if (( previous_build > previous_stable_max )); then
+              previous_stable_max=$previous_build
+            fi
+          done < <(git tag --list 'v*')
+          if (( current_build <= previous_stable_max )); then
+            echo "devBuild $current_build must exceed prior stable maximum $previous_stable_max" >&2
+            exit 1
+          fi
+
+      - name: Read firmware version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["releaseVersion"])')
+          DEV_BUILD=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "dev_build=$DEV_BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: Check signed OTA runtime gate
+        id: ota_runtime
+        shell: bash
+        run: |
+          if [[ -f components/idf_web/OTA_RUNTIME_READY ]]; then ready=true; else ready=false; fi
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '24.14.0'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install Web UI dependencies
+        run: npm ci --prefix web
+
+      - name: Check Web UI
+        run: npm --prefix web run check
+
+      - name: Build and verify Web UI assets
+        run: |
+          npm --prefix web run build
+          node --test web/scripts/package.test.mjs
+          node web/scripts/package.mjs --check
+          git diff --exit-code -- code/web_assets.h code/web_assets.cpp
+
+      - name: Install host crypto test dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y libssl-dev
+
+      - name: Run host contract tests
+        shell: bash
+        run: |
+          python3 tools/test_config_schema.py
+          python3 tools/test_idf_config_codec.py
+          python3 tools/test_idf_config_persistence.py
+          python3 tools/test_idf_config_updates.py
+          python3 components/idf_modem/test/test_uart_owner.py
+          python3 components/idf_esim/test/test_lpa.py
+          python3 components/idf_lpa/test/test_rsp.py
+          python3 components/idf_lpa/test/test_es9_transport.py
+          python3 components/idf_lpa/test/test_bpp.py
+          python3 components/idf_push/test/test_push_runtime.py
+          python3 components/idf_sms/test/test_sms_retention_policy.py
+          python3 components/idf_wifi/test/test_wifi_security.py
+          python3 tools/test_idf_baseline.py
+          python3 tools/test_device.py
+          node --test tools/config_backup_verify.test.mjs
+          python3 tools/test_ota_test_profile.py
+          python3 tools/test_ota_observability.py
+          python3 tools/test_usb_recovery.py
+          python3 components/idf_web/test/test_web_security.py
+          python3 components/idf_web/test/test_openapi_conformance.py
+          python3 components/idf_web/test/test_ota_runtime.py
+
+      - name: Build firmware
+        shell: bash
+        run: |
+          RELEASE_BUILD=0
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then RELEASE_BUILD=1; fi
+          export FIRMWARE_IS_RELEASE="$RELEASE_BUILD"
+          export SMS_OTA_TEST_KEY=0
+          ./tools/idf.sh build
+
+      - name: Check ESP-IDF baseline and firmware size
+        run: python3 tools/check_idf_baseline.py --build-dir build/idf
+
+      - name: Build USB recovery development firmware
+        shell: bash
+        env:
+          SMS_OTA_TEST_KEY: 0
+          SMS_OTA_TEST_PUBLIC_KEY: ""
+        run: SMS_USB_RECOVERY=1 FIRMWARE_IS_RELEASE=0 ./tools/idf.sh build
+
+      - name: Verify USB recovery build guard
+        shell: bash
+        run: SMS_USB_RECOVERY_REQUIRE_BUILD=1 python3 tools/test_usb_recovery.py
+
+      - name: Package full USB image
+        shell: bash
+        run: |
+          . "$IDF_PATH/export.sh"
+          VERSION=${{ steps.version.outputs.version }}
+          mkdir -p dist
+          esptool --chip esp32c3 merge-bin -o "dist/sms-forwarder-${VERSION}.bin" \
+            0x0 build/idf/bootloader/bootloader.bin \
+            0x8000 build/idf/partition_table/partition-table.bin \
+            0x10000 build/idf/sms_forwarding_idf.bin
+
+      - name: Upload verified firmware inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp-idf-firmware-bin
+          path: |
+            dist/*.bin
+            build/idf/sms_forwarding_idf.bin
+            build/idf/bootloader/bootloader.bin
+            build/idf/partition_table/partition-table.bin
+            firmware-version.json
+            scripts/sign-ota-release.py
+          retention-days: 7
 
   prerelease:
-    if: github.ref == 'refs/heads/develop'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    steps:
-    - name: Download verified build input
-      uses: actions/download-artifact@v4
-      with:
-        name: release-input
-        path: release-input
+      actions: read
 
-    - name: Publish GitHub prerelease
-      env:
-        GH_TOKEN: ${{ github.token }}
-        GH_REPO: ${{ github.repository }}
-      run: |
-        FIRMWARE_DEV_BUILD=$(jq -r .devBuild release-input/firmware-version.json)
-        DEV_TAG="dev-${FIRMWARE_DEV_BUILD}"
-        ASSET_NAME="sms-forwarder-${DEV_TAG}.bin"
-        mv release-input/build/firmware/code.ino.merged.bin "$ASSET_NAME"
-        if gh release view "$DEV_TAG" >/dev/null 2>&1; then
-          gh release upload "$DEV_TAG" "$ASSET_NAME" --clobber
-        else
+    steps:
+      - name: Download verified build input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: esp-idf-firmware-bin
+          path: release-input
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DEV_BUILD: ${{ needs.build.outputs.dev_build }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        shell: bash
+        run: |
+          DEV_TAG="dev-${DEV_BUILD}"
+          ASSET_NAME="sms-forwarder-${DEV_TAG}.bin"
+          mv "release-input/dist/sms-forwarder-${RELEASE_VERSION}.bin" "$ASSET_NAME"
+          if gh release view "$DEV_TAG" >/dev/null 2>&1; then
+            echo "Refusing to replace existing prerelease $DEV_TAG" >&2
+            exit 1
+          fi
           gh release create "$DEV_TAG" "$ASSET_NAME" --target "$GITHUB_SHA" --prerelease \
-            --title "Development build ${FIRMWARE_DEV_BUILD}" \
-            --notes "Development firmware build ${FIRMWARE_DEV_BUILD}."
-        fi
+            --title "Development build ${DEV_BUILD}" \
+            --notes "Development firmware build ${DEV_BUILD}."
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      needs.build.outputs.ota_runtime_ready == 'true'
     needs: build
     runs-on: ubuntu-latest
     environment: release
     permissions:
       contents: write
+      actions: read
+
     steps:
-    - name: Download verified build input
-      uses: actions/download-artifact@v4
-      with:
-        name: release-input
-        path: release-input
+      - name: Download verified build input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: esp-idf-firmware-bin
+          path: release-input
 
-    - name: Build signed OTA package
-      id: sign
-      env:
-        OTA_SIGNING_PRIVATE_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
-      run: |
-        umask 077
-        trap 'rm -f "$RUNNER_TEMP/ota-signing-private.pem"' EXIT
-        echo '95c411a29f8bc98c8c9d35220cdbfa5983d77ff66c9be4569a0de9d7bae28460  release-input/scripts/sign-ota-release.py' | sha256sum --check
-        printf '%s' "$OTA_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/ota-signing-private.pem"
-        FIRMWARE_DEV_BUILD=$(jq -r .devBuild release-input/firmware-version.json)
-        FIRMWARE_VERSION=$(jq -r .releaseVersion release-input/firmware-version.json)
-        OTA_COUNTER=$((FIRMWARE_DEV_BUILD * 2 + 1))
-        ASSET_NAME="sms-forwarder-${FIRMWARE_VERSION}.smsota"
-        FULL_IMAGE_NAME="sms-forwarder-${FIRMWARE_VERSION}.bin"
-        python3 release-input/scripts/sign-ota-release.py release-input/build/firmware/code.ino.bin "$ASSET_NAME" \
-          --private-key "$RUNNER_TEMP/ota-signing-private.pem" \
-          --version "$FIRMWARE_VERSION" \
-          --counter "$OTA_COUNTER" \
-          --expected-public-sha256 a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735
-        mv release-input/build/firmware/code.ino.merged.bin "$FULL_IMAGE_NAME"
-        echo "asset=$ASSET_NAME" >> "$GITHUB_OUTPUT"
-        echo "full_image=$FULL_IMAGE_NAME" >> "$GITHUB_OUTPUT"
+      - name: Build signed OTA package
+        id: sign
+        env:
+          OTA_SIGNING_PRIVATE_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          DEV_BUILD: ${{ needs.build.outputs.dev_build }}
+        shell: bash
+        run: |
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/ota-signing-private.pem"' EXIT
+          echo 'df6f2cd2a298f52c589823e8bee923c7cd7f6c379985207031958875bb5a3d02  release-input/scripts/sign-ota-release.py' | sha256sum --check
+          printf '%s' "$OTA_SIGNING_PRIVATE_KEY" > "$RUNNER_TEMP/ota-signing-private.pem"
+          OTA_COUNTER=$((DEV_BUILD * 2 + 1))
+          OTA_ASSET="sms-forwarder-${RELEASE_VERSION}.smsota"
+          FULL_ASSET="sms-forwarder-${RELEASE_VERSION}.bin"
+          python3 release-input/scripts/sign-ota-release.py \
+            release-input/build/idf/sms_forwarding_idf.bin "$OTA_ASSET" \
+            --private-key "$RUNNER_TEMP/ota-signing-private.pem" \
+            --version "$RELEASE_VERSION" \
+            --counter "$OTA_COUNTER" \
+            --expected-public-sha256 a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735
+          mv "release-input/dist/sms-forwarder-${RELEASE_VERSION}.bin" "$FULL_ASSET"
+          echo "ota_asset=$OTA_ASSET" >> "$GITHUB_OUTPUT"
+          echo "full_asset=$FULL_ASSET" >> "$GITHUB_OUTPUT"
 
-    - name: Publish GitHub release
-      env:
-        GH_TOKEN: ${{ github.token }}
-        GH_REPO: ${{ github.repository }}
-        ASSET_NAME: ${{ steps.sign.outputs.asset }}
-        FULL_IMAGE_NAME: ${{ steps.sign.outputs.full_image }}
-      run: |
-        if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-          gh release upload "$GITHUB_REF_NAME" "$ASSET_NAME" "$FULL_IMAGE_NAME" --clobber
-        else
-          gh release create "$GITHUB_REF_NAME" "$ASSET_NAME" "$FULL_IMAGE_NAME" --generate-notes
-        fi
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OTA_ASSET: ${{ steps.sign.outputs.ota_asset }}
+          FULL_ASSET: ${{ steps.sign.outputs.full_asset }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Refusing to replace existing release $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" "$OTA_ASSET" "$FULL_ASSET" --generate-notes

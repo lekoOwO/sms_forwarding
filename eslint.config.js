@@ -11,7 +11,7 @@ const svelte = require('eslint-plugin-svelte');
 const ts = require('typescript-eslint');
 
 export default [
-	{ ignores: ['**/.svelte-kit/**', '**/build/**', '**/node_modules/**'] },
+	{ ignores: ['**/.svelte-kit/**', '**/build/**', '**/node_modules/**', '**/*.generated.ts'] },
 	js.configs.recommended,
 	...ts.configs.recommended,
 	...svelte.configs.recommended,

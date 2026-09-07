@@ -31,9 +31,24 @@
     "bodyBytes": 16384,
     "description": "Limits are enforced before authentication. Rejections use 414, 431, or 413 with Connection: close and Cache-Control: no-store. Fields must contain valid UTF-8 text and stay within their byte limits; rejections leave state unchanged and put only the field name in detail."
   },
+	"x-espIdfMigration": {
+	  "deferredRoutes": [],
+	  "blockedContracts": [],
+	  "description": "Signed, replay-protected OTA is available. Legacy plaintext import and raw OTA routes are not exposed."
+	},
+	"x-apProvisioning": {
+	  "localAddress": "192.168.1.1",
+	  "unauthenticatedRoutes": ["GET /", "GET /wifiscan", "GET /apstatus", "POST /wificonfig"],
+	  "csrfException": {
+		"route": "POST /wificonfig",
+		"header": "X-SMS-CSRF",
+		"value": "1"
+	  },
+	  "description": "These exceptions apply only when the accepted TCP socket's local address is the provisioning AP address. APSTA requests received on the STA address use normal Basic authentication and X-CSRF-Token checks."
+	},
 	"x-configSchema": {
 	  "source": "config-schema/manifest.json",
-	  "currentVersion": 4,
+	  "currentVersion": 7,
 	  "mimeType": "application/vnd.sms-forwarding.config",
 	  "maxEncryptedBytes": 32828
 	},
@@ -41,7 +56,8 @@
     { "name": "UI" },
     { "name": "Configuration" },
     { "name": "Messaging" },
-    { "name": "Device" }
+    { "name": "Device" },
+    { "name": "Cellular & eSIM" }
   ],
   "paths": {
     "/": {
@@ -78,7 +94,7 @@
       "get": {
         "tags": ["Configuration"],
         "summary": "Get the device state and configuration",
-        "description": "SMTP, management account, and WiFi password values are empty strings in this response.",
+        "description": "SMTP, management account, and WiFi password values are empty strings in this response. Forwarding rules are returned exactly so they can be edited without changing multiline, tab, or UTF-8 content.",
         "responses": {
           "200": {
             "description": "The current state and configuration.",
@@ -93,12 +109,40 @@
         }
       }
     },
+    "/api/esim": {
+      "get": {
+        "tags": ["Cellular & eSIM"],
+        "summary": "Get eSIM structural status and masked profiles",
+        "description": "Returns EID structural metadata and opaque profile handles. ICCID, ISD-P AID, EID, network identifiers, server addresses, and modem identifiers never appear. During authenticated installation consent, bounded profile and provider display names are included. The response is not cached.",
+        "responses": {
+          "200": { "description": "The current cached eSIM view.", "headers": { "Cache-Control": { "schema": { "type": "string", "const": "no-store, max-age=0" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EsimStatus" } } } },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET and POST are supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET, POST" } } } }
+        }
+      },
+      "post": {
+        "tags": ["Cellular & eSIM"],
+        "summary": "Queue an eSIM profile action",
+        "description": "Queues profile actions or installation without automatically enabling the installed profile. Profile mutations require a current opaque handle. Install accepts exactly action and activationCode. After authenticated profile details are available, confirm accepts exactly action, jobId, accepted (true or false), and confirmationCode only when accepted=true and the carrier requires a code. Consent is required even without a carrier code. accepted=false postpones the installation without terminating the carrier order. Confirmation expires after at most five minutes without status polling. The form-encoded body is limited to 2048 bytes and four fields. Codes stay in memory and are never logged or returned. Poll GET /api/esim for the exact accepted job ID, not /api/jobs. One job is retained until the next job or reboot. Installation uses bounded phases without an overall job TTL. Installed profiles with pending notification report success with ACTION_ESIM_NOTIFICATION_PENDING. Uncertain installation or cancellation failure must not trigger automatic activation-code reuse. Only ordinary three-field activation codes and profiles without policy-rule restrictions are supported.",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "$ref": "#/components/schemas/EsimAction" } } } },
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "409": { "description": "The device is busy, the profile handle is stale, or confirmation does not match an active pending installation.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/save": {
       "post": {
         "tags": ["Configuration"],
         "summary": "Update the configuration",
 		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "description": "The request can contain one configuration section. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
+		"description": "The request can contain one configuration section. forwardRules is saved as exact multiline, tab, and UTF-8 text after the existing 2048-byte and enabled regular-expression validation. emailEnabled and pushEnabled use explicit 0 or 1 values, and each can be updated alone without changing credentials or per-channel settings. A blank account username disables that account. Blank account passwords and blank WiFi passwords for unchanged secured SSIDs keep their stored values. A non-empty WiFi password must contain 8 to 63 printable ASCII characters. Changing a WiFi SSID or converting an open profile to secured requires a new password or the explicit wifiNopen field; an empty SSID disables the profile and clears its password. Blank or omitted push url, key1, key2, and custom body fields retain stored values only when the provider type is unchanged; changing the provider type clears all four stored fields before applying non-empty replacements. At least one usable account must remain. A present empty smtpPass clears the SMTP password. Validation completes before persistence and a rejected request does not change configuration.",
         "requestBody": {
           "required": true,
           "content": {
@@ -148,9 +192,9 @@
     "/ping": {
       "post": {
         "tags": ["Device"],
-        "summary": "Ping 8.8.8.8 through the cellular modem",
+        "summary": "Legacy cellular ping (unsupported)",
 		"parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "description": "The device enables the PDP context for this operation. Then the device disables the PDP context.",
+        "description": "The route is retained for client compatibility and completes with ACTION_PING_UNSUPPORTED. The device does not access the cellular modem or enable a PDP context.",
         "responses": {
 		  "202": { "$ref": "#/components/responses/JobAccepted" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -315,6 +359,23 @@
         }
       }
     },
+    "/api/device/restart": {
+      "post": {
+        "tags": ["Device"],
+        "summary": "Restart the whole device",
+        "description": "Requests one planned whole-device restart. The request body must be empty. The device authenticates and checks the POST CSRF token before body validation, then returns 409 when a backup transfer, OTA, device or restore restart, API job, or push test is active. This direct action uses 200 OK because it has no queued API job or job ID; the delayed restart task powers off the modem before esp_restart.",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "responses": {
+          "200": { "description": "The restart was admitted and will occur after a short delay.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "description": "The request body is not empty.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The POST CSRF token is missing or invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "Another transfer, job, push test, or planned restart is active.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/api/jobs": {
       "get": {
         "tags": ["Device"],
@@ -327,12 +388,108 @@
         }
       }
     },
+    "/api/push/test": {
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Get one push channel test status",
+        "description": "Without detail=1, the response is the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, failureResponseReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } }
+        ],
+        "responses": {
+          "200": { "description": "The bounded per-channel test status. Provider credentials are never returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "400": { "description": "The channel index is invalid.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Test one saved push channel",
+        "description": "Queues one test against the selected saved channel configuration. The request body must be empty, and the route never accepts or returns provider credentials. Without detail=1, responses are the legacy exact five-key status shape. With detail=1, terminal responses may add bounded cleanupMessage, failureReason, failureResponseReason, cleanupReason, failureParseReason, cleanupParseReason, failureParseShape, cleanupParseShape, resetNeeded, transportPath, dispatchAttempted, failureStage, and httpStatus fields; active responses never add diagnostic fields. Unknown, duplicate, or invalid query fields are rejected. A duplicate active channel, another mutation, an incomplete channel, unavailable WiFi, or unsupported cellular-only mode fails closed; cellular data is never enabled. A queued test that cannot start becomes a terminal timeout result after 60 seconds.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "name": "detail", "in": "query", "required": false, "description": "Set to 1 to opt in to bounded terminal diagnostic detail.", "schema": { "type": "string", "enum": ["1"] } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "responses": {
+          "202": { "description": "The bounded channel test was queued.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "400": { "description": "The channel index is invalid.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is missing or invalid." },
+          "409": { "description": "The selected channel is already active or the test was not admitted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PushTestStatus" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
+    "/api/push/ca/probe": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Probe the saved channel TLS chain over WiFi",
+        "description": "Runs a strict bundle-authenticated TLS handshake with SNI and hostname verification. channel is the only query key, the request body must be empty, and any Transfer-Encoding header is rejected. It sends no HTTP request. The terminal GET /api/jobs result contains only a one-time 128-bit nonce and bounded leaf-first certificate hashes, issuer Name DER, and authority-key identifiers.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "description": "The channel or empty-body contract is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "WiFi is unavailable or the channel already has an active CA job." },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "429": { "description": "The bounded job queue is full." }
+        }
+      }
+    },
+    "/api/push/ca/install": {
+      "post": {
+        "tags": ["Configuration"],
+        "summary": "Validate and install one candidate cellular root CA",
+        "description": "Consumes the nonce on the first attempt. channel and nonce are the only query keys. The request requires exact Content-Type application/pkix-cert, an explicit decimal Content-Length matching the body, and no Transfer-Encoding header. The device requires the candidate DER hash in its build-time ESP-IDF bundle allowlist, BasicConstraints CA=true, keyCertSign when a KeyUsage extension is present, a current self-signed certificate, an unchanged channel generation, and a complete hostname-valid path for the retained peer chain.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } },
+          { "name": "nonce", "in": "query", "required": true, "schema": { "type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$" } },
+          { "$ref": "#/components/parameters/CsrfToken" }
+        ],
+        "requestBody": { "required": true, "content": { "application/pkix-cert": { "schema": { "type": "string", "contentEncoding": "binary", "minLength": 1, "maxLength": 8192 } } } },
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "description": "The channel, nonce, or body is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "POST" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "409": { "description": "The channel already has an active CA job." },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "415": { "description": "Content-Type is not exactly application/pkix-cert." },
+          "429": { "description": "The bounded job queue is full." }
+        }
+      }
+    },
+    "/api/push/ca/status": {
+      "get": {
+        "tags": ["Configuration"],
+        "summary": "Get non-secret cellular CA status for one channel",
+        "description": "channel is the only query key, the request body must be empty, and any Transfer-Encoding header is rejected.",
+        "parameters": [
+          { "name": "channel", "in": "query", "required": true, "schema": { "type": "integer", "minimum": 0, "maximum": 4 } }
+        ],
+        "responses": {
+          "200": { "description": "Configured state and SHA-256 only; no certificate DER or origin is returned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "description": "The channel is invalid." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" }
+        }
+      }
+    },
     "/api/config/export": {
       "post": {
         "tags": ["Configuration"],
         "summary": "Start an encrypted portable configuration export",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12 } } } } } },
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12, "maxLength": 128, "x-maxUtf8Bytes": 128 } } } } } },
         "responses": {
           "202": { "description": "The export job was accepted.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
           "400": { "$ref": "#/components/responses/InputTooLong" },
@@ -371,7 +528,7 @@
       "post": {
         "tags": ["Configuration"], "summary": "Validate and restore the uploaded configuration",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }],
-        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12 } } } } } },
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["passphrase"], "properties": { "passphrase": { "type": "string", "minLength": 12, "maxLength": 128, "x-maxUtf8Bytes": 128 } } } } } },
         "responses": { "202": { "$ref": "#/components/responses/JobAccepted" }, "400": { "description": "Decryption, schema validation, or portable merge failed." }, "401": { "$ref": "#/components/responses/Unauthorized" } }
       }
     },
@@ -379,8 +536,8 @@
       "post": {
         "tags": ["Device"], "summary": "Start a signed firmware upload",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
-        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "required": ["manifest", "signature"], "properties": { "manifest": { "type": "string" }, "signature": { "type": "string", "pattern": "^[0-9a-f]+$" } } } } } },
-        "responses": { "201": { "$ref": "#/components/responses/UploadStarted" }, "400": { "description": "The package metadata or signature is invalid." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "Another upload is active." } }
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": { "type": "object", "additionalProperties": false, "required": ["manifest", "signature"], "properties": { "manifest": { "type": "string", "maxLength": 512 }, "signature": { "type": "string", "minLength": 16, "maxLength": 144, "pattern": "^[0-9a-f]+$" } } } } } },
+        "responses": { "201": { "$ref": "#/components/responses/UploadStarted" }, "400": { "description": "The package metadata, replay counter, or signature is invalid." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "description": "The CSRF token is invalid." }, "409": { "description": "Another mutation or upload is active." }, "413": { "description": "The request body is too large." }, "500": { "description": "OTA initialization or durable metadata access failed." } }
       }
     },
     "/api/ota/chunk": {
@@ -388,14 +545,29 @@
         "tags": ["Device"], "summary": "Upload the next firmware chunk",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }, { "$ref": "#/components/parameters/UploadOffset" }],
         "requestBody": { "required": true, "content": { "text/plain": { "schema": { "type": "string", "contentEncoding": "base64", "minLength": 4, "maxLength": 10924 } } } },
-        "responses": { "200": { "$ref": "#/components/responses/UploadChunk" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "409": { "description": "The session or offset is invalid." } }
+        "responses": { "200": { "$ref": "#/components/responses/UploadChunk" }, "400": { "description": "The chunk encoding, size, offset, or write is invalid." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "description": "The CSRF token is invalid." }, "409": { "description": "The upload session is invalid." }, "413": { "description": "The request body is too large." }, "500": { "description": "Firmware flash write or memory allocation failed." } }
       }
     },
     "/api/ota/finish": {
       "post": {
         "tags": ["Device"], "summary": "Validate and activate the uploaded firmware",
         "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }, { "$ref": "#/components/parameters/UploadId" }],
-        "responses": { "202": { "$ref": "#/components/responses/JobAccepted" }, "400": { "description": "The firmware hash or image validation failed." }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+        "responses": { "202": { "$ref": "#/components/responses/JobAccepted", "description": "Validation is asynchronous; hash, image, metadata, and boot-selection failures are returned by GET /api/jobs." }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "description": "The CSRF token is invalid." }, "409": { "description": "The upload session is invalid or incomplete." }, "413": { "description": "The request body is too large." }, "429": { "description": "The bounded job queue is full." } }
+      }
+    },
+    "/api/ota/state": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Read non-secret signed OTA state",
+        "description": "Returns the running app slot and image validity, accepted and pending replay metadata, and the SHA-256 identity of the embedded OTA public key. The route is read-only, requires Basic Auth, does not require CSRF, rejects a non-empty request body, and never returns firmware, NVS contents, credentials, or private key material.",
+        "responses": {
+          "200": { "description": "The bounded OTA state snapshot.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OtaState" } } } },
+          "400": { "description": "The GET request included a body.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "500": { "description": "The running image or OTA metadata could not be read.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } }
+        }
       }
     }
   },
@@ -482,7 +654,7 @@
           "success": { "type": "boolean" },
           "code": {
             "type": "string",
-            "description": "Stable code translated by the frontend. Firmware and mock server expose the same set.",
+            "description": "Stable code translated by the frontend. Firmware and mock server expose the same set. The retained /ping route completes with ACTION_PING_UNSUPPORTED; older ping result codes remain only for compatibility.",
             "enum": [
               "ACTION_CONFIG_SAVED",
               "ACTION_CONFIG_SAVE_FAILED",
@@ -497,6 +669,7 @@
               "ACTION_PING_MODEM_ERROR",
               "ACTION_PING_UNREACHABLE",
               "ACTION_PING_TIMEOUT",
+              "ACTION_PING_UNSUPPORTED",
               "ACTION_QUERY_OK",
               "ACTION_QUERY_FAILED",
               "ACTION_QUERY_UNKNOWN",
@@ -518,10 +691,29 @@
               "ACTION_MODEM_OK",
               "ACTION_MODEM_FAILED",
               "ACTION_WIFI_RESTARTING",
-			  "ACTION_WIFI_PASSWORD_REQUIRED",
+              "ACTION_DEVICE_RESTARTING",
+              "ACTION_WIFI_PASSWORD_REQUIRED",
               "ACTION_CSRF_INVALID",
               "ACTION_JOB_ACCEPTED",
               "ACTION_JOB_NOT_FOUND",
+			  "ACTION_ESIM_IDLE",
+			  "ACTION_ESIM_RUNNING",
+			  "ACTION_ESIM_COMPLETE",
+			  "ACTION_ESIM_FAILED",
+			  "ACTION_ESIM_BUSY",
+			  "ACTION_ESIM_HANDLE_STALE",
+			  "ACTION_ESIM_CONFIRMATION_STALE",
+			  "ACTION_ESIM_NOTIFICATION_PENDING",
+			  "ACTION_ESIM_INSTALLATION_UNCERTAIN",
+			  "ACTION_ESIM_POSTPONED",
+			  "ACTION_ESIM_CANCELLATION_FAILED",
+			  "PUSH_CA_PROBE_READY",
+			  "PUSH_CA_PROBE_FAILED",
+			  "PUSH_CA_INSTALLED",
+			  "PUSH_CA_STALE",
+			  "PUSH_CA_REJECTED",
+			  "PUSH_CA_STORE_FAILED",
+			  "PUSH_CA_STATUS",
 			  "ACTION_CONFIG_EXPORT_READY",
               "ACTION_CONFIG_RESTORED",
               "ACTION_OTA_UPLOAD_STARTED",
@@ -554,6 +746,7 @@
 			  "ACTION_OTA_SESSION_INVALID",
 			  "ACTION_OTA_SIGNATURE_INVALID",
 			  "ACTION_OTA_WRITE_FAILED",
+			  "ACTION_OTA_STATE_UNAVAILABLE",
 			  "ACTION_TOO_MANY_FIELDS"
             ]
           },
@@ -604,7 +797,110 @@
 		  "uploadId": { "type": "integer" },
 		  "exportId": { "type": "integer" },
 		  "chunkSize": { "type": "integer", "maximum": 8192 },
-		  "nextOffset": { "type": "integer" }
+		  "nextOffset": { "type": "integer" },
+          "nonce": { "type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[0-9a-f]{32}$" },
+          "expiresInMs": { "type": "integer", "minimum": 1, "maximum": 120000 },
+          "chain": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["certSha256", "issuerDer", "aki"],
+              "properties": {
+                "certSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "issuerDer": { "type": "string", "contentEncoding": "base64", "maxLength": 216 },
+                "aki": { "type": "string", "pattern": "^(?:[0-9a-f]{2}){0,32}$" }
+              }
+            }
+          },
+          "configured": { "type": "boolean" },
+          "sha256": { "type": "string", "pattern": "^(?:|[0-9a-f]{64})$" }
+        }
+      },
+      "OtaState": {
+        "type": "object",
+        "required": ["activeOffset", "imageState", "pendingVerify", "accepted", "pending", "pendingAddress", "publicKeySha256"],
+        "additionalProperties": false,
+        "properties": {
+          "activeOffset": { "type": "integer", "enum": [65536, 2031616] },
+          "imageState": { "type": "string", "enum": ["other", "pending-verify", "valid"] },
+          "pendingVerify": { "type": "boolean" },
+          "accepted": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "pending": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+          "pendingAddress": { "type": "integer", "enum": [0, 65536, 2031616] },
+          "publicKeySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+        }
+      },
+      "EsimAction": {
+        "type": "object",
+        "additionalProperties": false,
+        "maxProperties": 4,
+        "required": ["action"],
+        "properties": {
+          "action": { "type": "string", "enum": ["refresh", "info", "enable", "disable", "delete", "switch", "nickname", "install", "confirm"], "x-maxUtf8Bytes": 16 },
+          "handle": { "type": "string", "pattern": "^p[0-9a-f]{16}$", "x-maxUtf8Bytes": 17, "description": "Opaque profile selector issued by GET /api/esim." },
+          "nickname": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 64 },
+          "activationCode": { "type": "string", "minLength": 1, "maxLength": 516, "x-maxUtf8Bytes": 516, "writeOnly": true },
+          "jobId": { "type": "string", "pattern": "^[1-9][0-9]{0,9}$", "description": "Exact current installation job ID, at most 4294967295." },
+          "accepted": { "type": "string", "enum": ["true", "false"] },
+          "confirmationCode": { "type": "string", "pattern": "^[ -~]{1,128}$", "writeOnly": true }
+        },
+        "oneOf": [
+          { "properties": { "action": { "enum": ["refresh", "info"] } }, "maxProperties": 1 },
+          { "required": ["handle"], "properties": { "action": { "enum": ["enable", "disable", "delete", "switch"] } }, "maxProperties": 2 },
+          { "required": ["handle"], "maxProperties": 3, "properties": { "action": { "const": "nickname" } }, "not": { "anyOf": [{ "required": ["activationCode"] }, { "required": ["jobId"] }, { "required": ["accepted"] }, { "required": ["confirmationCode"] }] } },
+          { "required": ["activationCode"], "properties": { "action": { "const": "install" } }, "maxProperties": 2 },
+          { "required": ["jobId", "accepted"], "properties": { "action": { "const": "confirm" } }, "not": { "anyOf": [{ "required": ["activationCode"] }, { "required": ["handle"] }, { "required": ["nickname"] }] }, "if": { "properties": { "accepted": { "const": "false" } } }, "then": { "maxProperties": 3 } }
+        ]
+      },
+      "EsimProfile": {
+        "type": "object",
+        "required": ["handle", "displayId", "state", "nickname", "profileClass"],
+        "additionalProperties": false,
+        "properties": {
+          "handle": { "type": "string", "pattern": "^p[0-9a-f]{16}$" },
+          "displayId": { "type": "string", "const": "••••", "description": "Non-identifying masked display value." },
+          "state": { "type": "string", "enum": ["enabled", "disabled", "unknown"] },
+          "nickname": { "type": "string", "x-maxUtf8Bytes": 64 },
+          "profileClass": { "type": "string", "enum": ["operational", "provisioning", "unknown"] }
+        }
+      },
+      "EsimJob": {
+        "type": "object",
+        "required": ["id", "state", "action", "success", "code", "stage", "confirmationRequired", "notificationPending", "profileName", "providerName"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "integer", "minimum": 0 },
+          "state": { "type": "string", "enum": ["idle", "queued", "running", "succeeded", "failed"] },
+          "action": { "type": "string", "enum": ["", "refresh", "info", "enable", "disable", "delete", "switch", "nickname", "install"] },
+          "success": { "type": "boolean" },
+          "code": { "type": "string", "enum": ["ACTION_ESIM_IDLE", "ACTION_ESIM_RUNNING", "ACTION_ESIM_COMPLETE", "ACTION_ESIM_FAILED", "ACTION_ESIM_NOTIFICATION_PENDING", "ACTION_ESIM_INSTALLATION_UNCERTAIN", "ACTION_ESIM_POSTPONED", "ACTION_ESIM_CANCELLATION_FAILED"] },
+          "stage": { "type": "string", "enum": ["", "validating", "recovering_notifications", "authenticating", "awaiting_confirmation", "preparing", "downloading", "notifying", "completed"] },
+          "confirmationRequired": { "type": "boolean", "description": "Whether the carrier requires a confirmation code. Consent is requested by running state and awaiting_confirmation stage even when this is false." },
+          "notificationPending": { "type": "boolean" },
+          "profileName": { "type": "string", "maxLength": 64, "x-maxUtf8Bytes": 256 },
+          "providerName": { "type": "string", "maxLength": 32, "x-maxUtf8Bytes": 128 }
+        }
+      },
+      "EsimStatus": {
+        "type": "object",
+        "required": ["eid", "profiles", "job"],
+        "additionalProperties": false,
+        "properties": {
+          "eid": {
+            "type": "object",
+            "required": ["available", "state", "length"],
+            "additionalProperties": false,
+            "properties": {
+              "available": { "type": "boolean" },
+              "state": { "type": "string", "enum": ["available", "unavailable"] },
+              "length": { "type": "integer", "minimum": 0, "maximum": 32 }
+            }
+          },
+          "profiles": { "type": "array", "maxItems": 32, "items": { "$ref": "#/components/schemas/EsimProfile" } },
+          "job": { "$ref": "#/components/schemas/EsimJob" }
         }
       },
       "Job": {
@@ -617,6 +913,229 @@
           "state": { "type": "string", "enum": ["queued", "running", "succeeded", "failed"] },
           "result": { "$ref": "#/components/schemas/ActionResult" }
         }
+      },
+      "PushTestParseShape": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded parser structural metadata with no payload or raw response values. fieldCount 8 represents 8 or more fields; quoteMask bits 0 through 7 indicate quoted CSV fields; presenceMask bits are MIPSTATE=1, MIPOPEN=2, MIPCLOSE=4, MIPURC=8, and other=16; responseTraceMask bits are echo=1, OK=2, valid rtcp=4, MIPRD prefix=8, valid disconnect=16, OK-before-rtcp=32, and rtcp-before-OK=64; rtcp lengths are bounded to 65536 and meaningful only when valid rtcp is present; lineClass distinguishes missing, unexpected, duplicate, and extra lines; singleFieldClass is classified only for one CSV field.",
+        "required": ["fieldCount", "quoteMask", "presenceMask", "responseTraceMask", "rtcpRecvLength", "rtcpTotalLength", "stateClass", "lineClass", "singleFieldClass"],
+        "properties": {
+          "fieldCount": { "type": "integer", "minimum": 0, "maximum": 8 },
+          "quoteMask": { "type": "integer", "minimum": 0, "maximum": 255 },
+          "presenceMask": { "type": "integer", "minimum": 0, "maximum": 31 },
+          "responseTraceMask": { "type": "integer", "minimum": 0, "maximum": 127 },
+          "rtcpRecvLength": { "type": "integer", "minimum": 0, "maximum": 65536 },
+          "rtcpTotalLength": { "type": "integer", "minimum": 0, "maximum": 65536 },
+          "stateClass": {
+            "type": "string",
+            "enum": ["none", "initial", "closed", "connected", "connecting", "unknown"]
+          },
+          "lineClass": {
+            "type": "string",
+            "enum": ["none", "missing", "unexpected", "duplicate", "extra"]
+          },
+          "singleFieldClass": {
+            "type": "string",
+            "enum": ["none", "zero", "nonzero", "non_numeric"]
+          }
+        }
+      },
+      "PushTestStatus": {
+        "type": "object",
+        "required": ["queued", "running", "done", "success", "message"],
+        "additionalProperties": false,
+        "description": "Exactly one lifecycle shape applies: idle, queued, running, succeeded, or failed. Success is true only for a completed successful test.",
+        "properties": {
+          "queued": { "type": "boolean" },
+          "running": { "type": "boolean" },
+          "done": { "type": "boolean" },
+          "success": { "type": "boolean" },
+          "message": { "type": "string" },
+          "cleanupMessage": {
+            "type": "string",
+            "maxLength": 95,
+            "enum": [
+              "HTTPS cleanup socket close failed",
+              "HTTPS cleanup SSL config restore failed",
+              "HTTPS cleanup autofree config restore failed",
+              "HTTPS cleanup encoding config restore failed",
+              "HTTPS cleanup PDP deactivate failed",
+              "HTTPS cleanup PDP profile restore failed"
+            ]
+          },
+          "failureReason": {
+            "type": "string",
+            "enum": ["command_failure", "timeout", "response_invalid", "terminal_failure", "poll_timeout", "result_nonzero", "unknown"]
+          },
+          "failureResponseReason": {
+            "type": "string",
+            "enum": ["timeout", "peer_eof", "modem_read", "tls_read", "http_parse", "http_incomplete", "modem_command", "unknown"]
+          },
+          "cleanupReason": {
+            "type": "string",
+            "enum": ["command_failure", "timeout", "response_invalid", "result_nonzero", "unknown"]
+          },
+          "failureParseReason": {
+            "type": "string",
+            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "read_data", "unknown"]
+          },
+          "cleanupParseReason": {
+            "type": "string",
+            "enum": ["oversize", "terminal", "urc", "prefix", "field_count", "quote", "cid", "state", "endpoint", "result", "read_data", "unknown"]
+          },
+          "failureParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },
+          "cleanupParseShape": { "$ref": "#/components/schemas/PushTestParseShape" },
+          "resetNeeded": { "type": "boolean" },
+          "transportPath": {
+            "type": "string",
+            "enum": ["none", "wifi", "cellular"]
+          },
+          "dispatchAttempted": { "type": "boolean" },
+          "failureStage": {
+            "type": "string",
+            "enum": ["none", "preflight", "target", "ca", "modem", "registration", "pdp", "socket", "tls", "request", "response", "http", "cleanup"]
+          },
+          "httpStatus": {
+            "type": "integer",
+            "minimum": 100,
+            "maximum": 599
+          }
+        },
+        "oneOf": [
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": true }, "running": { "const": false }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": true }, "done": { "const": false }, "success": { "const": false } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": true } } },
+          { "properties": { "queued": { "const": false }, "running": { "const": false }, "done": { "const": true }, "success": { "const": false } } }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": { "done": { "const": false } },
+              "required": ["done"]
+            },
+            "then": {
+              "not": {
+                "anyOf": [
+                  { "required": ["cleanupMessage"] },
+                  { "required": ["failureReason"] },
+                  { "required": ["failureResponseReason"] },
+                  { "required": ["cleanupReason"] },
+                  { "required": ["failureParseReason"] },
+                  { "required": ["cleanupParseReason"] },
+                  { "required": ["failureParseShape"] },
+                  { "required": ["cleanupParseShape"] },
+                  { "required": ["resetNeeded"] },
+                  { "required": ["transportPath"] },
+                  { "required": ["dispatchAttempted"] },
+                  { "required": ["failureStage"] },
+                  { "required": ["httpStatus"] }
+                ]
+              }
+            }
+          },
+          {
+            "if": { "required": ["failureResponseReason"] },
+            "then": {
+              "required": ["failureStage", "success"],
+              "properties": {
+                "failureStage": { "const": "response" },
+                "success": { "const": false }
+              }
+            }
+          },
+          {
+            "if": { "required": ["failureParseReason"] },
+            "then": {
+              "required": ["failureReason"],
+              "properties": { "failureReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": { "required": ["cleanupParseReason"] },
+            "then": {
+              "required": ["cleanupReason"],
+              "properties": { "cleanupReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": { "required": ["failureParseShape"] },
+            "then": {
+              "required": ["failureReason", "failureParseReason"],
+              "properties": { "failureReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": { "required": ["cleanupParseShape"] },
+            "then": {
+              "required": ["cleanupReason", "cleanupParseReason"],
+              "properties": { "cleanupReason": { "const": "response_invalid" } }
+            }
+          },
+          {
+            "if": {
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "required": ["transportPath", "dispatchAttempted", "failureStage"]
+            }
+          },
+          {
+            "if": { "required": ["httpStatus"] },
+            "then": {
+              "required": ["dispatchAttempted"],
+              "properties": { "dispatchAttempted": { "const": true } }
+            }
+          },
+          {
+            "if": {
+              "required": ["transportPath"],
+              "properties": { "transportPath": { "const": "none" } }
+            },
+            "then": { "properties": { "dispatchAttempted": { "const": false } } }
+          },
+          {
+            "if": {
+              "required": ["success"],
+              "properties": { "success": { "const": true } },
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "required": ["transportPath", "dispatchAttempted", "failureStage", "httpStatus"],
+              "properties": {
+                "transportPath": { "enum": ["wifi", "cellular"] },
+                "dispatchAttempted": { "const": true },
+                "failureStage": { "const": "none" },
+                "httpStatus": { "minimum": 200, "maximum": 299 }
+              }
+            }
+          },
+          {
+            "if": {
+              "required": ["success"],
+              "properties": { "success": { "const": false } },
+              "anyOf": [
+                { "required": ["transportPath"] },
+                { "required": ["dispatchAttempted"] },
+                { "required": ["failureStage"] },
+                { "required": ["httpStatus"] }
+              ]
+            },
+            "then": {
+              "properties": { "failureStage": { "not": { "const": "none" } } }
+            }
+          }
+        ]
       },
       "WebAccount": {
         "type": "object",
@@ -639,7 +1158,7 @@
 	  },
       "PushChannel": {
         "type": "object",
-		"required": ["enabled", "type", "name", "url", "urlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"],
+		"required": ["enabled", "type", "name", "url", "urlSet", "cellularEnabled", "cellularUrlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"],
         "additionalProperties": false,
         "properties": {
           "enabled": { "type": "boolean" },
@@ -647,6 +1166,8 @@
           "name": { "type": "string" },
           "url": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
 		  "urlSet": { "type": "boolean", "description": "True when a URL is stored for the current provider type." },
+		  "cellularEnabled": { "type": "boolean", "description": "False permanently blocks this channel from cellular delivery." },
+		  "cellularUrlSet": { "type": "boolean", "description": "True when a sensitive cellular URL override is stored. The URL itself is never returned." },
 		  "key1": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
 		  "key1Set": { "type": "boolean", "description": "True when key1 is stored for the current provider type." },
 		  "key2": { "type": "string", "const": "", "description": "Always masked in configuration snapshots." },
@@ -681,12 +1202,14 @@
           },
           "config": {
             "type": "object",
-			"required": ["deviceName", "hostname", "notificationLocale", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "pushChannels"],
+		"required": ["deviceName", "hostname", "notificationLocale", "emailEnabled", "pushEnabled", "webAccounts", "smtpServer", "smtpPort", "smtpUser", "smtpPass", "smtpSendTo", "adminPhone", "numberBlackList", "forwardRules", "wifiProfiles", "networkMode", "heartbeatEnable", "heartbeatInterval", "kaEnabled", "kaIntervalDays", "kaTrafficKB", "pushChannels"],
             "additionalProperties": false,
             "properties": {
 			  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
 			  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
 			  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"] },
+			  "emailEnabled": { "type": "boolean", "description": "Global email delivery switch. SMTP credentials remain configured while this is false." },
+			  "pushEnabled": { "type": "boolean", "description": "Global push delivery switch. Per-channel enabled values and credentials remain configured while this is false." },
               "webAccounts": {
                 "type": "array",
                 "minItems": 10,
@@ -700,15 +1223,19 @@
               "smtpSendTo": { "type": "string" },
               "adminPhone": { "type": "string" },
               "numberBlackList": { "type": "string" },
+			  "forwardRules": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Exact saved rule text. This editor field is not masked; credential fields remain redacted separately." },
 			  "wifiProfiles": {
 				"type": "array",
 				"minItems": 5,
 				"maxItems": 5,
 				"items": { "$ref": "#/components/schemas/WifiProfile" }
 			  },
-			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback when available. The preference is stored, but all cellular delivery currently fails closed until CA provisioning is available. ML307Y cellular transport is disabled, GET and ntfy channels are WiFi-only, and roaming always fails closed." },
+			  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "description": "0 selects WiFi only, 1 selects 4G only, and 2 prefers WiFi with cellular fallback. Cellular delivery requires an enabled per-channel cellular target and an installed device-validated CA. Cellular GET uses the same HTTPS, CA, clock, home-registration, cleanup, and 2xx gates as POST; it accepts no body, keeps the fixed GET method, limits rendered URLs to 4096 bytes, keeps POST URLs at 240 bytes and POST bodies at 4096 bytes, rejects HTTP downgrade, and preserves existing response-parser limits. ML307Y cellular transport is disabled and roaming fails closed." },
 			  "heartbeatEnable": { "type": "boolean" },
 			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
+			  "kaEnabled": { "type": "boolean" },
+			  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650 },
+			  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1, "description": "Stored values up to 10000 KB are preserved for configuration compatibility. Cellular HTTP keepalive is unsupported for every value; no cellular activation or transfer occurs." },
               "pushChannels": {
                 "type": "array",
                 "minItems": 5,
@@ -722,21 +1249,28 @@
       "ConfigUpdate": {
         "type": "object",
         "minProperties": 1,
+		"maxProperties": 66,
         "additionalProperties": false,
         "properties": {
 		  "deviceName": { "type": "string", "x-maxUtf8Bytes": 64 },
 		  "hostname": { "type": "string", "x-maxUtf8Bytes": 32, "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$" },
 		  "notificationLocale": { "type": "string", "enum": ["zh-TW", "zh-CN", "en"], "x-maxUtf8Bytes": 16 },
+		  "emailEnabled": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
+		  "pushEnabled": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
           "smtpServer": { "type": "string", "x-maxUtf8Bytes": 253 },
-          "smtpPort": { "type": "integer", "minimum": 0, "maximum": 65535, "x-maxUtf8Bytes": 32 },
+          "smtpPort": { "type": "integer", "minimum": 1, "maximum": 65535, "x-maxUtf8Bytes": 32 },
           "smtpUser": { "type": "string", "x-maxUtf8Bytes": 254 },
           "smtpPass": { "type": "string", "x-maxUtf8Bytes": 256 },
-          "smtpSendTo": { "type": "string", "x-maxUtf8Bytes": 254 },
-          "adminPhone": { "type": "string", "x-maxUtf8Bytes": 32 },
+          "smtpSendTo": { "type": "string", "x-maxUtf8Bytes": 256 },
+          "adminPhone": { "type": "string", "x-maxUtf8Bytes": 64 },
 		  "numberBlackList": { "type": "string", "x-maxUtf8Bytes": 1024 },
+		  "forwardRules": { "type": "string", "x-maxUtf8Bytes": 2048 },
 		  "networkMode": { "type": "integer", "minimum": 0, "maximum": 2, "x-maxUtf8Bytes": 32 },
 		  "heartbeatEnable": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
-		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 }
+		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 },
+		  "kaEnabled": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
+		  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650, "x-maxUtf8Bytes": 32 },
+		  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "x-maxUtf8Bytes": 32, "description": "Values are stored for configuration compatibility; cellular HTTP keepalive is unsupported and no cellular activation occurs." }
         },
         "patternProperties": {
           "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },
@@ -747,7 +1281,10 @@
           "^push[0-4]en$": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
           "^push[0-4]type$": { "type": "integer", "minimum": 0, "maximum": 12, "x-maxUtf8Bytes": 32 },
           "^push[0-4]name$": { "type": "string", "x-maxUtf8Bytes": 64 },
-          "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Blank or omitted retains the stored URL when the provider type is unchanged." },
+		  "^push[0-4]url$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Blank or omitted retains the stored URL when the provider type is unchanged." },
+		  "^push[0-4]cellularEnabled$": { "type": "string", "enum": ["0", "1"], "x-maxUtf8Bytes": 32 },
+		  "^push[0-4]cellularUrl$": { "type": "string", "x-maxUtf8Bytes": 512, "description": "Sensitive override. Blank or omitted preserves the stored value." },
+		  "^push[0-4]cellularUrlClear$": { "type": "string", "enum": ["1"], "x-maxUtf8Bytes": 32, "description": "Explicitly clears the stored override. It is invalid with a nonempty cellularUrl in the same request." },
 		  "^push[0-4]key[12]$": { "type": "string", "x-maxUtf8Bytes": 256, "description": "Blank or omitted retains the stored key when the provider type is unchanged." },
 		  "^push[0-4]body$": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Blank or omitted retains the stored custom body when the provider type is unchanged." },
 		  "^push[0-4]title$": { "type": "string", "x-maxUtf8Bytes": 256 },

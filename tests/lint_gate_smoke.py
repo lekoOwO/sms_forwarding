@@ -7,7 +7,7 @@ from pathlib import Path
 def rejects(command: list[str], source: str, suffix: str) -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory, f"bad{suffix}")
-        path.write_text(source)
+        path.write_text(source, encoding="utf-8")
         result = subprocess.run([*command, path.name], cwd=directory, capture_output=True, text=True)
         if result.returncode == 0:
             raise SystemExit(f"{' '.join(command)} accepted an invalid fixture")

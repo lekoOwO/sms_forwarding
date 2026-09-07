@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--private-key", required=True, type=Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--counter", required=True, type=int)
-    parser.add_argument("--expected-public-sha256")
+    parser.add_argument("--expected-public-sha256", required=True)
     args = parser.parse_args()
 
     firmware = args.firmware.read_bytes()
@@ -39,9 +39,13 @@ def main() -> None:
     ):
         raise SystemExit("version must be 1-32 safe ASCII characters")
 
+    key_description = openssl("pkey", "-in", str(args.private_key), "-text_pub", "-noout").decode()
+    if "Public-Key: (256 bit)" not in key_description or "ASN1 OID: prime256v1" not in key_description:
+        raise SystemExit("OTA signing key must be ECDSA P-256")
+
     public_der = openssl("pkey", "-in", str(args.private_key), "-pubout", "-outform", "DER")
     public_fingerprint = hashlib.sha256(public_der).hexdigest()
-    if args.expected_public_sha256 and public_fingerprint != args.expected_public_sha256:
+    if public_fingerprint != args.expected_public_sha256:
         raise SystemExit("OTA private key does not match the firmware public key")
 
     manifest = json.dumps(

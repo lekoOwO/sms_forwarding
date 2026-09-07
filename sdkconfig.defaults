@@ -1,0 +1,54 @@
+# ESP32-C3 native ESP-IDF defaults for the SMS forwarder port.
+# Keep generated sdkconfig under build/ by invoking idf.py with:
+#   idf.py -B build/idf -D "SDKCONFIG=build/sdkconfig" set-target esp32c3 build
+
+CONFIG_IDF_TARGET="esp32c3"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_ota_1m6.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions_ota_1m6.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Remove build timestamps and absolute paths from firmware artifacts.
+CONFIG_APP_REPRODUCIBLE_BUILD=y
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_HZ=1000
+CONFIG_BT_ENABLED=n
+
+# ---- Flash 体积 ----
+# -Os 尺寸优化(默认 -Og 调试档，是最大的单项体积杠杆)
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# 断言保留但不打印文件名/行号字符串(省 rodata)
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+# 证书包用完整 CA 集：flash 尚有 30%+ 余量，避免小众推送服务因 CA 缺失握手失败
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# 憑證有效期驗證使用系統時間；尚未校時時保持驗證失敗，不跳過日期檢查。
+CONFIG_MBEDTLS_HAVE_TIME_DATE=y
+# 本固件只用 IPv4(推送/SMTP/NTP/captive DNS 均为 v4)，关 IPv6 省 flash+RAM
+CONFIG_LWIP_IPV6=n
+# 无终端应用，不需要 termios
+CONFIG_VFS_SUPPORT_TERMIOS=n
+# 代码强制 WIFI_STORAGE_RAM，WiFi 自身的 NVS 通道用不到
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# ---- RAM ----
+# 短信转发对 WiFi 吞吐无要求，把 WiFi 收发路径移出 IRAM 释放 ~20KB 内存
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# IDF 6 已移除 FreeRTOS/環形緩衝函式放置開關，沿用其預設 flash 放置行為
+# TLS 收发缓冲按需分配、会话结束即释放(空闲期节省 ~40KB 堆；本机同时只有一条 TLS)
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# ---- 可靠性 ----
+# 多浏览器标签页 + mDNS/SNTP/推送/SMTP 并存时默认 10 个 socket 会耗尽，
+# 表现为新页面打不开、旧页面轮询卡死。每个 socket 静态开销仅几百字节
+CONFIG_LWIP_MAX_SOCKETS=20
+# NTP 主服务器 + 2 个兜底(idf_wifi 里注册)，单服务器不可达时时间同步不再瘫痪
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+# Bound the request envelope before route handlers parse authenticated input.
+CONFIG_HTTPD_MAX_URI_LEN=2048
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=8192
+# 分区表本来就保留了 64KB coredump 分区，启用崩溃转储，无人值守设备排障必备
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

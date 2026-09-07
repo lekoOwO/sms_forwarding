@@ -1,9 +1,18 @@
 code/wifi_config.h
-code/wifi_config.local.h
-compose.override.yaml
-.secrets/
-/build/
-/code/build/
-.worktrees/
+/.secrets/
+/.svelte-kit/
+/.worktrees/
+/mock_server/node_modules/
 __pycache__/
-*.pyc
+
+# ESP-IDF 编译产物：统一只允许输出到 build/，且不纳入版本库
+/build/**
+!/build/
+!/build/AGENTS.md
+/build-codex/
+/build-codex2/
+/dist/
+/sdkconfig
+/sdkconfig.old
+/dependencies.lock
+/managed_components/

@@ -1,51 +1,24 @@
 # 開發文件
 
-這裡是本專案開發資訊的唯一入口。公開功能、硬體採購與接線說明仍放在
-根目錄 `README.md`；實作、建置、驗證與維護資訊集中在本目錄。
+本目錄是開發資訊的唯一入口。使用者功能、硬體接線與安裝步驟位於根目錄的三語 README。
 
-## 先讀哪一份
+## 文件地圖
 
-- 要建立環境、編譯、燒錄或驗證：讀 [development.md](development.md)。
-- 要理解啟動、資料流、模組邊界或 HTTP 路由：讀
-  [architecture.md](architecture.md)。
-- 要查 HTTP request、response 與狀態碼：讀 [openapi.json](openapi.json)。
-- 要維護文件語言與等價版本：讀
-  [document-languages.json](document-languages.json)，並執行
-  `python3 -m unittest tests/test_document_languages.py`。
-- 要修改韌體：再讀 [`../code/AGENTS.md`](../code/AGENTS.md)。
-- 要維護文件：再讀 [`AGENTS.md`](AGENTS.md)。
+- [development.md](development.md)：環境、建置、燒錄、發佈、硬體證據與驗證命令。
+- [architecture.md](architecture.md)：ESP-IDF 元件、啟動順序、資料流、flash 安全邊界與 OTA 流程。
+- [hardware-counter37.md](hardware-counter37.md)：counter36–45 的去識別化 ML307 parser 與 cellular 硬體觀察及證據邊界。
+- [openapi.json](openapi.json)：管理 API 的 machine-readable request 與 response contract。
+- [config-schema/README.md](config-schema/README.md)：版本化設定格式、加密備份與產生器。
+- [document-languages.json](document-languages.json)：文件語言與三語等價群組。
+- [AGENTS.md](AGENTS.md)：本目錄的維護規則。
 
-## 30 秒專案地圖
-
-這是一個 ESP32-C3 Arduino sketch。ESP32 透過 UART 控制 4G 模組，以 PDU
-模式接收/發送簡訊，透過 WiFi 提供 HTTP 管理頁，並把收到的簡訊寄到 SMTP
-或最多五個推送通道。所有執行期程式都在 `code/`。
-
-| 位置 | 職責 |
-|---|---|
-| `code/code.ino` | `setup()`、`loop()`、HTTP 路由註冊 |
-| `code/config*` | 資料型別、NVS 持久化、設定有效性 |
-| `code/modem*` | AT 傳輸、模組生命週期、簡訊發送 |
-| `code/sms_process*` | URC/PDU 接收、長簡訊、黑名單、管理員命令 |
-| `code/push*` | SMTP 與十種推送 provider |
-| `code/web_handlers*` | Basic Auth、HTTP handler、日誌環形緩衝 |
-| `code/config_backup*` | 加密設定備份、還原與可攜式合併 |
-| `code/ota_update*` | 已簽署 OTA 上傳、驗證與 rollback 狀態 |
-| `web/` | shadcn-svelte 管理頁、三語字典、單檔 bundle builder |
-| `mock_server/` | Express Mock Server、API 與瀏覽器驗證 |
-| `scripts/dev.sh` | 前端、韌體與 Mock Server 的統一操作入口 |
-| `code/web_bundle.h` | Web production build，gzip 後編入 firmware |
-| `dev_doc/config-schema/` | 版本化設定 schema 與 binary codec 唯一來源 |
-| `Dockerfile`、`compose.yaml` | 固定版本的 Alpine 開發環境 |
-| `.github/workflows/build.yml` | CI 的 Arduino CLI 編譯基線 |
+目前韌體只保留原生 ESP-IDF 路徑。Web OTA 只接受已簽章的 `.smsota` 套件。
 
 ## 證據邊界
 
-文件中的資訊分三種：
+- **程式事實**來自目前原始碼、OpenAPI 或 workflow。
+- **CI 基線**只證明固定工具鏈可建置，不證明實機模組行為。
+- **硬體事實**必須記錄板型、模組、輸入、韌體版本與觀察結果。
+- 2026-08-22 的 ML307A 紀錄只保存去識別化摘要。此紀錄不證明 4G 資料傳送可用。
 
-- **程式事實**：可直接由目前原始碼或 workflow 重現。
-- **CI 基線**：只證明 generic ESP32-C3 FQBN 能編譯，不證明實機行為。
-- **硬體事實**：必須附實際板型、模組、指令/fixture 與觀察結果；未附者只
-  能視為待驗證假設。
-
-若文件與程式衝突，以根目錄 `AGENTS.md` 的 source-of-truth 順序為準。
+如果文件與程式衝突，請依根目錄 `AGENTS.md` 的 source-of-truth 順序處理。

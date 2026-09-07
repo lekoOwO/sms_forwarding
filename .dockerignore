@@ -1,5 +1,0 @@
-.git
-tests/__pycache__
-web/.svelte-kit
-web/build
-web/node_modules

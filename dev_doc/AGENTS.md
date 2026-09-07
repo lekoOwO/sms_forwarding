@@ -2,15 +2,18 @@
 
 This file applies to `dev_doc/`. The root `AGENTS.md` also applies.
 
-- Keep all development documentation in this directory and link every document
-  from `README.md` here.
-- Prefer a task-oriented explanation over a manually maintained per-function
-  API catalogue; declarations and source already provide that index.
-- Verify claims against current source and workflows. Label hardware-only facts
-  with the board/modem and evidence date or report.
-- Do not state dependency versions as requirements unless the repository pins
-  them. Separate CI baselines from optional hardware-specific settings.
-- Write commands from the repository root and make placeholders obvious.
-- Update architecture limits, route tables, build commands, and cross-file
-  change maps in the same change that alters them.
-- Keep credentials and personal machine paths out of examples.
+- Keep development documentation in this directory. Link each document from
+  `dev_doc/README.md`.
+- Use task-oriented instructions. Do not maintain a manual per-function API
+  catalog when declarations and OpenAPI already provide that information.
+- Validate claims against the current source, workflow files, and
+  `openapi.json`.
+- Label hardware facts with the board, modem, input, and observed result.
+- Write commands from the repository root. Use clear placeholders for local
+  paths, ports, credentials, and keys.
+- Update architecture limits, route groups, build commands, and the document
+  map in the same change that alters them.
+- Classify documentation languages in `document-languages.json`. A Simplified
+  Chinese document must have both Traditional Chinese and English equivalents.
+- Do not add credentials, personal machine paths, raw SMS content, or complete
+  device identifiers to examples.

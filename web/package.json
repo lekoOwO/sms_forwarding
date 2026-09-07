@@ -6,7 +6,7 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build && node scripts/package.mjs",
-		"lint": "cd .. && eslint --suppressions-location eslint-suppressions.json eslint.config.js web/scripts web/src web/vite.config.ts mock_server",
+		"lint": "cd .. && eslint --suppressions-location eslint-suppressions.json eslint.config.js mock_server web/scripts web/src web/vite.config.ts",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",

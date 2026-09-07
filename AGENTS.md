@@ -1,64 +1,67 @@
-# Repository working agreement
+# AGENTS.md
 
-This file applies to the whole repository. Read the nearest scoped `AGENTS.md`
-before changing files below it.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
-## Start here
+## What This Is
 
-- Read `dev_doc/README.md` for the documentation map.
-- Read `dev_doc/architecture.md` before changing runtime flow or module boundaries.
-- Read `dev_doc/development.md` before starting the development container,
-  building, flashing, testing, or opening a PR.
-- For firmware changes, also read `code/AGENTS.md`.
-- For Web UI changes, also read `web/AGENTS.md`.
-- For Mock Server changes, also read `mock_server/AGENTS.md`.
-- For documentation changes, also read `dev_doc/AGENTS.md`.
+ESP32-C3 firmware for a low-cost SMS forwarder. A 4G/LTE modem (ML307R-DC) receives SMS over UART/AT; the ESP32-C3 decodes PDU, then forwards the message over WiFi to email (SMTP) and up to 5 simultaneous push channels, and serves a web UI for config/diagnostics.
 
-## Source of truth
+The firmware is now native **ESP-IDF only**. The former Arduino fallback sketch has been removed. Keep inline docs/comments in Chinese when editing source files.
 
-Use this order when facts conflict:
+## Build / Flash / Monitor
 
-1. Current source and workflow files.
-2. Reproducible build or hardware evidence.
-3. `dev_doc/`.
-4. Root `README.md` and historical discussion.
+Local ESP-IDF helper:
 
-Do not turn an observed modem response into a general protocol fact without a
-captured fixture, hardware report, or another documented promotion path.
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 build
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 flash -Port COM5
+powershell -ExecutionPolicy Bypass -File tools\idf.ps1 monitor -Port COM5
+```
 
-## Repository map
+The helper loads ESP-IDF 6.0.2, uses Ninja parallelism, and writes generated build files under `build/`.
 
-- `code/`: the Arduino ESP32-C3 sketch and all runtime code.
-- `web/`: the shadcn-svelte source and reproducible LittleFS bundle builder.
-- `mock_server/`: the Express implementation of the firmware HTTP contract.
-- `scripts/`: stable development entry points for Compose services and builds.
-- `dev_doc/`: the only home for development documentation.
-- `.github/workflows/`: CI and repository automation.
-- `.github/ISSUE_TEMPLATE/`: issue intake forms.
-- `assets/`: images used by the public README.
+Minimum ESP-IDF: **v6.0.2** — the local helper and CI use the same pinned IDF 6.0.2 baseline; older IDF versions are not supported.
 
-Keep end-user project information in `README.md`. Put development instructions,
-architecture, test evidence, and maintenance notes in `dev_doc/`; do not create
-new development notes elsewhere.
+Before committing Web UI changes, run:
 
-## Change workflow
+```powershell
+npm --prefix web run check
+npm --prefix web run build
+node --test web/scripts/package.test.mjs
+```
 
-- Trace the affected flow and all callers before editing shared behavior.
-- Reuse the current Arduino/ESP32 facilities and installed libraries. Add no
-  dependency or abstraction without a concrete need.
-- Reverse engineering and documentation discovery use deterministic evidence
-  checks, not artificial red/green tests.
-- Runtime features and bug fixes require a failing check first, then the
-  smallest passing change. If host-side automation is impractical, record why
-  and use the focused compile/hardware verification in `dev_doc/development.md`.
-- Preserve unrelated worktree changes. Stage only intended files.
-- Never commit real WiFi, SMTP, webhook, bot, or phone credentials.
+CI builds the ESP-IDF firmware via `.github/workflows/build.yml`.
 
-## Minimum completion checks
+## Architecture
 
-- Run the focused check for the changed area.
-- Run the CI-equivalent firmware compile inside the persistent Compose `dev`
-  container for runtime changes.
-- Run `git diff --check` and inspect tracked, untracked, ignored, staged, and
-  latest-commit contents before a PR.
-- State clearly which checks were not run, especially hardware checks.
+Project entrypoints:
+
+- `CMakeLists.txt`, `main/`, and `components/` are the ESP-IDF firmware.
+- `components/idf_modem` owns UART1 and all modem AT traffic.
+- `components/idf_sms` handles PDU SMS receive/send, SIM storage polling, multipart merge, dedup, blacklist/admin commands, and enqueueing forwards.
+- `components/idf_push` owns HTTP/HTTPS push, SMTP, forward queues, retry queues, test push, and forward-rule evaluation.
+- `components/idf_web` owns `esp_http_server`, all Web/API routes, scheduler, keep-alive jobs, OTA upload, diagnostics, and status JSON.
+- `components/idf_wifi` owns STA/SoftAP provisioning, captive DNS, lightweight mDNS, SNTP, reconnect watchdog, and BOOT long-press provisioning.
+- `components/idf_config` persists config in NVS namespace `sms_config`; old NVS keys remain additive/compatible.
+- `components/web_assets` links generated gzip Web assets from `code/web_assets.cpp`; editable sources live in `web/`.
+
+Slow work must stay off request handlers where possible: use existing worker queues for push/email/modem/keep-alive work so SMS receive and Web refresh stay responsive.
+
+## Web UI Assets
+
+Editable UI sources live in `web/`. Run `npm --prefix web run check` and
+`npm --prefix web run build` after UI changes. The build updates generated
+`code/web_assets.h` and `code/web_assets.cpp`; do not hand-edit those files.
+
+Keep page data and dynamic values in the Svelte routes and API helpers under
+`web/src/`, with matching config and locale keys where needed.
+
+## Extension Conventions
+
+- **New push channel**: add type handling in `components/idf_push/idf_push.cpp`, add validation, then add the Web UI option and hint under `web/src/`. `IDF_MAX_PUSH_CHANNELS` is 5.
+- **New config field**: add to `IdfConfig`, load/save it in `components/idf_config/idf_config.cpp`, expose/parse it in Web config handlers, and keep the key additive with a default.
+- **New HTTP route**: add a handler in `components/idf_web/idf_web.cpp`, register it in `idf_web_start()`, and prefer bounded/streaming responses over large one-shot strings.
+- **Logging**: use `idf_log_line()` / `idf_logf()` for Web-visible logs. Logs are mirrored into the 120-entry ring buffer.
+- **Privacy**: SMS body and phone numbers should remain masked in normal logs; full content belongs only behind explicit verbose/debug builds.
+- **Modem order matters**: handshake, disable/enable data per config via `CGACT`, configure storage/CNMI/PDU mode, then wait for CEREG. PDU mode is required for Chinese SMS.
+- **Receive robustness**: keep both URC receive and periodic `AT+CMGL` storage polling. Dedup makes the dual path safe.
