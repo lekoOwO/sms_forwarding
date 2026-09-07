@@ -106,11 +106,12 @@ jobs:
             (github.base_ref == 'develop' || github.base_ref == 'master'))
         env:
           BEFORE: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         shell: bash
         run: |
           current_build=$(python3 -c 'import json; print(json.load(open("firmware-version.json"))["devBuild"])')
-          if [[ -n "$GITHUB_BASE_REF" ]]; then
-            previous_ref="origin/$GITHUB_BASE_REF"
+          if [[ -n "$BASE_SHA" ]]; then
+            previous_ref="$BASE_SHA"
           else
             if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
               echo "Push event has no valid previous commit" >&2

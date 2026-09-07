@@ -200,7 +200,8 @@ def run_tag_gate(previous_version: str, current_version: str) -> subprocess.Comp
 
 
 def run_branch_counter_gate(previous_version: str | None, current_version: str, *,
-                            before: str = "previous", recreate_branch: bool = False
+                            before: str = "previous", recreate_branch: bool = False,
+                            base_sha: bool = False, base_ref: str = ""
                             ) -> subprocess.CompletedProcess[str]:
     """Execute the branch counter policy against real commits and refs."""
     with tempfile.TemporaryDirectory() as directory:
@@ -240,7 +241,11 @@ def run_branch_counter_gate(previous_version: str | None, current_version: str, 
         }[before]
         script = named_step(load_workflow(), "build", "Verify Dev build increased")["run"]
         env = os.environ.copy()
-        env.update({"BEFORE": before_value, "GITHUB_BASE_REF": ""})
+        env.update({
+            "BEFORE": before_value,
+            "BASE_SHA": previous_sha if base_sha else "",
+            "GITHUB_BASE_REF": base_ref,
+        })
         return subprocess.run(
             ["bash", "-euo", "pipefail", "-c", script], cwd=work, env=env,
             capture_output=True, text=True,
@@ -560,6 +565,15 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     previous, current, before=before, recreate_branch=recreate
                 )
                 self.assertEqual(expected, result.returncode == 0, result.stderr)
+
+    def test_branch_counter_gate_uses_pull_request_base_sha(self):
+        result = run_branch_counter_gate(
+            '{"releaseVersion":"1.1.4","devBuild":14}\n',
+            '{"releaseVersion":"1.1.4","devBuild":15}\n',
+            base_sha=True,
+            base_ref="develop",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
 
     def test_tag_gate_requires_a_new_counter_and_rejects_malformed_release_history(self):
         valid_previous = '{"releaseVersion":"1.1.3","devBuild":14}\n'
