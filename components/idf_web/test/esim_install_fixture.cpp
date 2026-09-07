@@ -74,8 +74,8 @@ static void vTaskDelay(TickType_t ticks) {
     clock_us += static_cast<int64_t>(ticks) * 1000;
     if (on_delay) { auto run = std::move(on_delay); on_delay = {}; run(); }
 }
-struct IdfModemStatus { bool atReady = true, modemReady = true; };
-static IdfModemStatus idf_modem_get_status() { return {}; }
+struct EsimFixtureModemStatus { bool atReady = true, modemReady = true; };
+static EsimFixtureModemStatus idf_modem_get_status() { return {}; }
 static bool idf_modem_at_idle() { return true; }
 static void idf_modem_invalidate_sim_identity() { ++enable_calls; }
 esp_err_t idf_esim_list_profiles(std::vector<IdfEsimProfile>& out, std::string& eid, std::string&) {
@@ -127,7 +127,9 @@ static int read_body(httpd_req_t* req, std::string& out, size_t max) {
     out = req->input; return ESP_OK;
 }
 
+#define IdfModemStatus EsimFixtureModemStatus
 // FUNCTIONS
+#undef IdfModemStatus
 
 static httpd_req_t request(std::string input = {}) {
     httpd_req_t req; req.input = std::move(input); req.content_len = req.input.size();
@@ -138,6 +140,7 @@ static void run_task() {
     assert(task_fn); auto fn = task_fn; auto arg = task_arg; task_fn = nullptr; task_arg = nullptr; fn(arg);
     assert(!locked && !admitted && s_esim_confirmation_code.empty());
 }
+
 int main() {
     const std::string start = "action=install&activationCode=LPA%3A1%24example.invalid%24INSTALL-SECRET";
     httpd_req_t unauthorized; unauthorized.input = start; unauthorized.content_len = start.size(); unauthorized.authenticated = false;

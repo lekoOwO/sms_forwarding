@@ -15,7 +15,7 @@
 using esp_err_t = int;
 constexpr int ESP_OK = 0, ESP_FAIL = -1;
 constexpr size_t MAX_PDU_HEX_CHARS = 600;
-struct IdfSmsProcessView { std::string numberBlackList; };
+struct CallFixtureSmsProcessView { std::string numberBlackList; };
 static int64_t now_us = 0;
 static bool enabled = true, esim_active = false, forward_accepts = true;
 static int query_result = ESP_OK;
@@ -25,7 +25,7 @@ static int urc_takes = 0;
 static int64_t esp_timer_get_time() { return now_us; }
 static bool idf_config_call_notify_enabled() { return enabled; }
 static bool idf_modem_esim_operation_active() { return esim_active; }
-static IdfSmsProcessView idf_config_get_sms_process_view() { return {blacklist}; }
+static CallFixtureSmsProcessView idf_config_get_sms_process_view() { return {blacklist}; }
 static int idf_config_get_tz_offset() { return 0; }
 static std::string idf_util_format_epoch_local(uint32_t, int) { return "synthetic time"; }
 static std::string idf_util_trim_copy(const std::string& text)
@@ -70,15 +70,19 @@ static bool idf_modem_take_urc(std::string& text)
     text.swap(queued_urcs);
     return !text.empty();
 }
-struct PduDecodeOutcome {
+struct CallFixturePduDecodeOutcome {
     bool decoded, safe_to_delete, admission_blocked;
 };
-static PduDecodeOutcome decode_pdu_line(const std::string& line, bool)
+static CallFixturePduDecodeOutcome decode_pdu_line(const std::string& line, bool)
 {
     return {line == "00112233445566778899AABBCCDDEEFF", true, false};
 }
 static void enqueue_index(int) {}
+#define IdfSmsProcessView CallFixtureSmsProcessView
+#define PduDecodeOutcome CallFixturePduDecodeOutcome
 #include "call_runtime.inc"
+#undef PduDecodeOutcome
+#undef IdfSmsProcessView
 
 static void test_repeated_ring_keeps_first_deadline()
 {

@@ -61,12 +61,12 @@ static esp_err_t idf_modem_send_at(const std::string& command, uint32_t timeout,
 #undef settimeofday
 #undef time
 
-struct IdfSimSettingsView {};
+struct ClockFixtureSimSettingsView {};
 static void retry_sms_storage_if_pending() {}
 static void apply_startup_data_mode(int) {}
-static IdfSimSettingsView idf_config_get_sim_settings_view() { return {}; }
-static void apply_operator_if_configured(IdfSimSettingsView, int) {}
-static void enforce_roaming_data_policy(IdfSimSettingsView, int) {}
+static ClockFixtureSimSettingsView idf_config_get_sim_settings_view() { return {}; }
+static void apply_operator_if_configured(ClockFixtureSimSettingsView, int) {}
+static void enforce_roaming_data_policy(ClockFixtureSimSettingsView, int) {}
 static void sample_signal_once()
 {
     if (!sample_seen) writes_at_first_sample = writes.size();
@@ -78,7 +78,9 @@ static bool startup_sampling_done() { return true; }
 static void set_phase(const char*) {}
 static void vTaskDelay(TickType_t ticks) { now_us += ticks * 1000; }
 static bool process_data_mode_retry() { return false; }
+#define IdfSimSettingsView ClockFixtureSimSettingsView
 #include "clock_owner.inc"
+#undef IdfSimSettingsView
 
 static std::string frame(const std::string& value)
 {
