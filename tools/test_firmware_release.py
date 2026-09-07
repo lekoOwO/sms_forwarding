@@ -253,6 +253,25 @@ def run_branch_counter_gate(previous_version: str | None, current_version: str, 
 
 
 class FirmwareVersionTests(unittest.TestCase):
+    def test_container_checkout_is_trusted_for_later_git_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            subprocess.run(["git", "init", "-q", str(work)], check=True)
+            env = os.environ.copy()
+            env.update({
+                "GITHUB_WORKSPACE": str(work),
+                "GIT_CONFIG_GLOBAL": str(work / "gitconfig"),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+            })
+            setup = next((step["run"] for step in load_workflow()["jobs"]["build"]["steps"]
+                          if step["name"] == "Trust container checkout"), "")
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", setup + "\ngit status --porcelain"],
+                cwd=work, env=env, capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+
     def test_checked_in_version_source_and_header_are_synchronized(self):
         self.assertTrue(VERSION.exists(), "firmware-version.json is missing")
         self.assertTrue(GENERATOR.exists(), "firmware version generator is missing")
