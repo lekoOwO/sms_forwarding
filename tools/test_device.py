@@ -294,6 +294,8 @@ class DeviceCommandTest(unittest.TestCase):
                 error = io.StringIO()
                 with self.subTest(name=case["name"]), \
                         mock.patch.dict(os.environ, case["environment"], clear=True), \
+                        mock.patch.object(device, "SYSFS_TTY_ROOT", root / "sys-class-tty"), \
+                        mock.patch.object(device, "_serial_usb_identity", return_value=USB_IDENTITY), \
                         mock.patch.object(device, "DEVICE_PREFIX", f"{by_id}/"), \
                         mock.patch.object(device.stat, "S_ISCHR", return_value=True), \
                         mock.patch.object(
