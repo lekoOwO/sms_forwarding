@@ -198,7 +198,7 @@ bool looks_like_pdu_line(std::string_view line)
 bool cgdcont_field_safe(std::string_view value, bool quoted)
 {
     return std::all_of(value.begin(), value.end(), [quoted](unsigned char ch) {
-        if (ch < 0x20 || ch > 0x7e || ch == 0x7f) return false;
+        if (ch < 0x20 || ch > 0x7e) return false;
         return !quoted || (ch != '"' && ch != '\\');
     });
 }
@@ -1127,7 +1127,7 @@ bool HttpResponse::parse_header(size_t body_start, IdfModemHttpsPostResult& resu
     while (position < header_end) {
         const size_t end = header_.find("\r\n", position);
         if (end == std::string::npos || end > header_end) return false;
-        const std::string_view line(header_.data() + position, end - position);
+        const std::string_view line = std::string_view(header_).substr(position, end - position);
         const size_t colon = line.find(':');
         if (colon == std::string_view::npos || colon == 0 || !header_value_bytes_valid(line)) {
             return false;

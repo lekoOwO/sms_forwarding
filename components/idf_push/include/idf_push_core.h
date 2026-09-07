@@ -71,7 +71,7 @@ bool idf_push_network_uses_wifi(NetworkMode mode, bool wifi_connected);
 IdfPushNetworkDecision idf_push_select_network(NetworkMode mode, bool wifi_connected);
 size_t idf_push_utf8_codepoint_count(const std::string& value, size_t limit);
 void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
-                                std::string message, std::string cleanup_message,
+                                std::string message, const std::string& cleanup_message,
                                 IdfModemHttpsDiagnosticReason failure_reason =
                                     IdfModemHttpsDiagnosticReason::none,
                                 IdfModemHttpsDiagnosticReason cleanup_reason =

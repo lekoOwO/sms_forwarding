@@ -161,7 +161,7 @@ static bool http_status_valid(int status)
 }
 
 void idf_push_complete_test_job(IdfPushTestJobState& job, bool success,
-                                std::string message, std::string cleanup_message,
+                                std::string message, const std::string& cleanup_message,
                                 IdfModemHttpsDiagnosticReason failure_reason,
                                 IdfModemHttpsDiagnosticReason cleanup_reason,
                                 bool reset_needed,

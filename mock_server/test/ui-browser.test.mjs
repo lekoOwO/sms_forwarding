@@ -212,9 +212,15 @@ test("device subpages keep deep links, scroll position, controls, and accessible
 
 		const activeStyle = await page.$eval(".desktop-sidebar .device-subnav-link[data-active=true]", (node) => {
 			const color = getComputedStyle(node).backgroundColor;
-			const oklch = color.match(/oklch\([^ ]+\s+([^ ]+)\s+[^)]+\)/);
-			const rgb = color.match(/\d+/g)?.map(Number) ?? [];
-			return { chroma: oklch ? Number(oklch[1]) : rgb.length >= 3 ? Math.max(...rgb.slice(0, 3)) - Math.min(...rgb.slice(0, 3)) : Number.NaN, dark: document.documentElement.classList.contains("dark") };
+			const canvas = document.createElement("canvas");
+			canvas.width = 1;
+			canvas.height = 1;
+			const context = canvas.getContext("2d");
+			if (!context) return { chroma: Number.NaN, dark: document.documentElement.classList.contains("dark") };
+			context.fillStyle = color;
+			context.fillRect(0, 0, 1, 1);
+			const [red, green, blue] = context.getImageData(0, 0, 1, 1).data;
+			return { chroma: Math.max(red, green, blue) - Math.min(red, green, blue), dark: document.documentElement.classList.contains("dark") };
 		});
 		assert.equal(activeStyle.dark, true);
 		assert.ok(activeStyle.chroma < 0.01, "dark active subnav must stay neutral");

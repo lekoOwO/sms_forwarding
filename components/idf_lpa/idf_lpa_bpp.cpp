@@ -1563,7 +1563,7 @@ private:
     esp_err_t complete_value(std::string& message)
     {
         if (depth_ == 0U) return fail(ESP_ERR_INVALID_RESPONSE, message);
-        JsonFrame& parent = frames_[depth_ - 1U];
+        const JsonFrame& parent = frames_[depth_ - 1U];
         if ((parent.kind == JsonFrameKind::object &&
              parent.state != JsonFrameState::object_after_value) ||
             (parent.kind == JsonFrameKind::array &&

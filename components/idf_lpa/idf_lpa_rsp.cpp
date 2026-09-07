@@ -698,7 +698,7 @@ bool valid_oid(const std::vector<std::uint8_t>& value) noexcept
         arc = arc * 128U + group;
         ++arc_bytes;
         if ((byte & 0x80U) != 0U) continue;
-        if (first_subidentifier) first_subidentifier = false;
+        first_subidentifier = false;
         arc = 0U;
         arc_bytes = 0U;
     }

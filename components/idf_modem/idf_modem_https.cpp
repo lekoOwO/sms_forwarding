@@ -455,18 +455,18 @@ private:
         }
         uint32_t unread = 0;
         std::vector<uint8_t> data;
-        bool remote_closed = false;
+        bool remote_closed_result = false;
         bool no_data = false;
         ParseReason parse_reason = ParseReason::none;
         ParseShape parse_shape{};
-        if (!parse_read(response, command, 0, unread, data, remote_closed,
+        if (!parse_read(response, command, 0, unread, data, remote_closed_result,
                         &parse_reason, &parse_shape, &no_data)) {
             failure_parse_reason_ = parse_reason;
             failure_parse_shape_ = parse_shape;
             record_failure_response_reason(IdfModemHttpsFailureResponseReason::modem_read);
             return false;
         }
-        if (remote_closed) remote_closed_ = true;
+        if (remote_closed_result) remote_closed_ = true;
         pending_ = std::move(data);
         if (pending_.empty()) {
             if (no_data && !deadline_.expired()) {
@@ -1238,7 +1238,8 @@ bool idf_modem_https_parse_url(std::string_view raw_url, IdfModemHttpsTarget& ta
     const size_t authority_start = kHttpsPrefix.size();
     const size_t path_start = owned.find_first_of("/?#", authority_start);
     const size_t authority_end = path_start == std::string::npos ? owned.size() : path_start;
-    std::string_view authority(owned.data() + authority_start, authority_end - authority_start);
+    const std::string_view authority = std::string_view(owned).substr(
+        authority_start, authority_end - authority_start);
     if (authority.empty() || authority.find('@') != std::string_view::npos) {
         error = "HTTPS URL host is invalid";
         return false;

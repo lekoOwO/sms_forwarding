@@ -837,7 +837,7 @@ bool idf_lpa_es9_post_json(IdfLpaEs9Operation operation,
     }
 
     IdfLpaEs9TransportError result = IdfLpaEs9TransportError::none;
-    int status_code = 0;
+    int status_code;
     do {
         if (esp_http_client_set_method(client, HTTP_METHOD_POST) != ESP_OK ||
             esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK ||
@@ -960,7 +960,7 @@ bool idf_lpa_es9_get_bound_profile_package(
         return fail(error, IdfLpaEs9TransportError::client_init);
     }
 
-    IdfLpaEs9TransportError result = IdfLpaEs9TransportError::none;
+    IdfLpaEs9TransportError result;
     if (esp_http_client_set_method(client, HTTP_METHOD_POST) != ESP_OK ||
         esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK ||
         esp_http_client_set_header(client, "X-Admin-Protocol", "gsma/rsp/v2.6.0") != ESP_OK ||
