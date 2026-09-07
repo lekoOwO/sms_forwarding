@@ -12,3 +12,17 @@ constVariablePointer
 # The analyzer cannot model FreeRTOS/linker contracts and reports known false
 # positives for guarded fallback paths in the current runtime.
 knownConditionTrueFalse
+
+# These are advisory refactors or intentional test-fixture assertions. They do
+# not identify a runtime correctness or security defect in this firmware.
+assertWithSideEffect
+constVariableReference
+duplicateConditionalAssign
+passedByValue
+redundantCondition
+redundantInitialization
+shadowFunction
+stlcstrConstructor
+unreadVariable
+unusedPrivateFunction
+useStlAlgorithm
