@@ -209,6 +209,11 @@ jobs:
           node web/scripts/package.mjs --check
           git diff --exit-code -- code/web_assets.h code/web_assets.cpp
 
+      - name: Install host crypto test dependencies
+        run: |
+          apt-get update
+          apt-get install --no-install-recommends -y libssl-dev
+
       - name: Run host contract tests
         shell: bash
         run: |
