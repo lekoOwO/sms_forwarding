@@ -120,6 +120,13 @@ jobs:
             previous_ref="$BEFORE"
           fi
           if ! git rev-parse --verify "${previous_ref}^{commit}" >/dev/null 2>&1; then
+            if [[ -z "$BASE_SHA" ]]; then
+              echo "Previous commit is not available: $previous_ref" >&2
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+          if ! git rev-parse --verify "${previous_ref}^{commit}" >/dev/null 2>&1; then
             echo "Previous commit is not available: $previous_ref" >&2
             exit 1
           fi
