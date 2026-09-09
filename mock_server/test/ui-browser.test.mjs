@@ -143,14 +143,37 @@ test("roaming diagnostics expose raw values by keyboard and touch", { timeout: 3
 		// Input dispatch can finish before the browser applies the native details toggle.
 		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
 		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
-		await page.setViewport({ width: 390, height: 844 });
-		await page.tap('summary[title="registration: 5"]');
-		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === false, { timeout: 1000 });
-		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), false);
-		await page.tap('summary[title="registration: 5"]');
-		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
-		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
-		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.nextElementSibling.textContent), /registration: 5/);
+		// Keep bounded geometry/input evidence for the CI-only touch failure; never collect page text.
+		const touchTrace = await page.evaluateHandle(() => {
+			const summary = document.querySelector('summary[title="registration: 5"]');
+			const describe = (element) => element instanceof Element ? { tag: element.tagName, slot: element.getAttribute("data-slot"), classes: element.getAttribute("class")?.slice(0, 160), summary: element === summary, insideSummary: summary.contains(element) } : null;
+			const snapshot = () => ({ time: performance.now(), rect: summary.getBoundingClientRect().toJSON(), open: summary.parentElement.open, viewport: { width: innerWidth, height: innerHeight, scrollY, touchPoints: navigator.maxTouchPoints }, animations: document.getAnimations().slice(0, 8).map((animation) => ({ name: animation.animationName, state: animation.playState, time: animation.currentTime, target: describe(animation.effect?.target) })) });
+			const events = [{ type: "before-resize", ...snapshot() }];
+			for (const type of ["resize", "scroll", "pointerdown", "pointerup", "touchstart", "touchend", "click", "toggle"]) {
+				window.addEventListener(type, (event) => {
+					if (events.length >= 32) return;
+					const point = event.changedTouches?.[0] ?? event;
+					const x = point.clientX, y = point.clientY;
+					events.push({ type, target: describe(event.target), x, y, hit: Number.isFinite(x) ? describe(document.elementFromPoint(x, y)) : null, ...snapshot() });
+				}, { capture: true, passive: true });
+			}
+			return { events, snapshot };
+		});
+		try {
+			await page.setViewport({ width: 390, height: 844 });
+			await page.tap('summary[title="registration: 5"]');
+			await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === false, { timeout: 1000 });
+			assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), false);
+			await page.tap('summary[title="registration: 5"]');
+			await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
+			assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
+			assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.nextElementSibling.textContent), /registration: 5/);
+		} catch (error) {
+			console.error("Diagnostic touch failure:", JSON.stringify(await touchTrace.evaluate((trace) => ({ events: trace.events, final: trace.snapshot() }))));
+			throw error;
+		} finally {
+			await touchTrace.dispose();
+		}
 	} finally {
 		await closeBrowser(browser, shared);
 		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
