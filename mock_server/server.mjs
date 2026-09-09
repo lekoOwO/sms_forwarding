@@ -6,6 +6,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import express from "express";
+import { previewMockRules } from "../web/src/lib/forward-rules.js";
 
 const defaultWebRoot = process.env.WEB_ROOT ?? "/web";
 const defaultOpenApiPath = process.env.OPENAPI_PATH ?? "/spec/openapi.json";
@@ -441,19 +442,10 @@ const fieldLimits = {
 	cmd: 256, action: 32, type: 32, deviceName: 64, hostname: 32, notificationLocale: 16,
 	networkMode: 32, heartbeatEnable: 32, heartbeatInterval: 32,
 	emailEnabled: 32, pushEnabled: 32,
-	kaEnabled: 32, kaIntervalDays: 32, kaTrafficKB: 32
+	kaEnabled: 32, kaIntervalDays: 32, kaTrafficKB: 32, kaUrl: 256
 };
 
-function forwardRulesValid(rules) {
-	for (const rawLine of rules.split("\n")) {
-		const [type, pattern, , enabled = "1"] = rawLine.trim().split("\t");
-		if (enabled.trim() === "0" || !pattern || !["from", "re"].includes(type)) continue;
-		if (/(^|[^\\])(?:\\\\)*\(\?/.test(pattern)) return false;
-		try { new RegExp(pattern, "i"); }
-		catch { return false; }
-	}
-	return true;
-}
+const forwardRulesValid = (rules) => previewMockRules(rules).success;
 
 function configSemanticallyValid(config) {
 	const bounded = (value, limit) => typeof value === "string" && byteLength(value) <= limit;
@@ -625,7 +617,7 @@ function saveFieldFamily(field) {
 		pushEnabled: "push",
 		adminPhone: "routing", numberBlackList: "routing", forwardRules: "routing", networkMode: "network",
 		heartbeatEnable: "heartbeat", heartbeatInterval: "heartbeat",
-		kaEnabled: "keepalive", kaIntervalDays: "keepalive", kaTrafficKB: "keepalive"
+		kaEnabled: "keepalive", kaIntervalDays: "keepalive", kaTrafficKB: "keepalive", kaUrl: "keepalive"
 	};
 	if (Object.hasOwn(direct, field)) return { family: direct[field] };
 	let match = field.match(/^account([0-9])(user|pass)$/);
@@ -684,7 +676,14 @@ export function createApp({
 		queued: false, running: false, done: false, success: false, message: "Test not started"
 	}));
 	const pushTestDeadlines = Array(5).fill(0);
-	const pushCa = Array.from({ length: 5 }, () => ({ configured: false, sha256: "" }));
+	const pushCa = Array.from({ length: 6 }, () => ({ configured: false, sha256: "" }));
+	const keepalive = { jobQueued: false, jobRunning: false, jobDone: false, jobSuccess: false, jobMessage: "", bodyBytes: 0, requests: 0, cancelRequested: false };
+	const keepaliveUrlValid = (url) => {
+		try { const parsed = new URL(url); return url.startsWith("https://") && parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.hash && !/\s/.test(url) && ![...url].some((ch) => ch.charCodeAt(0) < 32) && byteLength(url) <= 256; }
+		catch { return false; }
+	};
+	const caChannel = (request) => request.path.startsWith("/api/keepalive/ca/") ? 5 : boundedUnsigned(request.query.channel, 0, 4);
+	const caQuerySize = (channel, install = false) => (channel === 5 ? 0 : 1) + (install ? 1 : 0);
 	const pushCaNonces = new Map();
 	const exportsById = new Map();
 	let upload;
@@ -834,7 +833,8 @@ export function createApp({
 		"GET /wifi", "GET /api/config/export", "POST /api/config/export", "POST /api/config/restore/start",
 		"POST /api/config/restore/chunk", "POST /api/config/restore/finish", "POST /api/ota/start",
 		"POST /api/ota/chunk", "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
-		"POST /api/esim", "POST /wificonfig", "POST /api/push/ca/probe", "POST /api/push/ca/install"
+		"POST /api/esim", "POST /wificonfig", "POST /api/push/ca/probe", "POST /api/push/ca/install", "POST /api/rules/preview",
+		"POST /api/keepalive", "POST /api/keepalive/ca/probe", "POST /api/keepalive/ca/install"
 	]);
 	app.use(rejectEnvelope);
 	app.use("/api/esim", (_request, response, next) => {
@@ -1094,34 +1094,34 @@ export function createApp({
 		return response.status(202).json(serializePushTestStatus(status, parsed.detail));
 	});
 
-	app.use("/api/push/ca", (_request, response, next) => {
+	app.use(["/api/push/ca", "/api/keepalive"], (_request, response, next) => {
 		response.set("Cache-Control", "no-store, max-age=0");
 		next();
 	});
-	for (const [route, allow] of [["/api/push/ca/status", "GET"], ["/api/push/ca/probe", "POST"], ["/api/push/ca/install", "POST"]]) {
+	for (const [route, allow] of [["/api/push/ca/status", "GET"], ["/api/push/ca/probe", "POST"], ["/api/push/ca/install", "POST"], ["/api/keepalive/ca/status", "GET"], ["/api/keepalive/ca/probe", "POST"], ["/api/keepalive/ca/install", "POST"]]) {
 		app.all(route, (request, response, next) => request.method === allow ? next() : response.set("Allow", allow).status(405)
 			.json(result(false, "ACTION_INPUT_INVALID", {}, "method")));
 	}
 
-	app.get("/api/push/ca/status", (request, response) => {
-		const channel = boundedUnsigned(request.query.channel, 0, 4);
-		if (channel === undefined || Object.keys(request.query).length !== 1 || request.headers["transfer-encoding"] ||
+	app.get(["/api/push/ca/status", "/api/keepalive/ca/status"], (request, response) => {
+		const channel = caChannel(request);
+		if (channel === undefined || Object.keys(request.query).length !== caQuerySize(channel) || request.headers["transfer-encoding"] ||
 			Number(request.headers["content-length"] ?? 0) > 0 || Object.keys(request.body).length) {
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "channel"));
 		}
 		return response.json(result(true, "PUSH_CA_STATUS", { ...pushCa[channel] }));
 	});
 
-	app.post("/api/push/ca/probe", (request, response) => {
-		const channel = boundedUnsigned(request.query.channel, 0, 4);
-		if (channel === undefined || Object.keys(request.query).length !== 1 || request.headers["transfer-encoding"] ||
+	app.post(["/api/push/ca/probe", "/api/keepalive/ca/probe"], (request, response) => {
+		const channel = caChannel(request);
+		if (channel === undefined || Object.keys(request.query).length !== caQuerySize(channel) || request.headers["transfer-encoding"] ||
 			Number(request.headers["content-length"] ?? 0) > 0 || Object.keys(request.body).length) {
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "channel"));
 		}
-		if (!state.config.pushChannels[channel].cellularEnabled) return response.status(409).json(result(false, "PUSH_CA_PROBE_FAILED"));
+		if (channel === 5 ? !keepaliveUrlValid(state.config.kaUrl) : !state.config.pushChannels[channel].cellularEnabled) return response.status(409).json(result(false, "PUSH_CA_PROBE_FAILED"));
 		return acceptJob("push_ca_probe", () => {
 			const nonce = randomBytes(16).toString("hex");
-			pushCaNonces.set(nonce, { channel, expiresAt: now() + 30000 });
+			pushCaNonces.set(nonce, { channel, expiresAt: now() + 30000, url: channel === 5 ? state.config.kaUrl : "" });
 			return result(true, "PUSH_CA_PROBE_READY", {
 				nonce, expiresInMs: 30000,
 				chain: [{ certSha256: "0".repeat(64), issuerDer: "MAMBAQ==", aki: "" }]
@@ -1129,10 +1129,10 @@ export function createApp({
 		}, response);
 	});
 
-	app.post("/api/push/ca/install", (request, response) => {
-		const channel = boundedUnsigned(request.query.channel, 0, 4);
+	app.post(["/api/push/ca/install", "/api/keepalive/ca/install"], (request, response) => {
+		const channel = caChannel(request);
 		const nonce = typeof request.query.nonce === "string" && /^[0-9a-f]{32}$/.test(request.query.nonce) ? request.query.nonce : "";
-		if (channel === undefined || !nonce || Object.keys(request.query).length !== 2) return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
+		if (channel === undefined || !nonce || Object.keys(request.query).length !== caQuerySize(channel, true)) return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
 		if (request.headers["content-type"] !== "application/pkix-cert") return response.status(415).json(result(false, "ACTION_INPUT_INVALID"));
 		const contentLength = typeof request.headers["content-length"] === "string" && /^\d+$/.test(request.headers["content-length"])
 			? Number(request.headers["content-length"]) : 0;
@@ -1140,7 +1140,7 @@ export function createApp({
 			request.body.length > 8192 || contentLength !== request.body.length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "body"));
 		const admission = pushCaNonces.get(nonce);
 		pushCaNonces.delete(nonce);
-		if (!admission || admission.channel !== channel || now() >= admission.expiresAt) return response.status(409).json(result(false, "PUSH_CA_STALE"));
+		if (!admission || admission.channel !== channel || now() >= admission.expiresAt || (channel === 5 && admission.url !== state.config.kaUrl)) return response.status(409).json(result(false, "PUSH_CA_STALE"));
 		const certificate = Buffer.from(request.body);
 		return acceptJob("push_ca_install", () => {
 			if (remainingPushCaRejections > 0) { remainingPushCaRejections -= 1; return result(false, "PUSH_CA_REJECTED"); }
@@ -1151,6 +1151,39 @@ export function createApp({
 		}, response);
 	});
 
+	app.all("/api/keepalive", (request, response) => {
+		if (!["GET", "POST"].includes(request.method)) return response.set("Allow", "GET, POST").status(405).json(result(false, "ACTION_INPUT_INVALID"));
+		const action = request.query.action ?? "";
+		if (request.headers["transfer-encoding"] || Number(request.headers["content-length"] ?? 0) > 0 ||
+			byteLength(request.originalUrl.split("?")[1] ?? "") >= 64 ||
+			Object.keys(request.query).some((key) => key !== "action") || !["", "run", "reset", "cancel"].includes(action) || Object.keys(request.body).length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
+		const config = state.config;
+		const ready = config.kaAction !== 1 || (keepaliveUrlValid(config.kaUrl) && pushCa[5].configured && config.kaTrafficKB <= 512);
+		if (action && request.method !== "POST") return response.json({ success: false, message: "This action requires POST" });
+		if (action === "cancel") { keepalive.cancelRequested = true; return response.json({ success: true, message: "Cancellation requested" }); }
+		if (action === "reset") { config.kaLastTime = Math.floor(now() / 1000); return response.json({ success: true, message: "Baseline date reset" }); }
+		if (action === "run") {
+			if (!ready) return response.json({ success: false, queued: false, message: "Check HTTPS URL and root CA first" });
+			if (keepalive.jobQueued || keepalive.jobRunning) return response.json({ success: true, queued: true, message: "Keepalive already running" });
+			Object.assign(keepalive, { jobQueued: true, jobRunning: false, jobDone: false, jobSuccess: false, bodyBytes: 0, requests: 0, cancelRequested: false });
+			setTimeout(() => {
+				Object.assign(keepalive, { jobQueued: false, jobDone: true, jobSuccess: !keepalive.cancelRequested, bodyBytes: keepalive.cancelRequested ? 0 : config.kaTrafficKB * 1024, requests: keepalive.cancelRequested ? 0 : 1 });
+				if (keepalive.jobSuccess) config.kaLastTime = Math.floor(now() / 1000);
+			}, Math.max(20, jobDelayMs));
+			return response.json({ success: true, queued: true, message: "Keepalive queued" });
+		}
+		return response.json({ ...keepalive, enabled: config.kaEnabled, intervalDays: config.kaIntervalDays, trafficKB: config.kaTrafficKB, action: config.kaAction, url: config.kaUrl, target: config.kaTarget, profile: config.kaProfile, timeValid: true, lastTimeLocal: config.kaLastTime ? new Date(config.kaLastTime * 1000).toISOString() : "", daysLeft: config.kaIntervalDays, ready, readinessMessage: ready ? "" : "Check HTTPS URL and root CA first" });
+	});
+
+	app.post("/api/rules/preview", (request, response) => {
+		const body = request.body ?? {};
+		if (Object.keys(body).some((key) => !["rules", "sender", "text"].includes(key)) ||
+			Object.entries(body).some(([key, value]) => typeof value !== "string" || value.includes("\0") || byteLength(value) > (key === "sender" ? 32 : 2048)))
+			return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
+		const preview = previewMockRules(body.rules ?? "", body.sender ?? "", body.text ?? "");
+		preview.data.previewEngine = "mock";
+		return acceptJob("rules_preview", preview, response);
+	});
 	app.post("/save", (request, response) => {
 		if (pushTestActive()) return response.status(409).json(result(false, "ACTION_BUSY"));
 		const body = request.body;
@@ -1249,14 +1282,19 @@ export function createApp({
 				config.heartbeatInterval = value;
 			}
 		}
-		if (Object.hasOwn(body, "kaEnabled") || Object.hasOwn(body, "kaIntervalDays") || Object.hasOwn(body, "kaTrafficKB")) {
+		if (["kaEnabled", "kaIntervalDays", "kaTrafficKB", "kaUrl"].some((key) => Object.hasOwn(body, key))) {
 			config.kaEnabled = body.kaEnabled === "on";
+			const url = body.kaUrl ?? config.kaUrl;
+			if (config.kaAction === 1 && (config.kaEnabled || url !== config.kaUrl) && !keepaliveUrlValid(url)) return acceptJob("save", result(false, "ACTION_CONFIG_INVALID", {}, "kaUrl"), response);
+			if (url !== config.kaUrl && (!keepaliveUrlValid(config.kaUrl) || !keepaliveUrlValid(url) || new URL(url).origin !== new URL(config.kaUrl).origin)) pushCa[5] = { configured: false, sha256: "" };
+			config.kaUrl = url;
 			for (const [field, minimum, maximum] of [["kaIntervalDays", 1, 3650], ["kaTrafficKB", 1, 10000]]) {
 				if (!Object.hasOwn(body, field)) continue;
 				const value = boundedUnsigned(body[field], minimum, maximum);
 				if (value === undefined) return acceptJob("save", result(false, "ACTION_CONFIG_INVALID"), response);
 				config[field] = value;
 			}
+			if (config.kaEnabled && config.kaAction === 1 && config.kaTrafficKB > 512) return acceptJob("save", result(false, "ACTION_CONFIG_INVALID", {}, "kaTrafficKB"), response);
 		}
 		for (let index = 0; index < 5; index += 1) {
 			const prefix = `wifi${index}`;
@@ -1341,7 +1379,7 @@ export function createApp({
 		}
 		const dataByType = {
 			ati: { manufacturer: "Mock Telecom", model: "Mock LTE-C3", revision: "1.0.0" },
-			signal: { rsrpDbm: -82, rsrqDb: -9.5, cesq: "99,99,255,255,20,58" },
+			signal: { rsrpDbm: -82, rsrqDb: -9, cesq: "-82,-9,16" },
 			siminfo: { imsi: "001010123456789", iccid: "8986000000000000000", msisdn: null },
 			network: { registration: 1, operator: "Mock Mobile", pdpActive: true, apn: "internet" },
 			wifi: {

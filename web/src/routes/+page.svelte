@@ -4,7 +4,9 @@
 	import MenuIcon from "@lucide/svelte/icons/menu";
 	import SunIcon from "@lucide/svelte/icons/sun";
 	import ActionResult from "$lib/components/ActionResult.svelte";
+	import ForwardRulesEditor from "$lib/components/ForwardRulesEditor.svelte";
 	import CellularCaResult from "$lib/components/CellularCaResult.svelte";
+	import KeepaliveSettings from "$lib/components/KeepaliveSettings.svelte";
 	import * as Accordion from "$lib/components/ui/accordion";
 	import * as Alert from "$lib/components/ui/alert";
 	import { Badge } from "$lib/components/ui/badge";
@@ -87,7 +89,6 @@
 	let pushProviderDrafts = $state<Array<Record<number, PushProviderDraft>>>(Array.from({ length: 5 }, () => ({})));
 	let emailResult = $state(idle());
 	let heartbeatResult = $state(idle());
-	let keepaliveResult = $state(idle());
 	let pushResult = $state(idle());
 	let pushTestResults = $state(Array.from({ length: 5 }, idlePushTest));
 	let pushTestBusy = $state(Array.from({ length: 5 }, () => false));
@@ -99,6 +100,8 @@
 	let networkModeResult = $state(idle());
 	let routingResult = $state(idle());
 	let forwardRulesResult = $state(idle());
+	let forwardRulesInvalid = $state(false);
+	let messagingSection = $state("sms");
 	let forwardRulesDialogOpen = $state(false);
 	let securityResult = $state(idle());
 	let smsResult = $state(idle());
@@ -894,7 +897,7 @@
 				{:else if mainTab === "messaging"}
 					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("messagingTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("messagingDescription")}</p></div>
-					<Accordion.Root type="single" value="sms">
+					<Accordion.Root type="single" bind:value={messagingSection}>
 						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="forward-rules">
@@ -936,7 +939,7 @@
 										</Dialog.Portal>
 									</Dialog.Root>
 								</div>
-								<form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><Field.Group><Field.Field><Field.Label for="forward-rules">{t("forwardRulesTitle")}</Field.Label><Textarea id="forward-rules" rows={10} spellcheck={false} aria-describedby="forward-rules-hint" bind:value={snapshot.config.forwardRules} /><Field.Description id="forward-rules-hint">{t("forwardRulesHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
+								<form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); if (forwardRulesInvalid) return; void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><ForwardRulesEditor bind:value={snapshot.config.forwardRules} bind:invalid={forwardRulesInvalid} {locale} /></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesInvalid || forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 							</Accordion.Content>
 						</Accordion.Item>
 					</Accordion.Root>
@@ -1061,18 +1064,9 @@
 								</Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="keepalive-compatibility">
-								<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("keepaliveTitle")}</span><Badge variant={snapshot.config.kaEnabled ? "destructive" : "outline"}>{snapshot.config.kaEnabled ? t("keepaliveLegacyEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger>
+								<Accordion.Trigger>{t("keepaliveTitle")}</Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-5">
-									<Alert.Root><Alert.Title>{t("keepaliveUnsupportedTitle")}</Alert.Title><Alert.Description>{t("keepaliveUnsupportedDescription")}</Alert.Description></Alert.Root>
-									<p class="text-muted-foreground">{snapshot.config.kaEnabled ? t("keepaliveEnabledDescription") : t("keepaliveDisabledDescription")}</p>
-									<dl class="grid gap-4 sm:grid-cols-2">
-										<div><dt class="text-sm text-muted-foreground">{t("keepaliveIntervalDays")}</dt><dd class="mt-1 font-medium tabular-nums">{snapshot.config.kaIntervalDays}</dd></div>
-										<div><dt class="text-sm text-muted-foreground">{t("keepaliveTrafficKB")}</dt><dd class="mt-1 font-medium tabular-nums">{snapshot.config.kaTrafficKB}</dd></div>
-									</dl>
-									{#if snapshot.config.kaEnabled}
-										<div class="flex justify-end"><Button variant="destructive" data-device-action="keepalive-disable" disabled={keepaliveResult.state === "loading"} onclick={() => { const c = snapshot!.config; void save((value) => keepaliveResult = value, { kaIntervalDays: c.kaIntervalDays, kaTrafficKB: c.kaTrafficKB }); }}>{keepaliveResult.state === "loading" ? t("commonSaving") : t("keepaliveDisable")}</Button></div>
-									{/if}
-									<ActionResult result={keepaliveResult} title={t("resultTitle")} {locale} />
+									<KeepaliveSettings {locale} />
 								</Accordion.Content>
 							</Accordion.Item>
 							</section>
@@ -1140,7 +1134,6 @@
 									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateTarget")}</dt><dd class="mt-1 font-medium">{otaState.pendingAddress === 0 ? t("otaStateNoPending") : otaSlotLabel(otaState.pendingAddress)}</dd></div>
 									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateKey")}</dt><dd class="mt-1 break-all font-mono text-sm" aria-label={t("otaStateKey")}>{otaState.publicKeySha256}</dd></div>
 								</dl>
-								<p class="mt-4 text-sm text-muted-foreground">{t("otaStateKeyHint")}</p>
 							{:else if otaStateLoading}
 								<div aria-live="polite"><Skeleton class="h-20 w-full" /></div>
 							{/if}

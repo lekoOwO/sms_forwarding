@@ -102,14 +102,6 @@ static constexpr bool wifi_tx_power_valid(uint8_t power)
 static_assert(wifi_tx_power_valid(34) && wifi_tx_power_valid(80) && !wifi_tx_power_valid(40),
               "WiFi power levels must match the ESP-IDF mapping");
 
-static std::string trim_copy(const std::string& value)
-{
-    size_t start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) return {};
-    size_t end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
 static std::string cfg_escape(const std::string& value)
 {
     std::string out;
@@ -272,34 +264,23 @@ std::string idf_config_translate_perl_classes(const std::string& pattern)
 
 esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message) try
 {
-    size_t pos = 0;
-    int line_no = 0;
-    while (pos < rules.size()) {
-        size_t end = rules.find('\n', pos);
-        if (end == std::string::npos) end = rules.size();
-        std::string line = trim_copy(rules.substr(pos, end - pos));
-        pos = end + (end < rules.size() ? 1 : 0);
-        ++line_no;
-        if (line.empty()) continue;
-
-        size_t t1 = line.find('\t');
-        size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
-        if (t1 == std::string::npos || t2 == std::string::npos) continue;
-        size_t t3 = line.find('\t', t2 + 1);
-        std::string type = line.substr(0, t1);
-        std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
-        std::string enabled = t3 == std::string::npos ? "1" : trim_copy(line.substr(t3 + 1));
-        if (enabled == "0" || pat.empty() || type == "kw") continue;
-        if (type != "from" && type != "re") continue;
-
-        std::string posix = idf_config_translate_perl_classes(pat);
+    std::vector<IdfForwardRule> rows;
+    size_t error_line = 0;
+    std::string error;
+    if (rules.size() > MAX_FORWARD_RULES_BYTES || rules.find('\0') != std::string::npos) return ESP_ERR_INVALID_ARG;
+    if (!idf_forward_parse(rules, rows, error_line, error)) {
+        if (message) *message = std::to_string(error_line) + ":" + error;
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (const auto& row : rows) {
+        if (row.enabled == "0" || row.pattern.empty() || row.type == "kw") continue;
+        if (row.type != "from" && row.type != "re") continue;
+        std::string posix = idf_config_translate_perl_classes(row.pattern);
         regex_t re = {};
         int rc = regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB);
         if (rc != 0) {
             if (message) {
-                char errbuf[96] = {};
-                regerror(rc, &re, errbuf, sizeof(errbuf));
-                *message = "Invalid regex on line " + std::to_string(line_no) + ": " + errbuf;
+                *message = std::to_string(row.line) + ":regex";
             }
             return ESP_ERR_INVALID_ARG;
         }
@@ -309,6 +290,54 @@ esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::strin
     return ESP_OK;
 }
 catch (const std::bad_alloc&) { return ESP_ERR_NO_MEM; }
+
+IdfForwardDecision idf_config_evaluate_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)
+{
+    IdfForwardDecision decision;
+    std::vector<IdfForwardRule> rows;
+    size_t error_line = 0;
+    std::string error;
+    if (!idf_forward_parse(rules, rows, error_line, error)) {
+        // Corrupt CSV must not fall back to destinations the user did not select.
+        decision.matched = decision.drop = true;
+        return decision;
+    }
+    for (const auto& row : rows) {
+        if (row.enabled == "0" || row.pattern.empty()) continue;
+        bool hit = false;
+        if (row.type == "kw") hit = body.find(row.pattern) != std::string::npos;
+        else if (row.type == "from" || row.type == "re") {
+            regex_t regex = {};
+            const auto pattern = idf_config_translate_perl_classes(row.pattern);
+            if (regcomp(&regex, pattern.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) continue;
+            hit = regexec(&regex, (row.type == "from" ? sender : body).c_str(), 0, nullptr, 0) == 0;
+            regfree(&regex);
+        }
+        if (!hit) continue;
+        decision.matched = true; decision.line = row.line;
+        size_t pos = 0;
+        while (pos <= row.action.size()) {
+            const size_t end = row.action.find(',', pos);
+            const auto token = idf_forward_trim(row.action.substr(pos, end == std::string::npos ? end : end - pos));
+            if (token == "drop") decision.drop = true;
+            else if (token == "email") decision.email = true;
+            else {
+                unsigned channel = 0;
+                bool valid = !token.empty();
+                for (char ch : token) {
+                    if (ch < '0' || ch > '9') { valid = false; break; }
+                    channel = channel * 10 + ch - '0';
+                    if (channel > IDF_MAX_PUSH_CHANNELS) { valid = false; break; }
+                }
+                if (valid && channel) decision.chMask |= 1u << (channel - 1);
+            }
+            if (end == std::string::npos) break;
+            pos = end + 1;
+        }
+        return decision;
+    }
+    return decision;
+}
 
 esp_err_t idf_config_load(void)
 {
@@ -1396,31 +1425,42 @@ IdfConfigWebView idf_config_get_web_view(void)
 
 std::unique_ptr<IdfConfigWebView> idf_config_get_web_snapshot(void) try
 {
-    // 直接在 heap 建構回傳值；bad_alloc 不穿越未啟用例外的 Web 元件。
+    // Construct on the heap; do not let bad_alloc cross into the exception-disabled Web component.
     return std::unique_ptr<IdfConfigWebView>(new IdfConfigWebView(idf_config_get_web_view()));
 }
 catch (const std::bad_alloc&) { return nullptr; }
 
-IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
+static IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
 {
     IdfKeepaliveRunView view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    view.kaEnabled = s_config.kaEnabled;
-    view.kaIntervalDays = s_config.kaIntervalDays;
-    view.kaAction = s_config.kaAction;
-    view.kaTarget = s_config.kaTarget;
-    view.kaUrl = s_config.kaUrl;
-    view.kaProfile = s_config.kaProfile;
-    view.kaLastTime = s_config.kaLastTime;
-    view.kaTrafficKB = s_config.kaTrafficKB;
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    view.emailEnabled = s_config.emailEnabled;
-    view.dataEnabled = s_config.dataEnabled;
-    view.apn = s_config.apn;
+    try {
+        view.kaEnabled = s_config.kaEnabled;
+        view.kaIntervalDays = s_config.kaIntervalDays;
+        view.kaAction = s_config.kaAction;
+        view.kaTarget = s_config.kaTarget;
+        view.kaUrl = s_config.kaUrl;
+        view.kaProfile = s_config.kaProfile;
+        view.kaLastTime = s_config.kaLastTime;
+        view.kaTrafficKB = s_config.kaTrafficKB;
+        view.tzOffsetMin = s_config.tzOffsetMin;
+        view.emailEnabled = s_config.emailEnabled;
+        view.dataEnabled = s_config.dataEnabled;
+        view.apn = s_config.apn;
+    } catch (...) {
+        xSemaphoreGive(s_config_mutex);
+        throw;
+    }
     xSemaphoreGive(s_config_mutex);
     return view;
 }
+
+std::unique_ptr<IdfKeepaliveRunView> idf_config_get_keepalive_snapshot(void) try
+{
+    return std::unique_ptr<IdfKeepaliveRunView>(new IdfKeepaliveRunView(idf_config_get_keepalive_run_view()));
+}
+catch (const std::bad_alloc&) { return nullptr; }
 
 IdfSchedRunView idf_config_get_sched_run_view(int index)
 {

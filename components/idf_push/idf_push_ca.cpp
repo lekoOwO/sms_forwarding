@@ -21,6 +21,7 @@
 #include "idf_config.h"
 #include "idf_push_ca_allowlist_generated.h"
 #include "idf_push_cellular.h"
+#include "idf_modem_https.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
@@ -46,7 +47,7 @@ struct ProbeSession {
     std::vector<std::vector<uint8_t>> chain;
 };
 
-std::array<ProbeSession, IDF_MAX_PUSH_CHANNELS> sessions;
+std::array<ProbeSession, IDF_MAX_PUSH_CHANNELS + 1> sessions;
 SemaphoreHandle_t session_mutex;
 StaticSemaphore_t session_mutex_storage;
 portMUX_TYPE session_init_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -290,12 +291,31 @@ bool candidate_valid(const uint8_t* der, size_t length, const ProbeSession& sess
 
 bool current_target(uint8_t channel, IdfPushCellularTarget& target)
 {
+    if (channel == IDF_PUSH_CA_KEEPALIVE_TARGET) {
+        const auto snapshot = idf_config_get_keepalive_snapshot();
+        return snapshot && idf_push_prepare_keepalive_target(snapshot->kaUrl, target);
+    }
     IdfPushChannel config;
     return channel < IDF_MAX_PUSH_CHANNELS && idf_config_get_push_channel(channel, config) &&
            idf_push_prepare_cellular_target(config, target);
 }
 
 }  // namespace
+
+bool idf_push_prepare_keepalive_target(const std::string& url, IdfPushCellularTarget& target)
+{
+    target = {};
+    IdfModemHttpsTarget parsed;
+    std::string error;
+    if (url.size() > MAX_KEEPALIVE_URL_BYTES ||
+        !idf_modem_https_parse_url(url, parsed, error, IDF_MODEM_HTTPS_GET_MAX_URL)) return false;
+    // Reuse origin normalization and the existing certificate verification flow.
+    IdfPushChannel input;
+    input.enabled = true;
+    input.cellularEnabled = true;
+    input.cellularUrl = url;
+    return idf_push_prepare_cellular_target(input, target);
+}
 
 esp_err_t idf_push_ca_probe(uint8_t channel, IdfPushCaProbeResult& result)
 {
@@ -358,7 +378,7 @@ esp_err_t idf_push_ca_install(uint8_t channel, const std::string& nonce,
                               IdfConfigCaStatus& status)
 {
     status = {};
-    if (channel >= IDF_MAX_PUSH_CHANNELS || nonce.size() != 32) return ESP_ERR_INVALID_ARG;
+    if (channel > IDF_PUSH_CA_KEEPALIVE_TARGET || nonce.size() != 32) return ESP_ERR_INVALID_ARG;
     ensure_mutex();
     if (!session_mutex || xSemaphoreTake(session_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return ESP_ERR_TIMEOUT;

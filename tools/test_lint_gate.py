@@ -101,6 +101,7 @@ class LintGateTests(unittest.TestCase):
             "python3 tools/test_usb_recovery.py",
             "python3 components/idf_web/test/test_web_security.py",
             "python3 -m unittest components/idf_web/test/test_diagnostics.py",
+            "python3 -m unittest components/idf_web/test/test_keepalive_ca.py components/idf_modem/test/test_keepalive.py",
             "python3 tests/test_document_languages.py",
             "python3 components/idf_web/test/test_openapi_conformance.py",
             "python3 components/idf_web/test/test_ota_runtime.py",

@@ -8,6 +8,7 @@
 - [architecture.md](architecture.md)：ESP-IDF 元件、啟動順序、資料流、flash 安全邊界與 OTA 流程。
 - [hardware-counter37.md](hardware-counter37.md)：counter36–45 的去識別化 ML307 parser 與 cellular 硬體觀察及證據邊界。
 - [openapi.json](openapi.json)：管理 API 的 machine-readable request 與 response contract。
+- [forward-rules-fixtures.json](forward-rules-fixtures.json)：CSV 與舊 Tab 轉發規則的合成驗證案例。
 - [config-schema/README.md](config-schema/README.md)：版本化設定格式、加密備份與產生器。
 - [document-languages.json](document-languages.json)：文件語言與三語等價群組。
 - [AGENTS.md](AGENTS.md)：本目錄的維護規則。

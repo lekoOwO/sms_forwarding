@@ -20,6 +20,139 @@ const browserCandidates = [
 const browserExecutable = browserCandidates[0];
 const browserAvailable = Boolean(process.env.UI_BROWSER_URL || browserExecutable);
 
+test("mobile CSV editor preserves quoted text, tests first-match routing, and saves only on request", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 390, height: 844, hasTouch: true });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#messaging");
+		await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Forwarding rules"));
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Forwarding rules").click());
+		await page.waitForSelector("#forward-rules");
+		let saves = 0;
+		page.on("request", (request) => { if (new URL(request.url()).pathname === "/save") saves++; });
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Add rule").click());
+		await page.type("#rule-pattern-0", 'a,"b"');
+		await page.$eval("#rule-actions-0", (input) => { input.value = "email,2"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		assert.equal(await page.$eval("#forward-rules", (input) => input.value), 'kw,"a,""b""","email,2",1');
+		await page.type("#rule-test-sender", "+123456");
+		await page.type("#rule-test-message", 'a,"b"');
+		await page.click("#rule-test");
+		await page.waitForSelector("#rule-preview-result");
+		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /First match: line 1/);
+		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /email, 2/);
+		assert.equal(saves, 0);
+		await page.$eval("#forward-rules", (input) => { input.value = 'kw,"broken,email'; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.waitForFunction(() => document.querySelector('button[form="forward-rules-form"]').disabled);
+		assert.equal(await page.$eval("#rule-test", (button) => button.disabled), true);
+		assert.equal(await page.$("#rule-preview-result"), null, "stale results must disappear after an edit");
+		await page.$eval("#forward-rules", (input) => { input.value = 'kw,"line1\nline2",drop\nkw,OTP,email'; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#rule-test-message", (input) => { input.value = "OTP"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.click("#rule-test");
+		await page.waitForFunction(() => document.querySelector("#rule-preview-result")?.textContent.includes("First match: line 3"));
+		await page.click('button[form="forward-rules-form"]');
+		await page.waitForFunction(() => document.body.textContent.includes("Configuration saved"), { timeout: 5000 }).catch(async (error) => { throw new Error(`${error.message}: ${await page.$eval("#forward-rules-form", (form) => form.parentElement.textContent)}`); });
+		assert.equal(saves, 1);
+		const saved = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.forwardRules);
+		assert.equal(saved, '#!forward-rules-csv-v1\nkw,"line1\nline2",drop\nkw,OTP,email');
+		assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), "the editor must fit a narrow viewport");
+		await page.evaluate(async () => {
+			const response = await fetch("/save", { method: "POST", headers: { "X-CSRF-Token": "mock-csrf-token" }, body: new URLSearchParams({ forwardRules: "kw\tA,B\temail,1" }) });
+			const accepted = await response.json();
+			await fetch(`/api/jobs?id=${accepted.data.jobId}`);
+		});
+		await page.reload({ waitUntil: "domcontentloaded" });
+		await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Forwarding rules"));
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Forwarding rules").click());
+		await page.waitForSelector("#forward-rules");
+		assert.equal(await page.$eval("#forward-rules", (input) => input.value), "kw\tA,B\temail,1");
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Convert to CSV").click());
+		assert.equal(await page.$eval("#forward-rules", (input) => input.value), 'kw,"A,B","email,1",1');
+		assert.equal(await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.forwardRules), "kw\tA,B\temail,1", "conversion remains a draft until saved");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+// The journey includes cold Chromium and application startup; probe response still has a 5 s deadline.
+test("mobile keepalive settings preserve the HTTP draft and use a dedicated certificate target", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 390, height: 844, hasTouch: true });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		const calls = [];
+		await page.setRequestInterception(true);
+		page.on("request", (request) => {
+			const path = new URL(request.url()).pathname;
+			if (path.startsWith("/api/keepalive") || (path.startsWith("/api/push") && request.method() !== "GET")) calls.push(path);
+			if (path === "/api/keepalive/ca/probe") return void request.respond({ status: 409, contentType: "application/json", body: JSON.stringify({ success: false, code: "PUSH_CA_PROBE_FAILED", data: {}, detail: "" }) });
+			void request.continue();
+		});
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/connection");
+		await page.waitForSelector("#keepalive-url");
+		assert.match(await page.$eval("#keepalive-url", (input) => input.value), /^http:\/\//);
+		assert.match(await page.$eval("#keepalive-url", (input) => input.closest("form").textContent), /HTTPS is required/);
+		assert.equal(await page.$eval("#keepalive-enabled", (input) => input.getAttribute("aria-checked")), "false");
+		await page.$eval("#keepalive-url", (input) => { input.value = "https://example.test/payload"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		assert.equal(await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Check and set up certificate").disabled), true, "save the URL before probing its certificate");
+		await page.$eval("#keepalive-url", (input) => input.closest("form").querySelector('button[type="submit"]').click());
+		await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Check and set up certificate" && !button.disabled));
+		const config = await page.evaluate(async () => (await (await fetch("/api/keepalive")).json()));
+		assert.equal(config.url, "https://example.test/payload");
+		assert.equal(config.enabled, false, "saving a URL must not enable scheduled cellular traffic");
+		const probeResponse = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/keepalive/ca/probe", { timeout: 5000 });
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Check and set up certificate").click());
+		await probeResponse.catch(async (error) => { throw new Error(`${error.message}; calls=${JSON.stringify(calls)}; ${await page.$eval("#keepalive-url", (input) => input.closest("form").textContent)}`); });
+		await page.waitForFunction(() => document.querySelector("#keepalive-url")?.closest("form").textContent.includes("Cannot retrieve the server certificate"));
+		assert.ok(calls.includes("/api/keepalive/ca/probe"));
+		assert.equal(calls.some((path) => path.startsWith("/api/push")), false, "keepalive setup must not require a notification channel");
+		assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("roaming diagnostics expose raw values by keyboard and touch", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 1280, height: 800 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await page.setRequestInterception(true);
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname === "/api/jobs") return void request.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ id: 1, type: "query", state: "succeeded", result: { success: true, code: "ACTION_QUERY_OK", data: { registration: 5, cesq: "-70,-11,31" }, detail: "" } }) });
+			void request.continue();
+		});
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/diagnostics");
+		await page.$eval('[data-device-action="diagnostics-network"]', (button) => { const panel = button.closest('[data-slot="accordion-content"]'); if (panel) document.querySelector(`[aria-controls="${panel.id}"]`)?.click(); });
+		await page.$eval('[data-device-action="diagnostics-network"]', (button) => button.click());
+		await page.waitForSelector('summary[title="registration: 5"]');
+		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.textContent), /Registered on a roaming network/);
+		assert.match(await page.$eval('summary[title*="cesq"]', (summary) => summary.textContent), /CSQ: ≥ −51 dBm/);
+		await page.focus('summary[title="registration: 5"]');
+		await page.keyboard.press("Enter");
+		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
+		await page.setViewport({ width: 390, height: 844 });
+		await page.tap('summary[title="registration: 5"]');
+		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), false);
+		await page.tap('summary[title="registration: 5"]');
+		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.nextElementSibling.textContent), /registration: 5/);
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
 test("identity save replaces pending feedback after success, failure, retry, and lost response above its button", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
 	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
 	let browser;
@@ -289,7 +422,10 @@ test("device subpages keep deep links, scroll position, controls, and accessible
 			return { color, chroma: Math.max(red, green, blue) - Math.min(red, green, blue), dark: document.documentElement.classList.contains("dark") };
 		});
 		assert.equal(activeStyle.dark, true);
-		assert.ok(activeStyle.chroma < 0.01, `dark active subnav must stay neutral: ${JSON.stringify(activeStyle)}`);
+		// Canvas rounds neutral OKLCH to 8-bit RGB with up to one level of channel difference.
+		const neutralChroma = (chroma) => Number.isFinite(chroma) && chroma <= 1;
+		assert.equal(neutralChroma(30), false, "a visibly tinted control must still fail");
+		assert.ok(neutralChroma(activeStyle.chroma), `dark active subnav must stay neutral: ${JSON.stringify(activeStyle)}`);
 
 		await page.focus(".desktop-sidebar .device-subnav-link");
 		await page.keyboard.press("Tab");

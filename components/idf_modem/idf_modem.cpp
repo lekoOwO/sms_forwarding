@@ -2166,11 +2166,64 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
                                       const IdfCellularHttpConfig& config,
                                       IdfCellularHttpResult& result)
 {
-    (void)url;
-    (void)config;
     result = IdfCellularHttpResult();
-    result.message = "Cellular HTTP is not supported";
-    return ESP_ERR_NOT_SUPPORTED;
+    result.expectedBytes = config.minPayloadBytes;
+    if (config.minPayloadBytes == 0 ||
+        config.minPayloadBytes > IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES) {
+        result.message = "Keepalive traffic must be between 1 and 512 KiB";
+        return ESP_ERR_INVALID_ARG;
+    }
+    IdfModemHttpsPostRequest request;
+    request.url = url;
+    request.method = IdfModemHttpsMethod::Get;
+    request.contentType.clear();
+    request.apn = config.apn;
+    request.dataEnabled = config.dataEnabled;
+    request.rootCertificateDer = config.rootCertificateDer;
+    request.rootCertificateSha256 = config.rootCertificateSha256;
+    if (!idf_modem_https_validate_request(request, result.message)) return ESP_ERR_INVALID_ARG;
+    // Eight complete GETs bound payload to 512 KiB; each uses the existing 64 KiB parser.
+    // Check cancellation between requests so the UART owner can finish cleanup.
+    const int64_t deadline = esp_timer_get_time() + 120000000;
+    for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+        if (config.cancelled && config.cancelled()) {
+            result.message = "Keepalive cancelled";
+            return ESP_ERR_INVALID_STATE;
+        }
+        const int64_t remaining = deadline - esp_timer_get_time();
+        if (remaining < 1000) {
+            result.message = "Keepalive time budget exhausted";
+            return ESP_ERR_TIMEOUT;
+        }
+        request.timeoutMs = static_cast<uint32_t>(std::min<int64_t>(30000, remaining / 1000));
+        IdfModemHttpsPostResult response;
+        const esp_err_t err = idf_modem_https_post(request, response);
+        result.requests = attempt + 1;
+        result.httpStatus = response.httpStatus;
+        result.bytesRead += response.bodyBytes;
+        if (config.progress) config.progress(result.requests, result.bytesRead);
+        if (err != ESP_OK || !response.ok || response.cleanupRequiresReset ||
+            !idf_modem_https_status_success(response.httpStatus)) {
+            result.message = response.message.empty() ? "Keepalive HTTPS request failed" : response.message;
+            if (!response.cleanupMessage.empty()) result.message += "; " + response.cleanupMessage;
+            return err == ESP_OK ? ESP_FAIL : err;
+        }
+        if (esp_timer_get_time() > deadline) {
+            result.message = "Keepalive time budget exhausted";
+            return ESP_ERR_TIMEOUT;
+        }
+        if (response.bodyBytes == 0) {
+            result.message = "Keepalive server returned an empty body";
+            return ESP_FAIL;
+        }
+        if (result.bytesRead >= result.expectedBytes) {
+            result.ok = true;
+            result.message = "Cellular HTTPS keepalive completed";
+            return ESP_OK;
+        }
+    }
+    result.message = "Keepalive byte target not reached within eight requests";
+    return ESP_FAIL;
 }
 
 struct OwnerHttpsCallbackContext {
@@ -2615,7 +2668,7 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                         (!s_identity_network_attempted || before.operatorName.empty());
     if (need_network) {
         if (before.operatorName.empty()) {
-            // 漫遊只查詢現有格式，不修改模組選網設定。
+            // Query roaming status without changing the modem's network selection.
             if (before.ceregStat == 1) send_ok("AT+COPS=3,0", 1500, &resp);
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));

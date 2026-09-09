@@ -2508,8 +2508,29 @@ int main()
     assert(http.complete());
     assert(result.httpStatus == 200);
     assert(result.expectedResponseBytes == http_body.size());
+    assert(result.bodyBytes == http_body.size());
     assert(result.responseBytes == http_wire.size());
     assert(http.header_bytes() == http_headers.size());
+    // The 64 KiB ceiling applies to body bytes, independently of the header budget.
+    // This makes eight full responses sufficient for the 512 KiB keepalive target.
+    HttpResponse maximum_body;
+    IdfModemHttpsPostResult maximum_result;
+    const std::string maximum_headers = "HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\n";
+    assert(maximum_body.feed(reinterpret_cast<const uint8_t*>(maximum_headers.data()),
+                             maximum_headers.size(), maximum_result));
+    const std::string maximum_chunk(4096, 'x');
+    for (unsigned i = 0; i < 16; ++i) {
+        assert(maximum_body.feed(reinterpret_cast<const uint8_t*>(maximum_chunk.data()),
+                                 maximum_chunk.size(), maximum_result));
+    }
+    assert(maximum_body.complete() && maximum_result.bodyBytes == 65536);
+    assert(maximum_result.responseBytes == maximum_headers.size() + 65536);
+    assert(!maximum_body.feed(reinterpret_cast<const uint8_t*>("x"), 1, maximum_result));
+    HttpResponse oversized_body;
+    IdfModemHttpsPostResult oversized_result;
+    const std::string oversized_headers = "HTTP/1.1 200 OK\r\nContent-Length: 65537\r\n\r\n";
+    assert(!oversized_body.feed(reinterpret_cast<const uint8_t*>(oversized_headers.data()),
+                               oversized_headers.size(), oversized_result));
     phases.emplace_back("HTTP200");
 
     const std::string close_response = frame(close_command, "+MIPCLOSE: 0,0");

@@ -8,6 +8,25 @@ import { createApp, serializePushTestStatus } from "../server.mjs";
 const auth = `Basic ${Buffer.from("admin:admin123").toString("base64")}`;
 const headers = { Authorization: auth, "X-CSRF-Token": "mock-csrf-token" };
 
+test("rule preview requires authorization, validates fields, and leaves saved rules unchanged", async () => {
+	await withServer(async (baseUrl) => {
+		const before = (await (await request(baseUrl, "/api/config")).json()).config.forwardRules;
+		const values = { rules: '#!forward-rules-csv-v1\nkw,"a,b","email,2"', sender: "+1234", text: "a,b" };
+		assert.equal((await fetch(`${baseUrl}/api/rules/preview`, { method: "POST", body: new URLSearchParams(values) })).status, 401);
+		assert.equal((await request(baseUrl, "/api/rules/preview", { method: "POST", headers: { "X-CSRF-Token": "wrong" }, body: new URLSearchParams(values) })).status, 403);
+		const preview = await completed(baseUrl, await form(baseUrl, "/api/rules/preview", values));
+		assert.equal(preview.success, true);
+		assert.deepEqual(preview.data, { matched: true, line: 1, drop: false, email: true, channelMask: 2, previewEngine: "mock" });
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, before);
+		for (const invalid of [{ ...values, sender: "a".repeat(33) }, { ...values, text: "a".repeat(2049) }, { ...values, extra: "no" }]) {
+			assert.equal((await form(baseUrl, "/api/rules/preview", invalid)).status, 400);
+		}
+		const rejected = await completed(baseUrl, await form(baseUrl, "/save", { forwardRules: '#!forward-rules-csv-v1\nkw,"broken,email' }));
+		assert.equal(rejected.code, "ACTION_CONFIG_INVALID");
+		assert.equal((await (await request(baseUrl, "/api/config")).json()).config.forwardRules, before);
+	});
+});
+
 async function withServer(run, options = {}) {
 	const server = createApp(options).listen(0, "127.0.0.1");
 	await new Promise((resolve) => server.once("listening", resolve));
@@ -707,7 +726,7 @@ test("one save family and current limits reject without mutation", async () => {
 		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { smtpPass: "" }))).success, true);
 		assert.equal((await (await request(baseUrl, "/api/config")).json()).status.emailConfigured, false);
 		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", {
-			kaEnabled: "on", kaIntervalDays: 3650, kaTrafficKB: 10000
+			kaIntervalDays: 3650, kaTrafficKB: 10000
 		}))).success, true);
 		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { kaTrafficKB: 10001 }))).code,
 			"ACTION_CONFIG_INVALID");
@@ -721,17 +740,21 @@ test("one save family and current limits reject without mutation", async () => {
 	});
 });
 
-test("save jobs disable stale unsupported keepalive without changing compatibility values", async () => {
+test("keepalive preserves disabled compatibility values and rejects unsafe enablement atomically", async () => {
 	await withServer(async (baseUrl) => {
-		const enabled = await form(baseUrl, "/save", {
-			kaEnabled: "on", kaIntervalDays: 200, kaTrafficKB: 4321
+		const preserved = await form(baseUrl, "/save", {
+			kaIntervalDays: 200, kaTrafficKB: 4321
 		});
-		assert.equal(enabled.status, 202);
-		assert.equal((await completed(baseUrl, enabled)).code, "ACTION_CONFIG_SAVED");
+		assert.equal(preserved.status, 202);
+		assert.equal((await completed(baseUrl, preserved)).code, "ACTION_CONFIG_SAVED");
 		let snapshot = await (await request(baseUrl, "/api/config")).json();
 		assert.deepEqual([
 			snapshot.config.kaEnabled, snapshot.config.kaIntervalDays, snapshot.config.kaTrafficKB
-		], [true, 200, 4321]);
+		], [false, 200, 4321]);
+		const unsafe = await completed(baseUrl, await form(baseUrl, "/save", { kaEnabled: "on", kaIntervalDays: 201, kaTrafficKB: 4321 }));
+		assert.equal(unsafe.code, "ACTION_CONFIG_INVALID");
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.deepEqual([snapshot.config.kaEnabled, snapshot.config.kaIntervalDays, snapshot.config.kaTrafficKB], [false, 200, 4321]);
 
 		const disabled = await form(baseUrl, "/save", { kaIntervalDays: 200, kaTrafficKB: 4321 });
 		assert.equal(disabled.status, 202);

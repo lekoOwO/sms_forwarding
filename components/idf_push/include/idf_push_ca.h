@@ -8,6 +8,12 @@
 
 #include "esp_err.h"
 #include "idf_config_ca_store.h"
+#include "idf_config.h"
+#include "idf_push_cellular.h"
+
+// 獨立憑證工作槽，不是可寄送通知的推送通道。
+constexpr uint8_t IDF_PUSH_CA_KEEPALIVE_TARGET = IDF_MAX_PUSH_CHANNELS;
+bool idf_push_prepare_keepalive_target(const std::string& url, IdfPushCellularTarget& target);
 
 constexpr size_t IDF_PUSH_CA_CHAIN_MAX = 4;
 constexpr size_t IDF_PUSH_CA_ISSUER_DER_MAX = 160;

@@ -36,7 +36,7 @@ static constexpr size_t CONCAT_PARTS = 10;
 // Carrier retries and polling can take minutes after SIM storage rejects a segment.
 // Wait 15 minutes before forwarding a direct message with missing-segment markers.
 static constexpr int64_t CONCAT_TIMEOUT_US = 15LL * 60LL * 1000LL * 1000LL;
-// 首次 partial 入隊後再保留十五分鐘；新段不延長這個補齊窗口。
+// Retain segments for fifteen minutes after the first partial enqueue; new segments do not extend it.
 static constexpr int64_t CONCAT_RECOVERY_US = 15LL * 60LL * 1000LL * 1000LL;
 // Poll every 10 seconds while a multipart message is incomplete.
 static constexpr uint32_t CONCAT_HUNT_POLL_MS = 10000;
@@ -386,8 +386,8 @@ static SmsProcessResult process_sms_content(const char* sender_raw, const char* 
                                             const char* timestamp_raw, bool allow_ram_retry,
                                             bool supplement = false);
 
-// 已完成或結束補齊窗口的分段指紋，避免 SIM 回補重開已交付的舊段。
-// 窗口內的 partial 不進此 ring，仍能接受原段重送及晚段補齊。
+    // Fingerprint completed or expired assemblies so SIM replay cannot reopen delivered segments.
+    // Exclude partials within their completion window so replay and late segments can complete them.
 struct ConcatDone {
     bool used = false;
     int ref = 0;

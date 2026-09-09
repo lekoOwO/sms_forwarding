@@ -204,7 +204,7 @@ test("security destination surfaces the authenticated OTA trust snapshot", () =>
 	for (const key of [
 		"otaStateTitle", "otaStateDescription", "otaStateUnsupported", "otaStateUnavailable",
 		"otaStateRefresh", "otaStateSlot", "otaStateImage", "otaStateAccepted",
-		"otaStatePending", "otaStateTarget", "otaStateKey", "otaStateKeyHint",
+		"otaStatePending", "otaStateTarget", "otaStateKey",
 		"otaStateOther", "otaStatePendingVerify", "otaStateValid", "otaStateNoPending"
 	]) {
 		for (const [locale, messages] of localeSources) assert.equal(typeof messages[key], "string", `${locale}.${key}`);
@@ -237,7 +237,7 @@ test("forwarding-rule tips use the accessible Dialog primitive and document pars
 		assert.match(messages.forwardRulesEmpty, /0/);
 		assert.match(messages.forwardRulesEscaping, /\\d/);
 		assert.match(messages.forwardRulesExample1, /email,1/);
-		assert.match(messages.forwardRulesExample2, /↹2$/);
+		assert.match(messages.forwardRulesExample2, /,2$/);
 		assert.doesNotMatch(`${messages.forwardRulesExample1}\n${messages.forwardRulesExample2}`, /push[12]/i);
 	}
 });
@@ -261,15 +261,14 @@ test("user-facing copy omits internal opaque-handle and modem implementation wor
 		assert.doesNotMatch(JSON.stringify(messages), /opaque|控制代碼|控制句柄/i, locale);
 		for (const key of ["cellularCaNotReady", "cellularCaProvision", "networkModeHint", "networkModeWarningDescription"])
 			assert.doesNotMatch(messages[key], /fail-closed|fails closed|ML307Y|provisioning|provision/i, `${locale}.${key}`);
-		assert.match(messages.networkModeWarningDescription, /GET|ntfy/i);
 	}
 });
 
 test("network mode copy describes per-channel cellular eligibility", () => {
 	const requiredTerms = new Map([
-		["en", [/4G delivery.*enabled/i, /WiFi only/i, /roaming/i]],
-		["zh-CN", [/启用 4G 传送/, /仅使用 WiFi/, /漫游/]],
-		["zh-TW", [/啟用 4G 傳送/, /僅使用 WiFi/, /漫遊/]]
+		["en", [/4G enabled/i, /channels use WiFi/i, /roaming/i]],
+		["zh-CN", [/启用 4G/, /仅用 WiFi/, /漫游/]],
+		["zh-TW", [/啟用 4G/, /僅用 WiFi/, /漫遊/]]
 	]);
 	for (const [locale, messages] of localeSources) {
 		assert.doesNotMatch(messages.networkModeWarningDescription, /GET.*(?:only|僅|只能).*WiFi/i, locale);
@@ -326,8 +325,9 @@ test("device workspace uses four canonical deep-link subpages with safe fallback
 test("device tool inventory appears exactly once across the subpages", async () => {
 	const { DEVICE_TOOL_INVENTORY } = await import("../src/lib/device-navigation.js");
 	const ids = Object.values(DEVICE_TOOL_INVENTORY).flat();
+	const toolSource = pageSource + await readFile(new URL("../src/lib/components/KeepaliveSettings.svelte", import.meta.url), "utf8");
 	assert.equal(new Set(ids).size, ids.length);
-	for (const id of ids) assert.equal(pageSource.match(new RegExp(`data-device-action="${id}"`, "g"))?.length ?? 0, 1, id);
+	for (const id of ids) assert.equal(toolSource.match(new RegExp(`data-device-action="${id}"`, "g"))?.length ?? 0, 1, id);
 	for (const subpage of ["connection", "diagnostics", "maintenance", "advanced"])
 		assert.match(pageSource, new RegExp(`data-device-subpage="${subpage}"`));
 });

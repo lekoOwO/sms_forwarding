@@ -60,6 +60,394 @@
     { "name": "Cellular & eSIM" }
   ],
   "paths": {
+    "/api/keepalive/ca/status": {
+      "get": {
+        "tags": [
+          "Configuration"
+        ],
+        "summary": "Get non-secret cellular CA status for the saved keepalive URL",
+        "description": "No query keys are accepted, the request body must be empty, and any Transfer-Encoding header is rejected. This dedicated target uses saved kaUrl, not a push channel. A URL or configuration change invalidates the probe session. Installed roots are shared only by canonical HTTPS origin.",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Configured state and SHA-256 only; no certificate DER or origin is returned.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The channel is invalid."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "405": {
+            "description": "Only GET is supported.",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string",
+                  "const": "GET"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            }
+          },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          }
+        }
+      }
+    },
+    "/api/keepalive/ca/probe": {
+      "post": {
+        "tags": [
+          "Configuration"
+        ],
+        "summary": "Probe the saved keepalive URL TLS chain over WiFi",
+        "description": "Runs a strict bundle-authenticated TLS handshake with SNI and hostname verification. No query keys are accepted, the request body must be empty, and any Transfer-Encoding header is rejected. It sends no HTTP request. The terminal GET /api/jobs result contains only a one-time 128-bit nonce and bounded leaf-first certificate hashes, issuer Name DER, and authority-key identifiers. This dedicated target uses saved kaUrl, not a push channel. A URL or configuration change invalidates the probe session. Installed roots are shared only by canonical HTTPS origin.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "responses": {
+          "202": {
+            "$ref": "#/components/responses/JobAccepted"
+          },
+          "400": {
+            "description": "The channel or empty-body contract is invalid."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "The CSRF token is invalid."
+          },
+          "405": {
+            "description": "Only POST is supported.",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string",
+                  "const": "POST"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "WiFi is unavailable or the channel already has an active CA job."
+          },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
+          "429": {
+            "description": "The bounded job queue is full."
+          }
+        }
+      }
+    },
+    "/api/keepalive/ca/install": {
+      "post": {
+        "tags": [
+          "Configuration"
+        ],
+        "summary": "Validate and install the keepalive origin root CA",
+        "description": "Consumes the nonce on the first attempt. nonce is the only query key. The request requires exact Content-Type application/pkix-cert, an explicit decimal Content-Length matching the body, and no Transfer-Encoding header. The device requires the candidate DER hash in its build-time ESP-IDF bundle allowlist, BasicConstraints CA=true, keyCertSign when a KeyUsage extension is present, a current self-signed certificate, an unchanged configuration generation, and a complete hostname-valid path for the retained peer chain. This dedicated target uses saved kaUrl, not a push channel. A URL or configuration change invalidates the probe session. Installed roots are shared only by canonical HTTPS origin.",
+        "parameters": [
+          {
+            "name": "nonce",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 32,
+              "maxLength": 32,
+              "pattern": "^[0-9a-f]{32}$"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/pkix-cert": {
+              "schema": {
+                "type": "string",
+                "contentEncoding": "binary",
+                "minLength": 1,
+                "maxLength": 8192
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "$ref": "#/components/responses/JobAccepted"
+          },
+          "400": {
+            "description": "The channel, nonce, or body is invalid."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "The CSRF token is invalid."
+          },
+          "405": {
+            "description": "Only POST is supported.",
+            "headers": {
+              "Allow": {
+                "schema": {
+                  "type": "string",
+                  "const": "POST"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The channel already has an active CA job."
+          },
+          "413": {
+            "$ref": "#/components/responses/BodyTooLarge"
+          },
+          "415": {
+            "description": "Content-Type is not exactly application/pkix-cert."
+          },
+          "429": {
+            "description": "The bounded job queue is full."
+          }
+        }
+      }
+    },
+    "/api/keepalive": {
+      "get": {
+        "tags": [
+          "Cellular & eSIM"
+        ],
+        "summary": "Read saved keepalive settings and current job progress",
+        "responses": {
+          "200": {
+            "description": "Cached progress and preflight readiness; no traffic is sent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "timeValid": {
+                      "type": "boolean"
+                    },
+                    "jobQueued": {
+                      "type": "boolean"
+                    },
+                    "jobRunning": {
+                      "type": "boolean"
+                    },
+                    "jobDone": {
+                      "type": "boolean"
+                    },
+                    "jobSuccess": {
+                      "type": "boolean"
+                    },
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "queued": {
+                      "type": "boolean"
+                    },
+                    "cancelRequested": {
+                      "type": "boolean"
+                    },
+                    "ready": {
+                      "type": "boolean"
+                    },
+                    "intervalDays": {
+                      "type": "integer"
+                    },
+                    "trafficKB": {
+                      "type": "integer"
+                    },
+                    "action": {
+                      "type": "integer"
+                    },
+                    "tz": {
+                      "type": "integer"
+                    },
+                    "nowEpoch": {
+                      "type": "integer"
+                    },
+                    "lastTime": {
+                      "type": "integer"
+                    },
+                    "nextTime": {
+                      "type": "integer"
+                    },
+                    "daysLeft": {
+                      "type": "integer"
+                    },
+                    "bodyBytes": {
+                      "type": "integer",
+                      "description": "Received response-body bytes, excluding headers and transport overhead; not a carrier billing measurement."
+                    },
+                    "requests": {
+                      "type": "integer",
+                      "maximum": 8
+                    },
+                    "target": {
+                      "type": "string"
+                    },
+                    "url": {
+                      "type": "string"
+                    },
+                    "profile": {
+                      "type": "string"
+                    },
+                    "nowLocal": {
+                      "type": "string"
+                    },
+                    "lastTimeLocal": {
+                      "type": "string"
+                    },
+                    "jobMessage": {
+                      "type": "string"
+                    },
+                    "readinessMessage": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Cellular & eSIM"
+        ],
+        "summary": "Run, cancel, or reset the keepalive baseline",
+        "description": "The body must be empty. Run uses the saved action even if automatic scheduling is disabled. Data keepalive needs ML307A, home registration, valid time, an HTTPS URL, and its provisioned origin CA. Each GET retains the 64 KiB response limit; a job has at most eight requests and a two-minute request budget plus bounded cleanup. Cancellation stops before the next request; an in-flight request finishes cleanup. Reset changes only the baseline and requires synchronized time. Existing SMS/USSD actions and maintenance notices retain their behavior. A successful transfer does not guarantee SIM validity or carrier billing.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "run",
+                "cancel",
+                "reset"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Admission or reset result; inspect success and message, then poll GET for terminal job outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "type": "boolean"
+                    },
+                    "queued": {
+                      "type": "boolean"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "lastTime": {
+                      "type": "integer"
+                    },
+                    "lastTimeLocal": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid action or nonempty body."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "description": "Invalid CSRF token."
+          },
+          "409": {
+            "description": "No cancellable data job."
+          }
+        }
+      }
+    },
+    "/api/rules/preview": {
+      "post": {
+        "tags": ["Messaging"],
+        "summary": "Validate and preview forwarding rules without delivery",
+        "description": "Uses the same POSIX matcher as forwarding. The first active match determines the result. No match uses the default enabled channels. The request never saves settings, sends messages, or logs input text. The worker shares the bounded job queue. A failed result has detail line:reason, where CSV line numbers exclude the storage marker. Successful result data contains matched, line (0 for no match), drop, email, and channelMask (bits 0-4). These are selected actions, not a delivery guarantee. The form body is limited to 16384 bytes and three fields.",
+        "parameters": [{ "$ref": "#/components/parameters/CsrfToken" }],
+        "requestBody": { "required": true, "content": { "application/x-www-form-urlencoded": { "schema": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "rules": { "type": "string", "x-maxUtf8Bytes": 2048, "description": "Exact stored rules. CSV v1 has the prefix #!forward-rules-csv-v1 followed by LF. Unmarked text retains legacy Tab semantics." },
+            "sender": { "type": "string", "x-maxUtf8Bytes": 32 },
+            "text": { "type": "string", "x-maxUtf8Bytes": 2048 }
+          }
+        } } } },
+        "responses": {
+          "202": { "$ref": "#/components/responses/JobAccepted" },
+          "400": { "$ref": "#/components/responses/InputTooLong" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "description": "The CSRF token is invalid." },
+          "409": { "description": "Another exclusive operation is active." },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "429": { "description": "The bounded job queue is full." }
+        }
+      }
+    },
     "/": {
       "get": {
         "tags": ["UI"],
@@ -762,6 +1150,12 @@
         "description": "Structured operation output. Fields are present only when relevant to the requested action.",
         "additionalProperties": false,
         "properties": {
+          "matched": { "type": "boolean" },
+          "line": { "type": "integer", "minimum": 0 },
+          "drop": { "type": "boolean" },
+          "email": { "type": "boolean" },
+          "channelMask": { "type": "integer", "minimum": 0, "maximum": 31 },
+          "previewEngine": { "type": "string", "enum": ["mock"], "description": "Present only on mock-server preview results. Device results use the runtime POSIX engine and omit this field." },
           "manufacturer": { "type": ["string", "null"] },
           "model": { "type": ["string", "null"] },
           "revision": { "type": ["string", "null"] },
@@ -1235,7 +1629,7 @@
 			  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240 },
 			  "kaEnabled": { "type": "boolean" },
 			  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650 },
-			  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1, "description": "Stored values up to 10000 KB are preserved for configuration compatibility. Cellular HTTP keepalive is unsupported for every value; no cellular activation or transfer occurs." },
+			  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1, "description": "Stored values up to 10000 KiB are preserved. Data keepalive accepts at most 512 KiB at runtime. Body bytes estimate transfer volume, not carrier billing." },
               "pushChannels": {
                 "type": "array",
                 "minItems": 5,
@@ -1270,7 +1664,8 @@
 		  "heartbeatInterval": { "type": "integer", "minimum": 1, "maximum": 240, "x-maxUtf8Bytes": 32 },
 		  "kaEnabled": { "type": "string", "enum": ["on"], "x-maxUtf8Bytes": 32 },
 		  "kaIntervalDays": { "type": "integer", "minimum": 1, "maximum": 3650, "x-maxUtf8Bytes": 32 },
-		  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "x-maxUtf8Bytes": 32, "description": "Values are stored for configuration compatibility; cellular HTTP keepalive is unsupported and no cellular activation occurs." }
+		  "kaTrafficKB": { "type": "integer", "minimum": 1, "maximum": 10000, "x-maxUtf8Bytes": 32, "description": "Values above 512 KiB can remain stored while disabled but cannot run or enable data keepalive." },
+		  "kaUrl": { "type": "string", "x-maxUtf8Bytes": 256, "description": "Data keepalive HTTPS GET URL. An unchanged legacy HTTP URL may remain stored while disabled; changing the URL or enabling data keepalive requires HTTPS. No automatic scheme or host migration occurs." }
         },
         "patternProperties": {
           "^account[0-9]user$": { "type": "string", "x-maxUtf8Bytes": 64, "x-maxBasicPairUtf8Bytes": 180 },

@@ -337,10 +337,25 @@ npm ci --prefix web
 npm --prefix web run check
 npm --prefix web run build
 node --test web/scripts/package.test.mjs
+node --test web/scripts/forward-rules.test.mjs web/scripts/diagnostic-values.test.mjs
 node web/scripts/package.mjs --check
 ```
 
 `npm --prefix web run build` 會更新 `code/web_assets.h` 與 `code/web_assets.cpp`。請勿手動編輯這兩個檔案。
+
+轉發規則與保活的 host checks：
+
+```sh
+python3 tools/test_idf_config_updates.py
+python3 -m unittest components/idf_web/test/test_diagnostics.py
+python3 -m unittest components/idf_web/test/test_keepalive_ca.py components/idf_modem/test/test_keepalive.py
+npm --prefix mock_server test
+```
+
+CSV fixtures 同時檢查 Web 解析／序列化與韌體 POSIX 比對；Mock 的規則測試結果只供示範。
+瀏覽器測試涵蓋手機 CSV 編輯、舊 Tab 設定的明確轉換、來源號碼與簡訊預覽、診斷原值展開，
+以及獨立保活憑證入口。保活 host fixtures 使用合成 HTTP 回應與憑證狀態，
+不建立 SIM 連線、不下載真實保活流量，也不發送通知。這些檢查不能取代實機傳輸驗證。
 
 ## 燒錄與監看
 

@@ -84,10 +84,10 @@ class ConfigSchemaTest(unittest.TestCase):
         self.assertEqual(config["kaTrafficKB"]["maximum"], 10000)
         self.assertEqual(config["kaTrafficKB"]["default"], 1)
         self.assertEqual(config["kaTrafficKB"]["x-runtimeMax"], 512)
-        self.assertIn("unsupported", config["kaTrafficKB"]["description"].lower())
+        self.assertIn("512", config["kaTrafficKB"]["description"])
         self.assertNotIn("MHTTP", config["kaTrafficKB"]["description"])
         self.assertIn("action 1", config["kaAction"]["description"].lower())
-        self.assertIn("unsupported", config["kaAction"]["description"].lower())
+        self.assertIn("verified cellular HTTPS GET", config["kaAction"]["description"])
         task_action = config["schedTasks"]["items"]["properties"]["action"]
         self.assertIn("action 1", task_action["description"].lower())
         self.assertIn("unsupported", task_action["description"].lower())
