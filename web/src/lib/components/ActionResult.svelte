@@ -19,7 +19,7 @@
 	};
 
 	function formatValue(value: string | number | boolean | null, unit?: string) {
-		if (value === null) return translate(locale, "commonNotAvailable");
+		if (value === null || (typeof value === "string" && !value.trim())) return translate(locale, "commonNotAvailable");
 		if (typeof value === "boolean") return translate(locale, value ? "commonEnabled" : "commonDisabled");
 		return unit ? `${value} ${unit}` : String(value);
 	}

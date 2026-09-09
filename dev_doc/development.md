@@ -445,6 +445,7 @@ python3 -m unittest \
   components/idf_modem/test/test_uart_owner.py \
   components/idf_push/test/test_push_runtime.py \
   components/idf_sms/test/test_sms_retention_policy.py \
+  components/idf_sms/test/test_multipart.py \
   components/idf_wifi/test/test_wifi_security.py
 ```
 
@@ -520,6 +521,76 @@ cellular GET 僅使用固定 GET method、空 request body，rendered URL 上限
 - 證據邊界：wrong-certificate、hostname mismatch 與 expired-certificate rejection 都沒有可信的負向證據。
 
 此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。
+
+### 2026-09-09 儲存與診斷回歸
+
+- 修正前，在 ESP32-C3／ML307 裝置提交一次原值名稱與 hostname，HTTP 回覆
+  `202`，後續 job 查詢逾時。恢復連線後 uptime 已重新計數，啟動紀錄為
+  `Program panic (4)`。沒有取得 backtrace，因此不能將 panic 原因定論為 stack overflow。
+- ESP-IDF target 編譯的 `handle_modern_save` frame 原為 3552 bytes；將設定快照
+  改為 heap 配置後，production 與 USB profile 都是 1440 bytes。建置會執行
+  `tools/check_web_stack.py`，限制此 frame 不超過 2048 bytes。配置失敗須回覆
+  out-of-memory，並釋放設定鎖；`tools/test_idf_config_updates.py` 用實際配置失敗驗證。
+- 裝置當次為 roaming（registration 5）。模組與 SIM API 成功但識別欄位皆空，
+  原有採樣 gate 只允許 home registration。修正允許 roaming 的唯讀識別採樣，
+  保留 home-only 的 operator 設定與行動傳送限制。
+- 當次唯讀 operator 回覆為 `+COPS: 0,0,"",7`。這只是該次 capture，
+  不代表所有模組或網路的回覆。`components/idf_web/test/test_diagnostics.py`
+  執行 production query handler，驗證只呈現 operator 欄位且只送出查詢命令。
+- Browser 回歸涵蓋儲存成功、失敗、重試、job 失聯及結果位於按鈕上方。
+  已接受但失聯的操作顯示「結果未知」，不自動重送。正常成功未重現 Svelte 狀態更新問題。
+- 本機 production、USB 編譯、48 項 modem 測試、13 項 Web package 測試與
+  37 項 Mock／browser 測試通過。這是部署前的結果；後續實機儲存與識別資訊驗收
+  見下方 counter46 網路 OTA 紀錄。
+
+### 長簡訊回歸入口
+
+`components/idf_sms/test/test_multipart.py` 編譯目前 production 合併函式與 RAM retry
+函式，使用合成分段、可控時鐘與轉發入隊 sink。涵蓋晚段補齊、完成重送去重、
+過期槽復用、五槽競爭、reference 衝突、入隊背壓、固定補齊窗口與通知 metadata。
+舊碼會在「晚段補成 ABC 並發完整補充」斷言失敗。此測試不使用實機短信。
+
+`components/idf_push/test/test_push_runtime.py` 的執行式 core fixture 驗證三語補充標題、
+自訂範本及原文不變；同檔另有來源契約檢查。既有 SMS retention 測試主要也是來源
+契約檢查，不能取代以上時序回歸。以上入口都由 firmware CI 的 focused checks 呼叫。
+新加入的 diagnostics handler fixture 與文件語言／本地連結檢查也已接到同一 CI。
+真實 UART／電信重送時序與 provider 送達仍須另外進行硬體驗收，本輪未執行。
+
+### 2026-09-09 counter46 網路 OTA 驗收
+
+- 裝置：ESP32-C3／ML307 系列，使用既有 TEST-key USB-recovery profile；本次未接 USB。
+  輸入為已提交來源 `9a40705`（包含 save／diagnostics 修復、三語 README 與長簡訊修復）。
+  diagnostics CI 入口以 `python3 -m unittest components/idf_web/test/test_diagnostics.py`
+  實際執行通過；multipart 與 document-language 的 CI 命令也實際執行通過。
+- 建置：固定 ESP-IDF 6.0.2，`SMS_USB_RECOVERY=1`、`SMS_OTA_TEST_KEY=1`、
+  `SMS_OTA_TEST_FAIL_HEALTH=0`。App 為 1,542,944 bytes，SHA-256
+  `7a7893771b25756f7d63f07b7048da937e1f5d3d8fe8610e13a463fc3fec4f29`。
+  已確認內嵌既有 public key，不建立或更換 trust key。
+- 刷入前：app0／valid、accepted 45、零 pending。既有 public-key SHA-256 為
+  `8a10937f712f0948aef8c59e22b244f61f7411722575f32f688a690c5edc7b9f`。
+  加密設定 export-only 備份通過本機認證，mode 0600、863 bytes，SHA-256
+  `bcdf4bbb44c2883bc774d21a1e8a3f748ef1650182fe52d2e14a5c8bffe378d3`。
+- 透過既有 Web OTA 傳送 counter46、version `1.1.4-dev-9a40705` 的簽章套件。
+  套件 SHA-256 為 `4e4dfe59c1e3317665d3c25ad3f27e6c9494e6443d3d7ff534f5126dfd3e3bbb`，
+  terminal 結果為 `ACTION_OTA_READY`。重啟後首次 180 秒等待未能連線；延長唯讀觀察後，
+  原位址恢復，確認 app1／valid、accepted 46、pending 0、pendingVerify false，key 相同。
+  未重傳套件、手動 reset、切換 WiFi 或執行還原；網路恢復延遲原因未確定。
+- 完整 Web gzip bundle 為 162,305 bytes，與候選逐 byte 相同；解壓後也與 build HTML 相同。
+  SHA-256 為 `467c5d96a465d761f9395fc93d59822a5564fd20e5deeb9adbe2e82533bad4cc`。
+- 只提交一次原值 deviceName／hostname：HTTP 202 後取得 `ACTION_CONFIG_SAVED`，
+  含三秒觀察共 3.6 秒。API 可見設定前後逐值相同，uptime 連續；後續觀察 uptime
+  403 → 415 → 569 秒，reset reason 為 `Software restart (3)`。本次未重現原值儲存 panic。
+- 只讀診斷：manufacturer／model／revision 皆有值；IMSI／ICCID／MSISDN 皆有值。
+  operator 成功回覆空字串，不再把整行 COPS 當作名稱；匹配的 Web bundle 以無可用值標示。
+  不記錄識別資料原文。
+- 刷入後另存一份已認證加密備份，mode 0600、863 bytes，SHA-256
+  `206be2f5c0cc6c695ecb6055622126c5598420876c83008748564a46dcea99ca`。
+  兩份備份在 RAM 解密後逐 byte 相同，未輸出或寫入明文。此比較涵蓋可攜設定與 data 選項，
+  不涵蓋格式刻意排除的裝置本地身份／roaming 欄位。modern API 未暴露 roaming 旗標，
+  因此未直接量測它的跨 OTA 值；本次沒有修改網路設定，home-only guard 的程式未變。
+- 證據邊界：長簡訊修復已隨核對套件刷入，host 時序回歸通過；本次未發送實體簡訊、
+  測試外部推送或驗證電信重送，不據此保證真正遺失的分段可恢復。此 TEST-key 驗收
+  不提升 production OTA readiness。
 
 ## PR 清理 gate
 

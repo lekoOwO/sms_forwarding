@@ -413,6 +413,7 @@
 	"ACTION_WIFI_RESTARTING": "WiFi is reconnecting. Refresh in about 5 seconds.",
 	"ACTION_WIFI_PASSWORD_REQUIRED": "Enter a new 8 to 63 character printable ASCII WiFi password or explicitly select an open network. This is required when the SSID changes or an open network becomes secured.",
 	"ACTION_REQUEST_FAILED": "Request failed.",
+	"ACTION_JOB_RESULT_UNKNOWN": "The device did not return a result. Reload the page to check before trying again.",
 	"ACTION_LOGS_FAILED": "Logs could not be loaded.",
 	"ACTION_PASSPHRASE_INVALID": "Enter matching passphrases of at least 12 characters.",
 	"ACTION_BACKUP_TOO_LARGE": "The backup file is larger than 32,828 bytes.",

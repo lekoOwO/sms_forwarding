@@ -36,6 +36,8 @@ static constexpr size_t CONCAT_PARTS = 10;
 // Carrier retries and polling can take minutes after SIM storage rejects a segment.
 // Wait 15 minutes before forwarding a direct message with missing-segment markers.
 static constexpr int64_t CONCAT_TIMEOUT_US = 15LL * 60LL * 1000LL * 1000LL;
+// 首次 partial 入隊後再保留十五分鐘；新段不延長這個補齊窗口。
+static constexpr int64_t CONCAT_RECOVERY_US = 15LL * 60LL * 1000LL * 1000LL;
 // Poll every 10 seconds while a multipart message is incomplete.
 static constexpr uint32_t CONCAT_HUNT_POLL_MS = 10000;
 static constexpr uint32_t SMS_POLL_INTERVAL_MS = 60000;
@@ -59,6 +61,8 @@ struct ConcatSlot {
     std::string sender;
     std::string timestamp;
     int64_t lastUs = 0;
+    int64_t partialUs = 0;
+    int deliveredParts = 0;
     std::array<ConcatPart, CONCAT_PARTS> parts;
 };
 
@@ -72,6 +76,7 @@ struct PendingForwardJob {
     std::string text;
     std::string timestamp;
     uint32_t inbox_id = 0;
+    bool supplement = false;
 };
 
 struct DecodedSms {
@@ -172,7 +177,7 @@ static void remember_seen(uint32_t hash)
 }
 
 static bool enqueue_pending_forward(const std::string& sender, const std::string& text,
-                                    const std::string& timestamp, uint32_t inbox_id)
+                                    const std::string& timestamp, uint32_t inbox_id, bool supplement)
 {
     if (s_pending_forward_count >= PENDING_FORWARD_MAX) return false;
     size_t tail = (s_pending_forward_head + s_pending_forward_count) % PENDING_FORWARD_MAX;
@@ -181,6 +186,7 @@ static bool enqueue_pending_forward(const std::string& sender, const std::string
     job.text = text;
     job.timestamp = timestamp;
     job.inbox_id = inbox_id;
+    job.supplement = supplement;
     ++s_pending_forward_count;
     return true;
 }
@@ -190,7 +196,7 @@ static bool retry_pending_forward()
     if (s_pending_forward_count == 0) return false;
     PendingForwardJob& job = s_pending_forwards[s_pending_forward_head];
     if (!idf_push_enqueue_forward(job.sender.c_str(), job.text.c_str(),
-                                  job.timestamp.c_str(), job.inbox_id)) {
+                                  job.timestamp.c_str(), job.inbox_id, job.supplement)) {
         return false;
     }
     idf_logf("SMS RAM retry entered the forward queue id=%u", static_cast<unsigned>(job.inbox_id));
@@ -346,6 +352,8 @@ static void clear_concat_slot(ConcatSlot& slot)
     slot.sender.clear();
     slot.timestamp.clear();
     slot.lastUs = 0;
+    slot.partialUs = 0;
+    slot.deliveredParts = 0;
     for (auto& part : slot.parts) {
         part.valid = false;
         part.text.clear();
@@ -375,11 +383,11 @@ struct SmsProcessResult {
 };
 
 static SmsProcessResult process_sms_content(const char* sender_raw, const char* text_raw,
-                                            const char* timestamp_raw, bool allow_ram_retry);
+                                            const char* timestamp_raw, bool allow_ram_retry,
+                                            bool supplement = false);
 
-// Track completed multipart messages because an SMSC can retry the full message
-// after SIM storage rejects some segments. Match the reference, sender, total,
-// and content hash so carrier reference reuse does not discard a new message.
+// 已完成或結束補齊窗口的分段指紋，避免 SIM 回補重開已交付的舊段。
+// 窗口內的 partial 不進此 ring，仍能接受原段重送及晚段補齊。
 struct ConcatDone {
     bool used = false;
     int ref = 0;
@@ -427,10 +435,16 @@ static void record_concat_done(const ConcatSlot& slot)
 // a concat slot, admit its content to push or the SMS RAM fallback. Retain it on failure.
 static SmsProcessResult retain_concat_before_clear(ConcatSlot& slot, bool allow_ram_retry)
 {
+    if (slot.received == slot.deliveredParts) return {true, false};
     std::string partial = assemble_concat(slot);
     SmsProcessResult result = process_sms_content(
-        slot.sender.c_str(), partial.c_str(), slot.timestamp.c_str(), allow_ram_retry);
-    if (result.retained) record_concat_done(slot);
+        slot.sender.c_str(), partial.c_str(), slot.timestamp.c_str(), allow_ram_retry,
+        slot.partialUs != 0 && slot.received == slot.total);
+    if (result.retained) {
+        slot.deliveredParts = slot.received;
+        if (slot.received == slot.total) record_concat_done(slot);
+        else if (slot.partialUs == 0) slot.partialUs = esp_timer_get_time();
+    }
     return result;
 }
 
@@ -446,7 +460,7 @@ static ConcatSlot* find_concat_slot(int ref, const std::string& sender, int tota
     });
     if (slot != s_concat.end()) return &*slot;
     slot = std::find_if(s_concat.begin(), s_concat.end(), [&](const auto& candidate) {
-        return !candidate.active || now - candidate.lastUs > CONCAT_TIMEOUT_US;
+        return !candidate.active;
     });
     if (slot != s_concat.end()) {
         clear_concat_slot(*slot);
@@ -475,6 +489,7 @@ static ConcatSlot* find_concat_slot(int ref, const std::string& sender, int tota
         }
         eviction_admitted = result.admitted;
     }
+    if (oldest->received < oldest->total) record_concat_done(*oldest);
     clear_concat_slot(*oldest);
     oldest->active = true;
     oldest->ref = ref;
@@ -485,7 +500,8 @@ static ConcatSlot* find_concat_slot(int ref, const std::string& sender, int tota
 }
 
 static SmsProcessResult process_sms_content(const char* sender_raw, const char* text_raw,
-                                            const char* timestamp_raw, bool allow_ram_retry)
+                                            const char* timestamp_raw, bool allow_ram_retry,
+                                            bool supplement)
 {
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
@@ -511,9 +527,9 @@ static SmsProcessResult process_sms_content(const char* sender_raw, const char* 
     uint32_t id = idf_inbox_add(sender.c_str(), text.c_str(), display_ts.c_str());
     idf_logf("SMS received id=%u from %s; entering forward queue",
              static_cast<unsigned>(id), masked_phone(sender).c_str());
-    if (!idf_push_enqueue_forward(sender.c_str(), text.c_str(), display_ts.c_str(), id)) {
+    if (!idf_push_enqueue_forward(sender.c_str(), text.c_str(), display_ts.c_str(), id, supplement)) {
         if (allow_ram_retry &&
-            enqueue_pending_forward(sender, text, display_ts, id)) {
+            enqueue_pending_forward(sender, text, display_ts, id, supplement)) {
             update_status(true, true);
             remember_seen(hash);
             idf_logf("forward queue full; SMS id=%u entered the RAM retry queue",
@@ -590,6 +606,7 @@ static PduDecodeOutcome handle_decoded_pdu(const DecodedSms& sms, bool allow_ram
                 return {true, false, true, eviction_admitted, false};
             }
             eviction_admitted = result.admitted;
+            if (slot.received < slot.total) record_concat_done(slot);
             clear_concat_slot(slot);
             slot.active = true;
             slot.ref = ref;
@@ -669,13 +686,19 @@ static void expire_concat_slots()
 {
     int64_t now = esp_timer_get_time();
     for (auto& slot : s_concat) {
-        if (!slot.active || now - slot.lastUs <= CONCAT_TIMEOUT_US) continue;
+        if (!slot.active) continue;
+        bool recovery_ended = slot.partialUs != 0;
+        if (recovery_ended ? now - slot.partialUs <= CONCAT_RECOVERY_US
+                           : now - slot.lastUs <= CONCAT_TIMEOUT_US) continue;
         std::string full = assemble_concat(slot);
         if (!full.empty()) {
             idf_logf("multipart SMS timed out; assembled %d/%d segments", slot.received, slot.total);
             SmsProcessResult result = retain_concat_before_clear(slot, true);
             if (result.retained) {
-                clear_concat_slot(slot);
+                if (recovery_ended || slot.received == slot.total) {
+                    if (slot.received < slot.total) record_concat_done(slot);
+                    clear_concat_slot(slot);
+                }
             } else {
                 // Retain acknowledged direct segments if push and RAM fallback are full.
                 slot.lastUs = now;

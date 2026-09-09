@@ -7,6 +7,58 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import { gunzipSync } from "node:zlib";
 
+test("job polling aborts an unresponsive request and can retry", { timeout: 10000 }, async () => {
+	const previousCwd = process.cwd();
+	const originalFetch = globalThis.fetch;
+	let server;
+	try {
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		let aborted = false;
+		globalThis.fetch = (_url, init) => new Promise((_resolve, reject) => {
+			init?.signal?.addEventListener("abort", () => {
+				aborted = true;
+				reject(init.signal.reason);
+			}, { once: true });
+		});
+		await assert.rejects(api.waitForJob(1, 25), /timed out/i);
+		assert.equal(aborted, true, "the request must release its connection when the deadline expires");
+		globalThis.fetch = async () => new Response(JSON.stringify({ state: "succeeded", result: {
+			success: true, code: "ACTION_CONFIG_SAVED", data: {}, detail: ""
+		} }), { headers: { "Content-Type": "application/json" } });
+		assert.equal((await api.waitForJob(2, 1000)).code, "ACTION_CONFIG_SAVED");
+	} finally {
+		globalThis.fetch = originalFetch;
+		try { await server?.close(); } finally { process.chdir(previousCwd); }
+	}
+});
+
+test("diagnostic result renders unavailable values without hiding valid zero", async () => {
+	const previousCwd = process.cwd();
+	let server;
+	try {
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const [{ render }, component] = await Promise.all([
+			server.ssrLoadModule("svelte/server"), server.ssrLoadModule("/src/lib/components/ActionResult.svelte")
+		]);
+		const { body } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_QUERY_OK", data: { manufacturer: "", model: "   ", registration: 0 }, detail: "" },
+			title: "Result", locale: "en"
+		} });
+		const values = [...body.matchAll(/<dd\b[^>]*>([\s\S]*?)<\/dd>/g)].map((match) => match[1].replace(/<!--.*?-->/g, ""));
+		assert.equal(values.length, 3);
+		assert.ok(values[0].trim().length > 0, "empty modem data must have a visible unavailable label");
+		assert.equal(values[1], values[0]);
+		assert.equal(values[2], "0");
+	} finally {
+		try { await server?.close(); } finally { process.chdir(previousCwd); }
+	}
+});
+
 test("package output is deterministic and ESP-IDF compatible", async () => {
 	const root = mkdtempSync(join(tmpdir(), "web-assets-"));
 	const scripts = join(root, "web", "scripts");

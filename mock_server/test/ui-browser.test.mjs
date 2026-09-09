@@ -20,6 +20,72 @@ const browserCandidates = [
 const browserExecutable = browserCandidates[0];
 const browserAvailable = Boolean(process.env.UI_BROWSER_URL || browserExecutable);
 
+test("identity save replaces pending feedback after success, failure, retry, and lost response above its button", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser;
+	let page;
+	let userDataDir;
+	let shared = false;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 390, height: 844 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "zh-TW"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/connection");
+		await page.waitForSelector("#identity-form");
+		await page.setRequestInterception(true);
+		let receiveJob;
+		let saveRequests = 0;
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname === "/save") saveRequests += 1;
+			if (new URL(request.url()).pathname === "/api/jobs") receiveJob(request);
+			else void request.continue();
+		});
+		for (const success of [true, false, true]) {
+			const pendingJob = new Promise((resolve) => receiveJob = resolve);
+			await page.$eval("#identity-form", (form) => form.requestSubmit());
+			await page.waitForFunction(() => document.querySelector("#identity-form").parentElement.textContent.includes("儲存中"));
+			const request = await pendingJob;
+			const jobId = Number(new URL(request.url()).searchParams.get("id"));
+			await request.respond({ status: 200, contentType: "application/json", body: JSON.stringify({
+				id: jobId, type: "config-save", state: success ? "succeeded" : "failed",
+				result: { success, code: success ? "ACTION_CONFIG_SAVED" : "ACTION_CONFIG_SAVE_FAILED", data: {}, detail: "" }
+			}) });
+			const message = success ? "設定已儲存。" : "設定無法儲存。請重試，並在裝置重新啟動後確認。";
+			await page.waitForFunction((expected) => {
+				const region = document.querySelector("#identity-form")?.parentElement;
+				return region?.textContent.includes(expected) && !region.textContent.includes("儲存中");
+			}, { timeout: 5000 }, message).catch(() => {});
+			assert.equal(await page.$eval("#identity-form", (form) =>
+				form.parentElement.querySelector('[role="status"], [role="alert"]').textContent.includes("儲存中")), false,
+				`terminal ${success ? "success" : "failure"} must replace pending feedback`);
+			assert.ok(await page.$eval("#identity-form", (form, expected) => form.parentElement.textContent.includes(expected), message));
+		}
+		await page.evaluate(() => {
+			const original = globalThis.setTimeout;
+			globalThis.setTimeout = (callback, delay, ...args) => original(callback, delay === 90000 ? 100 : delay, ...args);
+		});
+		const lostJob = new Promise((resolve) => receiveJob = resolve);
+		await page.$eval("#identity-form", (form) => form.requestSubmit());
+		const lostRequest = await lostJob;
+		await page.waitForFunction(() => document.querySelector("#identity-form").parentElement.textContent.includes("裝置未回傳操作結果"));
+		assert.equal(saveRequests, 4, "an unknown result must not resubmit the save automatically");
+		assert.equal(await page.$eval('button[form="identity-form"]', (button) => button.disabled), false);
+		await lostRequest.abort().catch(() => {});
+		const position = await page.$eval("#identity-form", (form) => {
+			const region = form.parentElement;
+			return {
+				resultBottom: region.querySelector('[role="status"], [role="alert"]').getBoundingClientRect().bottom,
+				buttonTop: region.querySelector('button[form="identity-form"]').getBoundingClientRect().top
+			};
+		});
+		assert.ok(position.resultBottom <= position.buttonTop, "save feedback must be above the save button");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
 async function launchBrowser() {
 	if (process.env.UI_BROWSER_URL) {
 		const browser = await puppeteer.connect({ browserURL: process.env.UI_BROWSER_URL });
@@ -220,10 +286,10 @@ test("device subpages keep deep links, scroll position, controls, and accessible
 			context.fillStyle = color;
 			context.fillRect(0, 0, 1, 1);
 			const [red, green, blue] = context.getImageData(0, 0, 1, 1).data;
-			return { chroma: Math.max(red, green, blue) - Math.min(red, green, blue), dark: document.documentElement.classList.contains("dark") };
+			return { color, chroma: Math.max(red, green, blue) - Math.min(red, green, blue), dark: document.documentElement.classList.contains("dark") };
 		});
 		assert.equal(activeStyle.dark, true);
-		assert.ok(activeStyle.chroma < 0.01, "dark active subnav must stay neutral");
+		assert.ok(activeStyle.chroma < 0.01, `dark active subnav must stay neutral: ${JSON.stringify(activeStyle)}`);
 
 		await page.focus(".desktop-sidebar .device-subnav-link");
 		await page.keyboard.press("Tab");

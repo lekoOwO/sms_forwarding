@@ -17,6 +17,7 @@ struct IdfPushTemplateValues {
     std::string ip;
     std::string hostname;
     std::string wifi;
+    bool supplement = false;
 };
 
 enum class IdfPushNetworkDecision : uint8_t {
@@ -60,6 +61,7 @@ struct IdfPushTestJobState {
 };
 
 bool idf_push_utf8_valid(const std::string& value);
+const char* idf_push_sms_supplement_label(const std::string& locale);
 bool idf_push_render_template(const std::string& source, const IdfPushTemplateValues& values,
                               size_t max_bytes, bool header, std::string& output);
 bool idf_push_render_sms_notification(const std::string& locale,

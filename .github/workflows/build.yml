@@ -66,7 +66,11 @@ jobs:
         run: npm ci --prefix mock_server
 
       - name: Test mock API
-        run: npm --prefix mock_server test
+        env:
+          CHROME_BIN: /usr/bin/google-chrome
+        run: |
+          test -x "$CHROME_BIN"
+          npm --prefix mock_server test
 
       - name: Test mock development stack
         run: |
@@ -228,6 +232,7 @@ jobs:
           python3 components/idf_lpa/test/test_bpp.py
           python3 components/idf_push/test/test_push_runtime.py
           python3 components/idf_sms/test/test_sms_retention_policy.py
+          python3 components/idf_sms/test/test_multipart.py
           python3 components/idf_wifi/test/test_wifi_security.py
           python3 tools/test_idf_baseline.py
           python3 tools/test_device.py
@@ -236,6 +241,8 @@ jobs:
           python3 tools/test_ota_observability.py
           python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
+          python3 -m unittest components/idf_web/test/test_diagnostics.py
+          python3 tests/test_document_languages.py
           python3 components/idf_web/test/test_openapi_conformance.py
           python3 components/idf_web/test/test_ota_runtime.py
 

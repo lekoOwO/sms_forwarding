@@ -80,6 +80,7 @@ struct PushJob {
     uint8_t channel = 0;
     uint8_t attempts = 0;
     bool notify = false;  // true: custom alert with the task name as title; false: forwarded SMS
+    bool supplement = false;
     int64_t nextUs = 0;
     std::string sender;
     std::string text;
@@ -91,6 +92,7 @@ struct PushJob {
 struct ForwardJob {
     bool used = false;
     bool pushQueued = false;
+    bool supplement = false;
     uint8_t attempts = 0;
     int64_t nextUs = 0;
     std::string sender;
@@ -1116,7 +1118,8 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
                             IdfModemHttpsDiagnosticReason* failure_reason = nullptr,
                             IdfModemHttpsDiagnosticReason* cleanup_reason = nullptr,
                             bool* cleanup_requires_reset = nullptr,
-                            IdfPushTransportResult* transport_result = nullptr)
+                            IdfPushTransportResult* transport_result = nullptr,
+                            bool supplement = false)
 {
     IdfPushTransportResult transport;
     transport.transportPath = transport_path_for_network(network);
@@ -1158,10 +1161,12 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
 
     std::string sender = sender_raw ? sender_raw : "";
     std::string text = text_raw ? text_raw : "";
+    // 只標示通知呈現內容；收件匣、去重與轉發規則保留原始簡訊。
+    if (supplement) text.insert(0, std::string(idf_push_sms_supplement_label(cfg.notificationLocale)) + "\n\n");
     std::string timestamp = timestamp_raw ? timestamp_raw : "";
     IdfPushTemplateValues values{
         sender, text, timestamp, cfg.deviceName, notify ? std::string() : local_phone_number(),
-        wifi.ip, cfg.hostname, wifi.ssid,
+        wifi.ip, cfg.hostname, wifi.ssid, supplement,
     };
     std::string title;
     std::string notification_body;
@@ -1353,7 +1358,7 @@ static bool send_to_channel(const IdfPushChannel& input_channel, const char* sen
 static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const std::string& text,
                                     const std::string& timestamp, uint8_t attempts, uint32_t delay_sec,
                                     bool notify = false, uint32_t inbox_id = 0,
-                                    uint32_t completion_id = 0)
+                                    uint32_t completion_id = 0, bool supplement = false)
 {
     int slot = -1;
     for (size_t i = 0; i < s_push_jobs.size(); ++i) {
@@ -1371,6 +1376,7 @@ static bool enqueue_push_job_locked(uint8_t ch, const std::string& sender, const
     job.channel = ch;
     job.attempts = attempts;
     job.notify = notify;
+    job.supplement = supplement;
     job.nextUs = esp_timer_get_time() + static_cast<int64_t>(delay_sec) * 1000000LL;
     job.sender = sender;
     job.text = text;
@@ -1437,11 +1443,13 @@ static bool enqueue_forward_job_locked(const ForwardJob& src, uint32_t delay_sec
     return false;
 }
 
-static bool enqueue_forward_locked(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+static bool enqueue_forward_locked(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id,
+                                   bool supplement)
 {
     ForwardJob job;
     job.sender = sender ? sender : "";
     job.text = text ? text : "";
+    job.supplement = supplement;
     job.timestamp = timestamp ? timestamp : "";
     job.inboxId = inbox_id;
     return enqueue_forward_job_locked(job, 0);
@@ -1556,7 +1564,7 @@ static bool process_forward_one()
                 if (!(mask & (1u << i))) continue;
                 if (!channel_valid(cfg.pushChannels[i])) continue;
                 if (enqueue_push_job_locked(i, job.sender, job.text, job.timestamp, 0, 0, false,
-                                            job.inboxId, completion_id)) {
+                                            job.inboxId, completion_id, job.supplement)) {
                     ++dispatched;
                     had_queued_target = true;
             if (!targets.empty()) targets += ", ";
@@ -1572,6 +1580,7 @@ static bool process_forward_one()
         if (!enqueue_failed && will_queue_email) {
             // Put only the start of the message in the subject. The body has the full text, and strict MTAs reject long subjects.
             std::string subject = "SMS";
+            if (job.supplement) subject.insert(0, idf_push_sms_supplement_label(cfg.notificationLocale));
             subject += job.sender;
             subject += ",";
             subject += utf8_truncate(job.text, 48);
@@ -1740,7 +1749,8 @@ static bool process_push_one()
     bool permanent_failure = false;
     bool ok = send_to_channel(channel, job.sender.c_str(), job.text.c_str(),
                               job.timestamp.c_str(), cfg, wifi, network, job.notify,
-                              nullptr, &permanent_failure);
+                              nullptr, &permanent_failure, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              job.supplement);
     note_channel_result(job.channel, ok);
     if (ok) {
         note_forward_target_success(job.completionId);
@@ -1766,7 +1776,8 @@ static bool process_push_one()
     bool requeued = false;
     if (s_mutex && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         requeued = enqueue_push_job_locked(job.channel, job.sender, job.text, job.timestamp,
-                                           job.attempts, delay, job.notify, job.inboxId, job.completionId);
+                                           job.attempts, delay, job.notify, job.inboxId, job.completionId,
+                                           job.supplement);
         xSemaphoreGive(s_mutex);
     }
     if (!requeued) {
@@ -2070,12 +2081,13 @@ esp_err_t idf_push_start(void)
     return ESP_OK;
 }
 
-bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id)
+bool idf_push_enqueue_forward(const char* sender, const char* text, const char* timestamp, uint32_t inbox_id,
+                              bool supplement)
 {
     if (!ensure_init()) return false;
     // Critical sections contain only short memory operations. Wait for the lock so contention cannot drop an SMS.
     if (!s_mutex || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) return false;
-    bool ok = enqueue_forward_locked(sender, text, timestamp, inbox_id);
+    bool ok = enqueue_forward_locked(sender, text, timestamp, inbox_id, supplement);
     xSemaphoreGive(s_mutex);
     if (ok) wake_worker();
     else idf_log_line("Forwarding queue is full; SMS was not forwarded");

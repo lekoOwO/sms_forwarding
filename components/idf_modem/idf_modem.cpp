@@ -2118,7 +2118,7 @@ static bool plmn_valid(const std::string& plmn)
 
 static void apply_operator_if_configured(const IdfSimSettingsView& cfg, int cereg_stat)
 {
-    if (!idf_modem_identity_sampling_allowed(cereg_stat)) return;
+    if (cereg_stat != 1) return;
     if (cfg.operatorPlmn.empty()) return;
     if (!plmn_valid(cfg.operatorPlmn)) {
         idf_log_line("operator PLMN is invalid. COPS not sent at startup");
@@ -2615,8 +2615,8 @@ static bool sample_identity_once(bool log_summary = false, bool include_network_
                         (!s_identity_network_attempted || before.operatorName.empty());
     if (need_network) {
         if (before.operatorName.empty()) {
-            // Select the long-name format before COPS? so automatic mode returns an operator name.
-            send_ok("AT+COPS=3,0", 1500, &resp);
+            // 漫遊只查詢現有格式，不修改模組選網設定。
+            if (before.ceregStat == 1) send_ok("AT+COPS=3,0", 1500, &resp);
             if (send_ok("AT+COPS?", 1500, &resp)) patch.operatorName = parse_cops(resp);
             vTaskDelay(pdMS_TO_TICKS(150));
         }

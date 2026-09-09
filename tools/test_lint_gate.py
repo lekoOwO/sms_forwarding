@@ -52,11 +52,12 @@ def parse_workflow_job(workflow: str, name: str) -> dict[str, object]:
             *lines[start + 1:end],
         ])
         step: dict[str, object] = scalar_mapping(step_text, 8)
-        try:
-            _, with_block = yaml_node(step_text, 8, "with")
-            step["with"] = scalar_mapping(with_block, 10)
-        except AssertionError:
-            pass
+        for field in ("with", "env"):
+            try:
+                _, field_block = yaml_node(step_text, 8, field)
+                step[field] = scalar_mapping(field_block, 10)
+            except AssertionError:
+                pass
         steps.append(step)
     job["steps"] = steps
     return job
@@ -90,6 +91,7 @@ class LintGateTests(unittest.TestCase):
             "python3 components/idf_lpa/test/test_bpp.py",
             "python3 components/idf_push/test/test_push_runtime.py",
             "python3 components/idf_sms/test/test_sms_retention_policy.py",
+            "python3 components/idf_sms/test/test_multipart.py",
             "python3 components/idf_wifi/test/test_wifi_security.py",
             "python3 tools/test_idf_baseline.py",
             "python3 tools/test_device.py",
@@ -98,6 +100,8 @@ class LintGateTests(unittest.TestCase):
             "python3 tools/test_ota_observability.py",
             "python3 tools/test_usb_recovery.py",
             "python3 components/idf_web/test/test_web_security.py",
+            "python3 -m unittest components/idf_web/test/test_diagnostics.py",
+            "python3 tests/test_document_languages.py",
             "python3 components/idf_web/test/test_openapi_conformance.py",
             "python3 components/idf_web/test/test_ota_runtime.py",
         ], host_contracts["run"].splitlines())
@@ -278,7 +282,8 @@ class LintGateTests(unittest.TestCase):
                 },
                 {
                     "name": "Test mock API",
-                    "run": "npm --prefix mock_server test",
+                    "env": {"CHROME_BIN": "/usr/bin/google-chrome"},
+                    "run": 'test -x "$CHROME_BIN"\nnpm --prefix mock_server test\n',
                 },
                 {
                     "name": "Test mock development stack",
@@ -301,11 +306,12 @@ class LintGateTests(unittest.TestCase):
                 1,
             ),
             mock_block.replace(
-                "        run: npm --prefix mock_server test",
-                "        run: npm --prefix mock_server test\n"
+                "      - name: Test mock API",
+                "      - name: Test mock API\n"
                 "        continue-on-error: true",
                 1,
             ),
+            mock_block.replace('test -x "$CHROME_BIN"', "true", 1),
             mock_block.replace(
                 "    steps:\n      - name:",
                 "    steps:\n      - run: echo bypass\n      - name:",

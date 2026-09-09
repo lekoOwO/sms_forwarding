@@ -363,7 +363,7 @@ inline uint32_t idf_modem_health_reset_backoff_ms(uint8_t retry_count)
 
 inline bool idf_modem_identity_sampling_allowed(int cereg_stat)
 {
-    return cereg_stat == 1;
+    return cereg_stat == 1 || cereg_stat == 5;
 }
 
 inline void idf_modem_invalidate_registration_stat(int& cereg_stat)

@@ -94,6 +94,13 @@ bool idf_push_render_template(const std::string& source, const IdfPushTemplateVa
     return true;
 }
 
+const char* idf_push_sms_supplement_label(const std::string& locale)
+{
+    if (locale == NOTIFICATION_LOCALE_EN) return "[Complete SMS follow-up] ";
+    if (locale == NOTIFICATION_LOCALE_ZH_CN) return "[短信完整补充] ";
+    return "[簡訊完整補充] ";
+}
+
 bool idf_push_render_sms_notification(const std::string& locale,
                                       const std::string& title_template,
                                       const std::string& body_template,
@@ -109,7 +116,8 @@ bool idf_push_render_sms_notification(const std::string& locale,
         default_title = "来自 {sender} 的短信";
         default_body = "设备：{device}\n发件人：{sender}\n时间：{timestamp}\n内容：{message}";
     }
-    const std::string& title_source = title_template.empty() ? std::string(default_title) : title_template;
+    std::string title_source = title_template.empty() ? std::string(default_title) : title_template;
+    if (values.supplement) title_source.insert(0, idf_push_sms_supplement_label(locale));
     const std::string& body_source = body_template.empty() ? std::string(default_body) : body_template;
     return idf_push_render_template(title_source, values, MAX_RENDERED_TITLE_BYTES, true, title) &&
            idf_push_render_template(body_source, values, MAX_RENDERED_BODY_BYTES, false, body);
