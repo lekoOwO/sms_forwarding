@@ -30,7 +30,7 @@ test("mobile CSV editor preserves quoted text, tests first-match routing, and sa
 		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#messaging");
 		await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Forwarding rules"));
 		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Forwarding rules").click());
-		await page.waitForSelector("#forward-rules");
+		await waitForAccordionContent(page, "#forward-rules");
 		let saves = 0;
 		page.on("request", (request) => { if (new URL(request.url()).pathname === "/save") saves++; });
 		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Add rule").click());
@@ -39,7 +39,11 @@ test("mobile CSV editor preserves quoted text, tests first-match routing, and sa
 		assert.equal(await page.$eval("#forward-rules", (input) => input.value), 'kw,"a,""b""","email,2",1');
 		await page.type("#rule-test-sender", "+123456");
 		await page.type("#rule-test-message", 'a,"b"');
-		await page.click("#rule-test");
+		const [previewAccepted] = await Promise.all([
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/api/rules/preview" && response.request().method() === "POST", { timeout: 5000 }),
+			page.click("#rule-test")
+		]);
+		assert.equal(previewAccepted.status(), 202);
 		await page.waitForSelector("#rule-preview-result");
 		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /First match: line 1/);
 		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /email, 2/);
@@ -134,6 +138,7 @@ test("roaming diagnostics expose raw values by keyboard and touch", { timeout: 3
 		});
 		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/diagnostics");
 		await page.$eval('[data-device-action="diagnostics-network"]', (button) => { const panel = button.closest('[data-slot="accordion-content"]'); if (panel) document.querySelector(`[aria-controls="${panel.id}"]`)?.click(); });
+		await waitForAccordionContent(page, '[data-device-action="diagnostics-network"]');
 		await page.$eval('[data-device-action="diagnostics-network"]', (button) => button.click());
 		await page.waitForSelector('summary[title="registration: 5"]');
 		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.textContent), /Registered on a roaming network/);
@@ -320,6 +325,24 @@ async function openRoute(page, baseUrl, hash, expectedHash = hash) {
 	const requestedHash = hash === "#overview" ? "" : hash;
 	await page.goto(`${baseUrl}/${requestedHash}`, { waitUntil: "domcontentloaded" });
 	await waitForRoute(page, expectedHash);
+}
+
+async function waitForAccordionContent(page, selector) {
+	await page.waitForSelector(selector);
+	// Presence precedes the accordion's final layout; coordinates sampled during expansion can miss.
+	await page.waitForFunction(async (targetSelector) => {
+		const target = document.querySelector(targetSelector);
+		if (!target) return false;
+		const moving = () => document.getAnimations().some((animation) =>
+			animation.effect?.target instanceof Element && animation.effect.target.contains(target) &&
+			(animation.pending || animation.playState === "running" || animation.playState === "paused"));
+		if (moving()) return false;
+		const before = target.getBoundingClientRect();
+		await new Promise(requestAnimationFrame);
+		const after = target.getBoundingClientRect();
+		return !moving() && before.width > 0 && before.height > 0 &&
+			["x", "y", "width", "height"].every((key) => before[key] === after[key]);
+	}, { timeout: 1000 }, selector);
 }
 
 async function currentSubpage(page, hash) {
