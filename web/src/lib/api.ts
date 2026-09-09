@@ -1,6 +1,7 @@
 import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, OtaState, PushCaStatus, PushTestCleanupMessage, PushTestCleanupReason, PushTestDiagnosticFields, PushTestDiagnosticReason, PushTestFailureResponseReason, PushTestFailureStage, PushTestParseReason, PushTestParseShape, PushTestStatus, PushTestTransportPath } from "$lib/types";
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
+import { previewMockRules } from "$lib/forward-rules.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
 
 let csrfToken = "";
@@ -149,16 +150,7 @@ function demoSnapshot(): DeviceSnapshot {
 	};
 }
 
-function forwardRulesValid(rules: string) {
-	for (const rawLine of rules.split("\n")) {
-		const [type, pattern, , enabled = "1"] = rawLine.trim().split("\t");
-		if (enabled.trim() === "0" || !pattern || !["from", "re"].includes(type)) continue;
-		if (/(^|[^\\])(?:\\\\)*\(\?/.test(pattern)) return false;
-		try { new RegExp(pattern, "i"); }
-		catch { return false; }
-	}
-	return true;
-}
+const forwardRulesValid = (rules: string) => previewMockRules(rules).success;
 
 function isPushTestStatus(value: unknown): value is PushTestStatus {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -310,6 +302,9 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 	if (path.startsWith("/log?")) return {
 		entries: demoLogs.map((message, index) => ({ id: index + 1, message })), nextCursor: 1, hasMore: false
 	} as T;
+	if (path === "/api/rules/preview" && init?.body instanceof URLSearchParams) {
+		return previewMockRules(init.body.get("rules") ?? "", init.body.get("sender") ?? "", init.body.get("text") ?? "") as T;
+	}
 	if (path === "/save" && init?.body instanceof URLSearchParams) {
 		const form = init.body;
 		for (const field of ["emailEnabled", "pushEnabled"] as const) {
@@ -467,31 +462,81 @@ export async function provisionPushCa(channel: number): Promise<ActionResult> {
 		demoPushCa[channel] = { configured: true, sha256: "0".repeat(64) };
 		return { success: true, code: "PUSH_CA_INSTALLED", data: { sha256: demoPushCa[channel].sha256 }, detail: "" };
 	}
-	const current = await loadPushCaStatus(channel);
+	return provisionCaTarget(`/api/push/ca/status?channel=${channel}`, `/api/push/ca/probe?channel=${channel}`, `/api/push/ca/install?channel=${channel}&`);
+}
+
+async function provisionCaTarget(statusPath: string, probePath: string, installPath: string): Promise<ActionResult> {
+	const loadStatus = async () => (await runAction(statusPath)).data as PushCaStatus;
+	const current = await loadStatus();
 	if (current.configured) return { success: true, code: "PUSH_CA_STATUS", data: current, detail: "" };
-	let probe = await waitForAccepted(await runAction(`/api/push/ca/probe?channel=${channel}`, { method: "POST" }));
+	let probe = await waitForAccepted(await runAction(probePath, { method: "POST" }));
 	if (!probe.success || probe.code !== "PUSH_CA_PROBE_READY") return probe;
 	let metadata = probeMetadata(probe);
 	const candidates = selectMozillaRootCandidates(await fetchMozillaCertData(), metadata.issuers);
 	if (!candidates.length) return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
 	for (let index = 0; index < candidates.length; index += 1) {
 		if (index > 0) {
-			probe = await waitForAccepted(await runAction(`/api/push/ca/probe?channel=${channel}`, { method: "POST" }));
+			probe = await waitForAccepted(await runAction(probePath, { method: "POST" }));
 			if (!probe.success) return probe;
 			metadata = probeMetadata(probe);
 		}
 		const certificate = decodeBase64(candidates[index].derBase64);
 		if (certificate.length < 1 || certificate.length > 8192) continue;
-		const installed = await waitForAccepted(await runAction(`/api/push/ca/install?channel=${channel}&nonce=${metadata.nonce}`, {
+		const installed = await waitForAccepted(await runAction(`${installPath}nonce=${metadata.nonce}`, {
 			method: "POST", headers: { "Content-Type": "application/pkix-cert" }, body: certificate.buffer as ArrayBuffer
 		}));
 		if (installed.success) {
-			const status = await loadPushCaStatus(channel);
+			const status = await loadStatus();
 			return status.configured ? installed : { success: false, code: "PUSH_CA_STORE_FAILED", data: {}, detail: "" };
 		}
 		if (!["PUSH_CA_REJECTED", "PUSH_CA_STALE"].includes(installed.code)) return installed;
 	}
 	return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
+}
+
+export type KeepaliveStatus = {
+	enabled: boolean; intervalDays: number; trafficKB: number; action: number; url: string;
+	timeValid: boolean; lastTimeLocal: string; daysLeft: number;
+	jobQueued: boolean; jobRunning: boolean; jobDone: boolean; jobSuccess: boolean;
+	jobMessage: string; bodyBytes: number; requests: number; cancelRequested: boolean;
+	ready: boolean; readinessMessage: string;
+};
+
+let demoKeepalive: KeepaliveStatus = {
+	enabled: false, intervalDays: 175, trafficKB: 1, action: 1, url: "",
+	timeValid: true, lastTimeLocal: "", daysLeft: 175, jobQueued: false, jobRunning: false,
+	jobDone: false, jobSuccess: false, jobMessage: "", bodyBytes: 0, requests: 0,
+	cancelRequested: false, ready: false, readinessMessage: ""
+};
+
+export async function loadKeepalive(): Promise<KeepaliveStatus> {
+	return demoMode ? { ...demoKeepalive, enabled: demoConfig.kaEnabled, intervalDays: demoConfig.kaIntervalDays, trafficKB: demoConfig.kaTrafficKB } : requestJson<KeepaliveStatus>("/api/keepalive");
+}
+
+export async function saveKeepalive(enabled: boolean, interval: number, traffic: number, url: string): Promise<ActionResult> {
+	if (demoMode) {
+		if ((enabled || url !== demoKeepalive.url) && !url.startsWith("https://")) return { success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "kaUrl" };
+		demoKeepalive.url = url;
+	}
+	return waitForAccepted(await postForm("/save", { kaEnabled: enabled, kaIntervalDays: interval, kaTrafficKB: traffic, kaUrl: url }));
+}
+
+export async function provisionKeepaliveCa(): Promise<ActionResult> {
+	if (demoMode) {
+		demoKeepalive.ready = demoKeepalive.url.startsWith("https://");
+		return { success: demoKeepalive.ready, code: demoKeepalive.ready ? "PUSH_CA_INSTALLED" : "PUSH_CA_REJECTED", data: {}, detail: "" };
+	}
+	return provisionCaTarget("/api/keepalive/ca/status", "/api/keepalive/ca/probe", "/api/keepalive/ca/install?");
+}
+
+export async function runKeepaliveAction(action: "run" | "cancel" | "reset"): Promise<{ success: boolean; message: string }> {
+	if (demoMode) {
+		if (action === "run" && !demoKeepalive.ready) return { success: false, message: "Check the download URL and root CA first" };
+		if (action === "run") demoKeepalive = { ...demoKeepalive, jobDone: true, jobSuccess: true, bodyBytes: demoKeepalive.trafficKB * 1024, requests: 1, cancelRequested: false };
+		if (action === "cancel") demoKeepalive.cancelRequested = true;
+		return { success: true, message: "" };
+	}
+	return requestJson(`/api/keepalive?action=${action}`, { method: "POST" });
 }
 
 export function loadEsim(): Promise<EsimStatus> {

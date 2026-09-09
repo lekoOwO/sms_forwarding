@@ -59,6 +59,14 @@ class MockDevStackTests(unittest.TestCase):
         self.assertFalse((ROOT / "Dockerfile").exists(), "native IDF must not use an Arduino Dockerfile")
 
         service = config["services"]["mock-server"]
+        self.assertEqual(service["build"]["context"], str(ROOT))
+        self.assertEqual(service["build"]["dockerfile"], "mock_server/Dockerfile")
+        # Repository-root context must never include credentials, metadata, or caches.
+        self.assertEqual((ROOT / "mock_server/Dockerfile.dockerignore").read_text().splitlines(), [
+            "**", "!mock_server", "mock_server/**", "!mock_server/Dockerfile", "!mock_server/Dockerfile.dockerignore",
+            "!mock_server/package.json", "!mock_server/package-lock.json", "!mock_server/server.mjs",
+            "!web", "web/**", "!web/src", "web/src/**", "!web/src/lib", "web/src/lib/**", "!web/src/lib/forward-rules.js",
+        ])
         self.assertEqual(service["ports"], [{
             "mode": "ingress", "target": 3000, "published": "4174", "protocol": "tcp",
         }])

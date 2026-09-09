@@ -1087,6 +1087,7 @@ bool HttpResponse::feed(const uint8_t* bytes, size_t length, IdfModemHttpsPostRe
         if (has_content_length_ && body_bytes_ >= result.expectedResponseBytes) return false;
         ++position;
         ++body_bytes_;
+        result.bodyBytes = static_cast<uint32_t>(body_bytes_);
         ++response_bytes_;
         if (body_bytes_ > kHttpBodyMax) return false;
         if (has_content_length_ && body_bytes_ == result.expectedResponseBytes) complete_ = true;

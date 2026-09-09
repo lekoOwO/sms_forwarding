@@ -47,12 +47,13 @@ struct IdfCellularHttpResult {
     int httpStatus = -1;
     uint32_t bytesRead = 0;
     uint32_t expectedBytes = 0;
+    uint32_t requests = 0;
     int mhttpError = 0;
     std::string cellIp;
     std::string message;
 };
 
-// Keep the legacy cellular traffic limit for configuration compatibility; the HTTP API is unsupported.
+// Each HTTPS payload is at most 64 KiB, with up to eight keepalive requests; billing totals differ.
 static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB = 512;
 static constexpr uint32_t IDF_MODEM_KEEPALIVE_MAX_RUNTIME_BYTES =
     IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB * 1024UL;
@@ -61,6 +62,10 @@ struct IdfCellularHttpConfig {
     bool dataEnabled = false;
     std::string apn;
     uint32_t minPayloadBytes = 48UL * 1024UL;
+    std::vector<uint8_t> rootCertificateDer;
+    std::array<uint8_t, 32> rootCertificateSha256{};
+    bool (*cancelled)() = nullptr;
+    void (*progress)(uint32_t, uint32_t) = nullptr;
 };
 
 // Return immediately when the fixed command slots are full. ESP_ERR_TIMEOUT means an enqueued command timed out.

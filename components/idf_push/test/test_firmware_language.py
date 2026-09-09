@@ -29,6 +29,8 @@ ALLOWED_CJK_LINES = {
         '"\\n裝置網址：" + url + "\\n事件：設備在線\\n時間：" + event_time;',
     )),
     Path("idf_push/idf_push_core.cpp"): Counter((
+        'if (locale == NOTIFICATION_LOCALE_ZH_CN) return "[短信完整补充] ";',
+        'return "[簡訊完整補充] ";',
         'const char* default_title = "來自 {sender} 的簡訊";',
         'const char* default_body = "裝置：{device}\\n寄件者：{sender}\\n時間：{timestamp}\\n內容：{message}";',
         'default_title = "来自 {sender} 的短信";',

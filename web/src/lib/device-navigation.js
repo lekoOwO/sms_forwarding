@@ -9,7 +9,7 @@ export const DEVICE_SUBPAGES = Object.freeze([
 ]);
 
 export const DEVICE_TOOL_INVENTORY = Object.freeze({
-	connection: ["identity-save", "wifi-profile-save", "network-mode-save", "keepalive-disable"],
+	connection: ["identity-save", "wifi-profile-save", "network-mode-save", "keepalive-save"],
 	diagnostics: ["diagnostics-modem-info", "diagnostics-signal", "diagnostics-sim-info", "diagnostics-modem-signal", "diagnostics-operator", "diagnostics-imei", "diagnostics-network", "diagnostics-wifi", "diagnostics-flight", "diagnostics-logs-refresh", "diagnostics-logs-load-more"],
 	maintenance: ["maintenance-backup", "maintenance-restore", "maintenance-ota"],
 	advanced: ["advanced-wifi-restart", "advanced-flight-toggle", "advanced-modem-restart", "advanced-modem-hard-reset", "advanced-at-terminal"]

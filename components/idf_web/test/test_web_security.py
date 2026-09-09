@@ -13,7 +13,7 @@ WEB = ROOT / "components/idf_web"
 def scheduler_keepalive_baseline_model(ka_enabled, ka_action, ka_last_valid):
     """Model the scheduler's baseline write branch for a small executable matrix."""
     writes = []
-    if ka_enabled and ka_action != 1 and not ka_last_valid:
+    if ka_enabled and not ka_last_valid:
         writes.append("keepalive-last")
     return writes
 
@@ -977,6 +977,8 @@ int main() {
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",
         "/api/ota/chunk", "/api/ota/finish", "/api/ota/state", "/api/push/test", "/api/device/restart", "/*",
         "/api/push/ca/probe", "/api/push/ca/install", "/api/push/ca/status",
+        "/api/keepalive", "/api/keepalive/ca/probe", "/api/keepalive/ca/install", "/api/keepalive/ca/status",
+        "/api/rules/preview",
     }
     assert 'register_handler(s_server, "/ping", HTTP_POST, handle_ping)' in source
     assert 'register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push)' in source
@@ -1308,10 +1310,8 @@ int main() {
     assert "Keepalive traffic exceeds the safe 512 KB UART runtime limit" in traffic_preflight
 
     keepalive = function_body(source, "keepalive_task")
-    unsupported_keepalive = keepalive[keepalive.index("if (cfg.kaAction == 1)"):]
-    assert "Cellular HTTP keepalive is not supported" in unsupported_keepalive
-    assert unsupported_keepalive.index("Cellular HTTP keepalive is not supported") < unsupported_keepalive.index("keepalive_prepare_esim")
-    assert "idf_modem_cellular_http_get" not in keepalive
+    assert "idf_modem_cellular_http_get" in keepalive
+    assert "enqueue_maintenance_notice" in keepalive
 
     sched_action = function_body(source, "sched_run_action")
     assert "idf_modem_cellular_http_get" not in sched_action
@@ -1319,10 +1319,9 @@ int main() {
     scheduler = function_body(source, "scheduler_task")
     assert "t.action == 1" in scheduler
     assert scheduler.index("t.action == 1") < scheduler.index("start_sched_job")
-    assert "cfg.kaAction != 1" in scheduler
-    assert "if (cfg.kaEnabled && cfg.kaAction != 1 && !epoch_valid(cfg.kaLastTime))" in scheduler
+    assert "if (cfg.kaEnabled && !epoch_valid(cfg.kaLastTime))" in scheduler
     for ka_enabled, ka_action, ka_last_valid, expected_writes in (
-        (True, 1, False, []),
+        (True, 1, False, ["keepalive-last"]),
         (True, 1, True, []),
         (True, 2, False, ["keepalive-last"]),
         (False, 1, False, []),
@@ -1346,9 +1345,7 @@ int main() {
     keepalive_reset = keepalive_handler.split('if (action == "reset")', 1)[1].split(
         'if (action == "run")', 1
     )[0]
-    assert "IdfKeepaliveRunView reset_cfg = idf_config_get_keepalive_run_view();" in keepalive_reset
-    assert "reset_cfg.kaAction == 1" in keepalive_reset
-    assert keepalive_reset.index("reset_cfg.kaAction == 1") < keepalive_reset.index(
+    assert keepalive_reset.index("now < 1700000000u") < keepalive_reset.index(
         "idf_config_set_keepalive_last"
     )
     sched_reset = sched_handler.split('if (action == "reset")', 1)[1].split(

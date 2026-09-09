@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import shutil
+import json
 import subprocess
 import tempfile
 import unittest
@@ -72,10 +73,12 @@ static bool throw_storage_load = false;
 static bool throw_storage_save = false;
 static bool throw_portable_decode = false;
 static bool throw_next_allocation = false;
+static bool throw_locked_allocation = false;
 
 void* operator new(std::size_t size) {
-    if (throw_next_allocation) {
+    if (throw_next_allocation || (throw_locked_allocation && semaphore_depth > 0)) {
         throw_next_allocation = false;
+        throw_locked_allocation = false;
         throw std::bad_alloc();
     }
     void* value = std::malloc(size);
@@ -152,14 +155,35 @@ static void reset() {
     throw_storage_save = false;
     throw_portable_decode = false;
     throw_next_allocation = false;
+    throw_locked_allocation = false;
 }
 
 int run_config_tests() {
+    // FORWARD_RULE_FIXTURES
+    require(idf_config_validate_forward_rules("#!forward-rules-csv-v1\nkw,\"unclosed,email", nullptr) == ESP_ERR_INVALID_ARG);
+    require(idf_config_validate_forward_rules("#!forward-rules-csv-v1\nre,[,email", nullptr) == ESP_ERR_INVALID_ARG);
+    require(idf_config_validate_forward_rules("#!forward-rules-csv-v1\nkw,OTP,\"email,1\"", nullptr) == ESP_OK);
     reset();
     throw_next_allocation = true;
     require(!idf_config_get_web_snapshot());
     require(semaphore_depth == 0 && save_count == 0);
     require(idf_config_get_web_snapshot() != nullptr);
+
+    reset();
+    s_config.kaTarget = std::string(64, 'x');
+    throw_locked_allocation = true;
+    bool keepalive_copy_failed = false;
+    try { (void)idf_config_get_keepalive_run_view(); }
+    catch (const std::bad_alloc&) { keepalive_copy_failed = true; }
+    require(keepalive_copy_failed && semaphore_depth == 0);
+    throw_locked_allocation = true;
+    require(!idf_config_get_keepalive_snapshot());
+    require(semaphore_depth == 0);
+    throw_next_allocation = true;
+    require(!idf_config_get_keepalive_snapshot());
+    require(semaphore_depth == 0);
+    require(idf_config_get_keepalive_snapshot()->kaTarget == s_config.kaTarget);
+    require(std::is_nothrow_move_constructible<IdfKeepaliveRunView>::value);
 
     reset();
     s_config.deviceName = std::string(64, 'x');
@@ -349,7 +373,20 @@ class IdfConfigUpdateTest(unittest.TestCase):
             (temp / "freertos" / "semphr.h").write_text(SEMPHR_H, encoding="utf-8")
             (temp / "idf_log.h").write_text(IDF_LOG_H, encoding="utf-8")
             source = temp / "idf_config_update_host.cpp"
-            source.write_text(HOST_CPP, encoding="utf-8")
+            fixture_checks = []
+            def literal(value):
+                return json.dumps(value, ensure_ascii=True)
+
+            for case in json.loads((ROOT / "dev_doc/forward-rules-fixtures.json").read_text()):
+                fixture_checks.append("{ std::string error; require((idf_config_validate_forward_rules(" + literal(case["rules"]) + ", &error) == ESP_OK) == " + str(case["valid"]).lower() + ");")
+                if case["valid"]:
+                    fixture_checks.append("auto d = idf_config_evaluate_forward_rules(" + ",".join(literal(case.get(key, "")) for key in ("rules", "sender", "text")) + ");")
+                    for member, key in (("matched", "matched"), ("drop", "drop"), ("email", "email"), ("chMask", "mask"), ("line", "line")):
+                        fixture_checks.append(f"require(d.{member} == {str(case[key]).lower()});")
+                else:
+                    fixture_checks.append('require(error.rfind("' + str(case["line"]) + ':", 0) == 0);')
+                fixture_checks.append("}")
+            source.write_text(HOST_CPP.replace("// FORWARD_RULE_FIXTURES", "\n".join(fixture_checks)), encoding="utf-8")
             caller = temp / "idf_config_update_caller.cpp"
             caller.write_text(
                 "extern int run_config_tests();\nint main() { return run_config_tests(); }\n",

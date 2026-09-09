@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "esp_err.h"
+#include "idf_forward_rules.h"
 #include "firmware_version_generated.h"
 
 static constexpr int IDF_MAX_PUSH_CHANNELS = 5;
@@ -195,6 +196,7 @@ esp_err_t idf_config_save_email(bool enabled, const std::string& server, int por
 esp_err_t idf_config_save_push(bool enabled, const IdfPushChannel channels[IDF_MAX_PUSH_CHANNELS]);
 esp_err_t idf_config_save_filter(const std::string& admin_phone, const std::string& number_blacklist);
 esp_err_t idf_config_validate_forward_rules(const std::string& rules, std::string* message);
+IdfForwardDecision idf_config_evaluate_forward_rules(const std::string& rules, const std::string& sender, const std::string& body);
 // Translate Perl-style \d, \w, and \s to POSIX classes for validation and matching.
 std::string idf_config_translate_perl_classes(const std::string& pattern);
 esp_err_t idf_config_save_forward_rules(const std::string& rules);
@@ -418,7 +420,7 @@ IdfConfig idf_config_get(void);
 IdfConfigStatusView idf_config_get_status_view(void);
 IdfConfigWebView idf_config_get_web_view(void);
 std::unique_ptr<IdfConfigWebView> idf_config_get_web_snapshot(void);
-IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
+std::unique_ptr<IdfKeepaliveRunView> idf_config_get_keepalive_snapshot(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(void);
 IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid);

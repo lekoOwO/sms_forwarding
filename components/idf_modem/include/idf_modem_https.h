@@ -289,6 +289,7 @@ struct IdfModemHttpsPostResult {
     bool ok = false;
     int httpStatus = -1;
     uint32_t responseBytes = 0;
+    uint32_t bodyBytes = 0;
     uint32_t expectedResponseBytes = 0;
     int mhttpError = 0;
     std::string message;

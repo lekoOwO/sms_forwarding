@@ -5,9 +5,10 @@ ENV PORT=3000 \
     OPENAPI_PATH=/spec/openapi.json
 
 WORKDIR /app
-COPY --chown=node:node package.json package-lock.json ./
+COPY --chown=node:node mock_server/package.json mock_server/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
-COPY --chown=node:node server.mjs ./
+COPY --chown=node:node mock_server/server.mjs ./
+COPY --chown=node:node web/src/lib/forward-rules.js /web/src/lib/forward-rules.js
 
 EXPOSE 3000
 USER node

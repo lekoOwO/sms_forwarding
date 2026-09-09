@@ -90,6 +90,8 @@ def main() -> None:
         "POST /api/config/restore/finish", "POST /api/ota/start", "POST /api/ota/chunk",
         "POST /api/ota/finish", "POST /api/push/test", "POST /api/device/restart",
         "POST /api/esim", "POST /api/push/ca/probe", "POST /api/push/ca/install",
+        "POST /api/rules/preview",
+        "POST /api/keepalive", "POST /api/keepalive/ca/probe", "POST /api/keepalive/ca/install",
     }
 
     assert set(SPEC["paths"]["/api/push/ca/probe"]) == {"post"}

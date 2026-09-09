@@ -26,7 +26,8 @@ services:
 
   mock-server:
     build:
-      context: ./mock_server
+      context: .
+      dockerfile: mock_server/Dockerfile
     environment:
       AUTH_REQUIRED: "false"
       OPENAPI_PATH: /spec/openapi.json

@@ -7,6 +7,60 @@ from .test_web_security import function_body
 
 
 class DiagnosticsTest(unittest.TestCase):
+    def test_rule_preview_uses_runtime_matcher_and_never_saves(self):
+        from tools.test_idf_config_updates import HOST_CPP, ESP_ERR_H, ESP_LOG_H, FREERTOS_H, SEMPHR_H, IDF_LOG_H
+        root = Path(__file__).resolve().parents[3]
+        source = (root / "components/idf_web/idf_web.cpp").read_text()
+        fixture = HOST_CPP + r'''
+#include "idf_web_core.h"
+static bool preview_success;
+static std::string preview_code, preview_data, preview_detail;
+static std::string action_result(bool success, const char* code, const std::string& data = {}, const std::string& detail = {}) {
+    preview_success = success; preview_code = code; preview_data = data; preview_detail = detail;
+    return {};
+}
+'''
+        fixture += 'static std::string run_rules_preview_job(const std::string& payload) {' + function_body(source, "run_rules_preview_job") + '}\n'
+        fixture += r'''
+#undef require
+#define require(condition) do { if (!(condition)) { std::fprintf(stderr, "preview assertion line %d\n", __LINE__); std::abort(); } } while (0)
+int main() {
+    reset();
+    run_rules_preview_job("rules=%23!forward-rules-csv-v1%0Afrom%2C%5E09%5Cd%2B%2Cemail&sender=09123&text=sample");
+    require(preview_success && preview_code == "ACTION_QUERY_OK");
+    require(preview_data == "\"matched\":true,\"line\":1,\"drop\":false,\"email\":true,\"channelMask\":0");
+    run_rules_preview_job("rules=%23!forward-rules-csv-v1%0Are%2C%5B%2Cemail&text=sample");
+    require(!preview_success && preview_detail == "1:regex");
+    run_rules_preview_job("rules=kw%09X%09drop&sender=" + std::string(33, 'a'));
+    require(!preview_success && preview_code == "ACTION_INPUT_TOO_LONG");
+    run_rules_preview_job("rules=kw%09X%09drop&text=" + std::string(2049, 'a'));
+    require(!preview_success && preview_code == "ACTION_INPUT_TOO_LONG");
+    run_rules_preview_job("rules=kw%09X%09drop&text=X%00Y");
+    require(!preview_success);
+    run_rules_preview_job("rules=&rules=kw%09X%09drop");
+    require(!preview_success);
+    run_rules_preview_job("rules=&unexpected=value");
+    require(!preview_success);
+    require(save_count == 0 && s_config.forwardRules.empty());
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory)
+            (temp / "freertos").mkdir()
+            for name, content in {"esp_err.h": ESP_ERR_H, "esp_log.h": ESP_LOG_H,
+                                  "freertos/FreeRTOS.h": FREERTOS_H, "freertos/semphr.h": SEMPHR_H,
+                                  "idf_log.h": IDF_LOG_H}.items():
+                (temp / name).write_text(content)
+            cpp, binary = temp / "preview.cpp", temp / "preview"
+            cpp.write_text(fixture)
+            subprocess.run(["g++", "-std=c++17", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
+                            "-I", str(temp), "-I", str(root / "components/idf_config"),
+                            "-I", str(root / "components/idf_config/include"),
+                            "-I", str(root / "components/idf_web/include"), str(cpp),
+                            str(root / "components/idf_web/idf_web_core.cpp"), "-o", str(binary)], check=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_operator_query_returns_name_or_empty_without_format_write(self):
         source = (Path(__file__).resolve().parents[1] / "idf_web.cpp").read_text()
         fixture = r'''

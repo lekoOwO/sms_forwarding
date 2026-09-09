@@ -120,13 +120,6 @@ struct ForwardCompletion {
 
 using TestJob = IdfPushTestJobState;
 
-struct ForwardDecision {
-    bool matched = false;
-    bool drop = false;
-    uint32_t chMask = 0;
-    bool email = false;
-};
-
 static SemaphoreHandle_t s_mutex = nullptr;
 // Wake the worker when a new job enters the queue instead of waiting for the 100 ms idle poll.
 static SemaphoreHandle_t s_wake_sem = nullptr;
@@ -345,20 +338,6 @@ static std::string local_phone_number()
     return idf_config_get_status_view().phoneNumber;
 }
 
-static bool parse_push_channel_token(const std::string& value, uint8_t& channel)
-{
-    if (value.empty()) return false;
-    uint32_t parsed = 0;
-    for (char ch : value) {
-        if (!isdigit(static_cast<unsigned char>(ch))) return false;
-        parsed = parsed * 10U + static_cast<uint32_t>(ch - '0');
-        if (parsed > IDF_MAX_PUSH_CHANNELS) return false;
-    }
-    if (parsed == 0) return false;
-    channel = static_cast<uint8_t>(parsed);
-    return true;
-}
-
 static std::string json_escape(const std::string& value)
 {
     std::string out;
@@ -468,64 +447,6 @@ static bool channel_valid(const IdfPushChannel& ch)
         default:
             return false;
     }
-}
-
-static bool regex_search_case_insensitive(const std::string& pattern, const std::string& text)
-{
-    // Convert Perl-style \d, \w, and \s to POSIX character classes. idf_config uses the same conversion for validation.
-    std::string posix = idf_config_translate_perl_classes(pattern);
-    regex_t re = {};
-    if (regcomp(&re, posix.c_str(), REG_EXTENDED | REG_ICASE | REG_NOSUB) != 0) return false;
-    bool hit = regexec(&re, text.c_str(), 0, nullptr, 0) == 0;
-    regfree(&re);
-    return hit;
-}
-
-static ForwardDecision eval_forward_rules(const std::string& rules, const std::string& sender, const std::string& body)
-{
-    ForwardDecision d;
-    size_t pos = 0;
-    while (pos < rules.size()) {
-        size_t end = rules.find('\n', pos);
-        if (end == std::string::npos) end = rules.size();
-        std::string line = idf_util_trim_copy(rules.substr(pos, end - pos));
-        pos = end + (end < rules.size() ? 1 : 0);
-        if (line.empty()) continue;
-
-        size_t t1 = line.find('\t');
-        size_t t2 = t1 == std::string::npos ? std::string::npos : line.find('\t', t1 + 1);
-        if (t1 == std::string::npos || t2 == std::string::npos) continue;
-        size_t t3 = line.find('\t', t2 + 1);
-        std::string type = line.substr(0, t1);
-        std::string pat = line.substr(t1 + 1, t2 - t1 - 1);
-        std::string action = t3 == std::string::npos ? line.substr(t2 + 1) : line.substr(t2 + 1, t3 - t2 - 1);
-        std::string enabled = t3 == std::string::npos ? "1" : idf_util_trim_copy(line.substr(t3 + 1));
-        if (enabled == "0" || pat.empty()) continue;
-
-        bool hit = false;
-        if (type == "kw") hit = body.find(pat) != std::string::npos;
-        else if (type == "from") hit = regex_search_case_insensitive(pat, sender);
-        else if (type == "re") hit = regex_search_case_insensitive(pat, body);
-        if (!hit) continue;
-
-        d.matched = true;
-        size_t ap = 0;
-        while (ap <= action.size()) {
-            size_t comma = action.find(',', ap);
-            if (comma == std::string::npos) comma = action.size();
-            std::string tok = idf_util_trim_copy(action.substr(ap, comma - ap));
-            if (tok == "drop") d.drop = true;
-            else if (tok == "email") d.email = true;
-            else {
-                uint8_t ch = 0;
-                if (parse_push_channel_token(tok, ch)) d.chMask |= 1u << (ch - 1);
-            }
-            if (comma == action.size()) break;
-            ap = comma + 1;
-        }
-        return d;
-    }
-    return d;
 }
 
 static uint32_t backoff_seconds(uint8_t attempts, uint32_t seed)
@@ -1515,7 +1436,7 @@ static bool process_forward_one()
     }
 
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
-    ForwardDecision fd = eval_forward_rules(cfg.forwardRules, job.sender, job.text);
+    IdfForwardDecision fd = idf_config_evaluate_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
         idf_logf("Forwarding rule matched: discard SMS id=%u", static_cast<unsigned>(job.inboxId));
         idf_inbox_mark_forwarded(job.inboxId);

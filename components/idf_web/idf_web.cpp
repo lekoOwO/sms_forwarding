@@ -167,6 +167,10 @@ struct EsimWebCache {
 };
 
 static WebAsyncJob s_keepalive_job;
+static std::atomic<bool> s_keepalive_cancel{false};
+static std::atomic<bool> s_keepalive_cancellable{false};
+static std::atomic<uint32_t> s_keepalive_bytes{0};
+static std::atomic<uint32_t> s_keepalive_requests{0};
 static WebAsyncJob s_esim_job;
 static WebAsyncJob s_sched_job;
 static int s_sched_job_index = -1;
@@ -1309,7 +1313,7 @@ static std::string base64_bytes(const std::vector<uint8_t>& data)
 static std::string run_push_ca_probe_job(const std::string& payload)
 {
     uint32_t channel = 0;
-    if (!parse_u32_strict(payload.c_str(), channel, true) || channel >= IDF_MAX_PUSH_CHANNELS) {
+    if (!parse_u32_strict(payload.c_str(), channel, true) || channel > IDF_PUSH_CA_KEEPALIVE_TARGET) {
         return action_result(false, "PUSH_CA_PROBE_FAILED");
     }
     IdfPushCaProbeResult probe;
@@ -1339,7 +1343,7 @@ static std::string run_push_ca_install_job(const std::string& payload,
     uint32_t channel = 0;
     if (separator == std::string::npos ||
         !parse_u32_strict(payload.substr(0, separator).c_str(), channel, true) ||
-        channel >= IDF_MAX_PUSH_CHANNELS) {
+        channel > IDF_PUSH_CA_KEEPALIVE_TARGET) {
         return action_result(false, "PUSH_CA_STALE");
     }
     IdfConfigCaStatus status;
@@ -1376,6 +1380,34 @@ static std::string run_ota_finish_job(const std::string& raw_id)
     }
     const IdfWebOtaCode result = idf_web_ota_finish(id);
     return action_result(result == IdfWebOtaCode::Ok, ota_action_code(result));
+}
+
+static std::string run_rules_preview_job(const std::string& payload)
+{
+    const auto decoded = idf_web_decode_form(payload, 3);
+    if (!decoded.valid) return action_result(false, "ACTION_INPUT_INVALID");
+    std::string rules, sender, text;
+    unsigned seen = 0;
+    for (const auto& field : decoded.fields) {
+        const unsigned bit = field.first == "rules" ? 1 : field.first == "sender" ? 2 : field.first == "text" ? 4 : 0;
+        if (!bit || (seen & bit)) return action_result(false, "ACTION_INPUT_INVALID");
+        seen |= bit;
+        if (field.first == "rules") rules = field.second;
+        else if (field.first == "sender") sender = field.second;
+        else if (field.first == "text") text = field.second;
+        else return action_result(false, "ACTION_INPUT_INVALID");
+    }
+    if (rules.size() > MAX_FORWARD_RULES_BYTES || sender.size() > 32 || text.size() > 2048 ||
+        sender.find('\0') != std::string::npos || text.find('\0') != std::string::npos)
+        return action_result(false, "ACTION_INPUT_TOO_LONG");
+    std::string error;
+    if (idf_config_validate_forward_rules(rules, &error) != ESP_OK)
+        return action_result(false, "ACTION_CONFIG_INVALID", {}, error);
+    const auto decision = idf_config_evaluate_forward_rules(rules, sender, text);
+    const std::string data = "\"matched\":" + std::string(decision.matched ? "true" : "false") +
+        ",\"line\":" + std::to_string(decision.line) + ",\"drop\":" + (decision.drop ? "true" : "false") +
+        ",\"email\":" + (decision.email ? "true" : "false") + ",\"channelMask\":" + std::to_string(decision.chMask);
+    return action_result(true, "ACTION_QUERY_OK", data);
 }
 
 static std::string run_query_job(const std::string& type)
@@ -1569,7 +1601,8 @@ static void api_job_task(void* raw)
     if (needs_modem && !api_job_modem_begin()) {
         result = action_result(false, "ACTION_MODEM_BUSY");
     } else {
-        if (job.input.type == "query") result = run_query_job(job.input.payload);
+        if (job.input.type == "rules_preview") result = run_rules_preview_job(job.input.payload);
+        else if (job.input.type == "query") result = run_query_job(job.input.payload);
         else if (job.input.type == "at") result = run_at_job(job.input.payload);
         else if (job.input.type == "flight") result = run_flight_job(job.input.payload);
         else if (job.input.type == "modem") result = run_modem_job(job.input.payload);
@@ -2739,7 +2772,7 @@ static ModernSaveFamily modern_save_field_family(const std::string& key)
     }
     if (key == "networkMode") return ModernSaveFamily::Network;
     if (key == "heartbeatEnable" || key == "heartbeatInterval") return ModernSaveFamily::Heartbeat;
-    if (key == "kaEnabled" || key == "kaIntervalDays" || key == "kaTrafficKB") {
+    if (key == "kaEnabled" || key == "kaIntervalDays" || key == "kaTrafficKB" || key == "kaUrl") {
         return ModernSaveFamily::Keepalive;
     }
     for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template",
@@ -2759,6 +2792,7 @@ static size_t modern_field_limit(const std::string& key)
 {
     if (key == "deviceName") return 64;
     if (key == "hostname") return 32;
+    if (key == "kaUrl") return MAX_KEEPALIVE_URL_BYTES;
     if (key == "notificationLocale") return 16;
     if (key == "smtpServer") return 253;
     if (key == "emailEnabled" || key == "pushEnabled" || key == "smtpPort" ||
@@ -2820,7 +2854,7 @@ static esp_err_t send_modern_save_result(httpd_req_t* req, esp_err_t err, const 
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
-// 儲存工作只有 6 KiB stack，需保留空間給持久化與 NVS 呼叫鏈。
+// The save job has a 6 KiB stack; leave room for persistence and NVS calls.
 static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& fields)
 {
     ModernSaveFamily family = ModernSaveFamily::Unknown;
@@ -2880,7 +2914,16 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     }
 
     if (family == ModernSaveFamily::Keepalive) {
-        const IdfKeepaliveRunView current = idf_config_get_keepalive_run_view();
+        const auto snapshot = idf_config_get_keepalive_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM, "keepalive");
+        const auto& current = *snapshot;
+        const std::string url = has_field(fields, "kaUrl") ? field_text(fields, "kaUrl") : current.kaUrl;
+        const bool enabled = has_field(fields, "kaEnabled");
+        IdfPushCellularTarget target;
+        if (current.kaAction == 1 && (enabled || (has_field(fields, "kaUrl") && url != current.kaUrl)) &&
+            !idf_push_prepare_keepalive_target(url, target)) {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaUrl");
+        }
         int interval = current.kaIntervalDays;
         int traffic = current.kaTrafficKB;
         if ((has_field(fields, "kaIntervalDays") &&
@@ -2893,10 +2936,13 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
             traffic < MIN_KEEPALIVE_TRAFFIC_KB || traffic > MAX_KEEPALIVE_TRAFFIC_KB) {
             return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaTrafficKB");
         }
-        return send_modern_save_result(req,
-            idf_config_save_keepalive(has_field(fields, "kaEnabled"), interval, current.kaAction,
-                                      current.kaTarget, current.kaUrl, current.kaProfile, traffic),
-            "keepalive");
+        if (enabled && current.kaAction == 1 && traffic > static_cast<int>(IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB)) {
+            return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaTrafficKB");
+        }
+        const esp_err_t saved = idf_config_save_keepalive(enabled, interval, current.kaAction,
+                                      current.kaTarget, url, current.kaProfile, traffic);
+        if (saved == ESP_OK && !enabled) s_keepalive_cancel.store(true);
+        return send_modern_save_result(req, saved, "keepalive");
     }
 
     if (family == ModernSaveFamily::Email) {
@@ -3085,6 +3131,15 @@ static esp_err_t send_action_error(httpd_req_t* req, const char* code, const std
     httpd_resp_set_status(req, status);
     const std::string result = action_result(false, code, {}, detail);
     return httpd_resp_send(req, result.c_str(), result.size());
+}
+
+static esp_err_t handle_rules_preview(httpd_req_t* req)
+{
+    if (!check_auth(req) || !check_csrf(req)) return ESP_OK;
+    std::string body;
+    if (read_body(req, body, 16384) != ESP_OK) return ESP_OK;
+    // Share bounded job admission; never log test text or trigger delivery.
+    return enqueue_api_job(req, "rules_preview", body);
 }
 
 static esp_err_t handle_save(httpd_req_t* req)
@@ -3292,7 +3347,9 @@ static esp_err_t handle_save(httpd_req_t* req)
     }
 
     if (ka_form) {
-        const IdfKeepaliveRunView current = idf_config_get_keepalive_run_view();
+        const auto snapshot = idf_config_get_keepalive_snapshot();
+        if (!snapshot) return fail(ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         esp_err_t err = idf_config_save_keepalive(has_field(fields, "kaEnabled"),
                                                   field_int(fields, "kaIntervalDays", current.kaIntervalDays),
                                                   field_u8(fields, "kaAction", 1),
@@ -3852,6 +3909,18 @@ static bool ca_has_transfer_encoding(httpd_req_t* req)
 static bool ca_parse_query(httpd_req_t* req, bool include_nonce, uint8_t& channel,
                            std::string* nonce)
 {
+    if (strncmp(req->uri, "/api/keepalive/ca/", 18) == 0) {
+        channel = IDF_PUSH_CA_KEEPALIVE_TARGET;
+        const size_t length = httpd_req_get_url_query_len(req);
+        if (!include_nonce) return length == 0;
+        if (!nonce || length == 0 || length >= 64) return false;
+        char query[64] = {};
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+        const auto decoded = idf_web_decode_form(query, 1);
+        if (!decoded.valid || decoded.fields.size() != 1 || decoded.fields[0].first != "nonce") return false;
+        *nonce = decoded.fields[0].second;
+        return true;
+    }
     char query[128] = {};
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
     const size_t expected = include_nonce ? 2 : 1;
@@ -4487,6 +4556,7 @@ static bool run_ussd(const std::string& code, std::string& resp_out)
 
 struct KeepAliveTaskArg {
     IdfKeepaliveRunView config;
+    explicit KeepAliveTaskArg(IdfKeepaliveRunView&& view) noexcept : config(std::move(view)) {}
 };
 
 static std::string keepalive_profile_note(const IdfKeepaliveRunView& cfg)
@@ -4644,6 +4714,29 @@ static bool keepalive_traffic_preflight(const IdfKeepaliveRunView& cfg, std::str
         message = "Keepalive traffic exceeds the safe 512 KB UART runtime limit";
         return false;
     }
+    IdfPushCellularTarget target;
+    if (!idf_push_prepare_keepalive_target(cfg.kaUrl, target)) {
+        message = "Keepalive requires an HTTPS download URL; the saved HTTP URL has not been changed";
+        return false;
+    }
+    IdfConfigCaStatus ca;
+    if (idf_config_ca_status(target.canonicalOrigin, ca) != ESP_OK || !ca.configured) {
+        message = "Check and set up the keepalive root CA first";
+        return false;
+    }
+    if (!epoch_valid(static_cast<uint32_t>(time(nullptr)))) {
+        message = "Keepalive requires synchronized device time";
+        return false;
+    }
+    const IdfModemStatus modem = idf_modem_get_status();
+    if (!idf_modem_https_model_allowed(modem.model)) {
+        message = "Cellular HTTPS keepalive currently supports ML307A only";
+        return false;
+    }
+    if (cfg.kaProfile.empty() && (!modem.atReady || modem.ceregStat != 1)) {
+        message = "Keepalive requires a ready modem registered on its home network; roaming is blocked";
+        return false;
+    }
     return true;
 }
 
@@ -4667,12 +4760,10 @@ static void keepalive_task(void* arg_raw)
     std::string profile_note = keepalive_profile_note(cfg);
     if (!profile_note.empty()) idf_logf("Keepalive task %s", profile_note.c_str());
     EsimJobSwitch esim_switch;
-    if (cfg.kaAction == 1) {
-        terminal_unsupported = true;
-        message = "Cellular HTTP keepalive is not supported";
-    } else {
+    {
         const bool traffic_ready = cfg.kaAction == 2 || cfg.kaAction == 3 ||
-                                   keepalive_traffic_preflight(cfg, message);
+                                   (!s_keepalive_cancel.load() && keepalive_traffic_preflight(cfg, message));
+        if (cfg.kaAction == 1 && s_keepalive_cancel.load()) message = "Keepalive cancelled";
         bool esim_ready = traffic_ready && keepalive_prepare_esim(cfg, esim_switch, message);
         if (!traffic_ready) {
             ok = false;
@@ -4696,6 +4787,27 @@ static void keepalive_task(void* arg_raw)
                 std::string ussd_msg;
                 ok = run_ussd(cfg.kaTarget, ussd_msg);
                 message = prefix + ussd_msg;
+            }
+        } else if (cfg.kaAction == 1) {
+            IdfPushCellularTarget target;
+            IdfConfigCaStatus ca;
+            IdfCellularHttpConfig http;
+            http.apn = cfg.apn;
+            http.dataEnabled = cfg.dataEnabled;
+            http.minPayloadBytes = static_cast<uint32_t>(cfg.kaTrafficKB) * 1024U;
+            http.cancelled = [] { return s_keepalive_cancel.load(); };
+            http.progress = [](uint32_t requests, uint32_t bytes) {
+                s_keepalive_requests.store(requests);
+                s_keepalive_bytes.store(bytes);
+            };
+            if (!idf_push_prepare_keepalive_target(cfg.kaUrl, target) ||
+                idf_config_ca_lookup(target.canonicalOrigin, http.rootCertificateDer, &ca) != ESP_OK) {
+                message = "Keepalive root CA is unavailable";
+            } else {
+                http.rootCertificateSha256 = ca.sha256;
+                IdfCellularHttpResult response;
+                ok = idf_modem_cellular_http_get(cfg.kaUrl, http, response) == ESP_OK && response.ok;
+                message = response.message;
             }
         } else {
             terminal_unsupported = true;
@@ -4749,24 +4861,63 @@ static void keepalive_task(void* arg_raw)
                                      : (message.empty() ? "Keepalive action failed; check the log" : message);
         cell_job_unlock();
     }
+    release_shared_admission();
     vTaskDelete(nullptr);
 }
 
-static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queued_message,
+static bool keepalive_due(uint32_t last_ts, uint32_t now, uint32_t interval_days);
+
+static bool start_keepalive_job(bool scheduled, const char* queued_message,
                                 std::string& message, bool& already_running)
 {
     already_running = false;
+    // Claim admission before inspecting API/backup state; do not hold the cell lock
+    // while acquiring those subsystems' locks. Keep ownership through cleanup.
+    if (!try_shared_admission(false)) {
+        message = "A device operation is already running";
+        return false;
+    }
+    if (backup_transfer_active() || ota_active() || device_restart_pending() ||
+        restore_restart_pending() || api_jobs_active() || idf_push_test_active()) {
+        message = "A device operation is already running";
+        release_shared_admission();
+        return false;
+    }
+    auto snapshot = idf_config_get_keepalive_snapshot();
+    if (!snapshot) {
+        release_shared_admission();
+        message.clear();
+        return false;
+    }
+    const auto& cfg = *snapshot;
+    if (scheduled && (!cfg.kaEnabled || cfg.kaIntervalDays <= 0 || !epoch_valid(cfg.kaLastTime) ||
+        !keepalive_due(cfg.kaLastTime, static_cast<uint32_t>(time(nullptr)),
+                       static_cast<uint32_t>(cfg.kaIntervalDays)))) {
+        message = "Scheduled keepalive is disabled or no longer due";
+        release_shared_admission();
+        return false;
+    }
+    if (cfg.kaAction == 1 && !keepalive_traffic_preflight(cfg, message)) {
+        release_shared_admission();
+        return false;
+    }
     if (!cell_job_lock()) {
         message = "Keepalive task state lock is busy";
+        release_shared_admission();
         return false;
     }
     if (cellular_job_active_locked()) {
         already_running = true;
         message = "A cellular/keepalive task is already running in the background";
         cell_job_unlock();
+        release_shared_admission();
         return false;
     }
     s_keepalive_job = WebAsyncJob();
+    s_keepalive_cancel.store(false);
+    s_keepalive_cancellable.store(cfg.kaAction == 1);
+    s_keepalive_bytes.store(0);
+    s_keepalive_requests.store(0);
     s_keepalive_job.queued = true;
     s_keepalive_job.done = false;
     s_keepalive_job.success = false;
@@ -4776,7 +4927,7 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
     s_keepalive_job.message = queued;
     cell_job_unlock();
 
-    KeepAliveTaskArg* arg = new (std::nothrow) KeepAliveTaskArg();
+    KeepAliveTaskArg* arg = new (std::nothrow) KeepAliveTaskArg(std::move(*snapshot));
     if (!arg) {
         if (cell_job_lock(portMAX_DELAY)) {
             s_keepalive_job.queued = false;
@@ -4786,9 +4937,9 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
             cell_job_unlock();
         }
         message = "Could not create keepalive task: insufficient memory";
+        release_shared_admission();
         return false;
     }
-    arg->config = cfg;
     // 8192: the kaProfile path runs the full eSIM list, switch, and TLV parsing chain; 6144 is insufficient.
     if (xTaskCreate(keepalive_task, "idf_keepalive", 8192, arg, 3, nullptr) != pdPASS) {
         delete arg;
@@ -4800,6 +4951,7 @@ static bool start_keepalive_job(const IdfKeepaliveRunView& cfg, const char* queu
             cell_job_unlock();
         }
         message = "Could not create keepalive task";
+        release_shared_admission();
         return false;
     }
     message = queued;
@@ -5144,25 +5296,20 @@ static void scheduler_task(void*)
             if (last_ka_check_ms == 0 || now_ms - last_ka_check_ms >= 3600000UL) {
                 last_ka_check_ms = now_ms;
                 bool retry_due_soon = false;
-                if (cfg.kaEnabled && cfg.kaAction != 1 && !epoch_valid(cfg.kaLastTime)) {
+                if (cfg.kaEnabled && !epoch_valid(cfg.kaLastTime)) {
                     // On first enable or without a baseline, establish only the baseline date. Running immediately
                     // could send SMS, issue USSD, or consume data and incur charges.
                     idf_config_set_keepalive_last(now);
                     idf_log_line("Keepalive baseline date established; no action on first enable");
-                } else if (cfg.kaEnabled && cfg.kaAction != 1 && cfg.kaIntervalDays > 0 &&
+                } else if (cfg.kaEnabled && cfg.kaIntervalDays > 0 &&
                            keepalive_due(cfg.kaLastTime, now, static_cast<uint32_t>(cfg.kaIntervalDays))) {
                     std::string msg;
                     bool already = false;
-                    IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view();
-                    bool still_due = run_cfg.kaEnabled && run_cfg.kaIntervalDays > 0 &&
-                        keepalive_due(run_cfg.kaLastTime, now, static_cast<uint32_t>(run_cfg.kaIntervalDays));
-                    if (still_due) {
-                        if (start_keepalive_job(run_cfg, "Scheduled keepalive action queued", msg, already)) {
-                            idf_log_line("Keepalive due; action triggered");
-                        } else {
-                            // If cellular/eSIM work or memory blocks a due action, retry before the next hourly tick.
-                            retry_due_soon = true;
-                        }
+                    if (start_keepalive_job(true, "Scheduled keepalive action queued", msg, already)) {
+                        idf_log_line("Keepalive due; action triggered");
+                    } else {
+                        // The start function rechecks a fresh snapshot after admission.
+                        retry_due_soon = true;
                     }
                 }
                 for (int i = 0; i < IDF_MAX_SCHED_TASKS; ++i) {
@@ -5429,19 +5576,37 @@ static esp_err_t handle_api_esim(httpd_req_t* req)
 
 static esp_err_t handle_keepalive(httpd_req_t* req)
 {
+    if (reject_oversized_body(req)) return ESP_OK;
     if (!check_auth(req)) return ESP_OK;
     if (!ensure_get_or_post(req)) return ESP_OK;
     std::string action;
-    get_query_param(req, "action", action);
     set_json_no_cache(req);
+    const size_t query_length = httpd_req_get_url_query_len(req);
+    if (query_length != 0) {
+        char query[64] = {};
+        if (query_length >= sizeof(query) ||
+            httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+            return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID");
+        }
+        const auto decoded = idf_web_decode_form(query, 1);
+        if (!decoded.valid || decoded.fields.size() != 1 || decoded.fields[0].first != "action") {
+            return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID");
+        }
+        action = decoded.fields[0].second;
+    }
+    if (ca_has_transfer_encoding(req) || req->content_len != 0 ||
+        (!action.empty() && action != "run" && action != "reset" && action != "cancel")) {
+        return send_ca_error(req, "400 Bad Request", "ACTION_INPUT_INVALID");
+    }
+    if (action == "cancel") {
+        if (req->method != HTTP_POST) return send_ca_method_error(req, "POST");
+        if (!s_keepalive_cancellable.load()) return send_ca_error(req, "409 Conflict", "ACTION_INPUT_INVALID");
+        s_keepalive_cancel.store(true);
+        return httpd_resp_sendstr(req, "{\"success\":true,\"message\":\"Cancellation requested; the current request must finish cleanup\"}");
+    }
     if (action == "reset") {
         if (req->method != HTTP_POST) {
             return httpd_resp_sendstr(req, "{\"success\":false,\"message\":\"This action requires POST\"}");
-        }
-        IdfKeepaliveRunView reset_cfg = idf_config_get_keepalive_run_view();
-        if (reset_cfg.kaAction == 1) {
-            return httpd_resp_sendstr(req,
-                "{\"success\":false,\"message\":\"Cellular HTTP keepalive is not supported\"}");
         }
         uint32_t now = static_cast<uint32_t>(time(nullptr));
         if (now < 1700000000u) {
@@ -5475,12 +5640,7 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
         }
         std::string message;
         bool already_running = false;
-        IdfKeepaliveRunView run_cfg = idf_config_get_keepalive_run_view();
-        if (run_cfg.kaAction == 1) {
-            return httpd_resp_sendstr(req,
-                "{\"success\":false,\"queued\":false,\"message\":\"Cellular HTTP keepalive is not supported\"}");
-        }
-        bool ok = start_keepalive_job(run_cfg, "Keepalive action queued; you may continue refreshing the page",
+        bool ok = start_keepalive_job(false, "Keepalive action queued; you may continue refreshing the page",
                                       message, already_running);
         std::string body = "{\"success\":";
         body += (ok || already_running) ? "true" : "false";
@@ -5492,7 +5652,9 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
         return httpd_resp_send(req, body.c_str(), body.size());
     }
 
-    const IdfKeepaliveRunView cfg = idf_config_get_keepalive_run_view();
+    const auto snapshot = idf_config_get_keepalive_snapshot();
+    if (!snapshot) return send_ca_error(req, "503 Service Unavailable", "ACTION_REQUEST_FAILED");
+    const auto& cfg = *snapshot;
     uint32_t now = static_cast<uint32_t>(time(nullptr));
     bool time_valid = now >= 1700000000u;
     int days_left = 0;
@@ -5547,6 +5709,14 @@ static esp_err_t handle_keepalive(httpd_req_t* req)
              (job.queued || job.running) ? "true" : "false");
     body += buf;
     json_prop(body, "jobMessage", job.message); body += ",";
+    snprintf(buf, sizeof(buf), "\"bodyBytes\":%u,\"requests\":%u,\"cancelRequested\":%s,",
+             static_cast<unsigned>(s_keepalive_bytes.load()),
+             static_cast<unsigned>(s_keepalive_requests.load()), s_keepalive_cancel.load() ? "true" : "false");
+    body += buf;
+    std::string readiness;
+    const bool supported = cfg.kaAction != 1 || keepalive_traffic_preflight(cfg, readiness);
+    body += supported ? "\"ready\":true," : "\"ready\":false,";
+    json_prop(body, "readinessMessage", readiness); body += ",";
     json_prop(body, "message", job.message);
     body += "}";
     return httpd_resp_send(req, body.c_str(), body.size());
@@ -5872,9 +6042,14 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/push/test", register_handler(s_server, "/api/push/test", HTTP_ANY, handle_test_push));
     IDF_WEB_TRY_REGISTER("/api/push/ca/probe", register_handler(s_server, "/api/push/ca/probe", HTTP_ANY, handle_push_ca_probe));
     IDF_WEB_TRY_REGISTER("/api/push/ca/install", register_handler(s_server, "/api/push/ca/install", HTTP_ANY, handle_push_ca_install));
+    IDF_WEB_TRY_REGISTER("/api/keepalive/ca/status", register_handler(s_server, "/api/keepalive/ca/status", HTTP_ANY, handle_push_ca_status));
+    IDF_WEB_TRY_REGISTER("/api/keepalive", register_handler(s_server, "/api/keepalive", HTTP_ANY, handle_keepalive));
+    IDF_WEB_TRY_REGISTER("/api/keepalive/ca/probe", register_handler(s_server, "/api/keepalive/ca/probe", HTTP_ANY, handle_push_ca_probe));
+    IDF_WEB_TRY_REGISTER("/api/keepalive/ca/install", register_handler(s_server, "/api/keepalive/ca/install", HTTP_ANY, handle_push_ca_install));
     IDF_WEB_TRY_REGISTER("/api/push/ca/status", register_handler(s_server, "/api/push/ca/status", HTTP_ANY, handle_push_ca_status));
     IDF_WEB_TRY_REGISTER("/query", register_handler(s_server, "/query", HTTP_GET, handle_query));
     IDF_WEB_TRY_REGISTER("/save", register_handler(s_server, "/save", HTTP_POST, handle_save));
+    IDF_WEB_TRY_REGISTER("/api/rules/preview", register_handler(s_server, "/api/rules/preview", HTTP_POST, handle_rules_preview));
     IDF_WEB_TRY_REGISTER("/wifi", register_handler(s_server, "/wifi", HTTP_GET, handle_wifi));
     IDF_WEB_TRY_REGISTER("/wifiscan", register_handler(s_server, "/wifiscan", HTTP_GET, handle_wifi_scan));
     IDF_WEB_TRY_REGISTER("/wificonfig", register_handler(s_server, "/wificonfig", HTTP_POST, handle_wifi_config));

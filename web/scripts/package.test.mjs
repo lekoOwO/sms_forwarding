@@ -52,8 +52,10 @@ test("diagnostic result renders unavailable values without hiding valid zero", a
 		const values = [...body.matchAll(/<dd\b[^>]*>([\s\S]*?)<\/dd>/g)].map((match) => match[1].replace(/<!--.*?-->/g, ""));
 		assert.equal(values.length, 3);
 		assert.ok(values[0].trim().length > 0, "empty modem data must have a visible unavailable label");
-		assert.equal(values[1], values[0]);
-		assert.equal(values[2], "0");
+		assert.match(values[0], /Not available/);
+		assert.match(values[1], /Not available/);
+		assert.match(values[2], /Not registered/);
+		assert.match(values[2], /registration: 0/);
 	} finally {
 		try { await server?.close(); } finally { process.chdir(previousCwd); }
 	}
@@ -126,7 +128,7 @@ test("a channel CA result renders its code and detail in its own live region", a
 		assert.match(body, /Not ready/);
 		assert.match(body, /configuration is invalid/i);
 		assert.match(body, /push1cellularUrl/);
-		assert.match(body, /device rejected all matching root CA candidates/i);
+		assert.match(body, /Cannot verify the server certificate/i);
 		assert.match(body, /candidate rejected/);
 		assert.match(body, /aria-live="polite"/);
 	} finally {

@@ -47,6 +47,41 @@ The result does not contain raw response text or unknown IDs. This change record
 
 HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作。這些操作使用現有 worker 與背景工作。
 
+## Cellular data keepalive
+
+Data keepalive uses the saved HTTPS URL and an independent CA target. In the Web UI,
+save the URL and byte target, then select certificate setup. Setup needs device WiFi,
+synchronized time, and browser Internet access. It reuses the Mozilla candidate selection
+and device-side certificate validation used by cellular push. No push channel is required.
+An unchanged legacy HTTP URL can remain stored while disabled. The UI does not replace
+its scheme or host. Changing that URL or enabling data keepalive requires HTTPS.
+
+Manual execution uses the saved action even when the automatic schedule is disabled.
+The first valid schedule initializes the baseline without sending data. Data execution
+requires ML307A and home registration; roaming is refused. A saved eSIM selection is
+restored after the action. Disabling mobile data does not prohibit keepalive: the request
+can temporarily activate data, then restore its state. Other modem models fail explicitly.
+
+The worker performs direct verified GET requests. It retains the shared 64 KiB response
+limit and allows at most eight requests, a 512 KiB target, and a two-minute request budget
+plus bounded cleanup. Redirects and chunked responses remain unsupported. Cancellation
+stops the next request; an in-flight request finishes its bounded operation and cleanup.
+Received body bytes exclude headers, TLS, and network overhead. They estimate transfer
+volume, not carrier billing, and do not prove that the carrier extended SIM validity.
+Existing SMS/USSD actions, timestamp updates, retries, and maintenance notices remain.
+
+The CA session uses a dedicated internal slot after the five push slots. Public push
+queries still accept only channels 0–4. The keepalive CA routes accept no channel query.
+Probe sessions bind the saved URL origin, configuration generation, nonce, and expiry.
+Configuration changes invalidate pending installs. Stored CAs use the canonical HTTPS
+origin, so paths on one origin can share a CA, but another host cannot inherit it.
+
+Offline evidence: `components/idf_modem/test/test_keepalive.py` executes the production
+bounded loop with mocked transport and clock boundaries. `test_keepalive_ca.py` executes
+the production query parser and target dispatcher. The HTTPS wire fixture checks body
+byte counts. `mock_server/test/keepalive.test.mjs` checks separate CA targets, same-origin
+reuse, stale nonces after URL changes, and cancellation. No hardware validation is claimed.
+
 ## 啟動流程
 
 `app_main()` 依序執行下列動作：
@@ -73,6 +108,29 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 
 接收流程同時使用 URC 與 SIM 儲存輪詢。精確去重避免雙路徑重複轉發。
 
+### 轉發規則
+
+新編輯器呈現純 CSV，欄位依序為 `type,pattern,action[,enabled]`。
+儲存字串以前綴 `#!forward-rules-csv-v1` 加 LF 區分版本；介面自動處理此前綴。
+逗號、雙引號與跨行欄位使用 CSV 雙引號，欄位內的雙引號寫成兩個。
+動作清單仍以逗號分隔，因此多個動作必須放在同一個已加引號的 CSV 欄位。
+
+沒有此前綴的設定繼續使用原有 Tab 規則，不猜測逗號代表新格式。
+介面只在使用者確認後轉換，且拒絕會遺失忽略行或未知動作的轉換。
+設定匯出與匯入仍保留原字串；轉換前後都受 2048-byte 上限約束。
+CSV 的空比對內容或 `enabled=0` 不參與比對；空動作表示不選擇任何通道。
+
+`kw` 區分大小寫；`from` 與 `re` 使用同一個不區分大小寫的 POSIX ERE 引擎，
+並沿用 `\d`、`\w`、`\s` 轉換。第一條啟用且命中的規則決定動作，後面的規則不再執行。
+沒有命中時沿用預設通知選擇；通道啟用、憑證、網路及重試限制仍由原轉發流程處理。
+已標記但損壞的 CSV 不會退回全部通道，而是停止該次轉發。
+
+`POST /api/rules/preview` 在既有有界背景工作中執行相同驗證器與比對器。
+它只接受規則、來源號碼與測試文字，不儲存、不發送，也不記錄輸入文字。
+結果列號是 CSV 原文的起始行號，不包含儲存前綴；跨行欄位會計入行數。
+Mock 與展示模式的正規表示式只提供近似結果，不是裝置引擎的驗證證據。
+[共用 fixtures](forward-rules-fixtures.json) 覆蓋 CSV 欄位與舊格式行為。
+
 長簡訊最多同時合併五條、每條十段。十五分鐘未收到新段時先轉發含缺段標示的內容，
 成功入隊後仍保留原段十五分鐘，供晚段補齊；此補齊窗口不因新段而延長。
 窗口內相同 partial 不重發；補齊後發出一次標示「簡訊完整補充」的新通知，
@@ -85,6 +143,16 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 收件匣與寄件匣是有界 RAM ring。裝置重啟後，電話號碼與簡訊內容不會保留在 Flash。
 
 收到的簡訊只會進入通知流程。韌體不會解析或執行簡訊內容中的遠端控制命令。
+
+## 診斷顯示
+
+註冊狀態與 CSQ 使用 [3GPP TS 27.007 v17.6](https://www.etsi.org/deliver/etsi_ts/127000_127099/127007/17.06.00_60/ts_127007v170600p.pdf)
+的 CEREG／CSQ 定義。註冊值 5 表示漫遊註冊，不是本網註冊；它本身不能證明資料或簡訊可用。
+未知值與未提供的數值保持未知，所有人話結果都保留可用鍵盤或觸控展開的原始欄位。
+
+目前 `/query?type=signal` 的 `cesq` 是快取的 `rsrp,rsrq,csq` 三欄摘要，並非 AT+CESQ 的六欄回覆。
+介面將既有 RSRP／RSRQ 標為估值，不從已換算的整數反推原始量測碼或半 dB 精度。
+CSQ 0／31 表示上下界，99 與既有 `-999` sentinel 顯示未知，不換算成訊號百分比。
 
 ## 通知與網路邊界
 

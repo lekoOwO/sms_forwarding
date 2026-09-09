@@ -5,7 +5,7 @@
 
 int main()
 {
-    // 漫遊已註冊時可取得靜態身分，但不能啟用資料或修改選網設定。
+// Roaming registration permits identity queries, not data activation or network selection changes.
     status.ceregStat = 5;
     assert(sample_identity_once(false, true));
     assert(!status.mfr.empty() && !status.model.empty() && !status.fwver.empty());

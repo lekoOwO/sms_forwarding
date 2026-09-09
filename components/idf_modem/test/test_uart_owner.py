@@ -527,8 +527,12 @@ class UartOwnerContractTest(unittest.TestCase):
             self.assertNotIn("owner_uart_read(", body)
             self.assertNotIn("owner_uart_write(", body)
             if api == "idf_modem_cellular_http_get":
-                self.assertIn("ESP_ERR_NOT_SUPPORTED", body)
+                self.assertIn("idf_modem_https_post(request, response)", body)
                 self.assertNotIn("submit_owner_command", body)
+                https = function_body(source, "idf_modem_https_post")
+                self.assertIn("submit_owner_command", https)
+                self.assertIn("OwnerCommandKind::https_post", https)
+                self.assertIn("assert_owner_task();", function_body(source, "owner_https_post"))
             else:
                 self.assertIn("submit_owner_command", body)
 
@@ -553,30 +557,42 @@ class UartOwnerContractTest(unittest.TestCase):
             owner_loop.index("owner_process_one_command(false)"),
         )
 
-    def test_cellular_http_public_entry_fails_closed_before_owner_or_uart(self):
+    def test_cellular_http_public_entry_validates_before_verified_owner_transport(self):
         source = SOURCE.read_text()
         body = function_body(source, "idf_modem_cellular_http_get")
         self.assertIn("result = IdfCellularHttpResult();", body)
-        self.assertIn('result.message = "Cellular HTTP is not supported";', body)
-        self.assertIn("return ESP_ERR_NOT_SUPPORTED;", body)
-        unsupported = body[:body.index("return ESP_ERR_NOT_SUPPORTED;")]
+        # The executable keepalive fixture covers byte/attempt/time budgets and
+        # cancellation; this gate prevents bypassing the verified UART owner path.
+        self.assertLess(body.index("idf_modem_https_validate_request"),
+                        body.index("idf_modem_https_post(request, response)"))
+        self.assertIn("request.method = IdfModemHttpsMethod::Get;", body)
+        self.assertIn("request.rootCertificateDer = config.rootCertificateDer;", body)
+        self.assertIn("request.rootCertificateSha256 = config.rootCertificateSha256;", body)
         for forbidden in (
             "submit_owner_command", "xTaskGetCurrentTaskHandle", "idf_modem_get_status",
             "owner_cellular_http_get", "send_at_locked", "owner_uart_write", "idf_log",
             "CEREG", "CGATT", "CGACT", "MHTTP", "url.c_str()",
         ):
-            self.assertNotIn(forbidden, unsupported)
+            self.assertNotIn(forbidden, body)
 
     def test_cellular_http_has_no_unapproved_production_callers_repo_wide(self):
-        # The public shape remains for a future secure implementation, but no
-        # production caller is currently allowed to reach this unsupported API.
-        allowed_terminal_callers = frozenset()
+        # Exactly one approved call lives in keepalive_task. Derive its location
+        # from the function boundary, not an unstable hard-coded line number.
+        # No other function (including scheduled HTTP actions) gains permission.
+        path = REPO_ROOT / "components/idf_web/idf_web.cpp"
+        source = path.read_text()
+        keepalive = function_body(source, "keepalive_task")
+        start = source.index(keepalive)
+        approved = list(re.finditer(r"\bidf_modem_cellular_http_get\s*\(", keepalive))
+        self.assertEqual(len(approved), 1, "keepalive must have exactly one bounded GET dispatch")
+        line = source.count("\n", 0, start + approved[0].start()) + 1
+        allowed_terminal_callers = frozenset({f"components/idf_web/idf_web.cpp:{line}"})
         call_sites = production_cellular_http_call_sites()
         unexpected = sorted(set(call_sites) - allowed_terminal_callers)
         self.assertEqual(
             unexpected,
             [],
-            "new cellular HTTP production caller requires an explicit terminal allowlist entry: "
+            "new cellular HTTP production caller requires an explicit approved allowlist entry: "
             + ", ".join(unexpected),
         )
 

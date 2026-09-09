@@ -487,7 +487,7 @@
           "maximum": 3,
           "x-codecOrder": 22,
           "default": 1,
-          "description": "Action 1 is retained for compatibility but is terminal unsupported; other values keep their stored action semantics."
+          "description": "Action 1 uses verified cellular HTTPS GET on supported home-registered modems with a provisioned origin CA. Other values keep their stored action semantics."
         },
         "kaTarget": {
           "type": "string",
@@ -524,7 +524,7 @@
           "x-codecOrder": 43,
           "default": 1,
           "x-runtimeMax": 512,
-          "description": "Stored values up to 10000 KB are preserved for configuration compatibility. Cellular HTTP keepalive is unsupported for every value; no cellular activation or transfer occurs."
+          "description": "Stored values up to 10000 KiB are preserved for compatibility. Cellular HTTPS keepalive accepts at most 512 KiB at runtime, with at most eight 64 KiB responses. Received body bytes estimate transfer volume, not carrier billing."
         },
         "tzOffsetMin": {
           "type": "integer",
