@@ -2,54 +2,31 @@
 
 [繁體中文](README.md) | [简体中文](README.zh-CN.md) | [English](README.en.md)
 
-使用 ESP32-C3 与 ML307 系列 4G 模组接收短信，并通过 WiFi 转发到电子邮件或推送服务。
+用 ESP32-C3 与 ML307 系列 4G 模组，把 SIM 卡收到的短信转发到电子邮件或推送服务。日常配置、查看短信和诊断都可以在浏览器完成。
 
-[管理页 Demo](https://lekoowo.github.io/sms_forwarding/)
+[下载固件](https://github.com/lekoOwO/sms_forwarding/releases) · [试用管理页](https://lekoowo.github.io/sms_forwarding/) · [反馈问题](https://github.com/lekoOwO/sms_forwarding/issues)
 
-> Demo 不连接真实设备，并停用备份、恢复和 OTA 操作。
+Demo 不连接真实设备，也不会执行备份、恢复或固件更新。
 
-<p>
-  <a href="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
-</p>
+## 可以做什么
 
-## 主要功能
+- 将短信转发到电子邮件，或同时使用最多五个推送通道。
+  - 支持 Bark、Telegram、Discord Webhook、Gotify、ntfy、钉钉、飞书、PushPlus、Server 酱，以及自定义 GET／JSON 请求。
+- 按来源号码或内容配置转发规则，并自定义通知标题与正文。
+- 在管理页查看、发送短信，查询信号、SIM 与模组信息。
+- 保存最多五组 WiFi，配置心跳通知，导出加密配置备份。
+- 管理兼容 eSIM 卡的配置文件，实际功能依卡片、模组和运营商而异。
+- 管理页提供繁体中文、简体中文和英文。
 
-- 原生 ESP-IDF 固件与三语 Web 管理页，支持繁体中文、简体中文和英文。
-- 支持 PDU、Unicode、长短信合并、去重、黑名单、RAM 收件箱及 Web 短信发送。
-- 可以使用 SMTP，或同时启用最多五个推送通道。
-- 支持 POST JSON、Bark、GET、钉钉、PushPlus、Server 酱、自定义 JSON、飞书、Gotify、Telegram、Discord Webhook 和 ntfy。
-- 每个推送通道可以设置名称、标题模板、正文模板和转发规则，并可以单独测试。
-- 可以保存五组 WiFi 配置文件。设备会自动选择、连接并重连可用的已保存网络。
-- 开发版可以在配置加载成功后、WiFi 启动前提供 USB recovery；生产版不编译此路径。
-- USB recovery 只接受固定 17 个只读 modem query ID（`0x01` 至 `0x11`）和 WiFi 配网命令。普通 USB console 输出不等于 recovery endpoint。
-- 可以设置每 1 至 240 小时发送心跳通知。NTP 时间同步完成后，心跳计时才会开始。
-- 可以导出加密 `.smscfg` 配置备份，并将可移植配置恢复到另一台设备。
-- Web OTA 只接受已签名的 `.smsota` 包。Release 只有通过 readiness gate 才会发布此包。
-- Web 页脚会显示固件版本。正式版显示 `releaseVersion (devBuild)`，开发版显示 `devBuild`。
+电子邮件只通过 WiFi 发送。使用 4G 推送前，请确认移动网络可用，并启用通道的移动网络功能与 HTTPS 证书。目前不支持漫游时的 4G 推送。实际可用性取决于模组、SIM 卡和网络。
 
-> 通知目前只通过 WiFi 发送。设备会保存 4G 和混合模式选项，但 TLS 或网络注册未经验证时，4G push 会 fail closed。现有硬件证据没有证明 4G 数据传送可用。GET 和 ntfy 只支持 WiFi。
+## 准备硬件
 
-## 快速开始
+- ESP32-C3 开发板，至少 4 MB Flash。
+- ML307 系列模组、可以接收短信的 SIM 卡和合适的天线。
+- 稳定电源、USB 线，以及首次配置使用的 WiFi 网络。
 
-1. 从 [Releases](https://github.com/lekoOwO/sms_forwarding/releases) 下载 `sms-forwarder-VERSION.bin` 完整镜像。
-2. 使用乐鑫 [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html) 或 [ESP Launchpad](https://espressif.github.io/esp-launchpad/) 将镜像烧录到地址 `0x0`。
-3. 设备找不到已保存的 WiFi 时，连接到 `SMS-Forwarder-XXXXXX`。
-4. 输入密码 `sms-forwarder-setup`，然后打开 `http://192.168.1.1`。
-5. 设备连接到路由器后，使用管理页显示的局域网地址登录。
-6. 使用管理账号 `admin` 和密码 `admin123` 登录。首次登录后立即修改密码。
-7. 配置电子邮件或推送通道，并使用通道测试确认发送结果。
-
-### 后续 OTA 更新
-
-从已通过 readiness gate 的 Release 下载 `sms-forwarder-VERSION.smsota`。在管理页打开“系统设置 → 固件更新”，然后选择此文件。
-
-**请勿将 `.bin` 文件上传到 Web OTA。** `.bin` 是从 `0x0` 烧录的 USB 完整镜像，`.smsota` 才是已签名的 Web OTA 包。
-Web OTA 会写入一个 OTA app slot，大小上限为 1,920 KiB。它不会写入 bootloader、partition table、`appcfg` 或 `coredump`，并会将 OTA metadata 写入 `otadata` 和 NVS。
-
-## 硬件与接线
-
-已测试的组合是 ESP32-C3 Super Mini 与 ML307R-DC。设备需要 4 MB Flash、Nano SIM 和适合当地网络的天线。
+以下接线以 ESP32-C3 Super Mini 与 ML307R-DC 转接板为例。其他板型请先确认供电电压，不要将裸模组直接接到 5V。
 
 <img src="assets/photo.png" width="200" alt="ESP32-C3 与 ML307R-DC 短信转发器" />
 
@@ -61,16 +38,33 @@ Web OTA 会写入一个 OTA app slot，大小上限为 1,920 KiB。它不会写�
 | GND | GND |
 | 5V | VCC (5V) |
 
-## 安全提醒
+## 首次使用
 
-- 管理页使用明文 HTTP。只能在可信局域网使用，且不能直接公开到 Internet。
-- 加密配置备份包含 WiFi、SMTP 和推送凭证。请分开保存备份文件与密码短语。
-- 设备只将收到的短信用于通知转发，不会执行短信内容中的远程控制命令。
+1. 从 [Releases](https://github.com/lekoOwO/sms_forwarding/releases) 下载 `sms-forwarder-VERSION.bin`。标为 Pre-release 的版本供测试使用。
+2. 使用乐鑫 [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html) 或 [ESP Launchpad](https://espressif.github.io/esp-launchpad/)，将完整镜像烧录到 `0x0`。
+3. 设备找不到已保存的 WiFi 时，连接到 `SMS-Forwarder-XXXXXX`，密码为 `sms-forwarder-setup`。
+4. 打开 `http://192.168.1.1`，选择家中或办公室的 WiFi 并输入密码。
+5. 配网完成后，让电脑或手机连回同一个局域网。打开配网页显示的设备地址。
+6. 使用账号 `admin`、密码 `admin123` 登录，并立即修改管理密码。
+7. 配置电子邮件或推送通道，使用通道测试确认通知能送达。
 
-## 开发文档
+## 备份与更新
 
-构建、烧录、发布、架构、配置格式、API 和验证流程见 [`dev_doc/`](dev_doc/README.md)。
+管理页可以导出加密的 `.smscfg` 配置备份。请将备份文件与密码短语分开保存。备份包含 WiFi、电子邮件和推送凭证。
 
-## 致谢
+Web 固件更新只接受适用于本设备的已签名 `.smsota` 包。如果下载页只有 `.bin`，请使用 USB 烧录方式。不要把 `.bin` 上传到 Web 更新页。
 
-感谢 [LINUX DO](https://linux.do) 社区提供交流与灵感。
+目前开发版下载提供 USB 完整镜像，正式签名 OTA 包尚未开放发布。
+
+## 使用前请注意
+
+- 管理页使用明文 HTTP。只在可信局域网使用，不要直接公开到 Internet。
+- 收件箱和发件箱不会永久保存短信，设备重启后会清空。
+- 设备不会执行短信内容中的远程控制命令。
+- 发送短信或使用移动数据可能产生电信费用。
+
+## 开发与致谢
+
+源码构建、架构与测试说明统一放在 [开发文档](dev_doc/README.md)。本项目使用 [MIT 许可](LICENSE)。
+
+本项目衍生自 [MineSunshineone/sms_forwarding](https://github.com/MineSunshineone/sms_forwarding)。感谢上游维护者与贡献者，也感谢 [LINUX DO](https://linux.do) 社区的交流与分享。

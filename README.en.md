@@ -2,54 +2,31 @@
 
 [繁體中文](README.md) | [简体中文](README.zh-CN.md) | [English](README.en.md)
 
-This project uses an ESP32-C3 and an ML307-series 4G modem. It forwards received SMS messages through WiFi to email or push services.
+Use an ESP32-C3 and an ML307-series 4G modem to forward SMS messages from your SIM card to email or push services. A browser provides daily configuration, message access, and diagnostics.
 
-[Management UI demo](https://lekoowo.github.io/sms_forwarding/)
+[Download firmware](https://github.com/lekoOwO/sms_forwarding/releases) · [Try the management UI](https://lekoowo.github.io/sms_forwarding/) · [Report a problem](https://github.com/lekoOwO/sms_forwarding/issues)
 
-> The demo does not connect to a device. It disables backup, restore, and OTA operations.
+The demo does not connect to a real device or perform backups, restores, or firmware updates.
 
-<p>
-  <a href="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml"><img alt="CI" src="https://github.com/lekoOwO/sms_forwarding/actions/workflows/build.yml/badge.svg" /></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg" /></a>
-</p>
+## What it does
 
-## Features
+- Forwards SMS messages to email or up to five push channels at once.
+  - Supports Bark, Telegram, Discord Webhook, Gotify, ntfy, DingTalk, Feishu, PushPlus, ServerChan, and custom GET or JSON requests.
+- Filters messages by sender or content, with custom notification titles and bodies.
+- Shows and sends SMS messages, and provides signal, SIM, and modem diagnostics.
+- Saves up to five WiFi profiles and provides heartbeat notifications and encrypted configuration backups.
+- Manages profiles on compatible eSIM cards. Available functions depend on the card, modem, and carrier.
+- Provides a management UI in Traditional Chinese, Simplified Chinese, and English.
 
-- Native ESP-IDF firmware and a web UI in Traditional Chinese, Simplified Chinese, and English.
-- PDU, Unicode, multipart SMS assembly, deduplication, a blacklist, a RAM inbox, and web SMS sending.
-- SMTP and up to five active push channels.
-- POST JSON, Bark, GET, DingTalk, PushPlus, ServerChan, Custom JSON, Feishu, Gotify, Telegram, Discord Webhook, and ntfy.
-- A separate name, title template, body template, forwarding rules, and test for each push channel.
-- Five saved WiFi profiles. The device selects, connects to, and reconnects to an available saved profile.
-- Development builds can provide USB recovery after config load and before WiFi starts. Production builds exclude this path.
-- USB recovery accepts seventeen fixed read-only modem query IDs (`0x01` through `0x11`) and WiFi provisioning commands. Generic USB console output is not a recovery endpoint.
-- Heartbeat notifications at intervals from 1 through 240 hours. The timer starts after NTP time synchronization.
-- Encrypted `.smscfg` configuration export and portable restore to another device.
-- Web OTA accepts signed `.smsota` packages only. Releases publish them only after the readiness gate passes.
-- A firmware version in the web footer. Releases show `releaseVersion (devBuild)`. Development firmware shows `devBuild`.
+Email uses WiFi only. Before you use 4G push, check mobile connectivity and enable cellular support and HTTPS certificates for the channel. 4G push does not support roaming. Availability depends on the modem, SIM card, and network.
 
-> Notifications currently use WiFi only. The device stores 4G and mixed-mode choices. 4G push fails closed without verified TLS and network registration. Current hardware evidence does not prove usable 4G data delivery. GET and ntfy are WiFi-only.
+## Prepare the hardware
 
-## Quick start
+- An ESP32-C3 development board with at least 4 MB flash.
+- An ML307-series modem, a SIM card that can receive SMS messages, and a suitable antenna.
+- A stable power supply, a USB cable, and WiFi for the initial configuration.
 
-1. Download the `sms-forwarder-VERSION.bin` full image from [Releases](https://github.com/lekoOwO/sms_forwarding/releases).
-2. Flash the image at address `0x0` with Espressif [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html) or [ESP Launchpad](https://espressif.github.io/esp-launchpad/).
-3. If the device cannot find saved WiFi, connect to `SMS-Forwarder-XXXXXX`.
-4. Enter password `sms-forwarder-setup`. Then open `http://192.168.1.1`.
-5. After the device joins the router, sign in at the LAN address that the management page shows.
-6. Sign in with username `admin` and password `admin123`. Change the password after the first login.
-7. Configure email or push channels. Use the channel test to confirm delivery.
-
-### Later OTA updates
-
-Download `sms-forwarder-VERSION.smsota` from a release that passed the readiness gate. Open System Settings → Firmware Update in the web UI, and select this file.
-
-**Do not upload a `.bin` file through web OTA.** `.bin` is the full USB image flashed at `0x0`. `.smsota` is the signed Web OTA package.
-Web OTA writes one OTA app slot, up to 1,920 KiB. It does not write the bootloader, partition table, `appcfg`, or `coredump` regions. It stores OTA metadata in `otadata` and NVS.
-
-## Hardware and wiring
-
-The tested combination is an ESP32-C3 Super Mini and an ML307R-DC. The device needs 4 MB flash, a Nano SIM, and a suitable antenna.
+This wiring example uses an ESP32-C3 Super Mini and an ML307R-DC adapter board. For other boards, check the supply voltage first. Do not connect a bare modem directly to 5V.
 
 <img src="assets/photo.png" width="200" alt="ESP32-C3 and ML307R-DC SMS forwarder" />
 
@@ -61,16 +38,33 @@ The tested combination is an ESP32-C3 Super Mini and an ML307R-DC. The device ne
 | GND | GND |
 | 5V | VCC (5V) |
 
-## Security notes
+## First use
 
-- The management UI uses plain HTTP. Use it only on a trusted LAN. Do not expose it directly to the Internet.
-- The encrypted configuration backup contains WiFi, SMTP, and push credentials. Store the backup file and passphrase separately.
-- The device uses received SMS messages only for notification forwarding. It does not execute remote-control commands from message content.
+1. Download `sms-forwarder-VERSION.bin` from [Releases](https://github.com/lekoOwO/sms_forwarding/releases). Versions marked Pre-release are for testing.
+2. Flash the full image at `0x0` with Espressif [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html) or [ESP Launchpad](https://espressif.github.io/esp-launchpad/).
+3. If the device cannot find saved WiFi, connect to `SMS-Forwarder-XXXXXX` with password `sms-forwarder-setup`.
+4. Open `http://192.168.1.1`. Select your home or office WiFi and enter its password.
+5. After provisioning, reconnect your computer or phone to the same LAN. Open the device address shown on the provisioning page.
+6. Sign in with username `admin` and password `admin123`. Change the management password immediately.
+7. Configure email or a push channel. Use the channel test to check delivery.
 
-## Development documentation
+## Backups and updates
 
-See [`dev_doc/`](dev_doc/README.md) for build, flash, release, architecture, configuration format, API, and validation information.
+The management UI exports encrypted `.smscfg` configuration backups. Store the backup file and passphrase separately. Backups contain WiFi, email, and push credentials.
 
-## Thanks
+Web firmware updates accept only signed `.smsota` packages compatible with your device. If the download page provides only `.bin`, use USB flashing. Do not upload `.bin` files through the web UI.
 
-Thanks to the [LINUX DO](https://linux.do) community for discussion and ideas.
+Development downloads currently provide full USB images. Production signed OTA packages are not yet available.
+
+## Before you use the device
+
+- The management UI uses plain HTTP. Use a trusted LAN and do not expose it directly to the Internet.
+- The inbox and outbox do not store messages permanently. A device restart clears both.
+- The device does not execute remote-control commands from SMS content.
+- SMS sending and mobile data can incur carrier charges.
+
+## Development and thanks
+
+Build, architecture, and test instructions are in the [development documentation](dev_doc/README.md). This project uses the [MIT license](LICENSE).
+
+This project derives from [MineSunshineone/sms_forwarding](https://github.com/MineSunshineone/sms_forwarding). Thanks to the upstream maintainers and contributors, and to the [LINUX DO](https://linux.do) community for discussion and shared ideas.
