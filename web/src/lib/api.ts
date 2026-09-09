@@ -605,16 +605,26 @@ export async function uploadRestore(bytes: Uint8Array, passphrase: string): Prom
 	return postForm(`/api/config/restore/finish?id=${id}`, { passphrase });
 }
 
-export async function waitForJob(id: number): Promise<ActionResult> {
-	for (let attempt = 0; attempt < 120; attempt += 1) {
-		const job = await requestJson<Job>(`/api/jobs?id=${id}`);
-		if (job.state === "succeeded" || job.state === "failed") {
-			if (!job.result) throw new Error("Completed job did not return a result.");
-			return job.result;
+export class JobResultUnknownError extends Error {}
+
+export async function waitForJob(id: number, timeoutMs = 90000): Promise<ActionResult> {
+	const controller = new AbortController();
+	const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		for (let attempt = 0; attempt < 120; attempt += 1) {
+			const job = await requestJson<Job>(`/api/jobs?id=${id}`, { signal: controller.signal });
+			if (job.state === "succeeded" || job.state === "failed") {
+				if (!job.result) throw new Error("Completed job did not return a result.");
+				return job.result;
+			}
+			await new Promise((resolve) => window.setTimeout(resolve, 750));
 		}
-		await new Promise((resolve) => window.setTimeout(resolve, 750));
+		throw new Error("Job polling timed out.");
+	} catch (error) {
+		throw new JobResultUnknownError(controller.signal.aborted ? "Job polling timed out." : "Job result unavailable.", { cause: error });
+	} finally {
+		globalThis.clearTimeout(timeout);
 	}
-	throw new Error("Job polling timed out.");
 }
 
 export async function waitForAccepted(result: ActionResult): Promise<ActionResult> {

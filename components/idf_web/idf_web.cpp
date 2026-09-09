@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <atomic>
 #include <utility>
@@ -1509,9 +1510,11 @@ static std::string run_modem_job(const std::string& action)
             data = buf;
         }
     } else if (action == "operator") {
-        idf_modem_send_at("AT+COPS=3,0", 3000, response);
         ok = idf_modem_send_at("AT+COPS?", 5000, response) == ESP_OK;
-        json_prop(data, "operator", first_line_containing(response, "+COPS:"));
+        const std::string line = first_line_containing(response, "+COPS:");
+        const size_t first = line.find('"');
+        const size_t last = first == std::string::npos ? std::string::npos : line.find('"', first + 1);
+        json_prop(data, "operator", last == std::string::npos ? std::string() : line.substr(first + 1, last - first - 1));
     } else if (action == "imei") {
         std::string imei;
         const esp_err_t err = idf_modem_get_imei(imei, 3000);
@@ -2817,6 +2820,7 @@ static esp_err_t send_modern_save_result(httpd_req_t* req, esp_err_t err, const 
     return httpd_resp_send(req, body.c_str(), body.size());
 }
 
+// 儲存工作只有 6 KiB stack，需保留空間給持久化與 NVS 呼叫鏈。
 static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& fields)
 {
     ModernSaveFamily family = ModernSaveFamily::Unknown;
@@ -2836,7 +2840,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     if (family == ModernSaveFamily::Unknown) return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "form");
 
     if (family == ModernSaveFamily::Identity) {
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         return send_modern_save_result(req,
             idf_config_save_identity(has_field(fields, "deviceName") ? field_text(fields, "deviceName") : current.deviceName,
                                      has_field(fields, "hostname") ? field_text(fields, "hostname") : current.hostname),
@@ -2860,7 +2866,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     }
 
     if (family == ModernSaveFamily::Heartbeat) {
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         int interval = current.heartbeatInterval;
         if ((has_field(fields, "heartbeatInterval") &&
              !parse_int_strict(field_text(fields, "heartbeatInterval"), interval)) ||
@@ -2892,7 +2900,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     }
 
     if (family == ModernSaveFamily::Email) {
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         bool enabled = current.emailEnabled;
         int port = current.smtpPort;
         if (has_field(fields, "emailEnabled")) {
@@ -2922,7 +2932,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
             return send_modern_save_result(req,
                 idf_config_save_forward_rules(field_text(fields, "forwardRules")), "forwardRules");
         }
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         return send_modern_save_result(req,
             idf_config_save_filter(has_field(fields, "adminPhone") ? field_text(fields, "adminPhone") : current.adminPhone,
                                    has_field(fields, "numberBlackList") ? field_text(fields, "numberBlackList") : current.numberBlackList),
@@ -2942,7 +2954,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
             if (index >= 0 && parsed != index) return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "push");
             index = parsed;
         }
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         bool enabled = current.pushEnabled;
         if (has_field(fields, "pushEnabled")) {
             const std::string pushEnabled = field_text(fields, "pushEnabled");
@@ -3012,7 +3026,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         snprintf(ssid_key, sizeof(ssid_key), "wifi%dssid", index);
         snprintf(pass_key, sizeof(pass_key), "wifi%dpass", index);
         snprintf(open_key, sizeof(open_key), "wifi%dopen", index);
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         const std::string ssid = has_field(fields, ssid_key) ? field_text(fields, ssid_key) :
                                  current.wifiNetworks[index].ssid;
         const std::string pass = field_text(fields, pass_key);
@@ -3028,7 +3044,9 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
     }
 
     if (family == ModernSaveFamily::Accounts) {
-        const IdfConfigWebView current = idf_config_get_web_view();
+        const auto snapshot = idf_config_get_web_snapshot();
+        if (!snapshot) return send_modern_save_result(req, ESP_ERR_NO_MEM);
+        const auto& current = *snapshot;
         IdfWebAccount accounts[IDF_MAX_WEB_ACCOUNTS];
         for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
             char user_key[24], pass_key[24];

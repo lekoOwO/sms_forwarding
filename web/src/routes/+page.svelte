@@ -22,7 +22,7 @@
 	import { Switch } from "$lib/components/ui/switch";
 	import * as Tabs from "$lib/components/ui/tabs";
 	import { Textarea } from "$lib/components/ui/textarea";
-	import { confirmEsimInstall, demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadOtaState, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, startEsimInstall, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
+	import { JobResultUnknownError, confirmEsimInstall, demoMode, exportEncryptedConfig, loadEsim, loadLogs, loadOtaState, loadPushCaStatus, loadSnapshot, postEsimAction, postForm, provisionPushCa, runAction, runPushTest, startEsimInstall, uploadOta, uploadRestore, waitForAccepted } from "$lib/api";
 	import { BACKUP_ENVELOPE, CONFIG_FIELD_LIMITS, CONFIG_VALUE_LIMITS } from "$lib/config-schema.generated";
 	import { detectLocale, translate, type TranslationKey } from "$lib/i18n";
 	import { DEVICE_SUBPAGES, parseDeviceHash } from "$lib/device-navigation.js";
@@ -34,6 +34,10 @@
 	type DeviceSubpage = "connection" | "diagnostics" | "maintenance" | "advanced";
 	type Theme = "light" | "dark";
 	type PushProviderDraft = Pick<PushChannel, "url" | "urlSet" | "key1" | "key1Set" | "key2" | "key2Set" | "customBody" | "customBodySet" | "titleTemplate" | "bodyTemplate">;
+
+	function requestFailure(error: unknown): UiResult {
+		return { state: "error", code: error instanceof JobResultUnknownError ? "ACTION_JOB_RESULT_UNKNOWN" : "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof JobResultUnknownError ? "" : error instanceof Error ? error.message : String(error) };
+	}
 
 	const idle = (): UiResult => ({ state: "idle", code: "", data: {}, detail: "" });
 	const idlePushTest = (): PushTestStatus => ({ queued: false, running: false, done: false, success: false, message: "" });
@@ -420,7 +424,7 @@
 				if (cellularIndex >= 0 && snapshot?.config.pushChannels[cellularIndex]?.cellularEnabled) await provisionCa(cellularIndex);
 			}
 		} catch (error) {
-			setResult({ state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) });
+			setResult(requestFailure(error));
 		}
 	}
 
@@ -431,7 +435,7 @@
 			const response = await waitForAccepted(await runAction(path, init));
 			setResult({ state: response.success ? "success" : "error", code: response.code, data: response.data, detail: response.detail });
 		} catch (error) {
-			setResult({ state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) });
+			setResult(requestFailure(error));
 		}
 	}
 
@@ -460,7 +464,7 @@
 			pushCaResults[index] = { state: response.success && pushCaStatuses[index]?.configured ? "success" : "error", code: response.code, data: response.data, detail: response.detail };
 		} catch (error) {
 			pushCaStatuses[index] = { configured: false, sha256: "" };
-			pushCaResults[index] = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+			pushCaResults[index] = requestFailure(error);
 		}
 	}
 
@@ -481,7 +485,7 @@
 			smsResult = { state: response.success ? "success" : "error", code: response.code, data: response.data, detail: response.detail };
 			if (response.success) message = "";
 		} catch (error) {
-			smsResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+			smsResult = requestFailure(error);
 		}
 	}
 
@@ -529,7 +533,7 @@
 			download(await exportEncryptedConfig(backupPassphrase), `${snapshot!.config.hostname}.smscfg`);
 			configFileResult = { state: "success", code: "ACTION_CONFIG_EXPORT_READY", data: {}, detail: "" };
 		} catch (error) {
-			configFileResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+			configFileResult = requestFailure(error);
 		}
 	}
 
@@ -544,7 +548,7 @@
 			configFileResult = { state: result.success ? "success" : "error", code: result.code, data: result.data, detail: result.detail };
 			if (result.success) await refreshSnapshot();
 		} catch (error) {
-			configFileResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+			configFileResult = requestFailure(error);
 		}
 	}
 
@@ -555,7 +559,7 @@
 			const result = await waitForAccepted(await uploadOta(new Uint8Array(await otaFile.arrayBuffer())));
 			otaResult = { state: result.success ? "success" : "error", code: result.code, data: result.data, detail: result.detail };
 		} catch (error) {
-			otaResult = { state: "error", code: "ACTION_REQUEST_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+			otaResult = requestFailure(error);
 		}
 	}
 
@@ -1020,7 +1024,7 @@
 								<div class="device-tool-group-heading"><h2 id="device-group-connection" class="text-sm font-semibold">{t("deviceGroupConnection")}</h2></div>
 							<Accordion.Item value="identity">
 								<Accordion.Trigger>{t("deviceTabIdentity")}</Accordion.Trigger>
-									<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" data-device-action="identity-save" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex justify-end"><Button type="submit" form="identity-form">{t("commonSave")}</Button></div><ActionResult result={identityResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+									<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" data-device-action="identity-save" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><ActionResult result={identityResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form="identity-form" disabled={identityResult.state === "loading"}>{identityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="wifi-profiles">
 								<Accordion.Trigger>{t("wifiProfilesTitle")}</Accordion.Trigger>

@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <string>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -416,6 +417,7 @@ struct IdfSchedulerView {
 IdfConfig idf_config_get(void);
 IdfConfigStatusView idf_config_get_status_view(void);
 IdfConfigWebView idf_config_get_web_view(void);
+std::unique_ptr<IdfConfigWebView> idf_config_get_web_snapshot(void);
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void);
 IdfSchedRunView idf_config_get_sched_run_view(int index);
 IdfSimSettingsView idf_config_get_sim_settings_view(void);

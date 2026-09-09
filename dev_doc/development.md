@@ -521,6 +521,27 @@ cellular GET 僅使用固定 GET method、空 request body，rendered URL 上限
 
 此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。
 
+### 2026-09-09 儲存與診斷回歸
+
+- 修正前，在 ESP32-C3／ML307 裝置提交一次原值名稱與 hostname，HTTP 回覆
+  `202`，後續 job 查詢逾時。恢復連線後 uptime 已重新計數，啟動紀錄為
+  `Program panic (4)`。沒有取得 backtrace，因此不能將 panic 原因定論為 stack overflow。
+- ESP-IDF target 編譯的 `handle_modern_save` frame 原為 3552 bytes；將設定快照
+  改為 heap 配置後，production 與 USB profile 都是 1440 bytes。建置會執行
+  `tools/check_web_stack.py`，限制此 frame 不超過 2048 bytes。配置失敗須回覆
+  out-of-memory，並釋放設定鎖；`tools/test_idf_config_updates.py` 用實際配置失敗驗證。
+- 裝置當次為 roaming（registration 5）。模組與 SIM API 成功但識別欄位皆空，
+  原有採樣 gate 只允許 home registration。修正允許 roaming 的唯讀識別採樣，
+  保留 home-only 的 operator 設定與行動傳送限制。
+- 當次唯讀 operator 回覆為 `+COPS: 0,0,"",7`。這只是該次 capture，
+  不代表所有模組或網路的回覆。`components/idf_web/test/test_diagnostics.py`
+  執行 production query handler，驗證只呈現 operator 欄位且只送出查詢命令。
+- Browser 回歸涵蓋儲存成功、失敗、重試、job 失聯及結果位於按鈕上方。
+  已接受但失聯的操作顯示「結果未知」，不自動重送。正常成功未重現 Svelte 狀態更新問題。
+- 本機 production、USB 編譯、48 項 modem 測試、13 項 Web package 測試與
+  37 項 Mock／browser 測試通過。尚未將此修正部署至實機，故上述 panic 風險修正、
+  roaming 識別資訊及實機儲存完成仍待硬體驗收。
+
 ## PR 清理 gate
 
 開啟 PR 前執行：

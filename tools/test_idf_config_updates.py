@@ -156,6 +156,22 @@ static void reset() {
 
 int run_config_tests() {
     reset();
+    throw_next_allocation = true;
+    require(!idf_config_get_web_snapshot());
+    require(semaphore_depth == 0 && save_count == 0);
+    require(idf_config_get_web_snapshot() != nullptr);
+
+    reset();
+    s_config.deviceName = std::string(64, 'x');
+    throw_next_allocation = true;
+    bool snapshot_failed = false;
+    try { (void)idf_config_get_web_view(); }
+    catch (const std::bad_alloc&) { snapshot_failed = true; }
+    require(snapshot_failed && semaphore_depth == 0);
+    require(idf_config_save_identity("retry", "retry-host") == ESP_OK);
+    require(s_config.deviceName == "retry" && s_config.hostname == "retry-host");
+
+    reset();
     require(idf_config_generation() == 0);
     require(idf_config_save_wifi_profile(2, "old-name", "", false, true) == ESP_OK);
     require(save_count == 1 && saved.wifiNetworks[2].pass == "old-password");

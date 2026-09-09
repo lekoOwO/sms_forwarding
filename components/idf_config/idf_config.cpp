@@ -1317,77 +1317,89 @@ IdfConfigWebView idf_config_get_web_view(void)
     IdfConfigWebView view;
     if (ensure_config_mutex() != ESP_OK) return view;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    view.deviceName = s_config.deviceName;
-    view.hostname = s_config.hostname;
-    view.notificationLocale = s_config.notificationLocale;
-    view.webUser = s_config.webUser;
-    view.webPass = s_config.webPass;
-    view.smtpServer = s_config.smtpServer;
-    view.smtpPort = s_config.smtpPort;
-    view.smtpUser = s_config.smtpUser;
-    view.smtpPass = s_config.smtpPass;
-    view.smtpSendTo = s_config.smtpSendTo;
-    view.adminPhone = s_config.adminPhone;
-    view.numberBlackList = s_config.numberBlackList;
-    view.forwardRules = s_config.forwardRules;
-    view.emailEnabled = s_config.emailEnabled;
-    view.pushEnabled = s_config.pushEnabled;
-    view.networkMode = s_config.networkMode;
-    view.heartbeatEnable = s_config.heartbeatEnable;
-    view.heartbeatInterval = s_config.heartbeatInterval;
-    view.ntpServer = s_config.ntpServer;
-    view.mdnsHost = s_config.mdnsHost;
-    view.tzOffsetMin = s_config.tzOffsetMin;
-    view.rebootEnabled = s_config.rebootEnabled;
-    view.rebootHour = s_config.rebootHour;
-    view.hbEnabled = s_config.hbEnabled;
-    view.hbHour = s_config.hbHour;
-    view.smsHealthEnabled = s_config.smsHealthEnabled;
-    view.smsHealthHour = s_config.smsHealthHour;
-    view.smsHealthNotify = s_config.smsHealthNotify;
-    view.dataEnabled = s_config.dataEnabled;
-    view.roamingEnabled = s_config.roamingEnabled;
-    view.apn = s_config.apn;
-    view.phoneNumber = s_config.phoneNumber;
-    view.operatorPlmn = s_config.operatorPlmn;
-    view.kaEnabled = s_config.kaEnabled;
-    view.kaIntervalDays = s_config.kaIntervalDays;
-    view.kaTrafficKB = s_config.kaTrafficKB;
-    view.kaProfile = s_config.kaProfile;
-    view.netLedEnabled = s_config.netLedEnabled;
-    view.callNotifyEnabled = s_config.callNotifyEnabled;
-    view.wifiTxPowerQuarterDbm = s_config.wifiTxPowerQuarterDbm;
-    for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
-        view.wifiNetworks[i].ssid = s_config.wifiNetworks[i].ssid;
-        view.wifiNetworks[i].passSet = !s_config.wifiNetworks[i].pass.empty();
+    try {
+        view.deviceName = s_config.deviceName;
+        view.hostname = s_config.hostname;
+        view.notificationLocale = s_config.notificationLocale;
+        view.webUser = s_config.webUser;
+        view.webPass = s_config.webPass;
+        view.smtpServer = s_config.smtpServer;
+        view.smtpPort = s_config.smtpPort;
+        view.smtpUser = s_config.smtpUser;
+        view.smtpPass = s_config.smtpPass;
+        view.smtpSendTo = s_config.smtpSendTo;
+        view.adminPhone = s_config.adminPhone;
+        view.numberBlackList = s_config.numberBlackList;
+        view.forwardRules = s_config.forwardRules;
+        view.emailEnabled = s_config.emailEnabled;
+        view.pushEnabled = s_config.pushEnabled;
+        view.networkMode = s_config.networkMode;
+        view.heartbeatEnable = s_config.heartbeatEnable;
+        view.heartbeatInterval = s_config.heartbeatInterval;
+        view.ntpServer = s_config.ntpServer;
+        view.mdnsHost = s_config.mdnsHost;
+        view.tzOffsetMin = s_config.tzOffsetMin;
+        view.rebootEnabled = s_config.rebootEnabled;
+        view.rebootHour = s_config.rebootHour;
+        view.hbEnabled = s_config.hbEnabled;
+        view.hbHour = s_config.hbHour;
+        view.smsHealthEnabled = s_config.smsHealthEnabled;
+        view.smsHealthHour = s_config.smsHealthHour;
+        view.smsHealthNotify = s_config.smsHealthNotify;
+        view.dataEnabled = s_config.dataEnabled;
+        view.roamingEnabled = s_config.roamingEnabled;
+        view.apn = s_config.apn;
+        view.phoneNumber = s_config.phoneNumber;
+        view.operatorPlmn = s_config.operatorPlmn;
+        view.kaEnabled = s_config.kaEnabled;
+        view.kaIntervalDays = s_config.kaIntervalDays;
+        view.kaTrafficKB = s_config.kaTrafficKB;
+        view.kaProfile = s_config.kaProfile;
+        view.netLedEnabled = s_config.netLedEnabled;
+        view.callNotifyEnabled = s_config.callNotifyEnabled;
+        view.wifiTxPowerQuarterDbm = s_config.wifiTxPowerQuarterDbm;
+        for (int i = 0; i < IDF_MAX_WIFI_NETWORKS; ++i) {
+            view.wifiNetworks[i].ssid = s_config.wifiNetworks[i].ssid;
+            view.wifiNetworks[i].passSet = !s_config.wifiNetworks[i].pass.empty();
+        }
+        for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
+            const IdfSimCredential& item = s_config.simCredentials[i];
+            view.simCredentials[i].iccid = item.iccid;
+            view.simCredentials[i].pinSet = !item.pin.empty();
+            view.simCredentials[i].pukSet = !item.puk.empty();
+            view.simCredentials[i].pinMaxAttempts = item.pinMaxAttempts;
+            view.simCredentials[i].pukMaxAttempts = item.pukMaxAttempts;
+            view.simCredentials[i].pinFailedAttempts = item.pinFailedAttempts;
+            view.simCredentials[i].pukFailedAttempts = item.pukFailedAttempts;
+        }
+        for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
+            view.webAccounts[i].username = s_config.webAccounts[i].username;
+            view.webAccounts[i].passwordSet = !s_config.webAccounts[i].password.empty();
+        }
+        view.emailConfigured = email_configured_locked();
+        for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
+            view.pushChannels[i] = s_config.pushChannels[i];
+            view.pushUrlSet[i] = !s_config.pushChannels[i].url.empty();
+            view.pushCellularUrlSet[i] = !s_config.pushChannels[i].cellularUrl.empty();
+            view.pushCustomBodySet[i] = !s_config.pushChannels[i].customBody.empty();
+            view.pushKey1Set[i] = !s_config.pushChannels[i].key1.empty();
+            view.pushKey2Set[i] = !s_config.pushChannels[i].key2.empty();
+        }
+        view.pushEnabledCount = enabled_push_count_locked();
+    } catch (...) {
+        xSemaphoreGive(s_config_mutex);
+        throw;
     }
-    for (int i = 0; i < IDF_MAX_SIM_CREDENTIALS; ++i) {
-        const IdfSimCredential& item = s_config.simCredentials[i];
-        view.simCredentials[i].iccid = item.iccid;
-        view.simCredentials[i].pinSet = !item.pin.empty();
-        view.simCredentials[i].pukSet = !item.puk.empty();
-        view.simCredentials[i].pinMaxAttempts = item.pinMaxAttempts;
-        view.simCredentials[i].pukMaxAttempts = item.pukMaxAttempts;
-        view.simCredentials[i].pinFailedAttempts = item.pinFailedAttempts;
-        view.simCredentials[i].pukFailedAttempts = item.pukFailedAttempts;
-    }
-    for (int i = 0; i < IDF_MAX_WEB_ACCOUNTS; ++i) {
-        view.webAccounts[i].username = s_config.webAccounts[i].username;
-        view.webAccounts[i].passwordSet = !s_config.webAccounts[i].password.empty();
-    }
-    view.emailConfigured = email_configured_locked();
-    for (int i = 0; i < IDF_MAX_PUSH_CHANNELS; ++i) {
-        view.pushChannels[i] = s_config.pushChannels[i];
-        view.pushUrlSet[i] = !s_config.pushChannels[i].url.empty();
-        view.pushCellularUrlSet[i] = !s_config.pushChannels[i].cellularUrl.empty();
-        view.pushCustomBodySet[i] = !s_config.pushChannels[i].customBody.empty();
-        view.pushKey1Set[i] = !s_config.pushChannels[i].key1.empty();
-        view.pushKey2Set[i] = !s_config.pushChannels[i].key2.empty();
-    }
-    view.pushEnabledCount = enabled_push_count_locked();
     xSemaphoreGive(s_config_mutex);
     return view;
 }
+
+std::unique_ptr<IdfConfigWebView> idf_config_get_web_snapshot(void) try
+{
+    // 直接在 heap 建構回傳值；bad_alloc 不穿越未啟用例外的 Web 元件。
+    return std::unique_ptr<IdfConfigWebView>(new IdfConfigWebView(idf_config_get_web_view()));
+}
+catch (const std::bad_alloc&) { return nullptr; }
 
 IdfKeepaliveRunView idf_config_get_keepalive_run_view(void)
 {

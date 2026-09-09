@@ -413,6 +413,7 @@
 	"ACTION_WIFI_RESTARTING": "WiFi 正在重新连接，请约 5 秒后刷新。",
 	"ACTION_WIFI_PASSWORD_REQUIRED": "SSID 变更或开放式网络改为加密网络时，请输入 8 至 63 个可显示 ASCII 字符的新 WiFi 密码，或明确选择开放式网络。",
 	"ACTION_REQUEST_FAILED": "请求失败。",
+	"ACTION_JOB_RESULT_UNKNOWN": "设备未返回操作结果。请重新加载页面确认后，再决定是否重试。",
 	"ACTION_LOGS_FAILED": "无法读取日志。",
 	"ACTION_PASSPHRASE_INVALID": "请输入两组相同且至少 12 个字符的密码短语。",
 	"ACTION_BACKUP_TOO_LARGE": "备份文件超过 32,828 bytes。",

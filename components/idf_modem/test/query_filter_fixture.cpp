@@ -389,7 +389,7 @@ int main()
     assert(raw_owner.urcs.find("+CEREG: 2") != std::string::npos);
     assert(raw_owner.urcs.find("+CSQ: 31,99") == std::string::npos);
     assert(idf_modem_identity_sampling_allowed(1));
-    assert(!idf_modem_identity_sampling_allowed(5));
+    assert(idf_modem_identity_sampling_allowed(5));
     assert(!idf_modem_identity_sampling_allowed(11));
     assert(!idf_modem_identity_sampling_allowed(0));
     int stale_stat = 1;

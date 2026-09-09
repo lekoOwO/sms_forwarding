@@ -46,6 +46,24 @@ def function_body(source: str, name: str) -> str:
 
 
 class UartOwnerContractTest(unittest.TestCase):
+    def test_roaming_identity_samples_without_network_writes(self):
+        source = SOURCE.read_text()
+        header = (SOURCE.parent / "include/idf_modem.h").read_text()
+        types = re.search(r"struct IdfModemStatus \{.*?\n\};", header, re.S).group()
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "identity_runtime.inc").write_text(
+                types + "\n" +
+                "static bool sample_identity_once(bool, bool);\n" +
+                Path(SOURCE.parent / "test/identity_sampling_stubs.inc").read_text() +
+                "static bool sample_identity_once(bool log_summary, bool include_network_fields) {" +
+                function_body(source, "sample_identity_once") + "}\n")
+            binary = Path(directory, "identity")
+            subprocess.run(["g++", "-std=c++17", "-I", str(SOURCE.parent / "include"),
+                            "-I", directory, str(SOURCE.parent / "test/identity_sampling_fixture.cpp"),
+                            "-o", str(binary)], check=True, capture_output=True, text=True)
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_dev_usb_query_is_fixed_id_and_uses_the_existing_owner_queue(self):
         source = SOURCE.read_text()
         body = function_body(source, "idf_modem_usb_query")
@@ -420,7 +438,7 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("Registration unavailable; modem reset not requested", health)
         self.assertIn("cereg_query_ok", health)
 
-    def test_identity_sampling_is_home_only_at_shared_entrypoint(self):
+    def test_identity_sampling_checks_registration_at_shared_entrypoint(self):
         source = SOURCE.read_text()
         identity = function_body(source, "sample_identity_once")
         self.assertIn("idf_modem_identity_sampling_allowed", identity)
@@ -455,7 +473,7 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("s_reset_request.load", retry)
         self.assertIn("ceregStat < 0", retry)
         operator = function_body(source, "apply_operator_if_configured")
-        self.assertIn("idf_modem_identity_sampling_allowed", operator)
+        self.assertIn("if (cereg_stat != 1) return;", operator)
 
     def test_successful_sim_unlock_invalidates_before_sms_reopen(self):
         source = SOURCE.read_text()

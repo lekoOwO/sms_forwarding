@@ -29,3 +29,10 @@ idf_component_register(
     web_assets
   EMBED_TXTFILES "${OTA_PUBLIC_KEY_FILE}"
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE "-fstack-usage")
+add_custom_command(TARGET ${COMPONENT_LIB} POST_BUILD
+  COMMAND ${PYTHON} "${PROJECT_DIR}/tools/check_web_stack.py"
+    "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/${COMPONENT_LIB}.dir/idf_web.cpp.su"
+  VERBATIM
+)
