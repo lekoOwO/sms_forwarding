@@ -445,6 +445,7 @@ python3 -m unittest \
   components/idf_modem/test/test_uart_owner.py \
   components/idf_push/test/test_push_runtime.py \
   components/idf_sms/test/test_sms_retention_policy.py \
+  components/idf_sms/test/test_multipart.py \
   components/idf_wifi/test/test_wifi_security.py
 ```
 
@@ -541,6 +542,19 @@ cellular GET 僅使用固定 GET method、空 request body，rendered URL 上限
 - 本機 production、USB 編譯、48 項 modem 測試、13 項 Web package 測試與
   37 項 Mock／browser 測試通過。尚未將此修正部署至實機，故上述 panic 風險修正、
   roaming 識別資訊及實機儲存完成仍待硬體驗收。
+
+### 長簡訊回歸入口
+
+`components/idf_sms/test/test_multipart.py` 編譯目前 production 合併函式與 RAM retry
+函式，使用合成分段、可控時鐘與轉發入隊 sink。涵蓋晚段補齊、完成重送去重、
+過期槽復用、五槽競爭、reference 衝突、入隊背壓、固定補齊窗口與通知 metadata。
+舊碼會在「晚段補成 ABC 並發完整補充」斷言失敗。此測試不使用實機短信。
+
+`components/idf_push/test/test_push_runtime.py` 的執行式 core fixture 驗證三語補充標題、
+自訂範本及原文不變；同檔另有來源契約檢查。既有 SMS retention 測試主要也是來源
+契約檢查，不能取代以上時序回歸。以上入口都由 firmware CI 的 focused checks 呼叫。
+新加入的 diagnostics handler fixture 與文件語言／本地連結檢查也已接到同一 CI。
+真實 UART／電信重送時序與 provider 送達仍須另外進行硬體驗收，本輪未執行。
 
 ## PR 清理 gate
 

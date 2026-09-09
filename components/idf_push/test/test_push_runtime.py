@@ -48,6 +48,16 @@ int main() {
     assert(title == "來自 +886900000001 的簡訊");
     assert(body == "裝置：Hallway C3\n寄件者：+886900000001\n時間：2026-08-16 12:34:56\n內容：OTP {device}: 1234");
 
+    values.supplement = true;
+    assert(idf_push_render_sms_notification("en", "Custom", "{message}", values, title, body));
+    assert(title == "[Complete SMS follow-up] Custom" && body == "OTP {device}: 1234");
+    assert(idf_push_render_sms_notification("zh-CN", "Custom", "{message}", values, title, body));
+    assert(title == "[短信完整补充] Custom");
+    assert(idf_push_render_sms_notification("zh-TW", "Custom", "{message}", values, title, body));
+    assert(title == "[簡訊完整補充] Custom");
+    assert(values.message == "OTP {device}: 1234");
+    values.supplement = false;
+
     assert(!idf_push_render_template("bad\nheader", values, 256, true, output));
     assert(!idf_push_render_template("bad\theader", values, 256, true, output));
     assert(!idf_push_render_template(std::string("bad\xC0\xAF", 5), values, 256, false, output));
