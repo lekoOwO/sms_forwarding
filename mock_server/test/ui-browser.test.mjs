@@ -140,11 +140,16 @@ test("roaming diagnostics expose raw values by keyboard and touch", { timeout: 3
 		assert.match(await page.$eval('summary[title*="cesq"]', (summary) => summary.textContent), /CSQ: ≥ −51 dBm/);
 		await page.focus('summary[title="registration: 5"]');
 		await page.keyboard.press("Enter");
+		// Input dispatch can finish before the browser applies the native details toggle.
+		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
 		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
 		await page.setViewport({ width: 390, height: 844 });
 		await page.tap('summary[title="registration: 5"]');
+		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === false, { timeout: 1000 });
 		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), false);
 		await page.tap('summary[title="registration: 5"]');
+		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
+		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
 		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.nextElementSibling.textContent), /registration: 5/);
 	} finally {
 		await closeBrowser(browser, shared);
