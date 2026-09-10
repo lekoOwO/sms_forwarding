@@ -53,6 +53,10 @@
       "language": "zh-TW"
     },
     {
+      "path": "dev_doc/hardware-evidence.md",
+      "language": "zh-TW"
+    },
+    {
       "path": "mock_server/AGENTS.md",
       "language": "en"
     },

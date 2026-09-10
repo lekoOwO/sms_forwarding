@@ -12,13 +12,12 @@ The demo does not connect to a real device or perform backups, restores, or firm
 
 - Forwards SMS messages to email or up to five push channels at once.
   - Supports Bark, Telegram, Discord Webhook, Gotify, ntfy, DingTalk, Feishu, PushPlus, ServerChan, and custom GET or JSON requests.
-- Filters messages by sender or content, with custom notification titles and bodies.
-- Shows and sends SMS messages, and provides signal, SIM, and modem diagnostics.
+- Filters messages by sender or content, with a mobile CSV editor, rule previews, and custom notification titles and bodies.
+- Shows and sends SMS messages, and provides signal, SIM, and modem diagnostics. A tap or keyboard action reveals the raw diagnostic values.
 - Saves up to five WiFi profiles and provides heartbeat notifications and encrypted configuration backups.
+- Downloads data over HTTPS for cellular keepalive, with certificate configuration in the management UI.
 - Manages profiles on compatible eSIM cards. Available functions depend on the card, modem, and carrier.
 - Provides a management UI in Traditional Chinese, Simplified Chinese, and English.
-
-Email uses WiFi only. Before you use 4G push, check mobile connectivity and enable cellular support and HTTPS certificates for the channel. 4G push does not support roaming. Availability depends on the modem, SIM card, and network.
 
 ## Prepare the hardware
 
@@ -47,6 +46,23 @@ This wiring example uses an ESP32-C3 Super Mini and an ML307R-DC adapter board. 
 5. After provisioning, reconnect your computer or phone to the same LAN. Open the device address shown on the provisioning page.
 6. Sign in with username `admin` and password `admin123`. Change the management password immediately.
 7. Configure email or a push channel. Use the channel test to check delivery.
+
+## Daily configuration
+
+### Forwarding rules
+
+The management UI provides an interactive CSV editor and syntax checks. Enter a sender number and message text to preview the rules.
+Previews do not save configuration or send notifications. Demo results are examples only.
+
+Existing Tab-separated rules remain supported. The management UI can convert them to CSV. Check the content before you save it.
+
+### Cellular delivery and keepalive
+
+Email uses WiFi only. Before you use 4G push, check mobile connectivity and enable cellular support and HTTPS certificates for the channel. 4G push does not support roaming. Availability depends on the modem, SIM card, and network.
+
+Cellular keepalive uses SIM data and can incur charges. It requires a compatible modem, home registration, and a certificate for the target.
+Existing HTTP keepalive URLs remain stored. Before execution, change the URL to HTTPS and complete certificate configuration.
+Keepalive has a separate certificate control and does not require a push channel.
 
 ## Backups and updates
 

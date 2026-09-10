@@ -62,9 +62,9 @@ requires ML307A and home registration; roaming is refused. A saved eSIM selectio
 restored after the action. Disabling mobile data does not prohibit keepalive: the request
 can temporarily activate data, then restore its state. Other modem models fail explicitly.
 
-The worker performs direct verified GET requests. It retains the shared 64 KiB response
-limit and allows at most eight requests, a 512 KiB target, and a two-minute request budget
-plus bounded cleanup. Redirects and chunked responses remain unsupported. Cancellation
+The worker performs direct verified GET requests. Each response allows a 64 KiB body
+and separate 4 KiB headers. The worker allows eight requests and a 512 KiB target.
+Requests share a two-minute budget plus bounded cleanup. Redirects and chunked responses remain unsupported. Cancellation
 stops the next request; an in-flight request finishes its bounded operation and cleanup.
 Received body bytes exclude headers, TLS, and network overhead. They estimate transfer
 volume, not carrier billing, and do not prove that the carrier extended SIM validity.
@@ -156,7 +156,7 @@ CSQ 0／31 表示上下界，99 與既有 `-999` sentinel 顯示未知，不換�
 
 ## 通知與網路邊界
 
-`idf_push` 支援 SMTP 與 12 種推送 provider。Provider enum 由 `dev_doc/config-schema/v6.json` 的
+`idf_push` 支援 SMTP 與 12 種推送 provider。Provider enum 由 `dev_doc/config-schema/v7.json` 的
 `x-enumMapping` 定義，並由 `tools/generate-config-schema.py` 產生。
 
 SMTP 僅使用 WiFi。推送在 4G-only 模式選擇 cellular 路徑。
@@ -181,50 +181,24 @@ ESP32 上的 Mbed TLS 執行 CA 與 hostname 驗證，並傳送 HTTPS。
 
 ### 2026-08-24 ML307A 已註冊紀錄
 
-這是單次去識別化的唯讀硬體紀錄，不是通用的 modem protocol fact：
-
-- 板型與韌體版本：去識別化摘要未記錄。`device.py doctor` 回報 `ready=true` 與 `host_read_write=true`。
-- 模組與輸入：ML307A；唯讀輸入為 `CPIN`、`CEREG`、`COPS`、`CGATT`、`CGACT` 與 `CGPADDR` 查詢。
-- 結果：`CPIN` ready；`CEREG stat=1` 是 home registered、E-UTRAN 且 `roaming=false`。
-  `COPS` 是 automatic，operator present，且 access technology 是 E-UTRAN。
-  `CGATT` 是 attached；`CGACT` 只有一個 active context。
-- `CGPADDR` 結構只有一個有效回覆行與一個 CID。該 CID 同時有 IPv4 與 IPv6。
-- `cc10c2a` 提供 `CGPADDR` sanitizer 結構；`41d3708` 提供 runtime dual-stack parser。
-
-文件不記錄 operator、ICCID、IMSI、IMEI、address、APN 或 credential 值。
-此次操作沒有使用 write AT、manual `COPS`，也沒有執行 `CFUN`、`CGATT`、`CGACT` 或 PDP 狀態變更。
-這份紀錄不證明 Internet、TLS 或 provider delivery 可用。
+完整觀察與證據限制見 [實機驗證紀錄](hardware-evidence.md#2026-08-24-ml307a-已註冊紀錄)。
 
 ### 2026-08-22 ML307A 未註冊歷史紀錄
 
-這是較早的單次去識別化硬體紀錄，不是通用的 modem protocol fact：
-
-- 板型：去識別化報告未記錄。
-- 模組：ML307A。
-- 輸入：`CPIN`、`CSQ`、`CESQ`、`CEREG`、`COPS`、`CGATT`、`CGACT`、`CGPADDR` 與 `ICCID` 查詢。
-- 結果：`CPIN` ready；`CSQ=31`；`CESQ` 約為 RSRP -70 dBm；`COPS` 使用 auto 選擇但 operator absent；原始註冊回覆只記錄 `+CEREG: 0,11`。
-  依 3GPP 定義，`stat=11` 是 RLOS-only；`n=0` 只控制 URC 詳細度。它不是 home、roaming 或 data-ready 狀態。
-  另見 `CGATT=0`、PDP inactive、no IP；ICCID 只保留 hash。
-- 識別資料已去識別化保存。
-
-這次結果表示 SIM 與 RF 路徑有回應，但尚未完成標準網路註冊與資料啟用。
-這個未註冊、RLOS-only 狀態不證明 4G push、roaming 或 data activation 已成功。
+完整觀察與證據限制見 [實機驗證紀錄](hardware-evidence.md#2026-08-22-ml307a-未註冊歷史紀錄)。
 
 ### 2026-08-16 Arduino 歷史 TLS 紀錄
 
-這份去識別化紀錄來自 `origin/develop` 的 Arduino 韌體，不是目前原生 ESP-IDF runtime 的實機證據：
-
-- 板型、模組與輸入：ESP32-C3、ML307A，以及 NTP 同步後的嚴格 TLS 1.2 MHTTP private-CA probe。
-- 結果：伺服器端確認正向 server-auth handshake 完成。
-- 證據邊界：wrong-certificate、hostname mismatch 與 expired-certificate rejection 都沒有可信的負向證據。
-
-此紀錄不證明目前原生 ESP-IDF 的 4G provider delivery 或 readiness。
+完整觀察與證據限制見 [實機驗證紀錄](hardware-evidence.md#2026-08-16-arduino-歷史-tls-紀錄)。
 
 ## 設定與備份
 
 `idf_config` 將設定保存在 `appcfg` NVS 的雙槽格式。每次更新會先完成編碼與讀回驗證，再更新有效 marker。
 
-`dev_doc/config-schema/manifest.json` 是格式的手寫來源。版本化 JSON Schema 保留 v1-v5 相容讀取邊界。目前版本為 v6，並追加 `kaTrafficKB`。
+`dev_doc/config-schema/manifest.json` 是格式的手寫來源。目前 schema 為 v7，韌體可讀取 v1–v7。
+只有推送通道使用非預設的 `cellularEnabled` 或 `cellularUrl` 時才寫入 v7，否則仍寫入 v6。
+映像處於 pending verification 時，不允許首次從舊 schema 升為 v7。
+欄位、相容寫入與大小限制見 [設定格式](config-schema/README.md)。
 
 可攜備份使用 `.smscfg`。檔案以 PBKDF2-SHA256 與 AES-256-GCM 加密，最大長度為 32,828 bytes。
 
@@ -285,7 +259,7 @@ SubjectPublicKeyInfo DER SHA-256。這只是可觀察的 trust key identity，�
 attestation；被修改的韌體仍可回報任意值。`public_key_sha256: null` 只表示較舊韌體
 無法觀察此欄位，不表示 production key。
 `components/idf_web/OTA_RUNTIME_READY` 仍不存在。Production hardware rollback/replay evidence 與 matching production private key 仍不可用。
-因此目前不能宣稱 signed OTA 已達到 READY。
+TEST-key OTA 已有 [實機驗收](hardware-evidence.md)，但 production OTA 發佈尚未開放。
 
 ## 分區
 

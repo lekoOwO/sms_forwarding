@@ -1,4 +1,8 @@
-# Counter36–42 ML307 parser 與 cellular 硬體報告
+<a id="counter3642-ml307-parser-與-cellular-硬體報告"></a>
+
+# Counter36–45 ML307 parser 與 cellular 硬體報告
+
+一般硬體歷史及 counter46–47 更新驗收見 [實機驗證紀錄](hardware-evidence.md)。
 
 ## 範圍與輸入
 
