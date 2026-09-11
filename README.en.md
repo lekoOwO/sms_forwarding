@@ -15,7 +15,7 @@ The demo does not connect to a real device or perform backups, restores, or firm
 - Filters messages by sender or content, with a mobile CSV editor, rule previews, and custom notification titles and bodies.
 - Shows and sends SMS messages, and provides signal, SIM, and modem diagnostics. A tap or keyboard action reveals the raw diagnostic values.
 - Saves up to five WiFi profiles and provides heartbeat notifications and encrypted configuration backups.
-- Downloads data over HTTPS for cellular keepalive, with certificate configuration in the management UI.
+- Downloads data over HTTP or HTTPS for cellular keepalive, with HTTPS certificate configuration in the management UI.
 - Manages profiles on compatible eSIM cards. Available functions depend on the card, modem, and carrier.
 - Provides a management UI in Traditional Chinese, Simplified Chinese, and English.
 
@@ -60,9 +60,9 @@ Existing Tab-separated rules remain supported. The management UI can convert the
 
 Email uses WiFi only. Before you use 4G push, check mobile connectivity and enable cellular support and HTTPS certificates for the channel. 4G push does not support roaming. Availability depends on the modem, SIM card, and network.
 
-Cellular keepalive uses SIM data and can incur charges. It requires a compatible modem, home registration, and a certificate for the target.
-Existing HTTP keepalive URLs remain stored. Before execution, change the URL to HTTPS and complete certificate configuration.
-Keepalive has a separate certificate control and does not require a push channel.
+Cellular keepalive uses SIM data and can incur charges. It requires a compatible modem and home registration.
+Keepalive supports HTTP and HTTPS. HTTP is unencrypted, so do not put sensitive information in the URL. HTTPS requires a certificate for the target.
+HTTPS keepalive has a separate certificate control and does not require a push channel.
 
 ## Backups and updates
 

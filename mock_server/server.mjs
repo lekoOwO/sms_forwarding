@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import express from "express";
 import { previewMockRules } from "../web/src/lib/forward-rules.js";
+import { validKeepaliveUrl } from "../web/src/lib/keepalive-url.js";
 
 const defaultWebRoot = process.env.WEB_ROOT ?? "/web";
 const defaultOpenApiPath = process.env.OPENAPI_PATH ?? "/spec/openapi.json";
@@ -678,10 +679,7 @@ export function createApp({
 	const pushTestDeadlines = Array(5).fill(0);
 	const pushCa = Array.from({ length: 6 }, () => ({ configured: false, sha256: "" }));
 	const keepalive = { jobQueued: false, jobRunning: false, jobDone: false, jobSuccess: false, jobMessage: "", bodyBytes: 0, requests: 0, cancelRequested: false };
-	const keepaliveUrlValid = (url) => {
-		try { const parsed = new URL(url); return url.startsWith("https://") && parsed.protocol === "https:" && !parsed.username && !parsed.password && !parsed.hash && !/\s/.test(url) && ![...url].some((ch) => ch.charCodeAt(0) < 32) && byteLength(url) <= 256; }
-		catch { return false; }
-	};
+	const keepaliveUrlValid = validKeepaliveUrl;
 	const caChannel = (request) => request.path.startsWith("/api/keepalive/ca/") ? 5 : boundedUnsigned(request.query.channel, 0, 4);
 	const caQuerySize = (channel, install = false) => (channel === 5 ? 0 : 1) + (install ? 1 : 0);
 	const pushCaNonces = new Map();
@@ -1118,7 +1116,7 @@ export function createApp({
 			Number(request.headers["content-length"] ?? 0) > 0 || Object.keys(request.body).length) {
 			return response.status(400).json(result(false, "ACTION_INPUT_INVALID", {}, "channel"));
 		}
-		if (channel === 5 ? !keepaliveUrlValid(state.config.kaUrl) : !state.config.pushChannels[channel].cellularEnabled) return response.status(409).json(result(false, "PUSH_CA_PROBE_FAILED"));
+		if (channel === 5 ? !keepaliveUrlValid(state.config.kaUrl) || !state.config.kaUrl.startsWith("https://") : !state.config.pushChannels[channel].cellularEnabled) return response.status(409).json(result(false, "PUSH_CA_PROBE_FAILED"));
 		return acceptJob("push_ca_probe", () => {
 			const nonce = randomBytes(16).toString("hex");
 			pushCaNonces.set(nonce, { channel, expiresAt: now() + 30000, url: channel === 5 ? state.config.kaUrl : "" });
@@ -1158,12 +1156,12 @@ export function createApp({
 			byteLength(request.originalUrl.split("?")[1] ?? "") >= 64 ||
 			Object.keys(request.query).some((key) => key !== "action") || !["", "run", "reset", "cancel"].includes(action) || Object.keys(request.body).length) return response.status(400).json(result(false, "ACTION_INPUT_INVALID"));
 		const config = state.config;
-		const ready = config.kaAction !== 1 || (keepaliveUrlValid(config.kaUrl) && pushCa[5].configured && config.kaTrafficKB <= 512);
+		const ready = config.kaAction !== 1 || (keepaliveUrlValid(config.kaUrl) && (config.kaUrl.startsWith("http://") || pushCa[5].configured) && config.kaTrafficKB <= 512);
 		if (action && request.method !== "POST") return response.json({ success: false, message: "This action requires POST" });
 		if (action === "cancel") { keepalive.cancelRequested = true; return response.json({ success: true, message: "Cancellation requested" }); }
 		if (action === "reset") { config.kaLastTime = Math.floor(now() / 1000); return response.json({ success: true, message: "Baseline date reset" }); }
 		if (action === "run") {
-			if (!ready) return response.json({ success: false, queued: false, message: "Check HTTPS URL and root CA first" });
+			if (!ready) return response.json({ success: false, queued: false, message: "Check download URL, byte target and HTTPS root CA" });
 			if (keepalive.jobQueued || keepalive.jobRunning) return response.json({ success: true, queued: true, message: "Keepalive already running" });
 			Object.assign(keepalive, { jobQueued: true, jobRunning: false, jobDone: false, jobSuccess: false, bodyBytes: 0, requests: 0, cancelRequested: false });
 			setTimeout(() => {
@@ -1324,6 +1322,7 @@ export function createApp({
 			if (body[`${prefix}cellularUrl`] && body[`${prefix}cellularUrlClear`] === "1") return acceptJob("config-save", result(false, "ACTION_CONFIG_INVALID", {}, `${prefix}cellularUrl`), response);
 			if (body[`${prefix}cellularUrlClear`] === "1") channel.cellularUrl = "";
 			else if (body[`${prefix}cellularUrl`]) channel.cellularUrl = body[`${prefix}cellularUrl`];
+			if (Object.keys(body).every((key) => ["cellularEnabled", "cellularUrl", "cellularUrlClear"].some((suffix) => key === `${prefix}${suffix}`))) continue;
 			channel.enabled = body[`${prefix}en`] === "on";
 			if (Object.hasOwn(body, `${prefix}type`)) channel.type = Number.parseInt(body[`${prefix}type`], 10) || 0;
 			if (channel.type !== previousType) {

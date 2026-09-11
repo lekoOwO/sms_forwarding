@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import "./alert-render.test.mjs";
+import "./keepalive-url.test.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import { gunzipSync } from "node:zlib";
@@ -56,6 +58,23 @@ test("diagnostic result renders unavailable values without hiding valid zero", a
 		assert.match(values[1], /Not available/);
 		assert.match(values[2], /Not registered/);
 		assert.match(values[2], /registration: 0/);
+		assert.doesNotMatch(body, /<details\b|<summary\b/, "raw data has one shared entry instead of per-field disclosures");
+		assert.equal([...body.matchAll(/data-result-raw-trigger/g)].length, 1);
+		const { body: signal } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_QUERY_OK", data: { cesq: "999,999,99", custom: null, flag: false }, detail: "detail-only", internal: "private-metadata" },
+			title: "Result", locale: "en"
+		} });
+		assert.equal([...signal.matchAll(/data-signal-metric/g)].length, 3);
+		for (const label of ["RSRP", "RSRQ", "CSQ"]) assert.match(signal, new RegExp(`<dt>${label}</dt>`));
+		assert.equal([...signal.matchAll(/<dd>Unknown or unavailable<\/dd>/g)].length, 3);
+		const raw = signal.match(/<textarea\b[^>]*>([\s\S]*?)<\/textarea>/)?.[1];
+		assert.match(raw, /cesq: (?:&quot;|")999,999,99(?:&quot;|")/);
+		assert.match(raw, /custom: null\nflag: false/);
+		assert.doesNotMatch(raw, /detail-only|private-metadata|ACTION_QUERY_OK/);
+		const { body: empty } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_CONFIG_SAVED", data: {}, detail: "" }, title: "Saved", locale: "en"
+		} });
+		assert.doesNotMatch(empty, /data-result-raw-trigger|<dialog/);
 	} finally {
 		try { await server?.close(); } finally { process.chdir(previousCwd); }
 	}

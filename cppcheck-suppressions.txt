@@ -20,8 +20,8 @@ assertWithSideEffect:components/idf_web/test/esim_install_fixture.cpp
 
 # cppcheck cannot see the mbedTLS callback edges into these private methods.
 # Keep the exceptions at the two callback targets, not for the whole file.
-unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:419
-unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:436
+unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:422
+unusedPrivateFunction:components/idf_modem/idf_modem_https.cpp:439
 
 # These loops are deliberate bounded parsing, validation, or state-machine
 # loops. Keep useStlAlgorithm exceptions line-specific so new loops remain
@@ -57,7 +57,7 @@ useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1949
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:1998
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:2053
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:2126
-useStlAlgorithm:components/idf_modem/idf_modem.cpp:1625
+useStlAlgorithm:components/idf_modem/idf_modem.cpp:1637
 useStlAlgorithm:components/idf_modem/idf_modem_https_wire.cpp:688
-useStlAlgorithm:components/idf_modem/test/imei_fixture.cpp:138
-useStlAlgorithm:components/idf_web/idf_web.cpp:3977
+useStlAlgorithm:components/idf_modem/test/imei_fixture.cpp:139
+useStlAlgorithm:components/idf_web/idf_web.cpp:3990

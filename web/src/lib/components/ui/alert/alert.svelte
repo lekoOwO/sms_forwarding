@@ -6,7 +6,9 @@
 		variants: {
 			variant: {
 				default: "bg-card text-card-foreground",
-				destructive: "bg-card text-destructive *:data-[slot=alert-description]:text-destructive/90 *:[svg]:text-current",
+				info: "border-alert-info-foreground/25 bg-alert-info text-alert-info-foreground *:data-[slot=alert-description]:text-current",
+				warning: "border-alert-warning-foreground/25 bg-alert-warning text-alert-warning-foreground *:data-[slot=alert-description]:text-current",
+				destructive: "border-alert-destructive-foreground/25 bg-alert-destructive text-alert-destructive-foreground *:data-[slot=alert-description]:text-current",
 			},
 		},
 		defaultVariants: {
@@ -35,7 +37,7 @@
 <div
 	bind:this={ref}
 	data-slot="alert"
-	role="alert"
+	role={variant === "destructive" ? "alert" : "status"}
 	class={cn(alertVariants({ variant }), className)}
 	{...restProps}
 >

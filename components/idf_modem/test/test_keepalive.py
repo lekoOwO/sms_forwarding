@@ -60,12 +60,18 @@ static bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& r,s
     return r.url.rfind("https://",0)==0 && !r.rootCertificateDer.empty();
 }
 static bool idf_modem_https_status_success(int status) { return status>=200 && status<300; }
+static bool idf_modem_keepalive_validate_request(const IdfModemHttpsPostRequest& r,std::string& error) {
+    return r.url.rfind("http://",0)==0 ? r.rootCertificateDer.empty() : idf_modem_https_validate_request(r,error);
+}
 static esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,IdfModemHttpsPostResult& out) {
     assert(request.method==IdfModemHttpsMethod::Get && request.body.empty() && request.contentType.empty());
     assert(request.timeoutMs>0 && request.timeoutMs<=30000);
     assert(!request.dataEnabled && request.apn=="test-apn");
-    assert(request.rootCertificateDer==std::vector<uint8_t>{1});
+    assert(request.url.rfind("http://",0)==0 ? request.rootCertificateDer.empty() : request.rootCertificateDer==std::vector<uint8_t>{1});
     ++calls; now+=duration; out=response; return response_error;
+}
+static esp_err_t submit_keepalive_request(const IdfModemHttpsPostRequest& request,IdfModemHttpsPostResult& out) {
+    return idf_modem_https_post(request,out);
 }
 '''
         fixture += "static esp_err_t idf_modem_cellular_http_get(const std::string& url, const IdfCellularHttpConfig& config, IdfCellularHttpResult& result) {" + function_body(source, "idf_modem_cellular_http_get") + "}\n"
@@ -83,7 +89,10 @@ int main() {
     calls=0; cfg.minPayloadBytes=1; cancel=true;
     assert(idf_modem_cellular_http_get("https://example.test/payload",cfg,result)!=ESP_OK && calls==0);
     cancel=false;
-    assert(idf_modem_cellular_http_get("http://example.test/payload",cfg,result)!=ESP_OK && calls==0);
+    cfg.rootCertificateDer.clear();
+    assert(idf_modem_cellular_http_get("http://example.test/payload",cfg,result)==ESP_OK && calls==1);
+    assert(result.ok && result.bytesRead==1024);
+    calls=0; cfg.rootCertificateDer={1};
     cfg.minPayloadBytes=512*1024+1;
     assert(idf_modem_cellular_http_get("https://example.test/payload",cfg,result)!=ESP_OK && calls==0);
     cfg.minPayloadBytes=16*1024; response.bodyBytes=1;

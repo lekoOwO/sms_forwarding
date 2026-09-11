@@ -1,4 +1,5 @@
 <script lang="ts">
+	import InfoIcon from "@lucide/svelte/icons/info";
 	import * as Field from "$lib/components/ui/field";
 	import * as NativeSelect from "$lib/components/ui/native-select";
 	import * as Alert from "$lib/components/ui/alert";
@@ -52,7 +53,8 @@
 
 <Field.Group>
 	{#if legacy}
-		<Alert.Root>
+		<Alert.Root variant="info">
+			<InfoIcon aria-hidden="true" />
 			<Alert.Title>{t("ruleLegacyTitle")}</Alert.Title>
 			<Alert.Description>{t("ruleLegacyDescription")}</Alert.Description>
 		</Alert.Root>
@@ -105,7 +107,16 @@
 						{#if /^\d+:[a-z]+$/.test(currentResult.detail)}<p>{t("ruleLine")} {currentResult.detail.split(":")[0]}: {errorText(currentResult.detail.split(":")[1])}</p>{/if}
 					{:else}
 						<p>{currentResult.data.matched ? `${t("ruleFirstMatch")} ${currentResult.data.line}` : t("ruleDefault")}</p>
-						{#if currentResult.data.matched}<p>{t("ruleActions")}: {currentResult.data.drop ? "drop" : [currentResult.data.email ? "email" : "", ...[1, 2, 3, 4, 5].filter((channel) => Number(currentResult.data.channelMask) & (1 << (channel - 1)))].filter(Boolean).join(", ") || t("ruleNoTargets")}</p>{/if}
+						{#if currentResult.data.matched}
+							<div><p>{t("ruleActions")}</p><ul data-rule-actions class="list-inside list-disc">
+								{#if currentResult.data.drop}<li>{t("ruleActionDrop")}</li>
+								{:else}
+									{#if currentResult.data.email}<li>{t("emailTitle")}</li>{/if}
+									{#each [1, 2, 3, 4, 5].filter((channel) => Number(currentResult.data.channelMask) & (1 << (channel - 1))) as channel (channel)}<li>{t("ruleActionPush").replace("{channel}", String(channel))}</li>{/each}
+									{#if !currentResult.data.email && !Number(currentResult.data.channelMask)}<li>{t("ruleNoTargets")}</li>{/if}
+								{/if}
+							</ul></div>
+						{/if}
 						<ul class="list-inside list-disc">
 							{#each parsed.rows as row (row.line)}<li>{t("ruleLine")} {row.line}: {currentResult.data.matched && row.line > Number(currentResult.data.line) ? t("ruleNotEvaluated") : row.enabled === "0" || !row.pattern ? t("ruleSkipped") : row.line === Number(currentResult.data.line) ? t("ruleMatched") : t("ruleNotMatched")}</li>{/each}
 						</ul>

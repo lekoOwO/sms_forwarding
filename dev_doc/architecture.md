@@ -49,12 +49,15 @@ HTTP handler 不直接執行慢速 SMTP、推送、加密、OTA 或模組操作�
 
 ## Cellular data keepalive
 
-Data keepalive uses the saved HTTPS URL and an independent CA target. In the Web UI,
-save the URL and byte target, then select certificate setup. Setup needs device WiFi,
+Data keepalive uses the saved HTTP or HTTPS download URL. HTTP sends only a public GET
+without credentials, custom headers, or a body. HTTP does not authenticate the server or
+protect the transfer from modification. The response body is counted and discarded, never executed.
+HTTP needs no CA lookup or probe. HTTPS retains its independent CA target and full certificate verification.
+In the Web UI, save the URL and byte target. For HTTPS, select certificate setup. Setup needs device WiFi,
 synchronized time, and browser Internet access. It reuses the Mozilla candidate selection
 and device-side certificate validation used by cellular push. No push channel is required.
-An unchanged legacy HTTP URL can remain stored while disabled. The UI does not replace
-its scheme or host. Changing that URL or enabling data keepalive requires HTTPS.
+The existing HTTP URL remains unchanged. Support for HTTP does not enable the schedule.
+URLs cannot contain login credentials, control characters, or fragments. The UI does not replace the scheme or host.
 
 Manual execution uses the saved action even when the automatic schedule is disabled.
 The first valid schedule initializes the baseline without sending data. Data execution
@@ -62,7 +65,8 @@ requires ML307A and home registration; roaming is refused. A saved eSIM selectio
 restored after the action. Disabling mobile data does not prohibit keepalive: the request
 can temporarily activate data, then restore its state. Other modem models fail explicitly.
 
-The worker performs direct verified GET requests. Each response allows a 64 KiB body
+The worker performs direct GET requests. HTTPS verifies the CA, hostname, and certificate dates.
+The public cellular push API remains HTTPS-only. Each response allows a 64 KiB body
 and separate 4 KiB headers. The worker allows eight requests and a 512 KiB target.
 Requests share a two-minute budget plus bounded cleanup. Redirects and chunked responses remain unsupported. Cancellation
 stops the next request; an in-flight request finishes its bounded operation and cleanup.
@@ -79,7 +83,7 @@ origin, so paths on one origin can share a CA, but another host cannot inherit i
 Offline evidence: `components/idf_modem/test/test_keepalive.py` executes the production
 bounded loop with mocked transport and clock boundaries. `test_keepalive_ca.py` executes
 the production query parser and target dispatcher. The HTTPS wire fixture checks body
-byte counts. `mock_server/test/keepalive.test.mjs` checks separate CA targets, same-origin
+byte counts and synthetic plain HTTP requests with bounded cleanup. `mock_server/test/keepalive.test.mjs` checks separate CA targets, same-origin
 reuse, stale nonces after URL changes, and cancellation. No hardware validation is claimed.
 
 ## 啟動流程

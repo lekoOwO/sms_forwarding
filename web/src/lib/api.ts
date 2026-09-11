@@ -2,6 +2,7 @@ import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, OtaState, 
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { previewMockRules } from "$lib/forward-rules.js";
+import { validKeepaliveUrl } from "$lib/keepalive-url.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
 
 let csrfToken = "";
@@ -363,6 +364,7 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 			if (form.has(`${prefix}cellularEnabled`)) channel.cellularEnabled = form.get(`${prefix}cellularEnabled`) === "1";
 			if (form.get(`${prefix}cellularUrlClear`) === "1") { channel.cellularUrl = ""; channel.cellularUrlSet = false; }
 			else if (form.get(`${prefix}cellularUrl`)) { channel.cellularUrl = ""; channel.cellularUrlSet = true; }
+			if ([...form.keys()].every((key) => ["cellularEnabled", "cellularUrl", "cellularUrlClear"].some((suffix) => key === `${prefix}${suffix}`))) continue;
 			if (type !== channel.type) {
 				channel.url = ""; channel.urlSet = false;
 				channel.key1 = ""; channel.key1Set = false;
@@ -515,15 +517,19 @@ export async function loadKeepalive(): Promise<KeepaliveStatus> {
 
 export async function saveKeepalive(enabled: boolean, interval: number, traffic: number, url: string): Promise<ActionResult> {
 	if (demoMode) {
-		if ((enabled || url !== demoKeepalive.url) && !url.startsWith("https://")) return { success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "kaUrl" };
+		if ((enabled || url !== demoKeepalive.url) && !validKeepaliveUrl(url)) return { success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "kaUrl" };
+		const sameOrigin = validKeepaliveUrl(url) && validKeepaliveUrl(demoKeepalive.url) && new URL(url).origin === new URL(demoKeepalive.url).origin;
+		demoKeepalive.ready = validKeepaliveUrl(url) && traffic <= 512 && (url.startsWith("http://") || (sameOrigin && demoKeepalive.ready));
 		demoKeepalive.url = url;
+		demoKeepalive.trafficKB = traffic;
 	}
 	return waitForAccepted(await postForm("/save", { kaEnabled: enabled, kaIntervalDays: interval, kaTrafficKB: traffic, kaUrl: url }));
 }
 
 export async function provisionKeepaliveCa(): Promise<ActionResult> {
 	if (demoMode) {
-		demoKeepalive.ready = demoKeepalive.url.startsWith("https://");
+		if (!demoKeepalive.url.startsWith("https://")) return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
+		demoKeepalive.ready = validKeepaliveUrl(demoKeepalive.url) && demoKeepalive.trafficKB <= 512;
 		return { success: demoKeepalive.ready, code: demoKeepalive.ready ? "PUSH_CA_INSTALLED" : "PUSH_CA_REJECTED", data: {}, detail: "" };
 	}
 	return provisionCaTarget("/api/keepalive/ca/status", "/api/keepalive/ca/probe", "/api/keepalive/ca/install?");

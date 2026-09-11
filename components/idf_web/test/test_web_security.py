@@ -622,6 +622,137 @@ def parse_esim_status_json(lines):
     return parsed
 
 
+def run_push_save_seam(source: str, legacy_enabled=False):
+    # 執行 production 分類、索引與 Push adapter；只替換 HTTP/NVS 邊界。
+    config = (ROOT / "components/idf_config/include/idf_config.h").read_text()
+    body = function_body(source, "handle_modern_save")
+    admission = body.split("    if (family == ModernSaveFamily::Identity)", 1)[0]
+    push = body[body.index("    if (family == ModernSaveFamily::Push)"):
+                body.index("    if (family == ModernSaveFamily::Wifi)")]
+    if legacy_enabled:
+        push = push.replace("channels[index] = std::move(next);",
+                            'next.enabled = has_field(fields, ("push" + std::to_string(index) + "en").c_str());\n'
+                            "        channels[index] = std::move(next);")
+    harness = r'''
+#include <algorithm>
+#include <cassert>
+#include <cerrno>
+#include <cctype>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+using esp_err_t = int;
+constexpr int ESP_OK=0, ESP_ERR_INVALID_ARG=1, ESP_ERR_NO_MEM=2;
+using IdfFormFields = std::vector<std::pair<std::string, std::string>>;
+struct httpd_req_t {};
+'''
+    for name in ("IDF_MAX_PUSH_CHANNELS", "IDF_MAX_WEB_ACCOUNTS", "IDF_MAX_WIFI_NETWORKS"):
+        harness += re.search(rf"static constexpr int {name} = \d+;", config).group() + "\n"
+    harness += "struct IdfPushChannel {" + definition_body(config, "struct IdfPushChannel {") + "};\n"
+    harness += "enum class ModernSaveFamily : uint8_t {" + definition_body(source, "enum class ModernSaveFamily") + "};\n"
+    for declaration in (
+        "static const std::string* find_field(const IdfFormFields& fields, const char* key)",
+        "static bool has_field(const IdfFormFields& fields, const char* key)",
+        "static std::string field_text(const IdfFormFields& fields, const char* key)",
+        "static bool parse_int_strict(const std::string& text, int& out)",
+        "static int indexed_save_key(const std::string& key, const char* prefix, const char* suffix, int count)",
+        "static ModernSaveFamily modern_save_field_family(const std::string& key)",
+    ):
+        harness += declaration + " {" + definition_body(source, declaration) + "}\n"
+    harness += r'''
+struct Saved { bool pushEnabled; IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS]; } saved;
+int writes=0;
+std::unique_ptr<Saved> idf_config_get_web_snapshot() { return std::make_unique<Saved>(saved); }
+int idf_config_save_push(bool enabled, const IdfPushChannel* channels) {
+    saved.pushEnabled=enabled;
+    std::copy(channels, channels+IDF_MAX_PUSH_CHANNELS, saved.pushChannels);
+    ++writes;
+    return ESP_OK;
+}
+int send_modern_save_result(httpd_req_t*, int err, const char* = "") { return err; }
+'''
+    harness += "int save_push(const IdfFormFields& fields) { httpd_req_t* req=nullptr;" + admission + push + "return ESP_ERR_INVALID_ARG;}\n"
+    harness += r'''
+void assert_provider_unchanged(const IdfPushChannel& expected) {
+    const auto& actual=saved.pushChannels[2];
+    assert(actual.enabled==expected.enabled && "cellular-only save changed provider enabled");
+    assert(actual.type==expected.type && actual.name==expected.name);
+    assert(actual.url==expected.url && actual.key1==expected.key1 && actual.key2==expected.key2);
+    assert(actual.customBody==expected.customBody);
+    assert(actual.titleTemplate==expected.titleTemplate && actual.bodyTemplate==expected.bodyTemplate);
+    assert(saved.pushChannels[0].name=="untouched channel");
+}
+int main() {
+    for(bool enabled:{true,false}) for(int type:{7,9}) {
+        saved={}; writes=0;
+        saved.pushEnabled=!enabled;
+        saved.pushChannels[0].name="untouched channel";
+        auto& channel=saved.pushChannels[2];
+        channel.enabled=enabled; channel.type=type; channel.name="Saved provider";
+        channel.url="https://saved.invalid/push"; channel.key1="saved key 1"; channel.key2="saved key 2";
+        channel.customBody=type==7 ? "{\"message\":\"{message}\"}" : "";
+        channel.titleTemplate=type==7 ? "" : "Saved {sender}";
+        channel.bodyTemplate=type==7 ? "" : "Saved {message}";
+        channel.cellularUrl="https://old.invalid/push";
+        const auto original=channel;
+        assert(save_push({{"push2cellularEnabled","0"}})==ESP_OK);
+        assert(writes==1 && saved.pushEnabled==!enabled);
+        assert_provider_unchanged(original);
+        assert(!channel.cellularEnabled && channel.cellularUrl=="https://old.invalid/push");
+        assert(save_push({{"push2cellularUrlClear","1"}})==ESP_OK);
+        assert_provider_unchanged(original);
+        assert(channel.cellularUrl.empty());
+        assert(save_push({{"push2cellularEnabled","1"},{"push2cellularUrl","https://new.invalid/push"}})==ESP_OK);
+        assert_provider_unchanged(original);
+        assert(channel.cellularEnabled && channel.cellularUrl=="https://new.invalid/push");
+        assert(saved.pushEnabled==!enabled && writes==3);
+        assert(save_push({{"push2type",std::to_string(type)},{"push2name","Disabled"}})==ESP_OK);
+        assert(!channel.enabled && channel.name=="Disabled");
+        assert(save_push({{"push2type",std::to_string(type)},{"push2en","on"}})==ESP_OK);
+        assert(channel.enabled && writes==5);
+        for(const IdfFormFields& invalid:{
+            IdfFormFields{{"push2cellularEnabled","0"},{"push3cellularEnabled","1"}},
+            IdfFormFields{{"push2unknown","1"}},
+            IdfFormFields{{"push2cellularUrl","https://bad.invalid"},{"push2cellularUrlClear","1"}}
+        }) {
+            assert(save_push(invalid)==ESP_ERR_INVALID_ARG && writes==5);
+            assert(channel.enabled && channel.cellularUrl=="https://new.invalid/push");
+        }
+    }
+    // 切換 provider 清除其舊憑證，但不覆寫另一個表單的已儲存行動設定。
+    saved={}; writes=0;
+    auto& channel=saved.pushChannels[2];
+    channel.type=9; channel.url="https://old.invalid/provider"; channel.key1="old secret";
+    channel.cellularEnabled=false; channel.cellularUrl="https://saved.invalid/cellular";
+    assert(save_push({{"push2type","7"},{"push2en","on"},
+                      {"push2url","https://new.invalid/provider"},{"push2body","{\"message\":\"{message}\"}"}})==ESP_OK);
+    assert(!channel.cellularEnabled && "provider change enabled cellular delivery");
+    assert(channel.cellularUrl=="https://saved.invalid/cellular" && "provider change erased cellular override");
+    assert(channel.type==7 && channel.enabled && channel.key1.empty());
+    assert(channel.url=="https://new.invalid/provider" && channel.customBody=="{\"message\":\"{message}\"}");
+    // 舊客戶端的混合提交仍可明確覆寫行動設定。
+    assert(save_push({{"push2type","9"},{"push2en","on"},{"push2cellularEnabled","1"},
+                      {"push2cellularUrl","https://replacement.invalid/cellular"}})==ESP_OK);
+    assert(channel.cellularEnabled && channel.cellularUrl=="https://replacement.invalid/cellular");
+    assert(save_push({{"push2type","7"},{"push2cellularEnabled","0"},{"push2cellularUrlClear","1"}})==ESP_OK);
+    assert(!channel.cellularEnabled && channel.cellularUrl.empty() && writes==3);
+}
+'''
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "push_save.cpp"
+        path.write_text(harness)
+        binary = Path(directory) / "push_save"
+        subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                        str(path), "-o", str(binary)], check=True)
+        return subprocess.run([str(binary)], check=False, capture_output=True, text=True)
+
+
 def main() -> None:
     harness = r'''
 #include <cassert>
@@ -916,6 +1047,11 @@ int main() {
         "psa_key_derivation_abort(&operation)", "psa_key_derivation_setup(&operation, 0)", 1))
 
     source = (WEB / "idf_web.cpp").read_text()
+    push_save = run_push_save_seam(source)
+    assert push_save.returncode == 0, push_save.stderr
+    old_push_save = run_push_save_seam(source, legacy_enabled=True)
+    assert old_push_save.returncode != 0
+    assert "cellular-only save changed provider enabled" in old_push_save.stderr
     assert run_imei_job_seam(source) == [
         {"success": True, "code": "ACTION_MODEM_OK",
          "data": {"imei": "860000000000001"}, "detail": ""},

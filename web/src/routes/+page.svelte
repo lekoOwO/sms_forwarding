@@ -3,6 +3,9 @@
 	import MoonIcon from "@lucide/svelte/icons/moon";
 	import MenuIcon from "@lucide/svelte/icons/menu";
 	import SunIcon from "@lucide/svelte/icons/sun";
+	import InfoIcon from "@lucide/svelte/icons/info";
+	import TriangleAlertIcon from "@lucide/svelte/icons/triangle-alert";
+	import CircleAlertIcon from "@lucide/svelte/icons/circle-alert";
 	import ActionResult from "$lib/components/ActionResult.svelte";
 	import ForwardRulesEditor from "$lib/components/ForwardRulesEditor.svelte";
 	import CellularCaResult from "$lib/components/CellularCaResult.svelte";
@@ -220,15 +223,31 @@
 		return () => window.clearInterval(timer);
 	});
 
-	async function refreshSnapshot() {
+	type PushDraftToKeep = { index: number; group: "provider" | "cellular" };
+	let savedPushChannels: PushChannel[] = [];
+
+	async function refreshSnapshot(keep?: PushDraftToKeep) {
 		loading = true;
 		loadError = "";
 		try {
+			const draft = keep && snapshot?.config.pushChannels[keep.index];
+			const baseline = keep && savedPushChannels[keep.index];
+			const providerDrafts = keep && pushProviderDrafts[keep.index];
+			const clearCellularUrl = keep && cellularUrlClears[keep.index];
 			snapshot = await loadSnapshot();
+			savedPushChannels = snapshot.config.pushChannels.map((channel) => ({ ...channel }));
+			if (keep && draft && baseline) {
+				const keys: (keyof PushChannel)[] = keep.group === "provider"
+					? ["enabled", "type", "name", "url", "urlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"]
+					: ["cellularEnabled", "cellularUrl", "cellularUrlSet"];
+				Object.assign(snapshot.config.pushChannels[keep.index], Object.fromEntries(keys.filter((key) => draft[key] !== baseline[key]).map((key) => [key, draft[key]])));
+			}
 			pushProviderTypes = snapshot.config.pushChannels.map((channel) => channel.type);
 			pushProviderDrafts = snapshot.config.pushChannels.map(() => ({}));
+			if (keep?.group === "provider" && providerDrafts) pushProviderDrafts[keep.index] = providerDrafts;
 			pushCaStatuses = await Promise.all(snapshot.config.pushChannels.map((_channel, index) => loadPushCaStatus(index).catch(() => null)));
 			cellularUrlClears = Array.from({ length: 5 }, () => false);
+			if (keep?.group === "cellular") cellularUrlClears[keep.index] = Boolean(clearCellularUrl);
 			emailEnabledDraft = snapshot.config.emailEnabled;
 			pushEnabledDraft = snapshot.config.pushEnabled;
 			originalWifiSsids = snapshot.config.wifiProfiles.map((profile) => profile.ssid);
@@ -410,7 +429,7 @@
 		if (profile) void runEsimAction("delete", profile);
 	}
 
-	async function save(setResult: (value: UiResult) => void, values: Record<string, string | number | boolean>) {
+	async function save(setResult: (value: UiResult) => void, values: Record<string, string | number | boolean>, keep?: PushDraftToKeep) {
 		const invalid = tooLong(values);
 		if (invalid) {
 			setResult({ state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: invalid });
@@ -423,7 +442,7 @@
 			if (response.success) {
 				const cellularField = Object.keys(values).find((field) => /^push[0-4]cellularEnabled$/.test(field));
 				const cellularIndex = cellularField ? Number(cellularField[4]) : -1;
-				await refreshSnapshot();
+				await refreshSnapshot(keep);
 				if (cellularIndex >= 0 && snapshot?.config.pushChannels[cellularIndex]?.cellularEnabled) await provisionCa(cellularIndex);
 			}
 		} catch (error) {
@@ -471,9 +490,28 @@
 		}
 	}
 
+	let pushInvalid = $state<Record<string, boolean>>({});
+
+	function updatePushValidity(event: Event) {
+		const input = event.currentTarget as HTMLInputElement | HTMLTextAreaElement;
+		pushInvalid[input.id] = !input.validity.valid;
+	}
+
+	function savePush(index: number) {
+		const form = document.getElementById(`push-form-${index}`);
+		if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+		void save((value) => pushResult = value, pushValues(index), { index, group: "cellular" });
+	}
+
 	function saveCellular(index: number) {
-		pushTab = String(index);
-		void save((value) => pushCellularSaveResults[index] = value, pushValues());
+		const form = document.getElementById(`push-cellular-form-${index}`);
+		const channel = snapshot?.config.pushChannels[index];
+		if (!channel || !(form instanceof HTMLFormElement) || !form.reportValidity()) return;
+		void save((value) => pushCellularSaveResults[index] = value, {
+			[`push${index}cellularEnabled`]: channel.cellularEnabled ? 1 : 0,
+			...(channel.cellularUrl ? { [`push${index}cellularUrl`]: channel.cellularUrl } : {}),
+			...(!channel.cellularUrl && cellularUrlClears[index] ? { [`push${index}cellularUrlClear`]: 1 } : {})
+		}, { index, group: "provider" });
 	}
 
 	async function sendSms() {
@@ -589,6 +627,7 @@
 	}
 
 	function changeProvider(channel: PushChannel, index: number) {
+		pushInvalid = {};
 		const previousType = pushProviderTypes[index] ?? channel.type;
 		switchProviderDraft(
 			channel,
@@ -605,15 +644,11 @@
 		return !value && isSet ? t("sensitiveValueSavedHint") : "";
 	}
 
-	function pushValues() {
+	function pushValues(index: number) {
 		const values: Record<string, string | number | boolean> = {};
-		const index = Number(pushTab);
 		const channel = snapshot?.config.pushChannels[index];
 		if (!channel) return values;
 		values[`push${index}en`] = channel.enabled;
-		values[`push${index}cellularEnabled`] = channel.cellularEnabled ? 1 : 0;
-		if (channel.cellularUrl) values[`push${index}cellularUrl`] = channel.cellularUrl;
-		else if (cellularUrlClears[index]) values[`push${index}cellularUrlClear`] = 1;
 		values[`push${index}type`] = channel.type;
 		values[`push${index}name`] = channel.name;
 		if (channel.url) values[`push${index}url`] = channel.url;
@@ -763,10 +798,11 @@
 		</div>
 	{:else if loadError || !snapshot}
 		<Alert.Root variant="destructive">
+			<CircleAlertIcon aria-hidden="true" />
 			<Alert.Title>{t("loadErrorTitle")}</Alert.Title>
 			<Alert.Description class="flex flex-col items-start gap-3">
 				<span>{loadError}</span>
-				<Button variant="outline" onclick={refreshSnapshot}>{t("retry")}</Button>
+				<Button variant="outline" onclick={() => void refreshSnapshot()}>{t("retry")}</Button>
 			</Alert.Description>
 		</Alert.Root>
 	{:else}
@@ -795,7 +831,7 @@
 			{#if mainTab === "overview"}
 					<section class="flex flex-col gap-6">
 						<div><h1 class="text-2xl font-semibold tracking-tight">{t("overviewTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("overviewDescription")}</p></div>
-						{#if snapshot.status.apMode}<Alert.Root><Alert.Title>{t("apModeTitle")}</Alert.Title><Alert.Description>{t("apModeDescription")} <strong>http://192.168.1.1</strong></Alert.Description></Alert.Root>{/if}
+						{#if snapshot.status.apMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("apModeTitle")}</Alert.Title><Alert.Description>{t("apModeDescription")} <strong>http://192.168.1.1</strong></Alert.Description></Alert.Root>{/if}
 					<dl data-overview-group="identity" class="grid gap-6 md:grid-cols-2">
 						{#each [
 							["deviceName", t("deviceName"), snapshot.config.deviceName],
@@ -803,7 +839,7 @@
 						] as item (item[0])}
 							<div class="min-w-0 border-l-2 pl-4">
 								<dt class="text-sm text-muted-foreground">{item[1]}</dt>
-								<dd class="mt-1 truncate text-lg font-semibold tabular-nums" title={item[2]}>{item[2]}</dd>
+								<dd class="mt-1 text-lg font-semibold tabular-nums [overflow-wrap:anywhere]" title={item[2]}>{item[2]}</dd>
 							</div>
 						{/each}
 					</dl>
@@ -816,7 +852,7 @@
 						] as item (item[0])}
 							<div class="min-w-0 border-l-2 pl-4">
 								<dt class="text-sm text-muted-foreground">{item[1]}</dt>
-								<dd class="mt-1 truncate text-lg font-semibold tabular-nums" title={item[2]}>{item[2]}</dd>
+								<dd class="mt-1 text-lg font-semibold tabular-nums [overflow-wrap:anywhere]" title={item[2]}>{item[2]}</dd>
 							</div>
 						{/each}
 					</dl>
@@ -861,7 +897,7 @@
 								<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("heartbeatTitle")}</span><Badge variant={snapshot.config.heartbeatEnable ? "secondary" : "outline"}>{snapshot.config.heartbeatEnable ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-5">
 									<p class="text-muted-foreground">{t("heartbeatDescription")}</p>
-									<Alert.Root><Alert.Title>{t("heartbeatNtpTitle")}</Alert.Title><Alert.Description>{t("heartbeatNtpDescription")}</Alert.Description></Alert.Root>
+									<Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("heartbeatNtpTitle")}</Alert.Title><Alert.Description>{t("heartbeatNtpDescription")}</Alert.Description></Alert.Root>
 									<form id="heartbeat-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((value) => heartbeatResult = value, { heartbeatEnable: c.heartbeatEnable, heartbeatInterval: c.heartbeatInterval }); }}>
 										<Field.Group>
 											<Field.Field orientation="horizontal"><Field.Label for="heartbeat-enabled">{t("heartbeatEnabled")}</Field.Label><Switch id="heartbeat-enabled" bind:checked={snapshot.config.heartbeatEnable} /></Field.Field>
@@ -878,7 +914,7 @@
 						</Accordion.Item>
 						<Accordion.Item value="push">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("pushTitle")}</span><Badge variant={snapshot.status.enabledPushChannels > 0 ? "secondary" : "outline"}>{snapshot.status.enabledPushChannels} / 5</Badge></span></Accordion.Trigger>
-			<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel, index)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-url-${index}`}>{endpointLabel(channel.type)}</Field.Label><Input id={`push-url-${index}`} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if pushProviderKeyFields(channel.type).includes("key1")}<Field.Field><Field.Label for={`push-key1-${index}`}>{keyLabel(channel.type, "key1")}</Field.Label><Input id={`push-key1-${index}`} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyTokenHint")}</Field.Description>{/if}</Field.Field>{/if}{#if pushProviderKeyFields(channel.type).includes("key2")}<Field.Field><Field.Label for={`push-key2-${index}`}>{keyLabel(channel.type, "key2")}</Field.Label><Input id={`push-key2-${index}`} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyChannelHint")}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2"><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} rows={5} class="font-mono" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><p class="text-sm text-muted-foreground" role={pushTestResults[index].done && !pushTestResults[index].success ? "alert" : "status"} aria-live="polite">{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</p></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button onclick={() => save((v) => pushResult = v, pushValues())} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+			<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><form id={`push-form-${index}`} onsubmit={(event) => { event.preventDefault(); savePush(index); }}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel, index)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-url-${index}`]}><Field.Label for={`push-url-${index}`}>{endpointLabel(channel.type)}</Field.Label><Input id={`push-url-${index}`} aria-invalid={pushInvalid[`push-url-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if pushProviderKeyFields(channel.type).includes("key1")}<Field.Field data-invalid={pushInvalid[`push-key1-${index}`]}><Field.Label for={`push-key1-${index}`}>{keyLabel(channel.type, "key1")}</Field.Label><Input id={`push-key1-${index}`} aria-invalid={pushInvalid[`push-key1-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyTokenHint")}</Field.Description>{/if}</Field.Field>{/if}{#if pushProviderKeyFields(channel.type).includes("key2")}<Field.Field data-invalid={pushInvalid[`push-key2-${index}`]}><Field.Label for={`push-key2-${index}`}>{keyLabel(channel.type, "key2")}</Field.Label><Input id={`push-key2-${index}`} aria-invalid={pushInvalid[`push-key2-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyChannelHint")}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-body-${index}`]}><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} aria-invalid={pushInvalid[`push-body-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} rows={5} class="font-mono" spellcheck={false} autocapitalize="none" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><Alert.Root variant={pushTestResults[index].done && !pushTestResults[index].success ? "destructive" : "info"} aria-live="polite">{#if pushTestResults[index].done && !pushTestResults[index].success}<CircleAlertIcon aria-hidden="true" />{:else}<InfoIcon aria-hidden="true" />{/if}<Alert.Title>{t("pushTestTitle")}</Alert.Title><Alert.Description>{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</Alert.Description></Alert.Root></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></form></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button type="submit" form={`push-form-${pushTab}`} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
 						</Accordion.Item>
 						<Accordion.Item value="push-cellular">
 							<Accordion.Trigger>{t("cellularPushTitle")}</Accordion.Trigger>
@@ -886,8 +922,8 @@
 								{#each snapshot.config.pushChannels as channel, index (index)}
 									<Card.Root>
 										<Card.Header><Card.Title>{channel.name || `${t("pushChannel")} ${index + 1}`}</Card.Title><Card.Description>{t("cellularPushDescription")}</Card.Description></Card.Header>
-										<Card.Content><Field.Group><Field.Field orientation="horizontal"><Field.Label for={`push-cellular-enabled-${index}`}>{t("cellularPushEnabled")}</Field.Label><Switch id={`push-cellular-enabled-${index}`} bind:checked={channel.cellularEnabled} /></Field.Field><Field.Field><Field.Label for={`push-cellular-url-${index}`}>{t("cellularPushUrl")}</Field.Label><Input id={`push-cellular-url-${index}`} type="url" placeholder={t("cellularPushUrlInherited")} bind:value={channel.cellularUrl} />{#if savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}<Field.Description>{savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}</Field.Description>{/if}<Button type="button" variant="ghost" disabled={!channel.cellularUrlSet && !channel.cellularUrl} onclick={() => { channel.cellularUrl = ""; cellularUrlClears[index] = true; }}>{t("cellularPushUrlClear")}</Button></Field.Field><CellularCaResult status={pushCaStatuses[index]} saveResult={pushCellularSaveResults[index]} result={pushCaResults[index]} title={t("cellularCaStatus")} saveTitle={t("resultTitle")} ready={t("cellularCaReady")} notReady={t("cellularCaNotReady")} {locale} /></Field.Group></Card.Content>
-										<Card.Footer class="flex-wrap justify-end gap-2"><Button variant="outline" disabled={pushCaResults[index].state === "loading" || !channel.cellularEnabled} onclick={() => void provisionCa(index)}>{#if pushCaResults[index].state === "loading"}<Spinner data-icon="inline-start" />{/if}{t("cellularCaProvision")}</Button><Button disabled={pushCellularSaveResults[index].state === "loading"} onclick={() => saveCellular(index)}>{t("commonSave")}</Button></Card.Footer>
+										<Card.Content><form id={`push-cellular-form-${index}`} onsubmit={(event) => { event.preventDefault(); saveCellular(index); }}><Field.Group><Field.Field orientation="horizontal"><Field.Label for={`push-cellular-enabled-${index}`}>{t("cellularPushEnabled")}</Field.Label><Switch id={`push-cellular-enabled-${index}`} bind:checked={channel.cellularEnabled} /></Field.Field><Field.Field data-invalid={pushInvalid[`push-cellular-url-${index}`]}><Field.Label for={`push-cellular-url-${index}`}>{t("cellularPushUrl")}</Field.Label><Input id={`push-cellular-url-${index}`} aria-invalid={pushInvalid[`push-cellular-url-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} type="url" placeholder={t("cellularPushUrlInherited")} bind:value={channel.cellularUrl} />{#if savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}<Field.Description>{savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}</Field.Description>{/if}<Button type="button" variant="ghost" disabled={!channel.cellularUrlSet && !channel.cellularUrl} onclick={() => { channel.cellularUrl = ""; cellularUrlClears[index] = true; pushInvalid[`push-cellular-url-${index}`] = false; }}>{t("cellularPushUrlClear")}</Button></Field.Field><CellularCaResult status={pushCaStatuses[index]} saveResult={pushCellularSaveResults[index]} result={pushCaResults[index]} title={t("cellularCaStatus")} saveTitle={t("resultTitle")} ready={t("cellularCaReady")} notReady={t("cellularCaNotReady")} {locale} /></Field.Group></form></Card.Content>
+										<Card.Footer class="flex-wrap justify-end gap-2"><Button variant="outline" disabled={pushCaResults[index].state === "loading" || !channel.cellularEnabled} onclick={() => void provisionCa(index)}>{#if pushCaResults[index].state === "loading"}<Spinner data-icon="inline-start" />{/if}{t("cellularCaProvision")}</Button><Button type="submit" form={`push-cellular-form-${index}`} disabled={pushCellularSaveResults[index].state === "loading"}>{t("commonSave")}</Button></Card.Footer>
 									</Card.Root>
 								{/each}
 							</Accordion.Content>
@@ -951,7 +987,7 @@
 							<Button variant="outline" onclick={() => void refreshEsim()} disabled={esimLoading}><span class="flex items-center gap-2">{#if esimLoading}<Spinner data-icon="inline-start" />{/if}{t("esimRefresh")}</span></Button>
 						</div>
 						{#if esimError}
-							<Alert.Root variant="destructive"><Alert.Title>{t("esimError")}</Alert.Title><Alert.Description class="flex flex-col items-start gap-3"><span>{t("esimErrorBody")}</span><Button variant="outline" onclick={() => void refreshEsim()}>{t("retry")}</Button></Alert.Description></Alert.Root>
+							<Alert.Root variant="destructive"><CircleAlertIcon aria-hidden="true" /><Alert.Title>{t("esimError")}</Alert.Title><Alert.Description class="flex flex-col items-start gap-3"><span>{t("esimErrorBody")}</span><Button variant="outline" onclick={() => void refreshEsim()}>{t("retry")}</Button></Alert.Description></Alert.Root>
 						{:else if esimLoading && !esim}
 							<div class="grid gap-4 sm:grid-cols-2"><Skeleton class="h-32" /><Skeleton class="h-32" /></div>
 						{:else if esim}
@@ -980,7 +1016,7 @@
 										</form>
 									{/if}
 									{#if esim.job.notificationPending || esim.job.code === "ACTION_ESIM_INSTALLATION_UNCERTAIN"}
-										<Alert.Root><Alert.Title>{t("esimInstallNotice")}</Alert.Title><Alert.Description>{t(esim.job.notificationPending ? "ACTION_ESIM_NOTIFICATION_PENDING" : "ACTION_ESIM_INSTALLATION_UNCERTAIN")}</Alert.Description></Alert.Root>
+										<Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("esimInstallNotice")}</Alert.Title><Alert.Description>{t(esim.job.notificationPending ? "ACTION_ESIM_NOTIFICATION_PENDING" : "ACTION_ESIM_INSTALLATION_UNCERTAIN")}</Alert.Description></Alert.Root>
 									{/if}
 								</Card.Content>
 							</Card.Root>
@@ -1033,7 +1069,7 @@
 								<Accordion.Trigger>{t("wifiProfilesTitle")}</Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-5">
 									<p class="text-muted-foreground">{t("wifiProfilesDescription")}</p>
-									{#if snapshot.status.apMode}<Alert.Root><Alert.Title>{t("apModeTitle")}</Alert.Title><Alert.Description>{t("apModeDescription")} <strong>http://192.168.1.1</strong></Alert.Description></Alert.Root>{/if}
+									{#if snapshot.status.apMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("apModeTitle")}</Alert.Title><Alert.Description>{t("apModeDescription")} <strong>http://192.168.1.1</strong></Alert.Description></Alert.Root>{/if}
 									<Tabs.Root bind:value={wifiTab} class="flex flex-col gap-6">
 										<div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.wifiProfiles as profile, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{t("wifiProfile")} {index + 1}</span><Badge variant={profile.ssid ? "secondary" : "outline"}>{profile.ssid ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>
 										{#each snapshot.config.wifiProfiles as profile, index (index)}
@@ -1055,7 +1091,7 @@
 							<Accordion.Item value="network-mode">
 								<Accordion.Trigger>{t("networkModeTitle")}</Accordion.Trigger>
 								<Accordion.Content class="flex flex-col gap-5">
-									<Alert.Root><Alert.Title>{t("networkModeWarningTitle")}</Alert.Title><Alert.Description>{t("networkModeWarningDescription")}</Alert.Description></Alert.Root>
+									<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("networkModeWarningTitle")}</Alert.Title><Alert.Description>{t("networkModeWarningDescription")}</Alert.Description></Alert.Root>
 									<form id="network-mode-form" data-device-action="network-mode-save" onsubmit={(event) => { event.preventDefault(); void save((value) => networkModeResult = value, { networkMode: snapshot!.config.networkMode }); }}>
 										<Field.Field><Field.Label for="network-mode">{t("networkMode")}</Field.Label><NativeSelect.Root id="network-mode" class="w-full" bind:value={snapshot.config.networkMode}><NativeSelect.Option value={0}>{t("networkModeWifiOnly")}</NativeSelect.Option><NativeSelect.Option value={1}>{t("networkMode4gOnly")}</NativeSelect.Option><NativeSelect.Option value={2}>{t("networkModeMix")}</NativeSelect.Option></NativeSelect.Root><Field.Description>{t("networkModeHint")}</Field.Description></Field.Field>
 									</form>
@@ -1080,24 +1116,24 @@
 							</section>
 							<section class="device-tool-group" data-tool-group="history" aria-labelledby="device-group-history">
 								<div class="device-tool-group-heading"><h2 id="device-group-history">{t("deviceHistoryTitle")}</h2><p>{t("deviceHistoryDescription")}</p></div>
-								<div class="device-tool-content"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header></Empty.Root>{:else}<pre class="max-h-[28rem] overflow-auto rounded-lg bg-muted p-4 text-xs whitespace-pre-wrap break-words">{logs.join("\n")}</pre>{/if}<div class="flex justify-end"><Button variant="outline" data-device-action="diagnostics-logs-refresh" onclick={refreshLogs}>{t("refresh")}</Button></div><ActionResult result={logsResult} title={t("resultTitle")} {locale} /></div>
+								<div class="device-tool-content"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header></Empty.Root>{:else}<Textarea readonly spellcheck={false} aria-label={t("logTitle")} class="field-sizing-fixed h-80 max-h-[28rem] min-h-48 resize-y font-mono" value={logs.join("\n")} />{/if}<div class="flex justify-end"><Button variant="outline" data-device-action="diagnostics-logs-refresh" onclick={refreshLogs}>{t("refresh")}</Button></div><ActionResult result={logsResult} title={t("resultTitle")} {locale} /></div>
 							</section>
 						</div>
 						{:else if deviceSubpage === "advanced"}
 						<div class="device-subpage" data-device-subpage="advanced">
 							<section class="device-tool-group device-tool-group-danger" data-tool-group="danger" aria-labelledby="device-group-danger">
 							<div class="device-tool-group-heading"><div><h2 id="device-group-danger" class="text-sm font-semibold">{t("deviceGroupDanger")}</h2><p class="mt-1 text-xs text-muted-foreground">{t("deviceGroupDangerDescription")}</p></div></div>
-								<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="advanced-wifi-restart" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" data-device-action="advanced-flight-toggle" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" data-device-action="advanced-modem-restart" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" data-device-action="advanced-modem-hard-reset" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form data-device-action="advanced-at-terminal" onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+								<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="advanced-wifi-restart" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" data-device-action="advanced-flight-toggle" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" data-device-action="advanced-modem-restart" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" data-device-action="advanced-modem-hard-reset" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form data-device-action="advanced-at-terminal" onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} class="font-mono" spellcheck={false} autocapitalize="none" required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 							</section>
 						</div>
 						{:else}
 						<div class="device-subpage" data-device-subpage="maintenance">
 							<section class="device-tool-group" data-tool-group="maintenance" aria-labelledby="device-group-maintenance">
 							<div class="device-tool-group-heading"><h2 id="device-group-maintenance" class="text-sm font-semibold">{t("deviceGroupMaintenance")}</h2></div>
-								<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button data-device-action="maintenance-backup" disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-							<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" data-device-action="maintenance-restore" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-							<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("otaDescription")}</p>{#if demoMode}<Alert.Root><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button data-device-action="maintenance-ota" disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+								<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button data-device-action="maintenance-backup" disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" data-device-action="maintenance-restore" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><dl><div><dt class="text-sm text-muted-foreground">{t("firmwareVersion")}</dt><dd data-firmware-version>{snapshot.status.firmwareVersion}</dd></div></dl><p class="text-muted-foreground">{t("otaReleaseBefore")}<a class="underline underline-offset-4 hover:text-foreground" href="https://github.com/lekoOwO/sms_forwarding/releases" target="_blank" rel="noopener noreferrer">{t("otaReleaseLink")}</a>{t("otaReleaseAfter")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button data-device-action="maintenance-ota" disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
 							</section>
 						</div>
 						{/if}
@@ -1107,7 +1143,7 @@
 				{:else}
 					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("securityTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("securityDescription")}</p></div>
-					<Alert.Root><Alert.Title>{t("securityWarningTitle")}</Alert.Title><Alert.Description>{t("securityWarningBody")}</Alert.Description></Alert.Root>
+					<Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("securityWarningTitle")}</Alert.Title><Alert.Description>{t("securityWarningBody")}</Alert.Description></Alert.Root>
 					<Card.Root data-security-updates>
 						<Card.Header>
 							<div class="flex flex-wrap items-start justify-between gap-3">
@@ -1122,9 +1158,9 @@
 						</Card.Header>
 						<Card.Content>
 							{#if otaStateError === "unsupported"}
-								<Alert.Root><Alert.Description>{t("otaStateUnsupported")}</Alert.Description></Alert.Root>
+								<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("otaStateTitle")}</Alert.Title><Alert.Description>{t("otaStateUnsupported")}</Alert.Description></Alert.Root>
 							{:else if otaStateError === "unavailable"}
-								<Alert.Root variant="destructive"><Alert.Description>{t("otaStateUnavailable")}</Alert.Description></Alert.Root>
+								<Alert.Root variant="destructive"><CircleAlertIcon aria-hidden="true" /><Alert.Title>{t("otaStateTitle")}</Alert.Title><Alert.Description>{t("otaStateUnavailable")}</Alert.Description></Alert.Root>
 							{:else if otaState}
 								<dl class="grid min-w-0 gap-4 sm:grid-cols-2">
 									<div class="min-w-0"><dt class="text-sm text-muted-foreground">{t("otaStateSlot")}</dt><dd class="mt-1 font-medium">{otaSlotLabel(otaState.activeOffset)}</dd></div>
@@ -1153,9 +1189,3 @@
 		<div class="flex justify-end gap-2"><Button variant="outline" onclick={cancelDelete}>{t("esimDeleteCancel")}</Button><Button variant="destructive" onclick={confirmDelete}>{t("esimDeleteConfirm")}</Button></div>
 	</div>
 </dialog>
-
-{#if snapshot}
-	<footer class="px-4 py-6 text-center text-xs text-muted-foreground" aria-label="Firmware version">
-		{snapshot.status.firmwareVersion}
-	</footer>
-{/if}

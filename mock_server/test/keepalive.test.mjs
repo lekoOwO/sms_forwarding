@@ -3,7 +3,7 @@ import test from "node:test";
 import { request as httpRequest } from "node:http";
 import { createApp } from "../server.mjs";
 
-test("keepalive uses its own certificate target, rejects HTTP and supports cancellation", async () => {
+test("keepalive accepts public HTTP without CA and keeps HTTPS certificate targets isolated", async () => {
 		let clock = Date.now();
 		const server = createApp({ jobDelayMs: 20, now: () => clock }).listen(0, "127.0.0.1");
 	await new Promise((resolve) => server.once("listening", resolve));
@@ -36,7 +36,15 @@ test("keepalive uses its own certificate target, rejects HTTP and supports cance
 		assert.equal((await request("/api/keepalive/ca/status?channel=0")).status, 400);
 		assert.equal((await request("/api/push/ca/status?channel=5")).status, 400);
 		const save = (url, enabled = false) => request("/save", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ kaUrl: url, kaIntervalDays: "175", kaTrafficKB: "1", ...(enabled ? { kaEnabled: "on" } : {}) }) });
-		assert.equal((await finish(await save("http://example.test/file", true))).success, false);
+		assert.equal((await finish(await save("http://example.test/file"))).success, true);
+		const plain = await (await request("/api/keepalive")).json();
+		assert.equal(plain.ready, true);
+		assert.equal(plain.enabled, false);
+		assert.equal((await request("/api/keepalive/ca/probe", { method: "POST" })).status, 409);
+		for (const url of ["ftp://example.test/file", "http://user:pass@example.test/file", "http://example.test/file#fragment", "http://example.test/a b"]) {
+			assert.equal((await finish(await save(url))).success, false);
+			clock += 60001;
+		}
 		assert.equal((await finish(await save("https://example.test/file"))).success, true);
 		const probe = await finish(await request("/api/keepalive/ca/probe", { method: "POST" }));
 		assert.equal(probe.code, "PUSH_CA_PROBE_READY");

@@ -2919,9 +2919,11 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         const auto& current = *snapshot;
         const std::string url = has_field(fields, "kaUrl") ? field_text(fields, "kaUrl") : current.kaUrl;
         const bool enabled = has_field(fields, "kaEnabled");
-        IdfPushCellularTarget target;
+        IdfModemHttpsTarget target;
+        bool plain_http = false;
+        std::string url_error;
         if (current.kaAction == 1 && (enabled || (has_field(fields, "kaUrl") && url != current.kaUrl)) &&
-            !idf_push_prepare_keepalive_target(url, target)) {
+            !idf_modem_keepalive_parse_url(url, target, plain_http, url_error)) {
             return send_modern_save_result(req, ESP_ERR_INVALID_ARG, "kaUrl");
         }
         int interval = current.kaIntervalDays;
@@ -2989,8 +2991,14 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
 
     if (family == ModernSaveFamily::Push) {
         int index = -1;
+        bool cellular_only = true;
         for (const auto& field : fields) {
-            if (field.first == "pushEnabled") continue;
+            if (field.first == "pushEnabled") { cellular_only = false; continue; }
+            if (indexed_save_key(field.first, "push", "cellularEnabled", IDF_MAX_PUSH_CHANNELS) < 0 &&
+                indexed_save_key(field.first, "push", "cellularUrl", IDF_MAX_PUSH_CHANNELS) < 0 &&
+                indexed_save_key(field.first, "push", "cellularUrlClear", IDF_MAX_PUSH_CHANNELS) < 0) {
+                cellular_only = false;
+            }
             int parsed = -1;
             for (const char* suffix : {"en", "type", "name", "url", "key1", "key2", "body", "title", "template",
                                        "cellularEnabled", "cellularUrl", "cellularUrlClear"}) {
@@ -3024,8 +3032,13 @@ static esp_err_t handle_modern_save(httpd_req_t* req, const IdfFormFields& field
         }
         IdfPushChannel next = type == current.pushChannels[index].type
             ? current.pushChannels[index] : IdfPushChannel();
+        if (type != current.pushChannels[index].type) {
+            next.cellularEnabled = current.pushChannels[index].cellularEnabled;
+            next.cellularUrl = current.pushChannels[index].cellularUrl;
+        }
         next.type = static_cast<uint8_t>(type);
-        snprintf(key, sizeof(key), "push%den", index); next.enabled = has_field(fields, key);
+        snprintf(key, sizeof(key), "push%den", index);
+        if (!cellular_only) next.enabled = has_field(fields, key);
         snprintf(key, sizeof(key), "push%dname", index); if (has_field(fields, key)) next.name = field_text(fields, key);
         snprintf(key, sizeof(key), "push%durl", index); if (!field_text(fields, key).empty()) next.url = field_text(fields, key);
         snprintf(key, sizeof(key), "push%dcellularEnabled", index);
@@ -4714,15 +4727,19 @@ static bool keepalive_traffic_preflight(const IdfKeepaliveRunView& cfg, std::str
         message = "Keepalive traffic exceeds the safe 512 KB UART runtime limit";
         return false;
     }
-    IdfPushCellularTarget target;
-    if (!idf_push_prepare_keepalive_target(cfg.kaUrl, target)) {
-        message = "Keepalive requires an HTTPS download URL; the saved HTTP URL has not been changed";
+    IdfModemHttpsTarget parsed;
+    bool plain_http = false;
+    if (!idf_modem_keepalive_parse_url(cfg.kaUrl, parsed, plain_http, message)) {
         return false;
     }
-    IdfConfigCaStatus ca;
-    if (idf_config_ca_status(target.canonicalOrigin, ca) != ESP_OK || !ca.configured) {
-        message = "Check and set up the keepalive root CA first";
-        return false;
+    if (!plain_http) {
+        IdfPushCellularTarget target;
+        IdfConfigCaStatus ca;
+        if (!idf_push_prepare_keepalive_target(cfg.kaUrl, target) ||
+            idf_config_ca_status(target.canonicalOrigin, ca) != ESP_OK || !ca.configured) {
+            message = "Check and set up the keepalive root CA first";
+            return false;
+        }
     }
     if (!epoch_valid(static_cast<uint32_t>(time(nullptr)))) {
         message = "Keepalive requires synchronized device time";
@@ -4730,7 +4747,7 @@ static bool keepalive_traffic_preflight(const IdfKeepaliveRunView& cfg, std::str
     }
     const IdfModemStatus modem = idf_modem_get_status();
     if (!idf_modem_https_model_allowed(modem.model)) {
-        message = "Cellular HTTPS keepalive currently supports ML307A only";
+        message = "Cellular keepalive currently supports ML307A only";
         return false;
     }
     if (cfg.kaProfile.empty() && (!modem.atReady || modem.ceregStat != 1)) {
@@ -4800,11 +4817,15 @@ static void keepalive_task(void* arg_raw)
                 s_keepalive_requests.store(requests);
                 s_keepalive_bytes.store(bytes);
             };
-            if (!idf_push_prepare_keepalive_target(cfg.kaUrl, target) ||
-                idf_config_ca_lookup(target.canonicalOrigin, http.rootCertificateDer, &ca) != ESP_OK) {
+            IdfModemHttpsTarget parsed;
+            bool plain_http = false;
+            const bool valid_url = idf_modem_keepalive_parse_url(cfg.kaUrl, parsed, plain_http, message);
+            if (!valid_url || (!plain_http &&
+                (!idf_push_prepare_keepalive_target(cfg.kaUrl, target) ||
+                 idf_config_ca_lookup(target.canonicalOrigin, http.rootCertificateDer, &ca) != ESP_OK))) {
                 message = "Keepalive root CA is unavailable";
             } else {
-                http.rootCertificateSha256 = ca.sha256;
+                if (!plain_http) http.rootCertificateSha256 = ca.sha256;
                 IdfCellularHttpResult response;
                 ok = idf_modem_cellular_http_get(cfg.kaUrl, http, response) == ESP_OK && response.ok;
                 message = response.message;

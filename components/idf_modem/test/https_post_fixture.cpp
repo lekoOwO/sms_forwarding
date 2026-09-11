@@ -1040,6 +1040,7 @@ struct RemoteCloseTranscript {
     uint8_t encoding_receive = 0;
     uint8_t autofree = 0;
     bool pdp_active = true;
+    uint16_t port = 443;
     CleanupCloseState cleanup_close_state = CleanupCloseState::initial;
     std::string current_apn = "fixture";
     std::string current_profile = "1,\"IPV4V6\",\"fixture\",,0,0,,,,";
@@ -1353,7 +1354,7 @@ struct RemoteCloseTranscript {
             response = frame(command, "");
             return IdfModemHttpsCommandResult::ok;
         }
-        constexpr std::string_view open_prefix = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\",443,";
+        const std::string open_prefix = "AT+MIPOPEN=0,\"TCP\",\"fixture.example\"," + std::to_string(transcript.port) + ",";
         if (command.compare(0, open_prefix.size(), open_prefix) == 0) {
             ++transcript.open_commands;
             transcript.open_latch.begin();
@@ -1514,7 +1515,8 @@ struct RemoteCloseTranscript {
 
 IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transcript,
                                                    IdfModemHttpsPostResult& result,
-                                                   bool get_request = false)
+                                                   bool get_request = false,
+                                                   bool plain_keepalive = false)
 {
     IdfModemHttpsPostRequest request;
     request.url = "https://fixture.example/notify";
@@ -1537,7 +1539,17 @@ IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transc
         transcript.mode == RemoteCloseMode::tls_handshake_failure ? -1 : 0;
     fixture_tls_read_result =
         transcript.mode == RemoteCloseMode::tls_read_failure ? -7 : 0;
-    const IdfModemHttpsRunResult outcome = idf_modem_https_run_post(request, callbacks, result);
+    if (plain_keepalive) {
+        transcript.port = 80;
+        request.url = "http://fixture.example/notify";
+        request.rootCertificateDer.clear();
+        request.rootCertificateSha256.fill(0);
+        fixture_tls_setup_result = -1;
+        fixture_tls_handshake_result = -1;
+    }
+    const IdfModemHttpsRunResult outcome = plain_keepalive
+        ? idf_modem_keepalive_run_get(request, callbacks, result)
+        : idf_modem_https_run_post(request, callbacks, result);
     fixture_tls_setup_result = 0;
     fixture_tls_handshake_result = 0;
     fixture_tls_read_result = 0;
@@ -2242,6 +2254,50 @@ void check_invalid_request_stages()
 
 int main()
 {
+    RemoteCloseTranscript plain{RemoteCloseMode::data_then_disconnect};
+    plain.pdp_active = false;
+    IdfModemHttpsPostResult plain_result;
+    assert(run_remote_close_transcript(plain, plain_result, true, true) == IdfModemHttpsRunResult::ok);
+    assert(plain_result.ok && plain_result.bodyBytes == 4 && !plain.pdp_active);
+    assert(plain.sent_wire == "GET /notify HTTP/1.1\r\nHost: fixture.example\r\nConnection: close\r\n\r\n");
+    assert(plain.close_commands == 1 && plain.close_was_cleanup && !plain_result.cleanupRequiresReset);
+    for (const auto mode : {RemoteCloseMode::response_read_http_parse,
+                            RemoteCloseMode::response_read_http_incomplete,
+                            RemoteCloseMode::response_read_modem_failure,
+                            RemoteCloseMode::open_result_failed}) {
+        RemoteCloseTranscript failed{mode};
+        failed.pdp_active = false;
+        assert(run_remote_close_transcript(failed, plain_result, true, true) != IdfModemHttpsRunResult::ok);
+        assert(!plain_result.ok && !failed.pdp_active && failed.close_was_cleanup);
+    }
+    {
+        IdfModemHttpsTarget target;
+        bool plain_http = false;
+        std::string error;
+        assert(idf_modem_keepalive_parse_url("http://example.test/body?size=1024", target, plain_http, error));
+        assert(plain_http && target.port == 80 && target.path == "/body?size=1024");
+        assert(idf_modem_keepalive_parse_url("http://example.test:8080/body", target, plain_http, error));
+        assert(target.port == 8080);
+        for (const auto url : {"http://user:pass@example.test/x", "http://example.test/x#y",
+                               "http://example.test/a b", "http://example.test/x\r\nX: y",
+                               "http://example.test/x\\y", "ftp://example.test/x"}) {
+            assert(!idf_modem_keepalive_parse_url(url, target, plain_http, error));
+        }
+        IdfModemHttpsPostRequest request;
+        request.url = "http://example.test/body";
+        request.method = IdfModemHttpsMethod::Get;
+        request.contentType.clear();
+        assert(idf_modem_keepalive_validate_request(request, error));
+        assert(!idf_modem_https_validate_request(request, error));
+        request.headerName = "Authorization"; request.headerValue = "secret";
+        assert(!idf_modem_keepalive_validate_request(request, error));
+        request.headerName.clear(); request.headerValue.clear(); request.body = "payload";
+        assert(!idf_modem_keepalive_validate_request(request, error));
+        request.body.clear(); request.method = IdfModemHttpsMethod::Post;
+        assert(!idf_modem_keepalive_validate_request(request, error));
+        request.method = IdfModemHttpsMethod::Get; request.url = "https://example.test/body";
+        assert(!idf_modem_keepalive_validate_request(request, error));
+    }
     check_initial_state_transcripts();
     check_parse_reasons();
     check_parse_read_reasons();

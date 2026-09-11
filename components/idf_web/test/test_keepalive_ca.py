@@ -7,6 +7,52 @@ from components.idf_web.test.test_web_security import function_body
 
 
 class KeepaliveCaQueryTest(unittest.TestCase):
+    def test_preflight_skips_ca_only_for_http_and_keeps_home_time_model_guards(self):
+        source = (Path(__file__).resolve().parents[1] / "idf_web.cpp").read_text()
+        fixture = r'''
+#include <cassert>
+#include <cstdint>
+#include <ctime>
+#include <string>
+constexpr int MIN_KEEPALIVE_TRAFFIC_KB=1,MAX_KEEPALIVE_TRAFFIC_KB=10000,IDF_MODEM_KEEPALIVE_MAX_RUNTIME_KB=512,ESP_OK=0;
+struct IdfKeepaliveRunView { int kaTrafficKB=1; std::string kaUrl="http://example.test/body",kaProfile; };
+struct IdfModemHttpsTarget {};
+struct IdfPushCellularTarget { std::string canonicalOrigin; };
+struct IdfConfigCaStatus { bool configured=false; };
+struct IdfModemStatus { bool atReady=true; int ceregStat=1; std::string model="ML307A"; };
+IdfModemStatus modem; bool synchronized=true,configured=false; int ca_calls=0;
+bool idf_modem_keepalive_parse_url(const std::string& url,IdfModemHttpsTarget&,bool& plain,std::string&) {
+    plain=url.rfind("http://",0)==0; return plain || url.rfind("https://",0)==0;
+}
+bool idf_push_prepare_keepalive_target(const std::string&,IdfPushCellularTarget&) { ++ca_calls;return true; }
+int idf_config_ca_status(const std::string&,IdfConfigCaStatus& out) { ++ca_calls;out.configured=configured;return ESP_OK; }
+bool epoch_valid(uint32_t) {return synchronized;}
+IdfModemStatus idf_modem_get_status(){return modem;}
+bool idf_modem_https_model_allowed(const std::string& model){return model=="ML307A";}
+'''
+        fixture += "bool preflight(const IdfKeepaliveRunView& cfg,std::string& message) {" + function_body(source, "keepalive_traffic_preflight") + "}\n"
+        fixture += r'''
+int main(){
+    IdfKeepaliveRunView cfg;std::string message;
+    assert(preflight(cfg,message)&&ca_calls==0);
+    cfg.kaUrl="https://example.test/body";assert(!preflight(cfg,message)&&ca_calls==2);
+    configured=true;assert(preflight(cfg,message));
+    for(const auto url:{"http://example.test/body","https://example.test/body"}){
+        cfg.kaUrl=url;modem.ceregStat=5;assert(!preflight(cfg,message));
+        modem.ceregStat=1;modem.model="ML307Y";assert(!preflight(cfg,message));
+        modem.model="ML307A";synchronized=false;assert(!preflight(cfg,message));
+        synchronized=true;cfg.kaTrafficKB=513;assert(!preflight(cfg,message));cfg.kaTrafficKB=1;
+    }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            cpp = Path(directory, "preflight.cpp")
+            binary = Path(directory, "preflight")
+            cpp.write_text(fixture)
+            subprocess.run(["g++", "-std=c++17", str(cpp), "-o", str(binary)], check=True)
+            run = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_keepalive_handler_rejects_ambiguous_query_and_transfer_encoding(self):
         root = Path(__file__).resolve().parents[1]
         source = (root / "idf_web.cpp").read_text()

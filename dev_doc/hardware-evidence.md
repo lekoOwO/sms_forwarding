@@ -146,3 +146,24 @@ The ignored test private key remains mode 0600. Encrypted configuration backups 
 - 本次未另寫設定、還原、使用 SIM 資料、探測 CA、執行保活或測試推送。
   此結果證明上述 TEST-key 套件完成 WiFi OTA 與健康確認，不證明保活或行動傳輸的實機效果。
   Production OTA 發佈 gate 維持不變。
+
+## 2026-09-11 dev20／counter48 網路 OTA 驗收
+
+- 裝置：ESP32-C3／ML307，沿用既有 TEST-key USB recovery profile，透過 WiFi 更新。
+  來源為 `0933c97` 上的 dev20 候選變更，包含介面整理、推送表單驗證與 HTTP 保活。
+- App 為 1,574,464 bytes，OTA 分區餘裕為 391,616 bytes。SHA-256 為
+  `ca0ecebf3e265f82ef9d960bad52d7373b2cbb27778581a6a7e212ab4d9117f5`。
+  套件 SHA-256 為 `fdb3b1824aa98b53a7a52c56e920552776d6e7c9b3d1962cc002561d28c4cbdf`。
+- 更新前為 dev18／app0／valid、accepted 47。只上傳一次套件，結果為 `ACTION_OTA_READY`。
+  重啟後前兩次 HTTP 查詢逾時，後續讀回 dev20／app1／valid、accepted 48、pending 0、pendingVerify false。
+  驗證金鑰保持不變，沒有重送套件或手動重置。
+- 裝置 Web gzip 與本機最終 bundle 相符：182,080 bytes，SHA-256 為
+  `90cbebf99fd72ccea9221ed4cd84f3388eedeb79a9aa513628f9ff97d2a2c7fc`。
+  解壓後的 HTML 也逐 byte 相同。
+- 更新前後的加密備份各為 863 bytes、mode 0600，均通過 AES-GCM 與 CFG2 schema 7 驗證。
+  RAM 解密後的 803 bytes 完全相同，沒有輸出或寫入明文。
+  備份內的 `dataEnabled=false`、`kaEnabled=false` 與 network mode 0 保持不變。
+  此比較不涵蓋可攜備份排除的裝置本地身份與 roaming 欄位。
+- 本次沒有另寫設定、還原、啟用 SIM 資料、探測 CA、執行保活或測試推送。
+  本次證據限於 TEST-key WiFi OTA、啟動健康、Web 內容與可攜設定保留。
+  表單互動與 HTTP／HTTPS 傳輸使用本機回歸驗證，未執行真實行動傳輸測試。
