@@ -352,7 +352,7 @@ class UartOwnerContractTest(unittest.TestCase):
                 check=False, capture_output=True, text=True,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
-            for scenario in ("vendor", "iccid", "retry"):
+            for scenario in ("vendor", "iccid", "ready", "retry"):
                 with self.subTest(scenario=scenario):
                     result = subprocess.run([str(binary), scenario], check=False,
                                             capture_output=True, text=True)

@@ -1727,7 +1727,11 @@ static bool try_unlock_sim(bool allow_puk)
     send_ok("AT+CMEE=1", 1200);
     std::string state = query_sim_state();
     if (state == "ready") {
-        set_sim_status("ready", false, "SIM is ready");
+        // ICCID 是 PIN 凭据的主键；读取它不应依赖网络注册完成。
+        IdfModemStatus status = idf_modem_get_status();
+        std::string iccid = is_iccid_text(status.iccid) ? status.iccid : query_current_iccid();
+        set_sim_status("ready", false, "SIM is ready", iccid);
+        if (!iccid.empty()) save_identity_cache(std::string(), iccid);
         return true;
     }
     if (state != "pin" && state != "puk") {
