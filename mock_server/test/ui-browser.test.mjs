@@ -7,7 +7,7 @@ import puppeteer from "puppeteer-core";
 import { createApp } from "../server.mjs";
 
 const ROOT = resolve(new URL("../..", import.meta.url).pathname);
-const WEB_ROOT = join(ROOT, "web", "build");
+const WEB_ROOT = process.env.UI_BROWSER_WEB_ROOT ?? join(ROOT, "web", "build");
 const OPENAPI_PATH = join(ROOT, "dev_doc", "openapi.json");
 const ROUTES = ["connection", "diagnostics", "maintenance", "advanced"];
 const browserCandidates = [
@@ -19,6 +19,284 @@ const browserCandidates = [
 ].filter((candidate) => candidate && existsSync(candidate));
 const browserExecutable = browserCandidates[0];
 const browserAvailable = Boolean(process.env.UI_BROWSER_URL || browserExecutable);
+
+test("heartbeat save reaches terminal feedback above its button without collapsing the form", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		// Cold navigation can exceed 30 s on the local host; action deadlines stay below.
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll('[data-slot="accordion-trigger"]')].find((button) => button.textContent.includes("Heartbeat")).click());
+		await waitForAccordionContent(page, "#heartbeat-form");
+		let rejectSave = false;
+		let freshCa = false;
+		const delayedCa = [];
+		await t.test("save settles in the open form", { timeout: 10000 }, async () => {
+		const storedPush = await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked"));
+		await page.$eval("#push-global-enabled", (button) => button.click());
+		await page.setRequestInterception(true);
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname === "/save" && rejectSave) void request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" });
+			else if (new URL(request.url()).pathname === "/api/push/ca/status") {
+				if (freshCa) void request.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, code: "PUSH_CA_STATUS", data: { configured: true, sha256: "a".repeat(64) }, detail: "" }) });
+				else delayedCa.push(request);
+			}
+			else void request.continue();
+		});
+		const responses = [];
+		page.on("response", (response) => { if (new URL(response.url()).pathname === "/save") responses.push(response.status()); });
+		const accepted = page.waitForResponse((response) => new URL(response.url()).pathname === "/save", { timeout: 5000 });
+		await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+		assert.equal((await accepted).status(), 202);
+		await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some((element) => element.textContent.includes("Configuration saved")), { timeout: 5000 });
+		await page.waitForFunction(() => !document.querySelector('button[form="heartbeat-form"]')?.disabled, { timeout: 5000 });
+		assert.deepEqual(responses, [202]);
+		assert.ok(await page.$eval("#heartbeat-form", (form) => form.getBoundingClientRect().height > 0), "successful save must leave the edited form open");
+		const position = await page.$eval("#heartbeat-form", (form) => {
+			const region = form.parentElement;
+			const result = [...region.querySelectorAll('[role="status"]')].find((element) => element.textContent.includes("Configuration saved"));
+			const button = region.querySelector('button[form="heartbeat-form"]');
+			return { result: result?.textContent, busy: button?.disabled, resultBottom: result?.getBoundingClientRect().bottom, buttonTop: button?.getBoundingClientRect().top };
+		});
+		assert.ok(position.result.includes("Configuration saved"));
+		assert.equal(position.busy, false);
+		assert.ok(position.resultBottom <= position.buttonTop, "heartbeat feedback must appear above Save");
+		assert.equal(await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked")), storedPush === "true" ? "false" : "true", "a successful heartbeat refresh must preserve the unrelated push-switch draft");
+		assert.ok(delayedCa.length > 0, "Save must settle while its background certificate reads remain pending");
+		await Promise.all(delayedCa.filter((request) => new URL(request.url()).searchParams.get("channel") !== "0").map((request) => request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" })));
+		});
+		await t.test("rejected save replaces success with terminal error", { timeout: 10000 }, async () => {
+			rejectSave = true;
+			await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+			await page.waitForFunction(() => document.querySelector("#heartbeat-form")?.parentElement.querySelector('[role="alert"]')?.textContent.includes("Request failed"), { timeout: 5000 });
+			const error = await page.$eval("#heartbeat-form", (form) => {
+				const result = form.parentElement.querySelector('[role="alert"]');
+				const button = form.parentElement.querySelector('button[form="heartbeat-form"]');
+				return { text: result.textContent, button: button.textContent.trim(), disabled: button.disabled, above: result.getBoundingClientRect().bottom <= button.getBoundingClientRect().top };
+			});
+			assert.equal(error.button, "Save");
+			assert.equal(error.disabled, false);
+			assert.equal(error.above, true);
+			assert.doesNotMatch(error.text, /Configuration saved/);
+		});
+		await t.test("late certificate reads cannot replace a newer configured state", { timeout: 10000 }, async () => {
+			freshCa = true;
+			await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "4G delivery and certificates").click());
+			await waitForAccordionContent(page, "#push-cellular-url-0");
+			await page.$eval("#push-cellular-url-0", (input) => [...input.closest('[data-slot="card"]').querySelectorAll("button")].find((button) => button.textContent.trim() === "Check and set up").click());
+			await page.waitForFunction(() => document.querySelector("#push-cellular-url-0").closest('[data-slot="card"]').textContent.includes("Certificate configured"), { timeout: 5000 });
+			const old = delayedCa.find((request) => new URL(request.url()).searchParams.get("channel") === "0");
+			assert.ok(old);
+			const response = page.waitForResponse((reply) => reply.request() === old, { timeout: 5000 });
+			await old.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, code: "PUSH_CA_STATUS", data: { configured: false, sha256: "" }, detail: "" }) });
+			await (await response).json();
+			await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+			assert.ok(await page.$eval("#push-cellular-url-0", (input) => input.closest('[data-slot="card"]').textContent.includes("Certificate configured")));
+		});
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("heartbeat refresh failure preserves successful feedback and unrelated drafts", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll('[data-slot="accordion-trigger"]')].find((button) => button.textContent.includes("Heartbeat")).click());
+		await waitForAccordionContent(page, "#heartbeat-form");
+		await t.test("save remains successful when its following read fails", { timeout: 10000 }, async () => {
+			const before = await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked"));
+			await page.$eval("#push-global-enabled", (button) => button.click());
+			await page.setRequestInterception(true);
+			let reads = 0;
+			page.on("request", (request) => {
+				if (new URL(request.url()).pathname === "/api/config") { reads++; return void request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" }); }
+				void request.continue();
+			});
+			await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+			await page.waitForFunction(() => document.body.textContent.includes("HTTP 503"), { timeout: 5000 });
+			assert.equal(reads, 1, "failed refresh must not automatically repeat a read or save");
+			assert.ok(await page.$eval("#heartbeat-form", (form) => form.parentElement.textContent.includes("Configuration saved")));
+			assert.equal(await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked")), before === "true" ? "false" : "true");
+			assert.equal(await page.$eval('button[form="heartbeat-form"]', (button) => button.textContent.trim()), "Save");
+		});
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("push channel saves validate active provider fields before sending any settings", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.includes("Push channels") && button.hasAttribute("aria-expanded")).click());
+		await waitForAccordionContent(page, "#push-url-0");
+		const before = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		const saves = [];
+		page.on("request", (request) => { if (new URL(request.url()).pathname === "/save") saves.push(request.postData()); });
+		await page.evaluate(() => { window.invalidFields = []; document.addEventListener("invalid", (event) => window.invalidFields.push(event.target.id), true); });
+		await page.$eval("#push-enabled-0", (button) => button.click());
+		await page.$eval("#push-name-0", (input) => { input.value = "Unsaved draft"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#push-url-0", (input) => [...input.closest('[data-slot="accordion-content"]').querySelectorAll("button")].find((button) => button.textContent.trim() === "Save").click());
+		assert.deepEqual(await page.evaluate(() => window.invalidFields), ["push-url-0"], "Save must report the missing active endpoint before invoking /save");
+		assert.equal(saves.length, 0);
+		assert.deepEqual(await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels), before, "invalid edits must leave all five stored channels unchanged");
+		await page.$eval("#push-url-0", (input) => { input.value = "not a URL"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.focus("#push-url-0");
+		await page.keyboard.press("Enter");
+		assert.equal(await page.evaluate(() => window.invalidFields.at(-1)), "push-url-0");
+		assert.equal(saves.length, 0);
+		await page.select("#push-type-0", "10");
+		await page.$eval("#push-key1-0", (input) => { input.value = "chat-id"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.focus("#push-key1-0");
+		await page.keyboard.press("Enter");
+		assert.equal(await page.evaluate(() => window.invalidFields.at(-1)), "push-key2-0", "Telegram requires its token but permits the default endpoint");
+		await page.select("#push-type-0", "7");
+		await page.$eval("#push-url-0", (input) => { input.value = "https://example.test/hook"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#push-body-0", (input) => { input.value = ""; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#push-url-0", (input) => [...input.closest('[data-slot="accordion-content"]').querySelectorAll("button")].find((button) => button.textContent.trim() === "Save").click());
+		assert.equal(await page.evaluate(() => window.invalidFields.at(-1)), "push-body-0");
+		assert.equal(saves.length, 0);
+		await page.select("#push-type-0", "6");
+		await page.$eval("#push-key1-0", (input) => { input.value = "synthetic-send-key"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.focus("#push-key1-0");
+		await Promise.all([
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/save", { timeout: 5000 }),
+			page.keyboard.press("Enter")
+		]);
+		await page.waitForFunction(() => document.body.textContent.includes("Configuration saved"), { timeout: 5000 });
+		assert.equal(saves.length, 1, "only the valid provider draft is submitted");
+		const after = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		assert.equal(after[0].type, 6);
+		assert.equal(after[0].name, "Unsaved draft");
+		assert.deepEqual(after.slice(1), before.slice(1));
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("a masked configured channel saves without validating another tab's incomplete draft", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	const base = `http://127.0.0.1:${server.address().port}`;
+	let browser, page, userDataDir, shared;
+	try {
+		const accepted = await (await fetch(`${base}/save`, { method: "POST", headers: { "X-CSRF-Token": "mock-csrf-token" }, body: new URLSearchParams({ push4en: "on", push4type: "9", push4url: "https://example.test/message", push4key1: "synthetic-token" }) })).json();
+		await fetch(`${base}/api/jobs?id=${accepted.data.jobId}`);
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, base, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.includes("Push channels") && button.hasAttribute("aria-expanded")).click());
+		await waitForAccordionContent(page, "#push-url-0");
+		await page.$eval("#push-enabled-0", (button) => button.click());
+		await page.$eval("#push-url-0", (input) => input.closest('[data-slot="accordion-content"]').querySelectorAll('[role="tab"]')[4].click());
+		await page.waitForSelector("#push-url-4");
+		assert.equal(await page.$eval("#push-url-4", (input) => input.value), "");
+		assert.equal(await page.$eval("#push-key1-4", (input) => input.value), "");
+		await page.$eval("#push-name-4", (input) => { input.value = "Renamed masked provider"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await Promise.all([
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/save", { timeout: 5000 }),
+			page.click('button[form="push-form-4"]')
+		]);
+		await page.waitForFunction(() => document.body.textContent.includes("Configuration saved"), { timeout: 5000 });
+		const channels = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		assert.deepEqual(channels.slice(0, 4).map((channel) => channel.enabled), [false, false, false, false]);
+		assert.deepEqual([channels[4].enabled, channels[4].urlSet, channels[4].key1Set, channels[4].name], [true, true, true, "Renamed masked provider"]);
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("an invalid cellular URL sends no configuration request", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "4G delivery and certificates").click());
+		await waitForAccordionContent(page, "#push-cellular-url-0");
+		const before = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		let saves = 0;
+		page.on("request", (request) => { if (new URL(request.url()).pathname === "/save") saves++; });
+		await page.$eval("#push-cellular-url-0", (input) => { input.value = "invalid cellular URL"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.click('button[form="push-cellular-form-0"]');
+		assert.equal(await page.$eval("#push-cellular-url-0", (input) => input.getAttribute("aria-invalid")), "true");
+		assert.equal(saves, 0);
+		assert.deepEqual(await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels), before);
+		await page.$eval("#push-cellular-url-0", (input) => [...input.closest("form").querySelectorAll("button")].find((button) => button.textContent.trim() === "Clear saved override").click());
+		assert.deepEqual(await page.$eval("#push-cellular-url-0", (input) => [input.value, input.validity.valid, input.getAttribute("aria-invalid")]), ["", true, null], "clearing the override also clears its validation error");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("cellular saves preserve both saved providers and unsaved provider drafts", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	const base = `http://127.0.0.1:${server.address().port}`;
+	let browser, page, userDataDir, shared;
+	try {
+		const accepted = await (await fetch(`${base}/save`, { method: "POST", headers: { "X-CSRF-Token": "mock-csrf-token" }, body: new URLSearchParams({ push0en: "on", push0type: "9", push0name: "Saved provider", push0url: "https://example.test/message", push0key1: "synthetic-token" }) })).json();
+		await fetch(`${base}/api/jobs?id=${accepted.data.jobId}`);
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, base, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.includes("Push channels") && button.hasAttribute("aria-expanded")).click());
+		await waitForAccordionContent(page, "#push-url-0");
+		await page.$eval("#push-url-0", (input) => { input.value = "invalid provider draft"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#push-name-0", (input) => { input.value = "Unsaved provider name"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "4G delivery and certificates").click());
+		await waitForAccordionContent(page, "#push-cellular-url-0");
+		const before = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		const saves = [];
+		page.on("request", (request) => { if (new URL(request.url()).pathname === "/save") saves.push(request.postData()); });
+		await page.$eval("#push-cellular-url-0", (input) => { input.value = "https://cell.example.test/message"; input.dispatchEvent(new Event("input", { bubbles: true })); });
+		await page.$eval("#push-cellular-enabled-0", (button) => button.click());
+		await page.focus("#push-cellular-url-0");
+		await Promise.all([
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/save", { timeout: 5000 }),
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/api/config", { timeout: 5000 }),
+			page.keyboard.press("Enter")
+		]);
+		await page.waitForSelector("#push-global-enabled", { timeout: 5000 });
+		const after = await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.pushChannels);
+		assert.deepEqual(after, before.map((channel, index) => index ? channel : { ...channel, cellularEnabled: false, cellularUrlSet: true }));
+		assert.deepEqual([...new URLSearchParams(saves[0]).keys()].sort(), ["push0cellularEnabled", "push0cellularUrl"]);
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.includes("Push channels") && button.hasAttribute("aria-expanded")).click());
+		await waitForAccordionContent(page, "#push-url-0");
+		assert.equal(await page.$eval("#push-url-0", (input) => input.value), "invalid provider draft");
+		assert.equal(await page.$eval("#push-name-0", (input) => input.value), "Unsaved provider name");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
 
 test("mobile CSV editor preserves quoted text, tests first-match routing, and saves only on request", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
 	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
@@ -46,7 +324,7 @@ test("mobile CSV editor preserves quoted text, tests first-match routing, and sa
 		assert.equal(previewAccepted.status(), 202);
 		await page.waitForSelector("#rule-preview-result");
 		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /First match: line 1/);
-		assert.match(await page.$eval("#rule-preview-result", (region) => region.textContent), /email, 2/);
+		assert.deepEqual(await page.$$eval("[data-rule-actions] li", (items) => items.map((item) => item.textContent)), ["Email", "Push channel 2"]);
 		assert.equal(saves, 0);
 		await page.$eval("#forward-rules", (input) => { input.value = 'kw,"broken,email'; input.dispatchEvent(new Event("input", { bubbles: true })); });
 		await page.waitForFunction(() => document.querySelector('button[form="forward-rules-form"]').disabled);
@@ -82,8 +360,74 @@ test("mobile CSV editor preserves quoted text, tests first-match routing, and sa
 	}
 });
 
+test("keepalive load failure stays visible and retry restores its form", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await page.setRequestInterception(true);
+		let fail = true;
+		let intercept = null;
+		page.on("request", (request) => {
+			if (intercept?.(request)) return;
+			if (new URL(request.url()).pathname === "/api/keepalive" && fail) { return void request.respond({ status: 503, contentType: "text/plain", body: "Service unavailable" }); }
+			void request.continue();
+		});
+		const failed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/keepalive" && response.status() === 503, { timeout: 60000 });
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/connection");
+		await failed;
+		await t.test("initial error and retry remain available", { timeout: 10000 }, async () => {
+		await page.waitForFunction(() => [...document.querySelectorAll('[role="alert"]')].some((element) => element.textContent.includes("Request failed")), { timeout: 1000 }).catch(() => {});
+		assert.ok(await page.evaluate(() => [...document.querySelectorAll('[role="alert"]')].some((element) => element.textContent.includes("Request failed"))), "failed initial keepalive load must expose its error even without status data");
+		fail = false;
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Retry").click());
+		await page.waitForSelector("#keepalive-url", { timeout: 5000 });
+		assert.equal(await page.$eval("#keepalive-enabled", (button) => button.getAttribute("aria-checked")), "false");
+		});
+		await t.test("run feedback belongs to Run, not Save", { timeout: 10000 }, async () => {
+			let held;
+			const started = new Promise((resolve) => { intercept = (request) => {
+				if (new URL(request.url()).searchParams.get("action") !== "run") return false;
+				held = request; resolve(); return true;
+			}; });
+			await page.$eval('[data-keepalive-operation="run"] button', (button) => button.click());
+			await started;
+			assert.equal(await page.$eval('[data-keepalive-operation="save"] button', (button) => button.textContent.trim()), "Save");
+			assert.equal(await page.$eval('[data-keepalive-operation="save"] button', (button) => button.getAttribute("aria-busy")), "false");
+			assert.equal(await page.$eval('[data-keepalive-operation="run"] button', (button) => button.getAttribute("aria-busy")), "true");
+			intercept = null;
+			await held.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, message: "" }) });
+			await page.waitForFunction(() => !document.querySelector('[data-keepalive-operation="run"] button').disabled, { timeout: 5000 });
+			assert.ok(await page.$eval('[data-keepalive-operation="run"]', (region) => region.querySelector('[role="status"]').getBoundingClientRect().bottom <= region.querySelector("button").getBoundingClientRect().top));
+		});
+		await t.test("successful Save stops its spinner while refreshing status", { timeout: 10000 }, async () => {
+			let held;
+			const started = new Promise((resolve) => { intercept = (request) => {
+				if (new URL(request.url()).pathname !== "/api/keepalive" || request.method() !== "GET") return false;
+				held = request; resolve(); return true;
+			}; });
+			await page.$eval('[data-keepalive-operation="save"] button', (button) => button.click());
+			await started;
+			const saved = await page.$eval('[data-keepalive-operation="save"]', (region) => {
+				const button = region.querySelector("button");
+				return { text: button.textContent.trim(), busy: button.getAttribute("aria-busy"), disabled: button.disabled, success: region.querySelector('[role="status"]').textContent.includes("Configuration saved") };
+			});
+			assert.deepEqual(saved, { text: "Save", busy: "false", disabled: true, success: true });
+			intercept = null;
+			await held.continue();
+			await page.waitForFunction(() => !document.querySelector('[data-keepalive-operation="save"] button').disabled, { timeout: 5000 });
+		});
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
 // The journey includes cold Chromium and application startup; probe response still has a 5 s deadline.
-test("mobile keepalive settings preserve the HTTP draft and use a dedicated certificate target", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+test("mobile keepalive uses HTTP without certificates and HTTPS with a dedicated certificate target", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
 	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
 	let browser, page, userDataDir, shared;
 	try {
@@ -101,8 +445,16 @@ test("mobile keepalive settings preserve the HTTP draft and use a dedicated cert
 		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/connection");
 		await page.waitForSelector("#keepalive-url");
 		assert.match(await page.$eval("#keepalive-url", (input) => input.value), /^http:\/\//);
-		assert.match(await page.$eval("#keepalive-url", (input) => input.closest("form").textContent), /HTTPS is required/);
+		assert.match(await page.$eval("#keepalive-url", (input) => input.closest("form").parentElement.textContent), /HTTP downloads are unencrypted/);
+		assert.equal(await page.evaluate(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Check and set up certificate")), false);
 		assert.equal(await page.$eval("#keepalive-enabled", (input) => input.getAttribute("aria-checked")), "false");
+		await page.waitForFunction(() => [...document.querySelectorAll("button")].some((button) => button.textContent.trim() === "Run once using mobile data" && !button.disabled));
+		await Promise.all([
+			page.waitForResponse((response) => new URL(response.url()).pathname === "/api/keepalive" && response.request().method() === "POST", { timeout: 5000 }),
+			page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Run once using mobile data").click())
+		]);
+		await page.waitForFunction(() => document.body.textContent.includes("Keepalive completed"), { timeout: 5000 });
+		assert.equal(calls.some((path) => path.includes("/ca/")), false, "the synthetic HTTP transfer must not probe or install a CA");
 		await page.$eval("#keepalive-url", (input) => { input.value = "https://example.test/payload"; input.dispatchEvent(new Event("input", { bubbles: true })); });
 		assert.equal(await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Check and set up certificate").disabled), true, "save the URL before probing its certificate");
 		await page.$eval("#keepalive-url", (input) => input.closest("form").querySelector('button[type="submit"]').click());
@@ -137,48 +489,127 @@ test("roaming diagnostics expose raw values by keyboard and touch", { timeout: 3
 			void request.continue();
 		});
 		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/diagnostics");
-		await page.$eval('[data-device-action="diagnostics-network"]', (button) => { const panel = button.closest('[data-slot="accordion-content"]'); if (panel) document.querySelector(`[aria-controls="${panel.id}"]`)?.click(); });
 		await waitForAccordionContent(page, '[data-device-action="diagnostics-network"]');
 		await page.$eval('[data-device-action="diagnostics-network"]', (button) => button.click());
-		await page.waitForSelector('summary[title="registration: 5"]');
-		assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.textContent), /Registered on a roaming network/);
-		assert.match(await page.$eval('summary[title*="cesq"]', (summary) => summary.textContent), /CSQ: ≥ −51 dBm/);
-		await page.focus('summary[title="registration: 5"]');
+		await page.waitForSelector('[title="registration: 5"]');
+		assert.equal(await page.$$eval("dd details", (elements) => elements.length), 0, "human values must not have per-field disclosure controls");
+		assert.match(await page.$eval('[title="registration: 5"]', (value) => value.textContent), /Registered on a roaming network/);
+		assert.doesNotMatch(await page.$eval('[title="registration: 5"]', (value) => value.textContent), /Original value/);
+		assert.deepEqual(await page.$$eval('[data-signal-metric] dt', (labels) => labels.map((label) => label.textContent)), ["RSRP", "RSRQ", "CSQ"]);
+		assert.match(await page.$eval('[data-signal-metric]:last-child dd', (value) => value.textContent), /≥ −51 dBm/);
+		assert.equal((await page.$$('[data-result-raw-trigger]')).length, 1);
+		await page.focus('[data-result-raw-trigger]');
 		await page.keyboard.press("Enter");
-		// Input dispatch can finish before the browser applies the native details toggle.
-		await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
-		assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
-		// Keep bounded geometry/input evidence for the CI-only touch failure; never collect page text.
-		const touchTrace = await page.evaluateHandle(() => {
-			const summary = document.querySelector('summary[title="registration: 5"]');
-			const describe = (element) => element instanceof Element ? { tag: element.tagName, slot: element.getAttribute("data-slot"), classes: element.getAttribute("class")?.slice(0, 160), summary: element === summary, insideSummary: summary.contains(element) } : null;
-			const snapshot = () => ({ time: performance.now(), rect: summary.getBoundingClientRect().toJSON(), open: summary.parentElement.open, viewport: { width: innerWidth, height: innerHeight, scrollY, touchPoints: navigator.maxTouchPoints }, animations: document.getAnimations().slice(0, 8).map((animation) => ({ name: animation.animationName, state: animation.playState, time: animation.currentTime, target: describe(animation.effect?.target) })) });
-			const events = [{ type: "before-resize", ...snapshot() }];
-			for (const type of ["resize", "scroll", "pointerdown", "pointerup", "touchstart", "touchend", "click", "toggle"]) {
-				window.addEventListener(type, (event) => {
-					if (events.length >= 32) return;
-					const point = event.changedTouches?.[0] ?? event;
-					const x = point.clientX, y = point.clientY;
-					events.push({ type, target: describe(event.target), x, y, hit: Number.isFinite(x) ? describe(document.elementFromPoint(x, y)) : null, ...snapshot() });
-				}, { capture: true, passive: true });
+		await page.waitForSelector('dialog[data-result-raw][open]', { timeout: 1000 });
+		assert.equal(await page.$eval('dialog[data-result-raw] textarea', (raw) => raw.value), 'registration: 5\ncesq: "-70,-11,31"');
+		await page.keyboard.press("Escape");
+		await page.waitForFunction(() => !document.querySelector('dialog[data-result-raw]').open, { timeout: 1000 });
+		assert.equal(await page.$eval('[data-result-raw-trigger]', (button) => button === document.activeElement), true);
+		await page.setViewport({ width: 390, height: 844 });
+		const metricRows = await page.$$eval("[data-signal-metric]", (rows) => rows.map((row) => ({ top: row.getBoundingClientRect().top, bottom: row.getBoundingClientRect().bottom })));
+		assert.ok(metricRows[1].top >= metricRows[0].bottom && metricRows[2].top >= metricRows[1].bottom);
+		await waitForAccordionContent(page, '[data-result-raw-trigger]');
+		await page.tap('[data-result-raw-trigger]');
+		await page.waitForSelector('dialog[data-result-raw][open]', { timeout: 1000 });
+		assert.equal(await page.$eval('dialog[data-result-raw] textarea', (raw) => raw.value), 'registration: 5\ncesq: "-70,-11,31"');
+		assert.ok(await page.$eval('dialog[data-result-raw]', (dialog) => dialog.getBoundingClientRect().width <= innerWidth));
+		assert.equal(await page.$eval('dialog[data-result-raw] textarea', (raw) => { raw.focus(); raw.select(); return raw.readOnly && raw.selectionEnd === raw.value.length && getComputedStyle(raw).fontFamily.includes("mono"); }), true);
+		await page.tap('dialog[data-result-raw] button');
+		await page.waitForFunction(() => !document.querySelector('dialog[data-result-raw]').open, { timeout: 1000 });
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("firmware version and the project release link belong to the update section", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 390, height: 844 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, "http://127.0.0.1:" + server.address().port, "#device/maintenance");
+		await page.$eval('[data-device-action="maintenance-ota"]', (button) => { const trigger = button.closest('[data-slot="accordion-item"]').querySelector('[data-slot="accordion-trigger"]'); if (trigger.getAttribute("aria-expanded") !== "true") trigger.click(); });
+		await waitForAccordionContent(page, '[data-firmware-version]');
+		const version = await page.evaluate(async () => (await (await fetch("/api/config")).json()).status.firmwareVersion);
+		assert.equal(await page.$eval('[data-firmware-version]', (value) => value.textContent), version);
+		assert.equal(await page.$$eval('footer[aria-label="Firmware version"]', (footers) => footers.length), 0);
+		assert.equal(await page.$eval('a[href="https://github.com/lekoOwO/sms_forwarding/releases"]', (link) => link.textContent), "project releases");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("mobile long values, technical text and semantic alerts stay readable in both themes", { timeout: 45000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		await page.setViewport({ width: 390, height: 844 });
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await page.setRequestInterception(true);
+		const longName = "Synthetic-device-name-with-a-long-readable-suffix";
+		page.on("request", async (request) => {
+			const path = new URL(request.url()).pathname;
+			if (path === "/api/config") {
+				const data = await (await fetch(request.url())).json();
+				data.config.deviceName = longName;
+				data.config.hostname = "synthetic-device-hostname-for-layout";
+				data.status.wifiSsid = "Synthetic-network-name-1234567890";
+				return void request.respond({ status: 200, contentType: "application/json", body: JSON.stringify(data) });
 			}
-			return { events, snapshot };
+			if (path === "/api/ota/state") return void request.respond({ status: 503, contentType: "application/json", body: "{}" });
+			if (path === "/log") return void request.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ entries: Array.from({ length: 50 }, (_, index) => ({ id: index + 1, message: "Synthetic diagnostic line " + index })), nextCursor: null, hasMore: false }) });
+			void request.continue();
 		});
-		try {
-			await page.setViewport({ width: 390, height: 844 });
-			await page.tap('summary[title="registration: 5"]');
-			await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === false, { timeout: 1000 });
-			assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), false);
-			await page.tap('summary[title="registration: 5"]');
-			await page.waitForFunction(() => document.querySelector('summary[title="registration: 5"]')?.parentElement.open === true, { timeout: 1000 });
-			assert.equal(await page.$eval('summary[title="registration: 5"]', (summary) => summary.parentElement.open), true);
-			assert.match(await page.$eval('summary[title="registration: 5"]', (summary) => summary.nextElementSibling.textContent), /registration: 5/);
-		} catch (error) {
-			console.error("Diagnostic touch failure:", JSON.stringify(await touchTrace.evaluate((trace) => ({ events: trace.events, final: trace.snapshot() }))));
-			throw error;
-		} finally {
-			await touchTrace.dispose();
-		}
+		const base = "http://127.0.0.1:" + server.address().port;
+		await openRoute(page, base, "#overview");
+		await page.waitForSelector('[data-overview-group="identity"] dd');
+		assert.equal(await page.$eval('[data-overview-group="identity"] dd', (value) => value.textContent), longName);
+		assert.ok(await page.$$eval("[data-overview-group] dd", (values) => values.every((value) => getComputedStyle(value).whiteSpace !== "nowrap" && value.scrollWidth <= value.clientWidth)));
+		const checkAlert = async (variant) => {
+			const selector = '[data-slot="alert"].bg-alert-' + variant;
+			await page.waitForSelector(selector);
+			for (const dark of [false, true]) {
+				await page.evaluate((enabled) => document.documentElement.classList.toggle("dark", enabled), dark);
+				const measured = await page.$eval(selector, (alert) => {
+					const description = alert.querySelector('[data-slot="alert-description"]');
+					const canvas = document.createElement("canvas");
+					canvas.width = canvas.height = 1;
+					const context = canvas.getContext("2d");
+					const rgb = (color) => { context.clearRect(0, 0, 1, 1); context.fillStyle = color; context.fillRect(0, 0, 1, 1); return [...context.getImageData(0, 0, 1, 1).data].slice(0, 3); };
+					const luminance = (color) => rgb(color).map((channel) => { const value = channel / 255; return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4; }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+					const styles = getComputedStyle(alert);
+					const foreground = luminance(getComputedStyle(description).color), background = luminance(styles.backgroundColor);
+					return { contrast: (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05), role: alert.getAttribute("role"), icon: Boolean(alert.querySelector('svg[aria-hidden="true"]')), title: Boolean(alert.querySelector('[data-slot="alert-title"]')?.textContent.trim()) };
+				});
+				assert.ok(measured.contrast >= 4.5, variant + "/" + dark + ": contrast " + measured.contrast);
+				assert.equal(measured.role, variant === "destructive" ? "alert" : "status");
+				assert.ok(measured.icon && measured.title, "severity must not depend on color alone");
+			}
+		};
+		await checkAlert("info");
+		await openRoute(page, base, "#notifications");
+		await page.waitForSelector("#heartbeat-form");
+		await page.$eval("#heartbeat-form", (form) => { const trigger = form.closest('[data-slot="accordion-item"]').querySelector('[data-slot="accordion-trigger"]'); if (trigger.getAttribute("aria-expanded") !== "true") trigger.click(); });
+		await waitForAccordionContent(page, "#heartbeat-form");
+		await checkAlert("warning");
+		await openRoute(page, base, "#security");
+		await checkAlert("destructive");
+		await openRoute(page, base, "#device/diagnostics");
+		await Promise.all([page.waitForResponse((response) => new URL(response.url()).pathname === "/log", { timeout: 5000 }), page.locator('[data-device-action="diagnostics-logs-refresh"]').setTimeout(1000).click()]);
+		await page.waitForSelector('textarea[aria-label="System logs"]', { timeout: 5000 });
+		assert.ok(await page.$eval('textarea[aria-label="System logs"]', (field) => {
+			field.focus(); field.select();
+			const style = getComputedStyle(field);
+			return field.readOnly && !field.disabled && document.activeElement === field && field.selectionEnd === field.value.length && style.fontFamily.includes("mono") && field.clientHeight >= 192 && field.clientHeight <= 448 && field.scrollHeight > field.clientHeight;
+		}));
+		await openRoute(page, base, "#device/advanced");
+		assert.ok(await page.$eval('[data-device-action="advanced-at-terminal"] input', (input) => !input.spellcheck && input.autocapitalize === "none" && getComputedStyle(input).fontFamily.includes("mono")));
 	} finally {
 		await closeBrowser(browser, shared);
 		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });

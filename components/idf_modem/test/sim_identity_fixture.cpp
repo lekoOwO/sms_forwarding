@@ -40,6 +40,7 @@ static unsigned failed_pin_records = 0, successful_pin_records = 0;
 static std::vector<std::string> commands, recovery_events;
 static std::vector<uint64_t> identity_samples;
 static std::string sampled_iccid;
+static std::string cached_iccid;
 
 static std::string idf_util_trim_copy(const std::string& input)
 {
@@ -48,6 +49,10 @@ static std::string idf_util_trim_copy(const std::string& input)
         input.substr(first, input.find_last_not_of(" \r\n\t") - first + 1);
 }
 static void idf_log_line(const char*) {}
+[[maybe_unused]] static void save_identity_cache(const std::string&, const std::string& iccid)
+{
+    cached_iccid = iccid;
+}
 static IdfSimUnlockView idf_config_get_sim_unlock_view(const std::string& iccid)
 {
     selected_iccid = iccid;
@@ -131,6 +136,7 @@ static void reset_fixture()
     pin_result = ESP_FAIL;
     failed_pin_records = 0; successful_pin_records = 0;
     commands.clear(); recovery_events.clear(); identity_samples.clear(); sampled_iccid.clear();
+    cached_iccid.clear();
 }
 
 static unsigned command_count(const std::string& command)
@@ -210,6 +216,33 @@ static void test_iccid()
     credential_found = true; credential.iccid = "8901234567890123456"; credential.pin = "1234";
     assert(!try_unlock_sim(false));
     assert(selected_iccid.empty() && command_count("AT+CPIN=\"1234\"") == 0);
+}
+
+static void test_ready_iccid()
+{
+    reset_fixture();
+    cpin = "READY";
+    s_status.ceregStat = 0;
+    vendor_iccid = "8901234567890123456";
+    assert(try_unlock_sim(false));
+    assert(s_status.simState == "ready" && s_status.iccid == vendor_iccid &&
+           cached_iccid == vendor_iccid);
+    assert(command_count("AT+CPIN=\"1234\"") == 0);
+
+    reset_fixture();
+    cpin = "READY";
+    s_status.iccid = "8901234567890123456";
+    assert(try_unlock_sim(false));
+    assert(s_status.iccid == "8901234567890123456");
+    assert(command_count("AT+MCCID") == 0 && command_count("AT+ICCID") == 0 &&
+           command_count("AT+CCID") == 0 && command_count("AT+CRSM=176,12258,0,0,10") == 0);
+    assert(command_count("AT+CPIN=\"1234\"") == 0);
+
+    reset_fixture();
+    cpin = "READY";
+    assert(try_unlock_sim(false));
+    assert(s_status.simState == "ready" && s_status.iccid.empty() && cached_iccid.empty());
+    assert(command_count("AT+CPIN=\"1234\"") == 0);
 }
 
 static void test_retry()
@@ -324,5 +357,6 @@ int main(int argc, char** argv)
     assert(argc == 2);
     if (std::string(argv[1]) == "vendor") test_vendor_frames();
     else if (std::string(argv[1]) == "iccid") test_iccid();
+    else if (std::string(argv[1]) == "ready") test_ready_iccid();
     else { assert(std::string(argv[1]) == "retry"); test_retry(); }
 }

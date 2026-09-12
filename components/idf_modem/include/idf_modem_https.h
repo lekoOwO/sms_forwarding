@@ -341,6 +341,13 @@ struct IdfModemHttpsCallbacks {
 
 bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,
                                       std::string& error);
+bool idf_modem_keepalive_parse_url(std::string_view url, IdfModemHttpsTarget& target,
+                                  bool& plain_http, std::string& error);
+bool idf_modem_keepalive_validate_request(const IdfModemHttpsPostRequest& request,
+                                         std::string& error);
+IdfModemHttpsRunResult idf_modem_keepalive_run_get(const IdfModemHttpsPostRequest& request,
+                                                  const IdfModemHttpsCallbacks& callbacks,
+                                                  IdfModemHttpsPostResult& result);
 bool idf_modem_https_model_allowed(std::string_view model);
 bool idf_modem_https_status_success(int httpStatus);
 bool idf_modem_https_parse_url(std::string_view url, IdfModemHttpsTarget& target,

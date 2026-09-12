@@ -289,6 +289,14 @@ test("cellular overrides stay redacted and rejected CA candidates require a fres
 		}))).success, true);
 		snapshot = await (await request(baseUrl, "/api/config")).json();
 		assert.equal(snapshot.config.pushChannels[1].cellularUrlSet, false);
+		assert.equal(snapshot.config.pushChannels[1].enabled, true, "cellular-only updates must preserve provider enablement");
+		assert.equal(snapshot.config.pushChannels[1].type, 9);
+		assert.equal(snapshot.config.pushChannels[1].name, "Cellular");
+		assert.deepEqual([snapshot.config.pushChannels[1].urlSet, snapshot.config.pushChannels[1].key1Set], [true, true]);
+		assert.deepEqual([snapshot.config.pushChannels[1].titleTemplate, snapshot.config.pushChannels[1].bodyTemplate], ["{sender}", "{message}"]);
+		assert.equal((await completed(baseUrl, await form(baseUrl, "/save", { push1type: 9, push1name: "Disabled" }))).success, true);
+		snapshot = await (await request(baseUrl, "/api/config")).json();
+		assert.equal(snapshot.config.pushChannels[1].enabled, false, "ordinary provider saves still disable when en is omitted");
 	});
 	await withServer(async (baseUrl) => {
 		const initialStatus = await (await request(baseUrl, "/api/push/ca/status?channel=1")).json();

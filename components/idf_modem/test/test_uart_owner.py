@@ -352,7 +352,7 @@ class UartOwnerContractTest(unittest.TestCase):
                 check=False, capture_output=True, text=True,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
-            for scenario in ("vendor", "iccid", "retry"):
+            for scenario in ("vendor", "iccid", "ready", "retry"):
                 with self.subTest(scenario=scenario):
                     result = subprocess.run([str(binary), scenario], check=False,
                                             capture_output=True, text=True)
@@ -527,7 +527,7 @@ class UartOwnerContractTest(unittest.TestCase):
             self.assertNotIn("owner_uart_read(", body)
             self.assertNotIn("owner_uart_write(", body)
             if api == "idf_modem_cellular_http_get":
-                self.assertIn("idf_modem_https_post(request, response)", body)
+                self.assertIn("submit_keepalive_request(request, response)", body)
                 self.assertNotIn("submit_owner_command", body)
                 https = function_body(source, "idf_modem_https_post")
                 self.assertIn("submit_owner_command", https)
@@ -563,8 +563,14 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("result = IdfCellularHttpResult();", body)
         # The executable keepalive fixture covers byte/attempt/time budgets and
         # cancellation; this gate prevents bypassing the verified UART owner path.
-        self.assertLess(body.index("idf_modem_https_validate_request"),
-                        body.index("idf_modem_https_post(request, response)"))
+        self.assertLess(body.index("idf_modem_keepalive_validate_request"),
+                        body.index("submit_keepalive_request(request, response)"))
+        submit = function_body(source, "submit_keepalive_request")
+        self.assertLess(submit.index("idf_modem_keepalive_validate_request"),
+                        submit.index("submit_owner_command"))
+        self.assertIn('request.url.rfind("http://", 0)', submit)
+        self.assertIn("idf_modem_https_post(request, result)", submit)
+        self.assertIn("owner_request.keepalive_plain_http = true", submit)
         self.assertIn("request.method = IdfModemHttpsMethod::Get;", body)
         self.assertIn("request.rootCertificateDer = config.rootCertificateDer;", body)
         self.assertIn("request.rootCertificateSha256 = config.rootCertificateSha256;", body)
@@ -1080,7 +1086,7 @@ inline void vTaskDelay(TickType_t) {
         self.assertIn("failure_parse_reason_ = parse_reason", receive)
         self.assertIn("failure_parse_shape_ = parse_shape", receive)
         https = (SOURCE.parent / "idf_modem_https.cpp").read_text()
-        read_failure = https.split("if (!tls.read_http(result_))", 1)[1].split(
+        read_failure = https.split("if (!tls.read_http(result_, plain_http_))", 1)[1].split(
             "result_.message", 1
         )[0]
         self.assertIn("failure_parse_reason()", read_failure)

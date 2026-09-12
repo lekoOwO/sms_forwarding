@@ -28,6 +28,7 @@ enum class IdfHttpsFailureStage { none, modem };
 enum class IdfModemUsbQueryBusyReason { gate_closed, mutex_timeout, slots_full, queue_full };
 enum class IdfModemHttpsMethod : uint8_t { Post, Get };
 struct ImeiFixtureHttpsPostRequest {
+    uint32_t timeoutMs = 30000;
     std::string url, body, contentType, headerName, headerValue, apn;
     std::vector<uint8_t> rootCertificateDer;
     std::array<uint8_t, 32> rootCertificateSha256{};
@@ -177,7 +178,7 @@ static esp_err_t submit_owner_command(const OwnerCommand&, std::string*, bool, u
                                       ImeiFixtureHttpsPostResult* = nullptr, bool* = nullptr, uint8_t* = nullptr);
 static esp_err_t owner_send_at_until(const std::string&, const char*, uint32_t, std::string&) { assert(false); return ESP_FAIL; }
 static esp_err_t owner_send_pdu(const std::string&, const char*, uint32_t, std::string&) { assert(false); return ESP_FAIL; }
-static esp_err_t owner_https_post(const ImeiFixtureHttpsPostRequest&, ImeiFixtureHttpsPostResult&, TickDeadline&) { assert(false); return ESP_FAIL; }
+static esp_err_t owner_https_post(const ImeiFixtureHttpsPostRequest&, ImeiFixtureHttpsPostResult&, TickDeadline&, bool) { assert(false); return ESP_FAIL; }
 #define IdfModemHttpsPostRequest ImeiFixtureHttpsPostRequest
 #define IdfModemHttpsPostResult ImeiFixtureHttpsPostResult
 #include "imei_runtime.inc"

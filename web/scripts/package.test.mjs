@@ -3,9 +3,87 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import "./alert-render.test.mjs";
+import "./keepalive-url.test.mjs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { runInNewContext } from "node:vm";
 import { gunzipSync } from "node:zlib";
+
+test("initial save response headers and body have a bounded unknown outcome without resubmission", async () => {
+	const previousCwd = process.cwd();
+	const originalFetch = globalThis.fetch;
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	let server;
+	try {
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		for (const stage of ["headers", "body"]) {
+			let deadline, calls = 0, aborted = false;
+			globalThis.setTimeout = (callback, delay, ...args) => {
+				if (delay !== 90000) return originalSetTimeout(callback, delay, ...args);
+				deadline = callback; return 1;
+			};
+			globalThis.clearTimeout = (timer) => { if (timer !== 1) originalClearTimeout(timer); };
+			globalThis.fetch = (_url, init) => {
+				calls += 1;
+				const pending = () => new Promise((_resolve, reject) => init?.signal?.addEventListener("abort", () => { aborted = true; reject(init.signal.reason); }, { once: true }));
+				return stage === "headers" ? pending() : Promise.resolve({ ok: true, json: pending });
+			};
+			const pending = api.postForm("/save", { heartbeatEnable: false, heartbeatInterval: 24 });
+			const outcome = pending.then(() => null, (error) => error);
+			await Promise.resolve(); await Promise.resolve();
+			assert.equal(typeof deadline, "function", `${stage} must not leave a save permanently pending`);
+			deadline();
+			assert.ok(await outcome instanceof api.JobResultUnknownError);
+			assert.equal(aborted, true);
+			assert.equal(calls, 1, "unknown save outcomes must never resend automatically");
+		}
+	} finally {
+		globalThis.fetch = originalFetch; globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout;
+		try { await server?.close(); } finally { process.chdir(previousCwd); }
+	}
+});
+
+test("encrypted backup download aborts a stalled body without repeating export", async () => {
+	const previousCwd = process.cwd();
+	const originalFetch = globalThis.fetch;
+	const originalSetTimeout = globalThis.setTimeout;
+	const originalClearTimeout = globalThis.clearTimeout;
+	let server;
+	try {
+		process.chdir(fileURLToPath(new URL("..", import.meta.url)));
+		const { createServer } = await import("vite");
+		server = await createServer({ server: { middlewareMode: true }, appType: "custom", logLevel: "silent" });
+		const api = await server.ssrLoadModule("/src/lib/api.ts");
+		const deadlines = new Map(); let nextTimer = 1, exports = 0, signal;
+		globalThis.setTimeout = (callback, delay, ...args) => {
+			if (delay !== 90000) return originalSetTimeout(callback, delay, ...args);
+			const timer = nextTimer++; deadlines.set(timer, callback); return timer;
+		};
+		globalThis.clearTimeout = (timer) => { if (!deadlines.delete(timer)) originalClearTimeout(timer); };
+		let bodyStarted;
+		const started = new Promise((resolve) => bodyStarted = resolve);
+		globalThis.fetch = async (path, init) => {
+			if (path === "/api/config/export") { exports++; return Response.json({ success: true, code: "ACTION_JOB_ACCEPTED", data: { jobId: 1 }, detail: "" }); }
+			if (path === "/api/jobs?id=1") return Response.json({ state: "succeeded", result: { success: true, code: "ACTION_CONFIG_EXPORT_READY", data: { exportId: 2 }, detail: "" } });
+			assert.equal(path, "/api/config/export?id=2"); signal = init.signal;
+			return { ok: true, arrayBuffer: () => { bodyStarted(); return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true })); } };
+		};
+		const outcome = api.exportEncryptedConfig("synthetic-passphrase").then(() => null, (error) => error);
+		await started;
+		assert.equal(deadlines.size, 1, "binary response body must retain a request deadline");
+		[...deadlines.values()][0]();
+		assert.ok(await outcome instanceof api.JobResultUnknownError);
+		assert.equal(signal.aborted, true);
+		assert.equal(exports, 1);
+	} finally {
+		globalThis.fetch = originalFetch; globalThis.setTimeout = originalSetTimeout; globalThis.clearTimeout = originalClearTimeout;
+		try { await server?.close(); } finally { process.chdir(previousCwd); }
+	}
+});
 
 test("job polling aborts an unresponsive request and can retry", { timeout: 10000 }, async () => {
 	const previousCwd = process.cwd();
@@ -56,6 +134,23 @@ test("diagnostic result renders unavailable values without hiding valid zero", a
 		assert.match(values[1], /Not available/);
 		assert.match(values[2], /Not registered/);
 		assert.match(values[2], /registration: 0/);
+		assert.doesNotMatch(body, /<details\b|<summary\b/, "raw data has one shared entry instead of per-field disclosures");
+		assert.equal([...body.matchAll(/data-result-raw-trigger/g)].length, 1);
+		const { body: signal } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_QUERY_OK", data: { cesq: "999,999,99", custom: null, flag: false }, detail: "detail-only", internal: "private-metadata" },
+			title: "Result", locale: "en"
+		} });
+		assert.equal([...signal.matchAll(/data-signal-metric/g)].length, 3);
+		for (const label of ["RSRP", "RSRQ", "CSQ"]) assert.match(signal, new RegExp(`<dt>${label}</dt>`));
+		assert.equal([...signal.matchAll(/<dd>Unknown or unavailable<\/dd>/g)].length, 3);
+		const raw = signal.match(/<textarea\b[^>]*>([\s\S]*?)<\/textarea>/)?.[1];
+		assert.match(raw, /cesq: (?:&quot;|")999,999,99(?:&quot;|")/);
+		assert.match(raw, /custom: null\nflag: false/);
+		assert.doesNotMatch(raw, /detail-only|private-metadata|ACTION_QUERY_OK/);
+		const { body: empty } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_CONFIG_SAVED", data: {}, detail: "" }, title: "Saved", locale: "en"
+		} });
+		assert.doesNotMatch(empty, /data-result-raw-trigger|<dialog/);
 	} finally {
 		try { await server?.close(); } finally { process.chdir(previousCwd); }
 	}

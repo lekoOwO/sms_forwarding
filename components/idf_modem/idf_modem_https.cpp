@@ -340,13 +340,14 @@ public:
         return false;
     }
 
-    bool write_all(std::string_view bytes)
+    bool write_all(std::string_view bytes, bool plain_http = false)
     {
         size_t sent = 0;
         while (sent < bytes.size() && !deadline_.expired()) {
-            const int result = mbedtls_ssl_write(
-                ssl_.get(), reinterpret_cast<const unsigned char*>(bytes.data() + sent),
-                bytes.size() - sent);
+            const auto* data = reinterpret_cast<const unsigned char*>(bytes.data() + sent);
+            const int result = plain_http
+                ? mip_bio_send(this, data, bytes.size() - sent)
+                : mbedtls_ssl_write(ssl_.get(), data, bytes.size() - sent);
             if (result > 0) {
                 sent += static_cast<size_t>(result);
             } else if (result != MBEDTLS_ERR_SSL_WANT_READ &&
@@ -358,13 +359,15 @@ public:
         return sent == bytes.size();
     }
 
-    bool read_http(IdfModemHttpsPostResult& result)
+    bool read_http(IdfModemHttpsPostResult& result, bool plain_http = false)
     {
         constexpr size_t kTlsPlaintextReadBytes = 1024;
         HttpResponse parser;
         std::array<uint8_t, kTlsPlaintextReadBytes> bytes{};
         while (!deadline_.expired() && !parser.complete()) {
-            const int received = mbedtls_ssl_read(ssl_.get(), bytes.data(), bytes.size());
+            const int received = plain_http
+                ? mip_bio_recv(this, bytes.data(), bytes.size())
+                : mbedtls_ssl_read(ssl_.get(), bytes.data(), bytes.size());
             if (received > 0) {
                 if (!parser.feed(bytes.data(), static_cast<size_t>(received), result)) {
                     record_failure_response_reason(
@@ -566,8 +569,9 @@ public:
                    const IdfModemHttpsTarget& target,
                    const IdfModemHttpsCallbacks& callbacks,
                    Deadline& deadline,
-                   IdfModemHttpsPostResult& result)
-        : request_(request), target_(target), callbacks_(callbacks), deadline_(deadline), result_(result) {}
+                   IdfModemHttpsPostResult& result, bool plain_http = false)
+        : request_(request), target_(target), callbacks_(callbacks), deadline_(deadline), result_(result),
+          plain_http_(plain_http) {}
 
     ~MipPostSession() { cleanup(); }
 
@@ -584,11 +588,11 @@ public:
         }
         {
             MipTlsSession tls(request_, target_, callbacks_, deadline_);
-            if (!tls.init()) {
+            if (!plain_http_ && !tls.init()) {
                 result_.message = failure_message(HttpsFailureStage::tls_setup);
                 return fail(HttpsFailureStage::tls_setup);
             }
-            if (!tls.handshake()) {
+            if (!plain_http_ && !tls.handshake()) {
                 result_.message = tls.open_failed()
                                       ? failure_message(HttpsFailureStage::socket_open)
                                       : tls.timed_out() ? "HTTPS TLS handshake timed out"
@@ -601,7 +605,7 @@ public:
                                                     : HttpsFailureStage::tls_handshake);
             }
             const std::string request_wire = build_http_request();
-            if (!tls.write_all(request_wire)) {
+            if (!tls.write_all(request_wire, plain_http_)) {
                 result_.message = tls.open_failed()
                                       ? failure_message(HttpsFailureStage::socket_open)
                                       : failure_message(HttpsFailureStage::request_write);
@@ -611,7 +615,7 @@ public:
                 return tls.timed_out() ? fail(stage, IdfModemHttpsRunResult::timed_out)
                                        : fail(stage);
             }
-            if (!tls.read_http(result_)) {
+            if (!tls.read_http(result_, plain_http_)) {
                 if (!tls.open_failed()) {
                     if (tls.failure_parse_reason() != ParseReason::none) {
                         record_failure_reason(IdfModemHttpsDiagnosticReason::response_invalid);
@@ -1182,6 +1186,7 @@ private:
     const IdfModemHttpsCallbacks& callbacks_;
     Deadline& deadline_;
     IdfModemHttpsPostResult& result_;
+    const bool plain_http_;
     MipConfig snapshot_;
     bool pdp_activated_ = false;
     bool pdp_profile_changed_ = false;
@@ -1199,7 +1204,7 @@ private:
     {
         std::string host = target_.host;
         if (host.find(':') != std::string::npos) host = "[" + host + "]";
-        if (target_.port != 443) host += ":" + std::to_string(target_.port);
+        if (target_.port != (plain_http_ ? 80 : 443)) host += ":" + std::to_string(target_.port);
         const bool is_get = request_.method == IdfModemHttpsMethod::Get;
         std::string wire = std::string(is_get ? "GET " : "POST ") + target_.path +
                            " HTTP/1.1\r\nHost: " + host + "\r\n";
@@ -1365,6 +1370,79 @@ bool idf_modem_https_validate_request(const IdfModemHttpsPostRequest& request,
 bool idf_modem_https_model_allowed(std::string_view model)
 {
     return model == "ML307A";
+}
+
+IdfModemHttpsRunResult idf_modem_keepalive_run_get(const IdfModemHttpsPostRequest& request,
+                                                  const IdfModemHttpsCallbacks& callbacks,
+                                                  IdfModemHttpsPostResult& result)
+{
+    result = {};
+    std::string error;
+    IdfModemHttpsTarget target;
+    bool plain_http = false;
+    if (!idf_modem_keepalive_validate_request(request, error) ||
+        !idf_modem_keepalive_parse_url(request.url, target, plain_http, error)) {
+        result.message = error;
+        result.failureStage = IdfHttpsFailureStage::request;
+        return IdfModemHttpsRunResult::invalid_request;
+    }
+    if (!plain_http) return idf_modem_https_run_post(request, callbacks, result);
+    if (!callbacks.sendCommand || !callbacks.confirmOpen) {
+        result.message = "Keepalive modem callbacks unavailable";
+        return IdfModemHttpsRunResult::invalid_request;
+    }
+    Deadline deadline(request.timeoutMs);
+    MipPostSession session(request, target, callbacks, deadline, result, true);
+    const auto outcome = session.run();
+    if (outcome == IdfModemHttpsRunResult::ok) result.message = "HTTP keepalive GET succeeded";
+    return outcome;
+}
+
+bool idf_modem_keepalive_parse_url(std::string_view url, IdfModemHttpsTarget& target,
+                                  bool& plain_http, std::string& error)
+{
+    target = {};
+    plain_http = starts_with(url, "http://");
+    if (url.empty() || url.size() > 256 ||
+        std::any_of(url.begin(), url.end(), [](unsigned char ch) { return ch <= 32 || ch == 127; }) ||
+        (!plain_http && !starts_with(url, "https://"))) {
+        error = "Keepalive requires a valid HTTP or HTTPS URL";
+        return false;
+    }
+    if (!plain_http) return idf_modem_https_parse_url(url, target, error, 256);
+    // Reuse the strict authority/path grammar; the public HTTPS parser stays HTTPS-only.
+    std::string normalized = "https://" + std::string(url.substr(7));
+    const size_t end = normalized.find_first_of("/?#", 8);
+    const size_t authority_end = end == std::string::npos ? normalized.size() : end;
+    const std::string_view authority = std::string_view(normalized).substr(8, authority_end - 8);
+    const bool has_port = !authority.empty() && authority.front() == '['
+        ? authority.find("]:") != std::string_view::npos
+        : authority.find(':') != std::string_view::npos;
+    if (!has_port) normalized.insert(authority_end, ":80");
+    return idf_modem_https_parse_url(normalized, target, error, normalized.size());
+}
+
+bool idf_modem_keepalive_validate_request(const IdfModemHttpsPostRequest& request,
+                                         std::string& error)
+{
+    IdfModemHttpsTarget target;
+    bool plain_http = false;
+    if (!idf_modem_keepalive_parse_url(request.url, target, plain_http, error)) return false;
+    if (request.method != IdfModemHttpsMethod::Get || !request.body.empty() ||
+        !request.contentType.empty() || !request.headerName.empty() || !request.headerValue.empty() ||
+        request.timeoutMs == 0 || request.timeoutMs > 30000 ||
+        request.apn.size() > 96 || forbidden_header_byte(request.apn)) {
+        error = "Keepalive accepts only bounded GET requests without headers or body";
+        return false;
+    }
+    if (!plain_http) return idf_modem_https_validate_request(request, error);
+    if (!request.rootCertificateDer.empty() ||
+        std::any_of(request.rootCertificateSha256.begin(), request.rootCertificateSha256.end(),
+                    [](uint8_t byte) { return byte != 0; })) {
+        error = "HTTP keepalive does not use a root CA";
+        return false;
+    }
+    return true;
 }
 
 bool idf_modem_https_status_success(int httpStatus)

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <type_traits>
 #include <utility>
 
 #include "esp_log.h"
@@ -74,9 +75,9 @@ static esp_err_t replace_config(IdfConfig& next)
     esp_err_t err = ensure_config_mutex();
     if (err != ESP_OK) return err;
     xSemaphoreTake(s_config_mutex, portMAX_DELAY);
-    using std::swap;
-    static_assert(noexcept(swap(s_config, next)), "IdfConfig publication must not allocate");
-    swap(s_config, next);
+    static_assert(std::is_nothrow_move_assignable<IdfConfig>::value,
+                  "IdfConfig publication must not allocate");
+    s_config = std::move(next);
     ++s_config_generation;
     xSemaphoreGive(s_config_mutex);
     return ESP_OK;

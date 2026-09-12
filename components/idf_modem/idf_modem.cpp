@@ -85,6 +85,7 @@ struct OwnerCommand {
     std::string token;
     std::string pdu;
     IdfModemHttpsPostRequest https_post_request;
+    bool keepalive_plain_http = false;
     uint32_t timeout_ms = 0;
     int64_t deadline_us = 0;
     TickType_t deadline_start = 0;
@@ -199,7 +200,8 @@ static esp_err_t owner_send_at_until(const std::string& cmd, const char* token,
 static esp_err_t owner_send_pdu(const std::string& cmgs_cmd, const char* pdu,
                                 uint32_t timeout_ms, std::string& response);
 static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
-                                  IdfModemHttpsPostResult& result, TickDeadline& deadline);
+                                  IdfModemHttpsPostResult& result, TickDeadline& deadline,
+                                  bool keepalive_plain_http = false);
 static esp_err_t submit_owner_command(const OwnerCommand& request, std::string* response,
                                       bool priority,
                                       uint8_t* query_busy_reason = nullptr,
@@ -1280,6 +1282,16 @@ static bool owner_request_bounded(const OwnerCommand& request)
         return false;
     }
     if (request.kind != OwnerCommandKind::https_post) return true;
+    if (request.keepalive_plain_http) {
+        const auto& value = request.https_post_request;
+        return value.url.rfind("http://", 0) == 0 && value.url.size() <= 256 &&
+               value.method == IdfModemHttpsMethod::Get && value.body.empty() &&
+               value.contentType.empty() && value.headerName.empty() && value.headerValue.empty() &&
+               value.rootCertificateDer.empty() &&
+               std::all_of(value.rootCertificateSha256.begin(), value.rootCertificateSha256.end(),
+                           [](uint8_t byte) { return byte == 0; }) &&
+               value.apn.size() <= 96 && value.timeoutMs > 0 && value.timeoutMs <= 30000;
+    }
     const bool post = request.https_post_request.method == IdfModemHttpsMethod::Post;
     const bool get = request.https_post_request.method == IdfModemHttpsMethod::Get;
     const bool body_bounded = post
@@ -1715,7 +1727,11 @@ static bool try_unlock_sim(bool allow_puk)
     send_ok("AT+CMEE=1", 1200);
     std::string state = query_sim_state();
     if (state == "ready") {
-        set_sim_status("ready", false, "SIM is ready");
+        // ICCID 是 PIN 凭据的主键；读取它不应依赖网络注册完成。
+        IdfModemStatus status = idf_modem_get_status();
+        std::string iccid = is_iccid_text(status.iccid) ? status.iccid : query_current_iccid();
+        set_sim_status("ready", false, "SIM is ready", iccid);
+        if (!iccid.empty()) save_identity_cache(std::string(), iccid);
         return true;
     }
     if (state != "pin" && state != "puk") {
@@ -2162,6 +2178,9 @@ static bool process_data_mode_retry(void)
     return true;
 }
 
+static esp_err_t submit_keepalive_request(const IdfModemHttpsPostRequest& request,
+                                          IdfModemHttpsPostResult& result);
+
 esp_err_t idf_modem_cellular_http_get(const std::string& url,
                                       const IdfCellularHttpConfig& config,
                                       IdfCellularHttpResult& result)
@@ -2181,7 +2200,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
     request.dataEnabled = config.dataEnabled;
     request.rootCertificateDer = config.rootCertificateDer;
     request.rootCertificateSha256 = config.rootCertificateSha256;
-    if (!idf_modem_https_validate_request(request, result.message)) return ESP_ERR_INVALID_ARG;
+    if (!idf_modem_keepalive_validate_request(request, result.message)) return ESP_ERR_INVALID_ARG;
     // Eight complete GETs bound payload to 512 KiB; each uses the existing 64 KiB parser.
     // Check cancellation between requests so the UART owner can finish cleanup.
     const int64_t deadline = esp_timer_get_time() + 120000000;
@@ -2197,7 +2216,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
         }
         request.timeoutMs = static_cast<uint32_t>(std::min<int64_t>(30000, remaining / 1000));
         IdfModemHttpsPostResult response;
-        const esp_err_t err = idf_modem_https_post(request, response);
+        const esp_err_t err = submit_keepalive_request(request, response);
         result.requests = attempt + 1;
         result.httpStatus = response.httpStatus;
         result.bytesRead += response.bodyBytes;
@@ -2218,7 +2237,7 @@ esp_err_t idf_modem_cellular_http_get(const std::string& url,
         }
         if (result.bytesRead >= result.expectedBytes) {
             result.ok = true;
-            result.message = "Cellular HTTPS keepalive completed";
+            result.message = "Cellular keepalive completed";
             return ESP_OK;
         }
     }
@@ -2407,10 +2426,13 @@ static IdfModemHttpsCommandResult owner_https_confirm_open(void* opaque)
 }
 
 static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
-                                  IdfModemHttpsPostResult& result, TickDeadline& deadline)
+                                  IdfModemHttpsPostResult& result, TickDeadline& deadline,
+                                  bool keepalive_plain_http)
 {
     assert_owner_task();
     result = IdfModemHttpsPostResult();
+    if (keepalive_plain_http && (request.url.rfind("http://", 0) != 0 ||
+        !idf_modem_keepalive_validate_request(request, result.message))) return ESP_ERR_INVALID_ARG;
     const IdfModemStatus status = idf_modem_get_status();
     if (!status.atReady) {
         result.message = "Modem AT is not ready";
@@ -2431,7 +2453,8 @@ static esp_err_t owner_https_post(const IdfModemHttpsPostRequest& request,
     const IdfModemHttpsCallbacks callbacks{
         &context, &owner_https_send_command, &owner_https_confirm_open};
     const IdfModemHttpsRunResult run_result =
-        idf_modem_https_run_post(request, callbacks, result);
+        keepalive_plain_http ? idf_modem_keepalive_run_get(request, callbacks, result)
+                             : idf_modem_https_run_post(request, callbacks, result);
     context.open_latch.reset();
     if (run_result == IdfModemHttpsRunResult::ok && !https_status_valid(result.httpStatus)) {
         result.ok = false;
@@ -2488,6 +2511,24 @@ esp_err_t idf_modem_https_post(const IdfModemHttpsPostRequest& request,
     return err;
 }
 
+static esp_err_t submit_keepalive_request(const IdfModemHttpsPostRequest& request,
+                                          IdfModemHttpsPostResult& result)
+{
+    result = {};
+    if (!idf_modem_keepalive_validate_request(request, result.message)) return ESP_ERR_INVALID_ARG;
+    if (request.url.rfind("http://", 0) != 0) return idf_modem_https_post(request, result);
+    OwnerCommand owner_request;
+    owner_request.kind = OwnerCommandKind::https_post;
+    owner_request.keepalive_plain_http = true;
+    owner_request.https_post_request = request;
+    owner_request.timeout_ms = request.timeoutMs;
+    if (xTaskGetCurrentTaskHandle() == s_owner_task) {
+        TickDeadline deadline(request.timeoutMs);
+        return owner_https_post(request, result, deadline, true);
+    }
+    return submit_owner_command(owner_request, nullptr, false, nullptr, &result);
+}
+
 static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
 {
     assert_owner_task();
@@ -2516,7 +2557,7 @@ static esp_err_t execute_owner_command(OwnerCommandSlot& slot)
         case OwnerCommandKind::https_post: {
             TickDeadline deadline(slot.request.deadline_start, slot.request.deadline_span);
             return owner_https_post(slot.request.https_post_request, slot.https_post_result,
-                                    deadline);
+                                    deadline, slot.request.keepalive_plain_http);
         }
     }
     return ESP_ERR_INVALID_ARG;

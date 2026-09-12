@@ -2,6 +2,7 @@ import type { ActionResult, DeviceSnapshot, EsimStatus, Job, LogPage, OtaState, 
 import { CONFIG_MIME_TYPE } from "$lib/config-schema.generated";
 import { pushSecretRequired } from "$lib/push-template-defaults.js";
 import { previewMockRules } from "$lib/forward-rules.js";
+import { validKeepaliveUrl } from "$lib/keepalive-url.js";
 import { fetchMozillaCertData, selectMozillaRootCandidates } from "$lib/mozilla-certdata";
 
 let csrfToken = "";
@@ -363,6 +364,7 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 			if (form.has(`${prefix}cellularEnabled`)) channel.cellularEnabled = form.get(`${prefix}cellularEnabled`) === "1";
 			if (form.get(`${prefix}cellularUrlClear`) === "1") { channel.cellularUrl = ""; channel.cellularUrlSet = false; }
 			else if (form.get(`${prefix}cellularUrl`)) { channel.cellularUrl = ""; channel.cellularUrlSet = true; }
+			if ([...form.keys()].every((key) => ["cellularEnabled", "cellularUrl", "cellularUrlClear"].some((suffix) => key === `${prefix}${suffix}`))) continue;
 			if (type !== channel.type) {
 				channel.url = ""; channel.urlSet = false;
 				channel.key1 = ""; channel.key1Set = false;
@@ -396,21 +398,44 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 	return { success: true, code, data, detail: "" } as T;
 }
 
+async function withRequestDeadline<T>(signal: AbortSignal | null | undefined, read: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+	const timeout = globalThis.setTimeout(() => controller.abort(), 90000);
+	try {
+		return await read(controller.signal);
+	} catch (error) {
+		if (controller.signal.aborted) throw new JobResultUnknownError("Request result unavailable.", { cause: error });
+		throw error;
+	} finally {
+		globalThis.clearTimeout(timeout);
+		signal?.removeEventListener("abort", abort);
+	}
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 	if (demoMode) return demoResponse<T>(path, init);
-	const response = await fetch(path, {
-		...init,
-		headers: {
-			Accept: "application/json",
-			...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-			...init?.headers
+	return withRequestDeadline(init?.signal, async (signal) => {
+		const response = await fetch(path, {
+			...init,
+			signal,
+			headers: {
+				Accept: "application/json",
+				...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+				...init?.headers
+			}
+		});
+		const data = await response.json().catch((error) => {
+			if (signal.aborted || response.ok) throw error;
+			throw new Error(`HTTP ${response.status}`);
+		});
+		if (!response.ok && !(data && typeof data === "object" && ("code" in data || isPushTestStatus(data)))) {
+			throw new Error(`HTTP ${response.status}`);
 		}
+		return data as T;
 	});
-	const data = await response.json().catch(() => undefined);
-	if (!response.ok && !(data && typeof data === "object" && ("code" in data || isPushTestStatus(data)))) {
-		throw new Error(`HTTP ${response.status}`);
-	}
-	return data as T;
 }
 
 export async function loadSnapshot(): Promise<DeviceSnapshot> {
@@ -515,15 +540,19 @@ export async function loadKeepalive(): Promise<KeepaliveStatus> {
 
 export async function saveKeepalive(enabled: boolean, interval: number, traffic: number, url: string): Promise<ActionResult> {
 	if (demoMode) {
-		if ((enabled || url !== demoKeepalive.url) && !url.startsWith("https://")) return { success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "kaUrl" };
+		if ((enabled || url !== demoKeepalive.url) && !validKeepaliveUrl(url)) return { success: false, code: "ACTION_CONFIG_INVALID", data: {}, detail: "kaUrl" };
+		const sameOrigin = validKeepaliveUrl(url) && validKeepaliveUrl(demoKeepalive.url) && new URL(url).origin === new URL(demoKeepalive.url).origin;
+		demoKeepalive.ready = validKeepaliveUrl(url) && traffic <= 512 && (url.startsWith("http://") || (sameOrigin && demoKeepalive.ready));
 		demoKeepalive.url = url;
+		demoKeepalive.trafficKB = traffic;
 	}
 	return waitForAccepted(await postForm("/save", { kaEnabled: enabled, kaIntervalDays: interval, kaTrafficKB: traffic, kaUrl: url }));
 }
 
 export async function provisionKeepaliveCa(): Promise<ActionResult> {
 	if (demoMode) {
-		demoKeepalive.ready = demoKeepalive.url.startsWith("https://");
+		if (!demoKeepalive.url.startsWith("https://")) return { success: false, code: "PUSH_CA_REJECTED", data: {}, detail: "" };
+		demoKeepalive.ready = validKeepaliveUrl(demoKeepalive.url) && demoKeepalive.trafficKB <= 512;
 		return { success: demoKeepalive.ready, code: demoKeepalive.ready ? "PUSH_CA_INSTALLED" : "PUSH_CA_REJECTED", data: {}, detail: "" };
 	}
 	return provisionCaTarget("/api/keepalive/ca/status", "/api/keepalive/ca/probe", "/api/keepalive/ca/install?");
@@ -582,11 +611,13 @@ export async function exportEncryptedConfig(passphrase: string): Promise<Uint8Ar
 	const completed = await waitForJob(jobId);
 	if (!completed.success) throw new Error(completed.code);
 	const exportId = Number(completed.data.exportId);
-	const response = await fetch(`/api/config/export?id=${exportId}`, {
-		headers: { Accept: CONFIG_MIME_TYPE, "X-CSRF-Token": csrfToken }
+	return withRequestDeadline(undefined, async (signal) => {
+		const response = await fetch(`/api/config/export?id=${exportId}`, {
+			signal, headers: { Accept: CONFIG_MIME_TYPE, "X-CSRF-Token": csrfToken }
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		return new Uint8Array(await response.arrayBuffer());
 	});
-	if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	return new Uint8Array(await response.arrayBuffer());
 }
 
 function otaPayload(file: Uint8Array) {
