@@ -776,6 +776,21 @@
         }
       }
     },
+    "/api/diagnostics/crash-summary": {
+      "get": {
+        "tags": ["Device"],
+        "summary": "Read a bounded authenticated crash summary",
+        "description": "Returns only reset classification and a bounded, validated core-dump summary. The route requires Basic Auth, accepts no request body, does not require CSRF, never returns raw core bytes, previous logs, registers, task control blocks, stack bytes, credentials, or modem data, and does not erase the core dump.",
+        "responses": {
+          "200": { "description": "A valid or absent core-dump summary.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "400": { "description": "The GET request included a body.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "const": "GET" } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } },
+          "413": { "$ref": "#/components/responses/BodyTooLarge" },
+          "500": { "description": "The core dump is invalid, unavailable, or cannot be summarized without exposing raw data.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActionResult" } } } }
+        }
+      }
+    },
     "/api/push/test": {
       "get": {
         "tags": ["Configuration"],
@@ -1084,6 +1099,10 @@
               "ACTION_CSRF_INVALID",
               "ACTION_JOB_ACCEPTED",
               "ACTION_JOB_NOT_FOUND",
+			  "ACTION_CRASH_SUMMARY_OK",
+			  "ACTION_CRASH_SUMMARY_NO_CORE",
+			  "ACTION_CRASH_SUMMARY_INVALID",
+			  "ACTION_CRASH_SUMMARY_UNAVAILABLE",
 			  "ACTION_ESIM_IDLE",
 			  "ACTION_ESIM_RUNNING",
 			  "ACTION_ESIM_COMPLETE",
@@ -1186,7 +1205,17 @@
           "signalDbm": { "type": ["integer", "null"] },
           "rssi": { "type": "integer" },
           "ber": { "type": "integer" },
-          "imei": { "type": "string" }
+          "imei": { "type": "string" },
+		  "resetReason": { "type": "string", "enum": ["power-on", "external", "software", "panic", "interrupt-watchdog", "task-watchdog", "watchdog", "deep-sleep", "brownout", "sdio", "usb", "jtag", "efuse", "power-glitch", "cpu-lockup", "unknown"] },
+		  "coreState": { "type": "string", "enum": ["absent", "invalid", "valid", "unavailable"] },
+		  "corePresent": { "type": ["boolean", "null"] },
+		  "coreValid": { "type": ["boolean", "null"] },
+		  "coreDumpVersion": { "type": "integer", "minimum": 0 },
+		  "pc": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+		  "ra": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+		  "task": { "type": "string", "enum": ["idf_web_job", "idf_sched", "idf_schedtask", "idf_keepalive", "idf_sim_apply", "idf_esim", "ota_restart", "prev_log_save", "idf_push", "idf_sms", "idf_wifi_scan", "idf_wifi_mem", "idf_dns", "idf_mdns", "idf_wifi_sel", "idf_boot_ap", "idf_sta_watch", "idf_modem", "other"] },
+		  "stackBytes": { "type": "integer", "minimum": 0, "maximum": 1024 },
+		  "elfShaPrefix": { "type": ["string", "null"], "pattern": "^[0-9a-f]{8}$" }
 		  ,"jobId": { "type": "integer" },
 		  "uploadId": { "type": "integer" },
 		  "exportId": { "type": "integer" },

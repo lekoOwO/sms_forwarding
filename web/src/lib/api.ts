@@ -398,21 +398,44 @@ function demoResponse<T>(path: string, init?: RequestInit): T {
 	return { success: true, code, data, detail: "" } as T;
 }
 
+async function withRequestDeadline<T>(signal: AbortSignal | null | undefined, read: (signal: AbortSignal) => Promise<T>): Promise<T> {
+	const controller = new AbortController();
+	const abort = () => controller.abort(signal?.reason);
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+	const timeout = globalThis.setTimeout(() => controller.abort(), 90000);
+	try {
+		return await read(controller.signal);
+	} catch (error) {
+		if (controller.signal.aborted) throw new JobResultUnknownError("Request result unavailable.", { cause: error });
+		throw error;
+	} finally {
+		globalThis.clearTimeout(timeout);
+		signal?.removeEventListener("abort", abort);
+	}
+}
+
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 	if (demoMode) return demoResponse<T>(path, init);
-	const response = await fetch(path, {
-		...init,
-		headers: {
-			Accept: "application/json",
-			...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
-			...init?.headers
+	return withRequestDeadline(init?.signal, async (signal) => {
+		const response = await fetch(path, {
+			...init,
+			signal,
+			headers: {
+				Accept: "application/json",
+				...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+				...init?.headers
+			}
+		});
+		const data = await response.json().catch((error) => {
+			if (signal.aborted || response.ok) throw error;
+			throw new Error(`HTTP ${response.status}`);
+		});
+		if (!response.ok && !(data && typeof data === "object" && ("code" in data || isPushTestStatus(data)))) {
+			throw new Error(`HTTP ${response.status}`);
 		}
+		return data as T;
 	});
-	const data = await response.json().catch(() => undefined);
-	if (!response.ok && !(data && typeof data === "object" && ("code" in data || isPushTestStatus(data)))) {
-		throw new Error(`HTTP ${response.status}`);
-	}
-	return data as T;
 }
 
 export async function loadSnapshot(): Promise<DeviceSnapshot> {
@@ -588,11 +611,13 @@ export async function exportEncryptedConfig(passphrase: string): Promise<Uint8Ar
 	const completed = await waitForJob(jobId);
 	if (!completed.success) throw new Error(completed.code);
 	const exportId = Number(completed.data.exportId);
-	const response = await fetch(`/api/config/export?id=${exportId}`, {
-		headers: { Accept: CONFIG_MIME_TYPE, "X-CSRF-Token": csrfToken }
+	return withRequestDeadline(undefined, async (signal) => {
+		const response = await fetch(`/api/config/export?id=${exportId}`, {
+			signal, headers: { Accept: CONFIG_MIME_TYPE, "X-CSRF-Token": csrfToken }
+		});
+		if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		return new Uint8Array(await response.arrayBuffer());
 	});
-	if (!response.ok) throw new Error(`HTTP ${response.status}`);
-	return new Uint8Array(await response.arrayBuffer());
 }
 
 function otaPayload(file: Uint8Array) {

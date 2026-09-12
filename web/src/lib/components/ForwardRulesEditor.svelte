@@ -41,8 +41,9 @@
 	}
 	async function preview() {
 		if (busy || localError) return;
-		busy = true; requestError = "";
+		busy = true; requestError = ""; result = null;
 		const key = inputKey;
+		checkedInput = key;
 		try {
 			const next = await waitForAccepted(await postForm("/api/rules/preview", { rules: value, sender, text: message }));
 			result = next; checkedInput = key;
@@ -98,8 +99,7 @@
 		<Field.Group>
 			<Field.Field><Field.Label for="rule-test-sender">{t("ruleTestSender")}</Field.Label><Input id="rule-test-sender" bind:value={sender} maxlength={32} /></Field.Field>
 			<Field.Field><Field.Label for="rule-test-message">{t("ruleTestMessage")}</Field.Label><Textarea id="rule-test-message" rows={3} bind:value={message} /></Field.Field>
-			<Button id="rule-test" type="button" variant="outline" disabled={busy || Boolean(localError)} onclick={preview}>{busy ? t("commonRunning") : t("ruleTest")}</Button>
-			{#if requestError}<p role="alert">{requestError}</p>{/if}
+			{#if requestError && checkedInput === inputKey}<p role="alert">{requestError}</p>{/if}
 			{#if currentResult}
 				<div id="rule-preview-result" role={currentResult.success ? "status" : "alert"} class="flex flex-col gap-2 text-sm">
 					{#if !currentResult.success}
@@ -124,6 +124,7 @@
 					{/if}
 				</div>
 			{/if}
+			<Button id="rule-test" type="button" variant="outline" aria-busy={busy} disabled={busy || Boolean(localError)} onclick={preview}>{busy ? t("commonRunning") : t("ruleTest")}</Button>
 		</Field.Group>
 	</Field.Set>
 </Field.Group>

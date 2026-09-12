@@ -398,6 +398,7 @@ class IdfConfigUpdateTest(unittest.TestCase):
             subprocess.run(
                 [
                     compiler, "-std=c++17", "-fexceptions", "-O0", "-ffunction-sections", "-fdata-sections", "-Werror",
+                    "-fstack-usage",
                     "-Wno-unused-function", "-Wno-unused-variable",
                     "-I", str(temp), "-I", str(ROOT / "components/idf_config"),
                     "-I", str(ROOT / "components/idf_config/include"), "-c", str(source),
@@ -405,6 +406,16 @@ class IdfConfigUpdateTest(unittest.TestCase):
                 ],
                 cwd=ROOT,
                 check=True,
+            )
+            stack_usage = implementation_object.with_suffix(".su").read_text(encoding="utf-8")
+            swap_frames = [
+                int(line.split("\t")[1])
+                for line in stack_usage.splitlines()
+                if "swap" in line and "IdfConfig" in line and len(line.split("\t")) >= 2
+            ]
+            self.assertTrue(
+                not swap_frames or max(swap_frames) <= 512,
+                f"publishing IdfConfig must not create a large stack temporary: {swap_frames}",
             )
             subprocess.run(
                 [compiler, "-std=c++17", "-fno-exceptions", "-Werror", "-c", str(caller),

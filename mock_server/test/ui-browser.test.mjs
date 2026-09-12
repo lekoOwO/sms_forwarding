@@ -7,7 +7,7 @@ import puppeteer from "puppeteer-core";
 import { createApp } from "../server.mjs";
 
 const ROOT = resolve(new URL("../..", import.meta.url).pathname);
-const WEB_ROOT = join(ROOT, "web", "build");
+const WEB_ROOT = process.env.UI_BROWSER_WEB_ROOT ?? join(ROOT, "web", "build");
 const OPENAPI_PATH = join(ROOT, "dev_doc", "openapi.json");
 const ROUTES = ["connection", "diagnostics", "maintenance", "advanced"];
 const browserCandidates = [
@@ -19,6 +19,124 @@ const browserCandidates = [
 ].filter((candidate) => candidate && existsSync(candidate));
 const browserExecutable = browserCandidates[0];
 const browserAvailable = Boolean(process.env.UI_BROWSER_URL || browserExecutable);
+
+test("heartbeat save reaches terminal feedback above its button without collapsing the form", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		// Cold navigation can exceed 30 s on the local host; action deadlines stay below.
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll('[data-slot="accordion-trigger"]')].find((button) => button.textContent.includes("Heartbeat")).click());
+		await waitForAccordionContent(page, "#heartbeat-form");
+		let rejectSave = false;
+		let freshCa = false;
+		const delayedCa = [];
+		await t.test("save settles in the open form", { timeout: 10000 }, async () => {
+		const storedPush = await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked"));
+		await page.$eval("#push-global-enabled", (button) => button.click());
+		await page.setRequestInterception(true);
+		page.on("request", (request) => {
+			if (new URL(request.url()).pathname === "/save" && rejectSave) void request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" });
+			else if (new URL(request.url()).pathname === "/api/push/ca/status") {
+				if (freshCa) void request.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, code: "PUSH_CA_STATUS", data: { configured: true, sha256: "a".repeat(64) }, detail: "" }) });
+				else delayedCa.push(request);
+			}
+			else void request.continue();
+		});
+		const responses = [];
+		page.on("response", (response) => { if (new URL(response.url()).pathname === "/save") responses.push(response.status()); });
+		const accepted = page.waitForResponse((response) => new URL(response.url()).pathname === "/save", { timeout: 5000 });
+		await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+		assert.equal((await accepted).status(), 202);
+		await page.waitForFunction(() => [...document.querySelectorAll('[role="status"]')].some((element) => element.textContent.includes("Configuration saved")), { timeout: 5000 });
+		await page.waitForFunction(() => !document.querySelector('button[form="heartbeat-form"]')?.disabled, { timeout: 5000 });
+		assert.deepEqual(responses, [202]);
+		assert.ok(await page.$eval("#heartbeat-form", (form) => form.getBoundingClientRect().height > 0), "successful save must leave the edited form open");
+		const position = await page.$eval("#heartbeat-form", (form) => {
+			const region = form.parentElement;
+			const result = [...region.querySelectorAll('[role="status"]')].find((element) => element.textContent.includes("Configuration saved"));
+			const button = region.querySelector('button[form="heartbeat-form"]');
+			return { result: result?.textContent, busy: button?.disabled, resultBottom: result?.getBoundingClientRect().bottom, buttonTop: button?.getBoundingClientRect().top };
+		});
+		assert.ok(position.result.includes("Configuration saved"));
+		assert.equal(position.busy, false);
+		assert.ok(position.resultBottom <= position.buttonTop, "heartbeat feedback must appear above Save");
+		assert.equal(await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked")), storedPush === "true" ? "false" : "true", "a successful heartbeat refresh must preserve the unrelated push-switch draft");
+		assert.ok(delayedCa.length > 0, "Save must settle while its background certificate reads remain pending");
+		await Promise.all(delayedCa.filter((request) => new URL(request.url()).searchParams.get("channel") !== "0").map((request) => request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" })));
+		});
+		await t.test("rejected save replaces success with terminal error", { timeout: 10000 }, async () => {
+			rejectSave = true;
+			await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+			await page.waitForFunction(() => document.querySelector("#heartbeat-form")?.parentElement.querySelector('[role="alert"]')?.textContent.includes("Request failed"), { timeout: 5000 });
+			const error = await page.$eval("#heartbeat-form", (form) => {
+				const result = form.parentElement.querySelector('[role="alert"]');
+				const button = form.parentElement.querySelector('button[form="heartbeat-form"]');
+				return { text: result.textContent, button: button.textContent.trim(), disabled: button.disabled, above: result.getBoundingClientRect().bottom <= button.getBoundingClientRect().top };
+			});
+			assert.equal(error.button, "Save");
+			assert.equal(error.disabled, false);
+			assert.equal(error.above, true);
+			assert.doesNotMatch(error.text, /Configuration saved/);
+		});
+		await t.test("late certificate reads cannot replace a newer configured state", { timeout: 10000 }, async () => {
+			freshCa = true;
+			await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "4G delivery and certificates").click());
+			await waitForAccordionContent(page, "#push-cellular-url-0");
+			await page.$eval("#push-cellular-url-0", (input) => [...input.closest('[data-slot="card"]').querySelectorAll("button")].find((button) => button.textContent.trim() === "Check and set up").click());
+			await page.waitForFunction(() => document.querySelector("#push-cellular-url-0").closest('[data-slot="card"]').textContent.includes("Certificate configured"), { timeout: 5000 });
+			const old = delayedCa.find((request) => new URL(request.url()).searchParams.get("channel") === "0");
+			assert.ok(old);
+			const response = page.waitForResponse((reply) => reply.request() === old, { timeout: 5000 });
+			await old.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, code: "PUSH_CA_STATUS", data: { configured: false, sha256: "" }, detail: "" }) });
+			await (await response).json();
+			await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+			assert.ok(await page.$eval("#push-cellular-url-0", (input) => input.closest('[data-slot="card"]').textContent.includes("Certificate configured")));
+		});
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("heartbeat refresh failure preserves successful feedback and unrelated drafts", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#notifications");
+		await page.waitForSelector("#push-global-enabled");
+		await page.evaluate(() => [...document.querySelectorAll('[data-slot="accordion-trigger"]')].find((button) => button.textContent.includes("Heartbeat")).click());
+		await waitForAccordionContent(page, "#heartbeat-form");
+		await t.test("save remains successful when its following read fails", { timeout: 10000 }, async () => {
+			const before = await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked"));
+			await page.$eval("#push-global-enabled", (button) => button.click());
+			await page.setRequestInterception(true);
+			let reads = 0;
+			page.on("request", (request) => {
+				if (new URL(request.url()).pathname === "/api/config") { reads++; return void request.respond({ status: 503, contentType: "text/plain", body: "Unavailable" }); }
+				void request.continue();
+			});
+			await page.$eval("#heartbeat-form", (form) => form.requestSubmit());
+			await page.waitForFunction(() => document.body.textContent.includes("HTTP 503"), { timeout: 5000 });
+			assert.equal(reads, 1, "failed refresh must not automatically repeat a read or save");
+			assert.ok(await page.$eval("#heartbeat-form", (form) => form.parentElement.textContent.includes("Configuration saved")));
+			assert.equal(await page.$eval("#push-global-enabled", (button) => button.getAttribute("aria-checked")), before === "true" ? "false" : "true");
+			assert.equal(await page.$eval('button[form="heartbeat-form"]', (button) => button.textContent.trim()), "Save");
+		});
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
 
 test("push channel saves validate active provider fields before sending any settings", { timeout: 30000, skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async () => {
 	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
@@ -235,6 +353,72 @@ test("mobile CSV editor preserves quoted text, tests first-match routing, and sa
 		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Convert to CSV").click());
 		assert.equal(await page.$eval("#forward-rules", (input) => input.value), 'kw,"A,B","email,1",1');
 		assert.equal(await page.evaluate(async () => (await (await fetch("/api/config")).json()).config.forwardRules), "kw\tA,B\temail,1", "conversion remains a draft until saved");
+	} finally {
+		await closeBrowser(browser, shared);
+		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+		await closeServer(server);
+	}
+});
+
+test("keepalive load failure stays visible and retry restores its form", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
+	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
+	let browser, page, userDataDir, shared;
+	try {
+		({ browser, page, userDataDir, shared } = await launchBrowser());
+		page.setDefaultNavigationTimeout(60000);
+		await page.evaluateOnNewDocument(() => localStorage.setItem("locale", "en"));
+		await page.setRequestInterception(true);
+		let fail = true;
+		let intercept = null;
+		page.on("request", (request) => {
+			if (intercept?.(request)) return;
+			if (new URL(request.url()).pathname === "/api/keepalive" && fail) { return void request.respond({ status: 503, contentType: "text/plain", body: "Service unavailable" }); }
+			void request.continue();
+		});
+		const failed = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/keepalive" && response.status() === 503, { timeout: 60000 });
+		await openRoute(page, `http://127.0.0.1:${server.address().port}`, "#device/connection");
+		await failed;
+		await t.test("initial error and retry remain available", { timeout: 10000 }, async () => {
+		await page.waitForFunction(() => [...document.querySelectorAll('[role="alert"]')].some((element) => element.textContent.includes("Request failed")), { timeout: 1000 }).catch(() => {});
+		assert.ok(await page.evaluate(() => [...document.querySelectorAll('[role="alert"]')].some((element) => element.textContent.includes("Request failed"))), "failed initial keepalive load must expose its error even without status data");
+		fail = false;
+		await page.evaluate(() => [...document.querySelectorAll("button")].find((button) => button.textContent.trim() === "Retry").click());
+		await page.waitForSelector("#keepalive-url", { timeout: 5000 });
+		assert.equal(await page.$eval("#keepalive-enabled", (button) => button.getAttribute("aria-checked")), "false");
+		});
+		await t.test("run feedback belongs to Run, not Save", { timeout: 10000 }, async () => {
+			let held;
+			const started = new Promise((resolve) => { intercept = (request) => {
+				if (new URL(request.url()).searchParams.get("action") !== "run") return false;
+				held = request; resolve(); return true;
+			}; });
+			await page.$eval('[data-keepalive-operation="run"] button', (button) => button.click());
+			await started;
+			assert.equal(await page.$eval('[data-keepalive-operation="save"] button', (button) => button.textContent.trim()), "Save");
+			assert.equal(await page.$eval('[data-keepalive-operation="save"] button', (button) => button.getAttribute("aria-busy")), "false");
+			assert.equal(await page.$eval('[data-keepalive-operation="run"] button', (button) => button.getAttribute("aria-busy")), "true");
+			intercept = null;
+			await held.respond({ status: 200, contentType: "application/json", body: JSON.stringify({ success: true, message: "" }) });
+			await page.waitForFunction(() => !document.querySelector('[data-keepalive-operation="run"] button').disabled, { timeout: 5000 });
+			assert.ok(await page.$eval('[data-keepalive-operation="run"]', (region) => region.querySelector('[role="status"]').getBoundingClientRect().bottom <= region.querySelector("button").getBoundingClientRect().top));
+		});
+		await t.test("successful Save stops its spinner while refreshing status", { timeout: 10000 }, async () => {
+			let held;
+			const started = new Promise((resolve) => { intercept = (request) => {
+				if (new URL(request.url()).pathname !== "/api/keepalive" || request.method() !== "GET") return false;
+				held = request; resolve(); return true;
+			}; });
+			await page.$eval('[data-keepalive-operation="save"] button', (button) => button.click());
+			await started;
+			const saved = await page.$eval('[data-keepalive-operation="save"]', (region) => {
+				const button = region.querySelector("button");
+				return { text: button.textContent.trim(), busy: button.getAttribute("aria-busy"), disabled: button.disabled, success: region.querySelector('[role="status"]').textContent.includes("Configuration saved") };
+			});
+			assert.deepEqual(saved, { text: "Save", busy: "false", disabled: true, success: true });
+			intercept = null;
+			await held.continue();
+			await page.waitForFunction(() => !document.querySelector('[data-keepalive-operation="save"] button').disabled, { timeout: 5000 });
+		});
 	} finally {
 		await closeBrowser(browser, shared);
 		if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });

@@ -1123,6 +1123,186 @@ static std::string action_result(bool success, const char* code,
     return out;
 }
 
+static const char* crash_summary_reset_reason(esp_reset_reason_t reason)
+{
+    switch (reason) {
+        case ESP_RST_POWERON: return "power-on";
+        case ESP_RST_EXT: return "external";
+        case ESP_RST_SW: return "software";
+        case ESP_RST_PANIC: return "panic";
+        case ESP_RST_INT_WDT: return "interrupt-watchdog";
+        case ESP_RST_TASK_WDT: return "task-watchdog";
+        case ESP_RST_WDT: return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep-sleep";
+        case ESP_RST_BROWNOUT: return "brownout";
+        case ESP_RST_SDIO: return "sdio";
+        case ESP_RST_USB: return "usb";
+        case ESP_RST_JTAG: return "jtag";
+        case ESP_RST_EFUSE: return "efuse";
+        case ESP_RST_PWR_GLITCH: return "power-glitch";
+        case ESP_RST_CPU_LOCKUP: return "cpu-lockup";
+        default: return "unknown";
+    }
+}
+
+static const char* crash_summary_task_class(const char* raw)
+{
+    static constexpr const char* allowed[] = {
+        "idf_web_job", "idf_sched", "idf_schedtask", "idf_keepalive", "idf_sim_apply",
+        "idf_esim", "ota_restart", "prev_log_save", "idf_push", "idf_sms",
+        "idf_wifi_scan", "idf_wifi_mem", "idf_dns", "idf_mdns", "idf_wifi_sel",
+        "idf_boot_ap", "idf_sta_watch", "idf_modem",
+    };
+    if (!raw) return "other";
+    for (const char* name : allowed) {
+        const size_t length = strlen(name);
+        if (length < 16 && strncmp(raw, name, length) == 0 && raw[length] == '\0') {
+            return name;
+        }
+    }
+    return "other";
+}
+
+static bool crash_summary_elf_prefix(std::string& out, const uint8_t* raw)
+{
+    out.clear();
+    if (!raw) return false;
+    for (size_t i = 0; i < 8; ++i) {
+        const char value = static_cast<char>(raw[i]);
+        const bool decimal = value >= '0' && value <= '9';
+        const bool alpha = value >= 'a' && value <= 'f';
+        if (!decimal && !alpha) {
+            out.clear();
+            return false;
+        }
+        out.push_back(value);
+    }
+    return true;
+}
+
+static std::string crash_summary_base_data(const char* reset_reason,
+                                           const char* core_state,
+                                           const char* core_present,
+                                           const char* core_valid)
+{
+    std::string data;
+    data.reserve(256);
+    json_prop(data, "resetReason", reset_reason);
+    data += ",";
+    json_prop(data, "coreState", core_state);
+    data += ",\"corePresent\":";
+    data += core_present;
+    data += ",\"coreValid\":";
+    data += core_valid;
+    return data;
+}
+
+static esp_err_t send_crash_summary_result(httpd_req_t* req, const char* status,
+                                           bool success, const char* code,
+                                           const std::string& data,
+                                           const char* detail = "")
+{
+    set_json_no_cache(req);
+    if (status) httpd_resp_set_status(req, status);
+    const std::string body = action_result(success, code, data, detail ? detail : "");
+    return httpd_resp_send(req, body.c_str(), body.size());
+}
+
+static esp_err_t handle_crash_summary(httpd_req_t* req)
+{
+    if (reject_oversized_body(req)) return ESP_OK;
+    if (!check_auth_strict(req)) return ESP_OK;
+    if (req->method != HTTP_GET) {
+        return send_crash_summary_result(req, "405 Method Not Allowed", false,
+                                         "ACTION_INPUT_INVALID", {}, "method");
+    }
+    if (req->content_len != 0) {
+        return send_crash_summary_result(req, "400 Bad Request", false,
+                                         "ACTION_INPUT_INVALID", {}, "body");
+    }
+
+    const char* reset_reason = crash_summary_reset_reason(esp_reset_reason());
+    size_t image_addr = 0;
+    size_t image_size = 0;
+    const esp_err_t image_info = esp_core_dump_image_get(&image_addr, &image_size);
+    (void)image_addr;
+    (void)image_size;
+    if (image_info == ESP_ERR_NOT_FOUND) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "absent", "false", "false");
+        return send_crash_summary_result(req, nullptr, true,
+                                         "ACTION_CRASH_SUMMARY_NO_CORE", data);
+    }
+    if (image_info == ESP_ERR_INVALID_SIZE) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "invalid", "true", "false");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_INVALID", data);
+    }
+    if (image_info != ESP_OK) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "unavailable", "null", "null");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_UNAVAILABLE", data);
+    }
+    const esp_err_t image_check = esp_core_dump_image_check();
+    if (image_check == ESP_ERR_NOT_FOUND) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "absent", "false", "false");
+        return send_crash_summary_result(req, nullptr, true,
+                                         "ACTION_CRASH_SUMMARY_NO_CORE", data);
+    }
+    if (image_check == ESP_ERR_INVALID_SIZE || image_check == ESP_ERR_INVALID_CRC) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "invalid", "true", "false");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_INVALID", data);
+    }
+    if (image_check != ESP_OK) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "unavailable", "null", "null");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_UNAVAILABLE", data);
+    }
+
+    std::unique_ptr<esp_core_dump_summary_t> summary(
+        new (std::nothrow) esp_core_dump_summary_t{});
+    if (!summary) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "unavailable", "null", "null");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_UNAVAILABLE", data, "memory");
+    }
+    if (esp_core_dump_get_summary(summary.get()) != ESP_OK) {
+        const std::string data = crash_summary_base_data(
+            reset_reason, "invalid", "true", "false");
+        return send_crash_summary_result(req, "500 Internal Server Error", false,
+                                         "ACTION_CRASH_SUMMARY_INVALID", data);
+    }
+
+    std::string elf_prefix;
+    const bool elf_prefix_valid = crash_summary_elf_prefix(
+        elf_prefix, summary->app_elf_sha256);
+    const uint32_t stack_bytes = std::min<uint32_t>(
+        summary->exc_bt_info.dump_size,
+        static_cast<uint32_t>(CONFIG_ESP_COREDUMP_SUMMARY_STACKDUMP_SIZE));
+    std::string data = crash_summary_base_data(reset_reason, "valid", "true", "true");
+    data += ",\"coreDumpVersion\":" + std::to_string(summary->core_dump_version);
+    data += ",\"pc\":" + std::to_string(summary->exc_pc);
+    data += ",\"ra\":" + std::to_string(summary->ex_info.ra);
+    data += ",";
+    json_prop(data, "task", crash_summary_task_class(summary->exc_task));
+    data += ",\"stackBytes\":" + std::to_string(stack_bytes);
+    if (elf_prefix_valid) {
+        data += ",";
+        json_prop(data, "elfShaPrefix", elf_prefix);
+    } else {
+        data += ",\"elfShaPrefix\":null";
+    }
+    return send_crash_summary_result(req, nullptr, true,
+                                     "ACTION_CRASH_SUMMARY_OK", data);
+}
+
 static uint32_t web_now_ms()
 {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000ULL);
@@ -6051,6 +6231,7 @@ esp_err_t idf_web_start(void)
     IDF_WEB_TRY_REGISTER("/api/config", register_handler(s_server, "/api/config", HTTP_GET, handle_api_config));
     IDF_WEB_TRY_REGISTER("/api/esim", register_handler(s_server, "/api/esim", HTTP_ANY, handle_api_esim));
     IDF_WEB_TRY_REGISTER("/api/jobs", register_handler(s_server, "/api/jobs", HTTP_GET, handle_api_job));
+    IDF_WEB_TRY_REGISTER("/api/diagnostics/crash-summary", register_handler(s_server, "/api/diagnostics/crash-summary", HTTP_GET, handle_crash_summary));
     IDF_WEB_TRY_REGISTER("/api/config/export", register_handler(s_server, "/api/config/export", HTTP_ANY, handle_config_export));
     IDF_WEB_TRY_REGISTER("/api/config/restore/start", register_handler(s_server, "/api/config/restore/start", HTTP_POST, handle_config_restore_start));
     IDF_WEB_TRY_REGISTER("/api/config/restore/chunk", register_handler(s_server, "/api/config/restore/chunk", HTTP_POST, handle_config_restore_chunk));

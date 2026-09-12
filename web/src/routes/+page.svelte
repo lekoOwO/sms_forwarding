@@ -92,14 +92,15 @@
 	let pushProviderDrafts = $state<Array<Record<number, PushProviderDraft>>>(Array.from({ length: 5 }, () => ({})));
 	let emailResult = $state(idle());
 	let heartbeatResult = $state(idle());
-	let pushResult = $state(idle());
+	let pushResults = $state(Array.from({ length: 5 }, idle));
 	let pushTestResults = $state(Array.from({ length: 5 }, idlePushTest));
 	let pushTestBusy = $state(Array.from({ length: 5 }, () => false));
 	let pushCaResults = $state(Array.from({ length: 5 }, idle));
 	let pushCellularSaveResults = $state(Array.from({ length: 5 }, idle));
 	let pushCaStatuses = $state<Array<PushCaStatus | null>>(Array.from({ length: 5 }, () => null));
+	const pushCaReadGeneration = Array.from({ length: 5 }, () => 0);
 	let cellularUrlClears = $state(Array.from({ length: 5 }, () => false));
-	let wifiResult = $state(idle());
+	let wifiResults = $state(Array.from({ length: 5 }, idle));
 	let networkModeResult = $state(idle());
 	let routingResult = $state(idle());
 	let forwardRulesResult = $state(idle());
@@ -120,11 +121,13 @@
 	let pushSwitchResult = $state(idle());
 	let emailEnabledDraft = $state(false);
 	let pushEnabledDraft = $state(false);
-	let notificationSwitchSaving = $derived(emailSwitchResult.state === "loading" || pushSwitchResult.state === "loading");
 	let esim = $state<EsimStatus | null>(null);
 	let esimLoading = $state(false);
 	let esimError = $state("");
 	let esimResult = $state(idle());
+	let esimResultAction = $state<TranslationKey>("esimRefresh");
+	let esimResultHandle = $state("");
+	let esimResultTarget = $state("");
 	let esimPollTimer: number | undefined;
 	let esimPollBusy = false;
 	let esimPollGeneration = 0;
@@ -141,7 +144,14 @@
 	let deleteHandle = $state("");
 	let deleteOriginId = $state("");
 	let deleteDialog: HTMLDialogElement;
-	let configFileResult = $state(idle());
+	let backupResult = $state(idle());
+	let restoreResult = $state(idle());
+	let configFileBusy = $derived(backupResult.state === "loading" || restoreResult.state === "loading");
+	let saving = $state(false);
+	let snapshotRefreshing = $state(false);
+	let formBusy = $derived(saving || snapshotRefreshing);
+	let notificationSwitchSaving = $derived(formBusy || emailSwitchResult.state === "loading" || pushSwitchResult.state === "loading");
+	let logsBusy = $state(false);
 	let otaResult = $state(idle());
 	let otaState = $state<OtaState | null>(null);
 	let otaStateLoading = $state(false);
@@ -225,17 +235,44 @@
 
 	type PushDraftToKeep = { index: number; group: "provider" | "cellular" };
 	let savedPushChannels: PushChannel[] = [];
+	let savedConfig: DeviceSnapshot["config"] | null = null;
 
-	async function refreshSnapshot(keep?: PushDraftToKeep) {
-		loading = true;
+	async function refreshSnapshot(keep?: PushDraftToKeep, submitted?: Record<string, string | number | boolean>) {
+		if (snapshotRefreshing) return;
+		snapshotRefreshing = true;
+		loading = snapshot === null;
 		loadError = "";
 		try {
+			const previous = snapshot?.config;
+			const previousSaved = savedConfig;
+			const cachedProviderDrafts = pushProviderDrafts;
 			const draft = keep && snapshot?.config.pushChannels[keep.index];
 			const baseline = keep && savedPushChannels[keep.index];
 			const providerDrafts = keep && pushProviderDrafts[keep.index];
-			const clearCellularUrl = keep && cellularUrlClears[keep.index];
-			snapshot = await loadSnapshot();
+			const fresh = await loadSnapshot();
+			const previousEmailDraft = emailEnabledDraft;
+			const previousPushDraft = pushEnabledDraft;
+			const previousOpenWifi = openWifiProfiles;
+			const previousCellularClears = cellularUrlClears;
+			snapshot = fresh;
+			savedConfig = $state.snapshot(snapshot.config);
 			savedPushChannels = snapshot.config.pushChannels.map((channel) => ({ ...channel }));
+			originalWifiSsids = snapshot.config.wifiProfiles.map((profile) => profile.ssid);
+			originalWifiOpen = snapshot.config.wifiProfiles.map((profile) => profile.open);
+			const names = Object.keys(submitted ?? {});
+			if (submitted && previous && previousSaved) {
+				for (const key of Object.keys(previous) as Array<keyof DeviceSnapshot["config"]>) {
+					if (["pushChannels", "wifiProfiles"].includes(key)) continue;
+					const written = key === "webAccounts" ? names.some((name) => /^account\d+(user|pass)$/.test(name)) : Object.hasOwn(submitted, key);
+					if (!written && JSON.stringify(previous[key]) !== JSON.stringify(previousSaved[key])) {
+						Object.assign(snapshot.config, { [key]: previous[key] });
+					}
+				}
+				for (let index = 0; index < 5; index++) {
+					if (!names.some((name) => name.startsWith(`push${index}`)) && JSON.stringify(previous.pushChannels[index]) !== JSON.stringify(previousSaved.pushChannels[index])) snapshot.config.pushChannels[index] = previous.pushChannels[index];
+					if (!names.some((name) => name.startsWith(`wifi${index}`)) && JSON.stringify(previous.wifiProfiles[index]) !== JSON.stringify(previousSaved.wifiProfiles[index])) snapshot.config.wifiProfiles[index] = previous.wifiProfiles[index];
+				}
+			}
 			if (keep && draft && baseline) {
 				const keys: (keyof PushChannel)[] = keep.group === "provider"
 					? ["enabled", "type", "name", "url", "urlSet", "key1", "key1Set", "key2", "key2Set", "customBody", "customBodySet", "titleTemplate", "bodyTemplate"]
@@ -244,19 +281,30 @@
 			}
 			pushProviderTypes = snapshot.config.pushChannels.map((channel) => channel.type);
 			pushProviderDrafts = snapshot.config.pushChannels.map(() => ({}));
+			if (submitted) for (let index = 0; index < 5; index++) if (!names.some((name) => name.startsWith(`push${index}`))) pushProviderDrafts[index] = cachedProviderDrafts[index];
 			if (keep?.group === "provider" && providerDrafts) pushProviderDrafts[keep.index] = providerDrafts;
-			pushCaStatuses = await Promise.all(snapshot.config.pushChannels.map((_channel, index) => loadPushCaStatus(index).catch(() => null)));
 			cellularUrlClears = Array.from({ length: 5 }, () => false);
-			if (keep?.group === "cellular") cellularUrlClears[keep.index] = Boolean(clearCellularUrl);
+			if (submitted) for (let index = 0; index < 5; index++) if (!names.some((name) => name.startsWith(`push${index}`))) cellularUrlClears[index] = previousCellularClears[index];
+			if (keep?.group === "cellular") cellularUrlClears[keep.index] = previousCellularClears[keep.index];
 			emailEnabledDraft = snapshot.config.emailEnabled;
 			pushEnabledDraft = snapshot.config.pushEnabled;
-			originalWifiSsids = snapshot.config.wifiProfiles.map((profile) => profile.ssid);
-			originalWifiOpen = snapshot.config.wifiProfiles.map((profile) => profile.open);
+			if (submitted && previousSaved) {
+				if (!Object.hasOwn(submitted, "emailEnabled") && previousEmailDraft !== previousSaved.emailEnabled) emailEnabledDraft = previousEmailDraft;
+				if (!Object.hasOwn(submitted, "pushEnabled") && previousPushDraft !== previousSaved.pushEnabled) pushEnabledDraft = previousPushDraft;
+			}
 			openWifiProfiles = snapshot.config.wifiProfiles.map((profile) => profile.open);
+			if (submitted && previousSaved) for (let index = 0; index < 5; index++) if (!names.some((name) => name.startsWith(`wifi${index}`)) && previousOpenWifi[index] !== previousSaved.wifiProfiles[index].open) openWifiProfiles[index] = previousOpenWifi[index];
+			for (let index = 0; index < 5; index++) {
+				const generation = ++pushCaReadGeneration[index];
+				void loadPushCaStatus(index).catch(() => null).then((status) => {
+					if (pushCaReadGeneration[index] === generation) pushCaStatuses[index] = status;
+				});
+			}
 		} catch (error) {
 			loadError = error instanceof Error ? error.message : String(error);
 		} finally {
 			loading = false;
+			snapshotRefreshing = false;
 		}
 	}
 
@@ -356,6 +404,9 @@
 	async function submitEsimInstall(confirmation = false, accepted = true) {
 		if (esimInstallSubmitting || (confirmation ? esim?.job.stage !== "awaiting_confirmation" : esimBusy)) return;
 		esimInstallSubmitting = true;
+		esimResultAction = "esimInstallTitle";
+		esimResultHandle = "";
+		esimResultTarget = "";
 		esimResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			const pending = confirmation
@@ -384,6 +435,10 @@
 	}
 
 	async function runEsimAction(actionName: string, profile?: EsimProfile, nickname?: string) {
+		if (esimBusy) return;
+		esimResultAction = ({ refresh: "esimRefresh", nickname: "esimSaveNickname", enable: "esimEnable", disable: "esimDisable", switch: "esimSwitch", delete: "esimDelete" } as Record<string, TranslationKey>)[actionName] ?? "resultTitle";
+		esimResultHandle = profile?.handle ?? "";
+		esimResultTarget = profile?.displayId ?? "";
 		esimResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			const result = await postEsimAction(actionName, profile?.handle, nickname);
@@ -430,11 +485,13 @@
 	}
 
 	async function save(setResult: (value: UiResult) => void, values: Record<string, string | number | boolean>, keep?: PushDraftToKeep) {
+		if (formBusy) return;
 		const invalid = tooLong(values);
 		if (invalid) {
 			setResult({ state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: invalid });
 			return;
 		}
+		saving = true;
 		setResult({ state: "loading", code: "commonSaving", data: {}, detail: "" });
 		try {
 			const response = await waitForAccepted(await postForm("/save", values));
@@ -442,15 +499,18 @@
 			if (response.success) {
 				const cellularField = Object.keys(values).find((field) => /^push[0-4]cellularEnabled$/.test(field));
 				const cellularIndex = cellularField ? Number(cellularField[4]) : -1;
-				await refreshSnapshot(keep);
+				await refreshSnapshot(keep, values);
 				if (cellularIndex >= 0 && snapshot?.config.pushChannels[cellularIndex]?.cellularEnabled) await provisionCa(cellularIndex);
 			}
 		} catch (error) {
 			setResult(requestFailure(error));
+		} finally {
+			saving = false;
 		}
 	}
 
-	async function action(setResult: (value: UiResult) => void, path: string, confirmText?: string, init?: RequestInit) {
+	async function action(current: UiResult, setResult: (value: UiResult) => void, path: string, confirmText?: string, init?: RequestInit) {
+		if (current.state === "loading") return;
 		if (confirmText && !window.confirm(confirmText)) return;
 		setResult({ state: "loading", code: "commonRunning", data: {}, detail: "" });
 		try {
@@ -479,13 +539,17 @@
 	}
 
 	async function provisionCa(index: number) {
+		if (pushCaResults[index].state === "loading") return;
+		let generation = ++pushCaReadGeneration[index];
 		pushCaResults[index] = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			const response = await provisionPushCa(index);
-			pushCaStatuses[index] = await loadPushCaStatus(index);
-			pushCaResults[index] = { state: response.success && pushCaStatuses[index]?.configured ? "success" : "error", code: response.code, data: response.data, detail: response.detail };
+			generation = ++pushCaReadGeneration[index];
+			const status = await loadPushCaStatus(index);
+			if (pushCaReadGeneration[index] === generation) pushCaStatuses[index] = status;
+			pushCaResults[index] = { state: response.success && status.configured ? "success" : "error", code: response.code, data: response.data, detail: response.detail };
 		} catch (error) {
-			pushCaStatuses[index] = { configured: false, sha256: "" };
+			if (pushCaReadGeneration[index] === generation) pushCaStatuses[index] = { configured: false, sha256: "" };
 			pushCaResults[index] = requestFailure(error);
 		}
 	}
@@ -500,7 +564,7 @@
 	function savePush(index: number) {
 		const form = document.getElementById(`push-form-${index}`);
 		if (!(form instanceof HTMLFormElement) || !form.reportValidity()) return;
-		void save((value) => pushResult = value, pushValues(index), { index, group: "cellular" });
+		void save((value) => pushResults[index] = value, pushValues(index), { index, group: "cellular" });
 	}
 
 	function saveCellular(index: number) {
@@ -515,6 +579,7 @@
 	}
 
 	async function sendSms() {
+		if (smsResult.state === "loading") return;
 		const invalid = tooLong({ phone, content: message });
 		if (invalid) {
 			smsResult = { state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: invalid };
@@ -531,6 +596,8 @@
 	}
 
 	async function refreshLogs() {
+		if (logsBusy) return;
+		logsBusy = true;
 		try {
 			const page = await loadLogs();
 			logs = page.entries.map((entry) => entry.message);
@@ -539,11 +606,14 @@
 			logsResult = idle();
 		} catch (error) {
 			logsResult = { state: "error", code: "ACTION_LOGS_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+		} finally {
+			logsBusy = false;
 		}
 	}
 
 	async function loadMoreLogs() {
-		if (logCursor === null) return;
+		if (logsBusy || logCursor === null) return;
+		logsBusy = true;
 		try {
 			const page = await loadLogs(logCursor);
 			logs = [...page.entries.map((entry) => entry.message), ...logs];
@@ -552,6 +622,8 @@
 			logsResult = idle();
 		} catch (error) {
 			logsResult = { state: "error", code: "ACTION_LOGS_FAILED", data: {}, detail: error instanceof Error ? error.message : String(error) };
+		} finally {
+			logsBusy = false;
 		}
 	}
 
@@ -565,36 +637,38 @@
 	}
 
 	async function backupConfig() {
+		if (configFileBusy) return;
 		if (backupPassphrase.length < 12 || backupPassphrase !== backupConfirmation) {
-			configFileResult = { state: "error", code: "ACTION_PASSPHRASE_INVALID", data: {}, detail: "" };
+			backupResult = { state: "error", code: "ACTION_PASSPHRASE_INVALID", data: {}, detail: "" };
 			return;
 		}
-		configFileResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
+		backupResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			download(await exportEncryptedConfig(backupPassphrase), `${snapshot!.config.hostname}.smscfg`);
-			configFileResult = { state: "success", code: "ACTION_CONFIG_EXPORT_READY", data: {}, detail: "" };
+			backupResult = { state: "success", code: "ACTION_CONFIG_EXPORT_READY", data: {}, detail: "" };
 		} catch (error) {
-			configFileResult = requestFailure(error);
+			backupResult = requestFailure(error);
 		}
 	}
 
 	async function restoreConfig() {
+		if (configFileBusy) return;
 		if (!restoreFile || restorePassphrase.length < 12) {
-			configFileResult = { state: "error", code: "ACTION_PASSPHRASE_INVALID", data: {}, detail: "" };
+			restoreResult = { state: "error", code: "ACTION_PASSPHRASE_INVALID", data: {}, detail: "" };
 			return;
 		}
-		configFileResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
+		restoreResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			const result = await waitForAccepted(await uploadRestore(new Uint8Array(await restoreFile.arrayBuffer()), restorePassphrase));
-			configFileResult = { state: result.success ? "success" : "error", code: result.code, data: result.data, detail: result.detail };
+			restoreResult = { state: result.success ? "success" : "error", code: result.code, data: result.data, detail: result.detail };
 			if (result.success) await refreshSnapshot();
 		} catch (error) {
-			configFileResult = requestFailure(error);
+			restoreResult = requestFailure(error);
 		}
 	}
 
 	async function installOta() {
-		if (!otaFile) return;
+		if (!otaFile || otaResult.state === "loading") return;
 		otaResult = { state: "loading", code: "commonRunning", data: {}, detail: "" };
 		try {
 			const result = await waitForAccepted(await uploadOta(new Uint8Array(await otaFile.arrayBuffer())));
@@ -706,7 +780,7 @@
 			terminalResult = { state: "error", code: "ACTION_INPUT_TOO_LONG", data: {}, detail: "cmd" };
 			return;
 		}
-		void action((value) => terminalResult = value, `/at?cmd=${encodeURIComponent(command)}`);
+		void action(terminalResult, (value) => terminalResult = value, `/at?cmd=${encodeURIComponent(command)}`);
 	}
 
 	function accountValues() {
@@ -796,7 +870,7 @@
 			</div>
 			<div><p class="text-sm font-medium">{t("loadingTitle")}</p><p class="text-sm text-muted-foreground">{t("loadingBody")}</p></div>
 		</div>
-	{:else if loadError || !snapshot}
+	{:else if !snapshot}
 		<Alert.Root variant="destructive">
 			<CircleAlertIcon aria-hidden="true" />
 			<Alert.Title>{t("loadErrorTitle")}</Alert.Title>
@@ -806,6 +880,13 @@
 			</Alert.Description>
 		</Alert.Root>
 	{:else}
+		{#if loadError}
+			<Alert.Root variant="destructive">
+				<CircleAlertIcon aria-hidden="true" />
+				<Alert.Title>{t("loadErrorTitle")}</Alert.Title>
+				<Alert.Description class="flex flex-col items-start gap-3"><span>{loadError}</span><Button variant="outline" disabled={snapshotRefreshing || saving} onclick={() => void refreshSnapshot(undefined, {})}>{t("retry")}</Button></Alert.Description>
+			</Alert.Root>
+		{/if}
 		<div class="app-layout">
 			<aside class="desktop-sidebar hidden lg:block" aria-label={t("navMenuTitle")}>
 				<nav class="flex flex-col gap-5">
@@ -865,7 +946,7 @@
 						<dl class="flex items-center justify-between gap-3"><dt class="text-sm text-muted-foreground">{t("overviewPush")}</dt><dd><Badge variant={snapshot.status.enabledPushChannels > 0 ? "default" : "outline"}>{snapshot.status.enabledPushChannels} / 5</Badge></dd></dl>
 					</div>
 					<Separator />
-					<section class="flex flex-col gap-3"><div><h2 class="font-semibold">{t("overviewQuick")}</h2><p class="text-sm text-muted-foreground">{t("overviewQuickDescription")}</p></div><div class="flex flex-wrap gap-2"><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=wifi")}>{t("overviewQueryWifi")}</Button><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=signal")}>{t("overviewQuerySignal")}</Button><Button variant="outline" onclick={() => action((value) => overviewResult = value, "/query?type=network")}>{t("overviewQueryNetwork")}</Button></div><ActionResult result={overviewResult} title={t("resultTitle")} {locale} /></section>
+					<section class="flex flex-col gap-3"><div><h2 class="font-semibold">{t("overviewQuick")}</h2><p class="text-sm text-muted-foreground">{t("overviewQuickDescription")}</p></div><ActionResult result={overviewResult} title={t("resultTitle")} {locale} /><div class="flex flex-wrap gap-2"><Button variant="outline" disabled={formBusy || overviewResult.state === "loading"} onclick={() => action(overviewResult, (value) => overviewResult = value, "/query?type=wifi")}>{t("overviewQueryWifi")}</Button><Button variant="outline" disabled={formBusy || overviewResult.state === "loading"} onclick={() => action(overviewResult, (value) => overviewResult = value, "/query?type=signal")}>{t("overviewQuerySignal")}</Button><Button variant="outline" disabled={formBusy || overviewResult.state === "loading"} onclick={() => action(overviewResult, (value) => overviewResult = value, "/query?type=network")}>{t("overviewQueryNetwork")}</Button></div></section>
 				</section>
 				{:else if mainTab === "notifications"}
 					<section class="flex flex-col gap-6">
@@ -889,8 +970,8 @@
 								<form id="notification-locale-form" onsubmit={(event) => { event.preventDefault(); void save((value) => notificationLocaleResult = value, { notificationLocale: snapshot!.config.notificationLocale }); }}>
 									<Field.Field><Field.Label for="notification-locale">{t("notificationLocale")}</Field.Label><NativeSelect.Root id="notification-locale" class="w-full" bind:value={snapshot.config.notificationLocale}><NativeSelect.Option value="zh-TW">{t("localeZhTw")}</NativeSelect.Option><NativeSelect.Option value="zh-CN">{t("localeZhCn")}</NativeSelect.Option><NativeSelect.Option value="en">{t("localeEn")}</NativeSelect.Option></NativeSelect.Root><Field.Description>{t("notificationLocaleHint")}</Field.Description></Field.Field>
 								</form>
-								<div class="flex justify-end"><Button type="submit" form="notification-locale-form" disabled={notificationLocaleResult.state === "loading"}>{notificationLocaleResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 								<ActionResult result={notificationLocaleResult} title={t("resultTitle")} {locale} />
+								<div class="flex justify-end"><Button type="submit" form="notification-locale-form" disabled={formBusy || notificationLocaleResult.state === "loading"}>{notificationLocaleResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 							</Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="heartbeat">
@@ -904,17 +985,17 @@
 											<Field.Field><Field.Label for="heartbeat-interval">{t("heartbeatInterval")}</Field.Label><Input id="heartbeat-interval" type="number" min={CONFIG_VALUE_LIMITS.heartbeatInterval.min} max={CONFIG_VALUE_LIMITS.heartbeatInterval.max} required bind:value={snapshot.config.heartbeatInterval} /><Field.Description>{t("heartbeatIntervalHint")}</Field.Description></Field.Field>
 										</Field.Group>
 									</form>
-									<div class="flex justify-end"><Button type="submit" form="heartbeat-form" disabled={heartbeatResult.state === "loading"}>{heartbeatResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 									<ActionResult result={heartbeatResult} title={t("resultTitle")} {locale} />
+									<div class="flex justify-end"><Button type="submit" form="heartbeat-form" disabled={formBusy || heartbeatResult.state === "loading"}>{heartbeatResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 								</Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="email">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("emailTitle")}</span><Badge variant={snapshot.status.emailConfigured ? "secondary" : "outline"}>{snapshot.status.emailConfigured ? t("commonConfigured") : t("commonNotConfigured")}</Badge></span></Accordion.Trigger>
-							<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("emailDescription")}</p><form id="email-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => emailResult = v, { smtpServer: c.smtpServer, smtpPort: c.smtpPort, smtpUser: c.smtpUser, ...(c.smtpPass ? { smtpPass: c.smtpPass } : {}), smtpSendTo: c.smtpSendTo }); }}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field><Field.Label for="smtp-server">{t("smtpServer")}</Field.Label><Input id="smtp-server" bind:value={snapshot.config.smtpServer} /></Field.Field><Field.Field><Field.Label for="smtp-port">{t("smtpPort")}</Field.Label><Input id="smtp-port" type="number" min="1" max="65535" bind:value={snapshot.config.smtpPort} /></Field.Field><Field.Field><Field.Label for="smtp-user">{t("smtpUser")}</Field.Label><Input id="smtp-user" type="email" bind:value={snapshot.config.smtpUser} /></Field.Field><Field.Field><Field.Label for="smtp-pass">{t("smtpPassword")}</Field.Label><Input id="smtp-pass" type="password" autocomplete="new-password" bind:value={snapshot.config.smtpPass} /><Field.Description>{t("smtpPasswordHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for="smtp-to">{t("smtpRecipient")}</Field.Label><Input id="smtp-to" type="email" bind:value={snapshot.config.smtpSendTo} /></Field.Field></Field.Group></form><div class="flex justify-end"><Button type="submit" form="email-form" disabled={emailResult.state === "loading"}>{emailResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={emailResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+							<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("emailDescription")}</p><form id="email-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => emailResult = v, { smtpServer: c.smtpServer, smtpPort: c.smtpPort, smtpUser: c.smtpUser, ...(c.smtpPass ? { smtpPass: c.smtpPass } : {}), smtpSendTo: c.smtpSendTo }); }}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field><Field.Label for="smtp-server">{t("smtpServer")}</Field.Label><Input id="smtp-server" bind:value={snapshot.config.smtpServer} /></Field.Field><Field.Field><Field.Label for="smtp-port">{t("smtpPort")}</Field.Label><Input id="smtp-port" type="number" min="1" max="65535" bind:value={snapshot.config.smtpPort} /></Field.Field><Field.Field><Field.Label for="smtp-user">{t("smtpUser")}</Field.Label><Input id="smtp-user" type="email" bind:value={snapshot.config.smtpUser} /></Field.Field><Field.Field><Field.Label for="smtp-pass">{t("smtpPassword")}</Field.Label><Input id="smtp-pass" type="password" autocomplete="new-password" bind:value={snapshot.config.smtpPass} /><Field.Description>{t("smtpPasswordHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for="smtp-to">{t("smtpRecipient")}</Field.Label><Input id="smtp-to" type="email" bind:value={snapshot.config.smtpSendTo} /></Field.Field></Field.Group></form><ActionResult result={emailResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form="email-form" disabled={formBusy || emailResult.state === "loading"}>{emailResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content>
 						</Accordion.Item>
 						<Accordion.Item value="push">
 							<Accordion.Trigger><span class="flex items-center gap-2"><span>{t("pushTitle")}</span><Badge variant={snapshot.status.enabledPushChannels > 0 ? "secondary" : "outline"}>{snapshot.status.enabledPushChannels} / 5</Badge></span></Accordion.Trigger>
-			<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><form id={`push-form-${index}`} onsubmit={(event) => { event.preventDefault(); savePush(index); }}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel, index)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-url-${index}`]}><Field.Label for={`push-url-${index}`}>{endpointLabel(channel.type)}</Field.Label><Input id={`push-url-${index}`} aria-invalid={pushInvalid[`push-url-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if pushProviderKeyFields(channel.type).includes("key1")}<Field.Field data-invalid={pushInvalid[`push-key1-${index}`]}><Field.Label for={`push-key1-${index}`}>{keyLabel(channel.type, "key1")}</Field.Label><Input id={`push-key1-${index}`} aria-invalid={pushInvalid[`push-key1-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyTokenHint")}</Field.Description>{/if}</Field.Field>{/if}{#if pushProviderKeyFields(channel.type).includes("key2")}<Field.Field data-invalid={pushInvalid[`push-key2-${index}`]}><Field.Label for={`push-key2-${index}`}>{keyLabel(channel.type, "key2")}</Field.Label><Input id={`push-key2-${index}`} aria-invalid={pushInvalid[`push-key2-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyChannelHint")}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-body-${index}`]}><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} aria-invalid={pushInvalid[`push-body-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} rows={5} class="font-mono" spellcheck={false} autocapitalize="none" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><Alert.Root variant={pushTestResults[index].done && !pushTestResults[index].success ? "destructive" : "info"} aria-live="polite">{#if pushTestResults[index].done && !pushTestResults[index].success}<CircleAlertIcon aria-hidden="true" />{:else}<InfoIcon aria-hidden="true" />{/if}<Alert.Title>{t("pushTestTitle")}</Alert.Title><Alert.Description>{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</Alert.Description></Alert.Root></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></form></Tabs.Content>{/each}</Tabs.Root><div class="flex justify-end"><Button type="submit" form={`push-form-${pushTab}`} disabled={pushResult.state === "loading"}>{pushResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={pushResult} title={t("resultTitle")} {locale} /></Accordion.Content>
+			<Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("pushDescription")}</p><Tabs.Root bind:value={pushTab} class="flex flex-col gap-6"><div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{channel.name || `${t("pushChannel")} ${index + 1}`}</span><Badge variant={channel.enabled ? "secondary" : "outline"}>{channel.enabled ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>{#each snapshot.config.pushChannels as channel, index (index)}<Tabs.Content value={String(index)}><form id={`push-form-${index}`} onsubmit={(event) => { event.preventDefault(); savePush(index); }}><Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field orientation="horizontal" class="md:col-span-2"><Field.Label for={`push-enabled-${index}`}>{t("channelEnabled")}</Field.Label><Switch id={`push-enabled-${index}`} bind:checked={channel.enabled} /></Field.Field><Field.Field><Field.Label for={`push-name-${index}`}>{t("channelName")}</Field.Label><Input id={`push-name-${index}`} bind:value={channel.name} /></Field.Field><Field.Field><Field.Label for={`push-type-${index}`}>{t("providerType")}</Field.Label><NativeSelect.Root id={`push-type-${index}`} class="w-full" bind:value={channel.type} onchange={() => changeProvider(channel, index)}>{#each providers as provider, providerIndex (provider)}<NativeSelect.Option value={providerIndex + 1}>{provider}</NativeSelect.Option>{/each}</NativeSelect.Root><Field.Description>{providerHint(channel.type)}</Field.Description></Field.Field><Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-url-${index}`]}><Field.Label for={`push-url-${index}`}>{endpointLabel(channel.type)}</Field.Label><Input id={`push-url-${index}`} aria-invalid={pushInvalid[`push-url-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} type="url" required={pushSecretRequired(channel, "url")} bind:value={channel.url} />{#if savedSecretHint(channel.url, channel.urlSet)}<Field.Description>{savedSecretHint(channel.url, channel.urlSet)}</Field.Description>{/if}</Field.Field>{#if pushProviderKeyFields(channel.type).includes("key1")}<Field.Field data-invalid={pushInvalid[`push-key1-${index}`]}><Field.Label for={`push-key1-${index}`}>{keyLabel(channel.type, "key1")}</Field.Label><Input id={`push-key1-${index}`} aria-invalid={pushInvalid[`push-key1-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key1")} bind:value={channel.key1} />{#if savedSecretHint(channel.key1, channel.key1Set)}<Field.Description>{savedSecretHint(channel.key1, channel.key1Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyTokenHint")}</Field.Description>{/if}</Field.Field>{/if}{#if pushProviderKeyFields(channel.type).includes("key2")}<Field.Field data-invalid={pushInvalid[`push-key2-${index}`]}><Field.Label for={`push-key2-${index}`}>{keyLabel(channel.type, "key2")}</Field.Label><Input id={`push-key2-${index}`} aria-invalid={pushInvalid[`push-key2-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} required={pushSecretRequired(channel, "key2")} bind:value={channel.key2} />{#if savedSecretHint(channel.key2, channel.key2Set)}<Field.Description>{savedSecretHint(channel.key2, channel.key2Set)}</Field.Description>{/if}{#if channel.type === 5}<Field.Description>{t("keyChannelHint")}</Field.Description>{/if}</Field.Field>{/if}<Separator class="md:col-span-2" /><div class="md:col-span-2"><p class="font-medium">{t("templateTitle")}</p><p class="text-sm text-muted-foreground">{t("templateDescription")}</p><p class="mt-1 text-sm text-muted-foreground">{t("templateValuesHint")}</p></div>{#if channel.type === 7}<Field.Field class="md:col-span-2" data-invalid={pushInvalid[`push-body-${index}`]}><Field.Label for={`push-body-${index}`}>{t("customBody")}</Field.Label><Textarea id={`push-body-${index}`} aria-invalid={pushInvalid[`push-body-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} rows={5} class="font-mono" spellcheck={false} autocapitalize="none" required={pushSecretRequired(channel, "customBody")} bind:value={channel.customBody} /><Field.Description>{savedSecretHint(channel.customBody, channel.customBodySet) || t("customBodyHint")}</Field.Description></Field.Field>{:else}<Field.Field class="md:col-span-2"><Field.Label for={`push-title-template-${index}`}>{t("titleTemplate")}</Field.Label><Input id={`push-title-template-${index}`} placeholder={t("templateInherited")} bind:value={channel.titleTemplate} /><Field.Description>{t("titleTemplateHint")}</Field.Description></Field.Field><Field.Field class="md:col-span-2"><Field.Label for={`push-body-template-${index}`}>{t("bodyTemplate")}</Field.Label><Textarea id={`push-body-template-${index}`} rows={4} placeholder={t("templateInherited")} bind:value={channel.bodyTemplate} /><Field.Description>{t("bodyTemplateHint")}</Field.Description></Field.Field>{/if}<Card.Root class="md:col-span-2"><Card.Header><Card.Title>{t("pushTestTitle")}</Card.Title><Card.Description>{t("pushTestDescription")}</Card.Description></Card.Header><Card.Content><Alert.Root variant={pushTestResults[index].done && !pushTestResults[index].success ? "destructive" : "info"} aria-live="polite">{#if pushTestResults[index].done && !pushTestResults[index].success}<CircleAlertIcon aria-hidden="true" />{:else}<InfoIcon aria-hidden="true" />{/if}<Alert.Title>{t("pushTestTitle")}</Alert.Title><Alert.Description>{pushTestBusy[index] && !pushTestResults[index].done ? t("pushTestRunning") : pushTestResults[index].message || t("pushTestIdle")}</Alert.Description></Alert.Root></Card.Content><Card.Footer class="justify-end"><Button variant="outline" disabled={formBusy || pushTestBusy[index]} aria-label={`${t("pushTestButton")} ${channel.name || `${t("pushChannel")} ${index + 1}`}`} onclick={() => void testPush(index)}>{#if pushTestBusy[index]}<Spinner data-icon="inline-start" />{t("pushTestRunning")}{:else}{t("pushTestButton")}{/if}</Button></Card.Footer></Card.Root></Field.Group></form></Tabs.Content>{/each}</Tabs.Root><ActionResult result={pushResults[Number(pushTab)]} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form={`push-form-${pushTab}`} disabled={formBusy || pushResults[Number(pushTab)].state === "loading"}>{pushResults[Number(pushTab)].state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content>
 						</Accordion.Item>
 						<Accordion.Item value="push-cellular">
 							<Accordion.Trigger>{t("cellularPushTitle")}</Accordion.Trigger>
@@ -923,7 +1004,7 @@
 									<Card.Root>
 										<Card.Header><Card.Title>{channel.name || `${t("pushChannel")} ${index + 1}`}</Card.Title><Card.Description>{t("cellularPushDescription")}</Card.Description></Card.Header>
 										<Card.Content><form id={`push-cellular-form-${index}`} onsubmit={(event) => { event.preventDefault(); saveCellular(index); }}><Field.Group><Field.Field orientation="horizontal"><Field.Label for={`push-cellular-enabled-${index}`}>{t("cellularPushEnabled")}</Field.Label><Switch id={`push-cellular-enabled-${index}`} bind:checked={channel.cellularEnabled} /></Field.Field><Field.Field data-invalid={pushInvalid[`push-cellular-url-${index}`]}><Field.Label for={`push-cellular-url-${index}`}>{t("cellularPushUrl")}</Field.Label><Input id={`push-cellular-url-${index}`} aria-invalid={pushInvalid[`push-cellular-url-${index}`] || undefined} oninvalid={updatePushValidity} oninput={updatePushValidity} type="url" placeholder={t("cellularPushUrlInherited")} bind:value={channel.cellularUrl} />{#if savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}<Field.Description>{savedSecretHint(channel.cellularUrl, channel.cellularUrlSet)}</Field.Description>{/if}<Button type="button" variant="ghost" disabled={!channel.cellularUrlSet && !channel.cellularUrl} onclick={() => { channel.cellularUrl = ""; cellularUrlClears[index] = true; pushInvalid[`push-cellular-url-${index}`] = false; }}>{t("cellularPushUrlClear")}</Button></Field.Field><CellularCaResult status={pushCaStatuses[index]} saveResult={pushCellularSaveResults[index]} result={pushCaResults[index]} title={t("cellularCaStatus")} saveTitle={t("resultTitle")} ready={t("cellularCaReady")} notReady={t("cellularCaNotReady")} {locale} /></Field.Group></form></Card.Content>
-										<Card.Footer class="flex-wrap justify-end gap-2"><Button variant="outline" disabled={pushCaResults[index].state === "loading" || !channel.cellularEnabled} onclick={() => void provisionCa(index)}>{#if pushCaResults[index].state === "loading"}<Spinner data-icon="inline-start" />{/if}{t("cellularCaProvision")}</Button><Button type="submit" form={`push-cellular-form-${index}`} disabled={pushCellularSaveResults[index].state === "loading"}>{t("commonSave")}</Button></Card.Footer>
+										<Card.Footer class="flex-wrap justify-end gap-2"><Button variant="outline" disabled={formBusy || pushCaResults[index].state === "loading" || !channel.cellularEnabled} onclick={() => void provisionCa(index)}>{#if pushCaResults[index].state === "loading"}<Spinner data-icon="inline-start" />{/if}{t("cellularCaProvision")}</Button><Button type="submit" form={`push-cellular-form-${index}`} disabled={formBusy || pushCellularSaveResults[index].state === "loading"}>{t("commonSave")}</Button></Card.Footer>
 									</Card.Root>
 								{/each}
 							</Accordion.Content>
@@ -934,8 +1015,8 @@
 					<section class="flex flex-col gap-6">
 					<div><h1 class="text-2xl font-semibold tracking-tight">{t("messagingTitle")}</h1><p class="mt-1 text-sm text-muted-foreground">{t("messagingDescription")}</p></div>
 					<Accordion.Root type="single" bind:value={messagingSection}>
-						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="sms"><Accordion.Trigger>{t("sendSmsTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("sendSmsDescription")}</p><form id="sms-form" onsubmit={(event) => { event.preventDefault(); void sendSms(); }}><Field.Group><Field.Field><Field.Label for="sms-phone">{t("targetPhone")}</Field.Label><Input id="sms-phone" type="tel" required bind:value={phone} /></Field.Field><Field.Field><Field.Label for="sms-message">{t("smsContent")}</Field.Label><Textarea id="sms-message" rows={8} required bind:value={message} /></Field.Field></Field.Group></form><div class="flex flex-col gap-4"><div class="min-w-0"><ActionResult result={smsResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="sms-form" disabled={formBusy || smsResult.state === "loading"}>{smsResult.state === "loading" ? t("sending") : t("send")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="routing"><Accordion.Trigger>{t("routingTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-5"><p class="text-muted-foreground">{t("routingDescription")}</p><form id="routing-form" onsubmit={(event) => { event.preventDefault(); const c = snapshot!.config; void save((v) => routingResult = v, { adminPhone: c.adminPhone, numberBlackList: c.numberBlackList }); }}><Field.Group><Field.Field><Field.Label for="admin-phone">{t("adminPhone")}</Field.Label><Input id="admin-phone" type="tel" bind:value={snapshot.config.adminPhone} /><Field.Description>{t("adminPhoneHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="blocklist">{t("blacklist")}</Field.Label><Textarea id="blocklist" rows={6} bind:value={snapshot.config.numberBlackList} /><Field.Description>{t("blacklistHint")}</Field.Description></Field.Field></Field.Group></form><div class="flex flex-col gap-4"><div class="min-w-0"><ActionResult result={routingResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="routing-form" disabled={formBusy || routingResult.state === "loading"}>{routingResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content></Accordion.Item>
 						<Accordion.Item value="forward-rules">
 							<Accordion.Trigger>{t("forwardRulesTitle")}</Accordion.Trigger>
 							<Accordion.Content class="flex flex-col gap-5">
@@ -975,7 +1056,7 @@
 										</Dialog.Portal>
 									</Dialog.Root>
 								</div>
-								<form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); if (forwardRulesInvalid) return; void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><ForwardRulesEditor bind:value={snapshot.config.forwardRules} bind:invalid={forwardRulesInvalid} {locale} /></form><div class="flex items-center justify-between gap-4"><div class="min-w-0 flex-1"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={forwardRulesInvalid || forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
+								<form id="forward-rules-form" onsubmit={(event) => { event.preventDefault(); if (forwardRulesInvalid) return; void save((v) => forwardRulesResult = v, { forwardRules: snapshot!.config.forwardRules }); }}><ForwardRulesEditor bind:value={snapshot.config.forwardRules} bind:invalid={forwardRulesInvalid} {locale} /></form><div class="flex flex-col gap-4"><div class="min-w-0"><ActionResult result={forwardRulesResult} title={t("resultTitle")} {locale} /></div><Button type="submit" form="forward-rules-form" disabled={formBusy || forwardRulesInvalid || forwardRulesResult.state === "loading"}>{forwardRulesResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 							</Accordion.Content>
 						</Accordion.Item>
 					</Accordion.Root>
@@ -984,7 +1065,6 @@
 					<section class="flex flex-col gap-6">
 						<div class="flex flex-wrap items-start justify-between gap-4">
 							<div><h1 class="text-2xl font-semibold tracking-tight">{t("esimTitle")}</h1><p class="mt-1 max-w-2xl text-sm text-muted-foreground">{t("esimDescription")}</p></div>
-							<Button variant="outline" onclick={() => void refreshEsim()} disabled={esimLoading}><span class="flex items-center gap-2">{#if esimLoading}<Spinner data-icon="inline-start" />{/if}{t("esimRefresh")}</span></Button>
 						</div>
 						{#if esimError}
 							<Alert.Root variant="destructive"><CircleAlertIcon aria-hidden="true" /><Alert.Title>{t("esimError")}</Alert.Title><Alert.Description class="flex flex-col items-start gap-3"><span>{t("esimErrorBody")}</span><Button variant="outline" onclick={() => void refreshEsim()}>{t("retry")}</Button></Alert.Description></Alert.Root>
@@ -998,6 +1078,7 @@
 							<Card.Root>
 								<Card.Header><Card.Title>{t("esimInstallTitle")}</Card.Title><Card.Description>{t("esimInstallDescription")}</Card.Description></Card.Header>
 								<Card.Content class="flex flex-col gap-4">
+									{#if esimResultAction === "esimInstallTitle"}<ActionResult result={esimResult} title={t(esimResultAction)} {locale} />{/if}
 									<form class="flex flex-col items-start gap-3" onsubmit={(event) => { event.preventDefault(); void submitEsimInstall(); }}>
 										<Field.Field><Field.Label for="esim-activation-code">{t("esimActivationCode")}</Field.Label><Input id="esim-activation-code" type="password" autocomplete="off" autocapitalize="none" spellcheck={false} maxlength={516} required disabled={esimBusy} bind:value={activationCode} /></Field.Field>
 										<Button type="submit" disabled={esimBusy || !activationCode || esimInstallSubmitting}>{t("esimInstallStart")}</Button>
@@ -1022,6 +1103,7 @@
 							</Card.Root>
 							<section class="flex flex-col gap-4" aria-labelledby="esim-profiles-title">
 								<div><h2 id="esim-profiles-title" class="text-xl font-semibold">{t("esimProfiles")}</h2></div>
+								{#if esimResultAction !== "esimInstallTitle" && (!esimResultHandle || !esim.profiles.some((profile) => profile.handle === esimResultHandle))}<ActionResult result={esimResult} title={esimResultTarget ? `${t(esimResultAction)} · ${esimResultTarget}` : t(esimResultAction)} {locale} />{/if}
 								{#if esim.profiles.length === 0}
 									<Empty.Root><Empty.Header><Empty.Title>{t("esimEmpty")}</Empty.Title></Empty.Header><Empty.Content><Button variant="outline" disabled={esimBusy} onclick={() => void runEsimAction("refresh")}>{t("esimRefresh")}</Button></Empty.Content></Empty.Root>
 								{:else}
@@ -1029,15 +1111,16 @@
 										{#each esim.profiles as profile, profileIndex (profile.handle)}
 											<Card.Root>
 												<Card.Header><div class="flex items-start justify-between gap-3"><div class="min-w-0"><Card.Title>{profile.nickname || t("esimProfileUnnamed")}</Card.Title><Card.Description>{t("esimProfileDisplayId")}: {profile.displayId}</Card.Description></div><Badge variant={profile.state === "enabled" ? "default" : "outline"}>{t(profile.state === "enabled" ? "esimProfileEnabled" : profile.state === "disabled" ? "esimProfileDisabled" : "esimProfileUnknown")}</Badge></div></Card.Header>
-												<Card.Content class="flex flex-col gap-4"><dl class="grid gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimNickname")}</dt><dd class="mt-1 font-medium">{profile.nickname || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProfileClass")}</dt><dd class="mt-1 font-medium">{t(profile.profileClass === "operational" ? "esimClassOperational" : profile.profileClass === "provisioning" ? "esimClassProvisioning" : "esimClassUnknown")}</dd></div></dl><form class="flex flex-col gap-3" onsubmit={(event) => { event.preventDefault(); void runEsimAction("nickname", profile, profile.nickname); }}><Field.Field><Field.Label for={`esim-nickname-${profile.handle}`}>{t("esimNickname")}</Field.Label><Input id={`esim-nickname-${profile.handle}`} maxlength={64} autocomplete="off" placeholder={t("esimNicknamePlaceholder")} bind:value={profile.nickname} /></Field.Field><Button type="submit" variant="outline" disabled={esimBusy}>{t("esimSaveNickname")}</Button></form></Card.Content>
+												<Card.Content class="flex flex-col gap-4"><dl class="grid gap-3 sm:grid-cols-2"><div><dt class="text-sm text-muted-foreground">{t("esimNickname")}</dt><dd class="mt-1 font-medium">{profile.nickname || t("esimProfileUnnamed")}</dd></div><div><dt class="text-sm text-muted-foreground">{t("esimProfileClass")}</dt><dd class="mt-1 font-medium">{t(profile.profileClass === "operational" ? "esimClassOperational" : profile.profileClass === "provisioning" ? "esimClassProvisioning" : "esimClassUnknown")}</dd></div></dl>{#if esimResultHandle === profile.handle}<ActionResult result={esimResult} title={`${t(esimResultAction)} · ${profile.displayId}`} {locale} />{/if}<form class="flex flex-col gap-3" onsubmit={(event) => { event.preventDefault(); void runEsimAction("nickname", profile, profile.nickname); }}><Field.Field><Field.Label for={`esim-nickname-${profile.handle}`}>{t("esimNickname")}</Field.Label><Input id={`esim-nickname-${profile.handle}`} maxlength={64} autocomplete="off" placeholder={t("esimNicknamePlaceholder")} bind:value={profile.nickname} /></Field.Field><Button type="submit" variant="outline" disabled={esimBusy}>{t("esimSaveNickname")}</Button></form></Card.Content>
 														<Card.Footer class="flex flex-wrap justify-end gap-2"><Button variant="outline" disabled={esimBusy || profile.state === "enabled"} onclick={() => void runEsimAction("enable", profile)}>{t("esimEnable")}</Button><Button variant="outline" disabled={esimBusy || profile.state !== "enabled"} onclick={() => void runEsimAction("disable", profile)}>{t("esimDisable")}</Button><Button variant="outline" disabled={esimBusy} onclick={() => void runEsimAction("switch", profile)}>{t("esimSwitch")}</Button><Button id={`esim-delete-${profileIndex}`} variant="destructive" disabled={esimBusy} onclick={() => askDelete(profile.handle, `esim-delete-${profileIndex}`)}>{t("esimDelete")}</Button></Card.Footer>
 											</Card.Root>
 										{/each}
 									</div>
 								{/if}
-								<ActionResult result={esimResult} title={t("resultTitle")} {locale} />
+
 							</section>
 						{/if}
+						{#if !esimError}<div class="flex justify-end"><Button variant="outline" onclick={() => void refreshEsim()} disabled={esimLoading}><span class="flex items-center gap-2">{#if esimLoading}<Spinner data-icon="inline-start" />{/if}{t("esimRefresh")}</span></Button></div>{/if}
 					</section>
 				{:else if mainTab === "device"}
 					<section id={`device/${deviceSubpage}`} class="device-page flex flex-col gap-6">
@@ -1063,7 +1146,7 @@
 								<div class="device-tool-group-heading"><h2 id="device-group-connection" class="text-sm font-semibold">{t("deviceGroupConnection")}</h2></div>
 							<Accordion.Item value="identity">
 								<Accordion.Trigger>{t("deviceTabIdentity")}</Accordion.Trigger>
-									<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" data-device-action="identity-save" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><ActionResult result={identityResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form="identity-form" disabled={identityResult.state === "loading"}>{identityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content>
+									<Accordion.Content class="flex flex-col gap-4"><form id="identity-form" data-device-action="identity-save" onsubmit={(event) => { event.preventDefault(); void save((value) => identityResult = value, { deviceName: snapshot!.config.deviceName, hostname: snapshot!.config.hostname }); }}><Field.Group><Field.Field><Field.Label for="device-name">{t("deviceName")}</Field.Label><Input id="device-name" required bind:value={snapshot.config.deviceName} /><Field.Description>{t("deviceNameHint")}</Field.Description></Field.Field><Field.Field><Field.Label for="hostname">{t("hostname")}</Field.Label><Input id="hostname" required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" bind:value={snapshot.config.hostname} /><Field.Description>{t("hostnameHint")}</Field.Description></Field.Field></Field.Group></form><ActionResult result={identityResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form="identity-form" disabled={formBusy || identityResult.state === "loading"}>{identityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="wifi-profiles">
 								<Accordion.Trigger>{t("wifiProfilesTitle")}</Accordion.Trigger>
@@ -1074,15 +1157,15 @@
 										<div class="overflow-x-auto pb-1"><Tabs.List class="min-w-max">{#each snapshot.config.wifiProfiles as profile, index (index)}<Tabs.Trigger value={String(index)}><span class="flex items-center gap-2"><span>{t("wifiProfile")} {index + 1}</span><Badge variant={profile.ssid ? "secondary" : "outline"}>{profile.ssid ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Tabs.Trigger>{/each}</Tabs.List></div>
 										{#each snapshot.config.wifiProfiles as profile, index (index)}
 											<Tabs.Content value={String(index)}>
-														<form class="flex flex-col gap-5" data-device-action="wifi-profile-save" onsubmit={(event) => { event.preventDefault(); void save((value) => wifiResult = value, wifiValues(index)); }}>
+														<form class="flex flex-col gap-5" data-device-action="wifi-profile-save" onsubmit={(event) => { event.preventDefault(); void save((value) => wifiResults[index] = value, wifiValues(index)); }}>
 													<Field.Group>
 														<Field.Field><Field.Label for={`wifi-ssid-${index}`}>{t("wifiSsid")}</Field.Label><Input id={`wifi-ssid-${index}`} maxlength={CONFIG_FIELD_LIMITS.wifiSsid} bind:value={profile.ssid} /><Field.Description>{t("wifiSsidHint")}</Field.Description></Field.Field>
 														<Field.Field data-invalid={wifiPasswordRequired(index) && !profile.password}><Field.Label for={`wifi-password-${index}`}>{t("wifiPassword")}</Field.Label><Input id={`wifi-password-${index}`} type="password" minlength={8} maxlength={CONFIG_FIELD_LIMITS.wifiPassword} pattern={"[ -~]{8,63}"} autocomplete="new-password" required={wifiPasswordRequired(index)} aria-invalid={wifiPasswordRequired(index) && !profile.password} disabled={!profile.ssid || openWifiProfiles[index]} bind:value={profile.password} /><Field.Description>{wifiPasswordRequired(index) ? t("wifiPasswordChangedHint") : t("wifiPasswordHint")}</Field.Description></Field.Field>
 														<Field.Field orientation="horizontal" data-disabled={!profile.ssid}><Field.Label for={`wifi-open-${index}`}>{t("wifiOpenNetwork")}</Field.Label><Switch id={`wifi-open-${index}`} disabled={!profile.ssid} bind:checked={openWifiProfiles[index]} onchange={() => { if (openWifiProfiles[index]) profile.password = ""; }} /></Field.Field>
 													</Field.Group>
-													<div class="flex justify-end"><Button type="submit" disabled={wifiResult.state === "loading"}>{wifiResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
+												<ActionResult result={wifiResults[index]} title={t("resultTitle")} {locale} />
+													<div class="flex justify-end"><Button type="submit" disabled={formBusy || wifiResults[index].state === "loading"}>{wifiResults[index].state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 												</form>
-												<ActionResult result={wifiResult} title={t("resultTitle")} {locale} />
 											</Tabs.Content>
 										{/each}
 									</Tabs.Root>
@@ -1095,8 +1178,8 @@
 									<form id="network-mode-form" data-device-action="network-mode-save" onsubmit={(event) => { event.preventDefault(); void save((value) => networkModeResult = value, { networkMode: snapshot!.config.networkMode }); }}>
 										<Field.Field><Field.Label for="network-mode">{t("networkMode")}</Field.Label><NativeSelect.Root id="network-mode" class="w-full" bind:value={snapshot.config.networkMode}><NativeSelect.Option value={0}>{t("networkModeWifiOnly")}</NativeSelect.Option><NativeSelect.Option value={1}>{t("networkMode4gOnly")}</NativeSelect.Option><NativeSelect.Option value={2}>{t("networkModeMix")}</NativeSelect.Option></NativeSelect.Root><Field.Description>{t("networkModeHint")}</Field.Description></Field.Field>
 									</form>
-									<div class="flex justify-end"><Button type="submit" form="network-mode-form" disabled={networkModeResult.state === "loading"}>{networkModeResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 									<ActionResult result={networkModeResult} title={t("resultTitle")} {locale} />
+									<div class="flex justify-end"><Button type="submit" form="network-mode-form" disabled={formBusy || networkModeResult.state === "loading"}>{networkModeResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div>
 								</Accordion.Content>
 							</Accordion.Item>
 							<Accordion.Item value="keepalive-compatibility">
@@ -1111,34 +1194,34 @@
 						<div class="device-subpage" data-device-subpage="diagnostics">
 							<section class="device-tool-group" data-tool-group="diagnostics" aria-labelledby="device-group-diagnostics">
 							<div class="device-tool-group-heading"><h2 id="device-group-diagnostics" class="text-sm font-semibold">{t("deviceGroupDiagnostics")}</h2></div>
-								<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-modem-info" onclick={() => action((value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" data-device-action="diagnostics-signal" onclick={() => action((value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" data-device-action="diagnostics-sim-info" onclick={() => action((value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" data-device-action="diagnostics-modem-signal" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" data-device-action="diagnostics-operator" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" data-device-action="diagnostics-imei" onclick={() => action((value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-network" onclick={() => action((value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" data-device-action="diagnostics-wifi" onclick={() => action((value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" data-device-action="diagnostics-flight" onclick={() => action((value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button></div><ActionResult result={networkResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+								<Accordion.Item value="diagnostics"><Accordion.Trigger>{t("deviceTabDiagnostics")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><ActionResult result={diagnosticsResult} title={t("resultTitle")} {locale} /><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-modem-info" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/query?type=ati")}>{t("modemInfo")}</Button><Button variant="outline" data-device-action="diagnostics-signal" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/query?type=signal")}>{t("signal")}</Button><Button variant="outline" data-device-action="diagnostics-sim-info" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/query?type=siminfo")}>{t("simInfo")}</Button><Button variant="outline" data-device-action="diagnostics-modem-signal" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/modem?action=signal")}>{t("modemSignal")}</Button><Button variant="outline" data-device-action="diagnostics-operator" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/modem?action=operator")}>{t("operator")}</Button><Button variant="outline" data-device-action="diagnostics-imei" disabled={formBusy || diagnosticsResult.state === "loading"} onclick={() => action(diagnosticsResult, (value) => diagnosticsResult = value, "/modem?action=imei")}>{t("imei")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="network"><Accordion.Trigger>{t("deviceTabNetwork")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><ActionResult result={networkResult} title={t("resultTitle")} {locale} /><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="diagnostics-network" disabled={formBusy || networkResult.state === "loading"} onclick={() => action(networkResult, (value) => networkResult = value, "/query?type=network")}>{t("networkState")}</Button><Button variant="outline" data-device-action="diagnostics-wifi" disabled={formBusy || networkResult.state === "loading"} onclick={() => action(networkResult, (value) => networkResult = value, "/query?type=wifi")}>{t("wifiState")}</Button><Button variant="outline" data-device-action="diagnostics-flight" disabled={formBusy || networkResult.state === "loading"} onclick={() => action(networkResult, (value) => networkResult = value, "/flight?action=query")}>{t("flightQuery")}</Button></div></Accordion.Content></Accordion.Item>
 							</section>
 							<section class="device-tool-group" data-tool-group="history" aria-labelledby="device-group-history">
 								<div class="device-tool-group-heading"><h2 id="device-group-history">{t("deviceHistoryTitle")}</h2><p>{t("deviceHistoryDescription")}</p></div>
-								<div class="device-tool-content"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header></Empty.Root>{:else}<Textarea readonly spellcheck={false} aria-label={t("logTitle")} class="field-sizing-fixed h-80 max-h-[28rem] min-h-48 resize-y font-mono" value={logs.join("\n")} />{/if}<div class="flex justify-end"><Button variant="outline" data-device-action="diagnostics-logs-refresh" onclick={refreshLogs}>{t("refresh")}</Button></div><ActionResult result={logsResult} title={t("resultTitle")} {locale} /></div>
+								<div class="device-tool-content"><Field.Field orientation="horizontal"><Field.Label for="auto-refresh">{t("autoRefresh")}</Field.Label><Switch id="auto-refresh" size="sm" bind:checked={autoRefresh} /></Field.Field>{#if logs.length === 0}<Empty.Root><Empty.Header><Empty.Title>{t("emptyLog")}</Empty.Title></Empty.Header></Empty.Root>{:else}<Textarea readonly spellcheck={false} aria-label={t("logTitle")} class="field-sizing-fixed h-80 max-h-[28rem] min-h-48 resize-y font-mono" value={logs.join("\n")} />{/if}<ActionResult result={logsResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button variant="outline" data-device-action="diagnostics-logs-refresh" disabled={logsBusy} aria-busy={logsBusy} onclick={refreshLogs}>{t("refresh")}</Button></div></div>
 							</section>
 						</div>
 						{:else if deviceSubpage === "advanced"}
 						<div class="device-subpage" data-device-subpage="advanced">
 							<section class="device-tool-group device-tool-group-danger" data-tool-group="danger" aria-labelledby="device-group-danger">
 							<div class="device-tool-group-heading"><div><h2 id="device-group-danger" class="text-sm font-semibold">{t("deviceGroupDanger")}</h2><p class="mt-1 text-xs text-muted-foreground">{t("deviceGroupDangerDescription")}</p></div></div>
-								<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="advanced-wifi-restart" onclick={() => action((value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" data-device-action="advanced-flight-toggle" onclick={() => action((value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" data-device-action="advanced-modem-restart" onclick={() => action((value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" data-device-action="advanced-modem-hard-reset" onclick={() => action((value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div><ActionResult result={controlResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><form data-device-action="advanced-at-terminal" onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} class="font-mono" spellcheck={false} autocapitalize="none" required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default">{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+								<Accordion.Item value="control"><Accordion.Trigger>{t("deviceTabControl")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><Alert.Root variant="warning"><TriangleAlertIcon aria-hidden="true" /><Alert.Title>{t("controlWarning")}</Alert.Title></Alert.Root><ActionResult result={controlResult} title={t("resultTitle")} {locale} /><div class="flex flex-wrap gap-2"><Button variant="outline" data-device-action="advanced-wifi-restart" disabled={formBusy || controlResult.state === "loading"} onclick={() => action(controlResult, (value) => controlResult = value, "/wifi?action=restart", t("confirmWifi"))}>{t("restartWifi")}</Button><Button variant="outline" data-device-action="advanced-flight-toggle" disabled={formBusy || controlResult.state === "loading"} onclick={() => action(controlResult, (value) => controlResult = value, "/flight?action=toggle", t("confirmFlight"))}>{t("flightToggle")}</Button><Button variant="outline" data-device-action="advanced-modem-restart" disabled={formBusy || controlResult.state === "loading"} onclick={() => action(controlResult, (value) => controlResult = value, "/modem?action=restart")}>{t("modemSoftReset")}</Button><Button variant="destructive" data-device-action="advanced-modem-hard-reset" disabled={formBusy || controlResult.state === "loading"} onclick={() => action(controlResult, (value) => controlResult = value, "/modem?action=hardreset", t("confirmHardReset"))}>{t("modemHardReset")}</Button></div></Accordion.Content></Accordion.Item>
+						<Accordion.Item value="terminal"><Accordion.Trigger>{t("deviceTabTerminal")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-3"><p class="text-muted-foreground">{t("atDescription")}</p><ActionResult result={terminalResult} title={t("resultTitle")} {locale} /><form data-device-action="advanced-at-terminal" onsubmit={(event) => { event.preventDefault(); sendAtCommand(); }}><InputGroup.Root><InputGroup.Input aria-label={t("atTitle")} placeholder={t("atPlaceholder")} class="font-mono" spellcheck={false} autocapitalize="none" required bind:value={command} /><InputGroup.Addon align="inline-end"><InputGroup.Button type="submit" variant="default" disabled={terminalResult.state === "loading"}>{t("atSend")}</InputGroup.Button></InputGroup.Addon></InputGroup.Root></form></Accordion.Content></Accordion.Item>
 							</section>
 						</div>
 						{:else}
 						<div class="device-subpage" data-device-subpage="maintenance">
 							<section class="device-tool-group" data-tool-group="maintenance" aria-labelledby="device-group-maintenance">
 							<div class="device-tool-group-heading"><h2 id="device-group-maintenance" class="text-sm font-semibold">{t("deviceGroupMaintenance")}</h2></div>
-								<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><div class="flex justify-end"><Button data-device-action="maintenance-backup" disabled={demoMode || configFileResult.state === "loading"} onclick={backupConfig}>{t("backupDownload")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-							<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) configFileResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><div class="flex justify-end"><Button variant="outline" data-device-action="maintenance-restore" disabled={demoMode || !restoreFile || configFileResult.state === "loading"} onclick={restoreConfig}>{t("restoreStart")}</Button></div><ActionResult result={configFileResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
-							<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><dl><div><dt class="text-sm text-muted-foreground">{t("firmwareVersion")}</dt><dd data-firmware-version>{snapshot.status.firmwareVersion}</dd></div></dl><p class="text-muted-foreground">{t("otaReleaseBefore")}<a class="underline underline-offset-4 hover:text-foreground" href="https://github.com/lekoOwO/sms_forwarding/releases" target="_blank" rel="noopener noreferrer">{t("otaReleaseLink")}</a>{t("otaReleaseAfter")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><Button data-device-action="maintenance-ota" disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button><ActionResult result={otaResult} title={t("resultTitle")} {locale} /></Accordion.Content></Accordion.Item>
+								<Accordion.Item value="config-backup"><Accordion.Trigger>{t("configBackupTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="backup-passphrase">{t("backupPassphrase")}</Field.Label><Input id="backup-passphrase" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupPassphrase} /><Field.Description>{t("passphraseHint")}</Field.Description></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="backup-confirmation">{t("backupConfirmation")}</Field.Label><Input id="backup-confirmation" type="password" minlength={12} autocomplete="new-password" disabled={demoMode} bind:value={backupConfirmation} /></Field.Field></Field.Group><ActionResult result={backupResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button data-device-action="maintenance-backup" disabled={demoMode || configFileBusy} onclick={backupConfig}>{t("backupDownload")}</Button></div></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="config-restore"><Accordion.Trigger>{t("configRestoreTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><p class="text-muted-foreground">{t("configFileDescription")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Group class="grid gap-5 md:grid-cols-2"><Field.Field data-disabled={demoMode}><Field.Label for="restore-file">{t("restoreFile")}</Field.Label><Input id="restore-file" type="file" accept=".smscfg,application/vnd.sms-forwarding.config" disabled={demoMode} onchange={(event) => { const file = event.currentTarget.files?.[0] ?? null; restoreFile = file && file.size <= BACKUP_ENVELOPE.maxEncryptedBytes ? file : null; if (file && !restoreFile) restoreResult = { state: "error", code: "ACTION_BACKUP_TOO_LARGE", data: {}, detail: "" }; }} /></Field.Field><Field.Field data-disabled={demoMode}><Field.Label for="restore-passphrase">{t("backupPassphrase")}</Field.Label><Input id="restore-passphrase" type="password" minlength={12} autocomplete="current-password" disabled={demoMode} bind:value={restorePassphrase} /></Field.Field></Field.Group><ActionResult result={restoreResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button variant="outline" data-device-action="maintenance-restore" disabled={demoMode || !restoreFile || configFileBusy} onclick={restoreConfig}>{t("restoreStart")}</Button></div></Accordion.Content></Accordion.Item>
+							<Accordion.Item value="ota"><Accordion.Trigger>{t("otaTitle")}</Accordion.Trigger><Accordion.Content class="flex flex-col gap-4"><dl><div><dt class="text-sm text-muted-foreground">{t("firmwareVersion")}</dt><dd data-firmware-version>{snapshot.status.firmwareVersion}</dd></div></dl><p class="text-muted-foreground">{t("otaReleaseBefore")}<a class="underline underline-offset-4 hover:text-foreground" href="https://github.com/lekoOwO/sms_forwarding/releases" target="_blank" rel="noopener noreferrer">{t("otaReleaseLink")}</a>{t("otaReleaseAfter")}</p>{#if demoMode}<Alert.Root variant="info"><InfoIcon aria-hidden="true" /><Alert.Title>{t("demoDisabledTitle")}</Alert.Title><Alert.Description>{t("demoDisabledBody")}</Alert.Description></Alert.Root>{/if}<Field.Field data-disabled={demoMode}><Field.Label for="ota-file">{t("otaPackage")}</Field.Label><Input id="ota-file" type="file" accept=".smsota,application/octet-stream" disabled={demoMode} onchange={(event) => otaFile = event.currentTarget.files?.[0] ?? null} /></Field.Field><ActionResult result={otaResult} title={t("resultTitle")} {locale} /><Button data-device-action="maintenance-ota" disabled={demoMode || !otaFile || otaResult.state === "loading"} onclick={installOta}>{t("otaInstall")}</Button></Accordion.Content></Accordion.Item>
 							</section>
 						</div>
 						{/if}
 						</Accordion.Root>
-						{#if deviceSubpage === "diagnostics" && hasMoreLogs}<div class="flex justify-center"><Button variant="outline" data-device-action="diagnostics-logs-load-more" onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
+						{#if deviceSubpage === "diagnostics" && hasMoreLogs}<div class="flex justify-center"><Button variant="outline" data-device-action="diagnostics-logs-load-more" disabled={logsBusy} aria-busy={logsBusy} onclick={loadMoreLogs}>{t("loadMoreLogs")}</Button></div>{/if}
 				</section>
 				{:else}
 					<section class="flex flex-col gap-6">
@@ -1151,9 +1234,6 @@
 									<Card.Title>{t("otaStateTitle")}</Card.Title>
 									<Card.Description>{t("otaStateDescription")}</Card.Description>
 								</div>
-								<Button variant="outline" size="sm" onclick={() => void refreshOtaState()} disabled={otaStateLoading}>
-									{#if otaStateLoading}<Spinner data-icon="inline-start" />{/if}{t("otaStateRefresh")}
-								</Button>
 							</div>
 						</Card.Header>
 						<Card.Content>
@@ -1174,8 +1254,9 @@
 								<div aria-live="polite"><Skeleton class="h-20 w-full" /></div>
 							{/if}
 						</Card.Content>
+						<Card.Footer class="justify-end"><Button variant="outline" size="sm" onclick={() => void refreshOtaState()} disabled={otaStateLoading}>{#if otaStateLoading}<Spinner data-icon="inline-start" />{/if}{t("otaStateRefresh")}</Button></Card.Footer>
 					</Card.Root>
-					<section class="flex flex-col gap-5"><div><h2 class="font-semibold">{t("accountTitle")}</h2><p class="text-sm text-muted-foreground">{t("accountDescription")}</p></div><form id="security-form" onsubmit={(event) => { event.preventDefault(); void save((value) => securityResult = value, accountValues()); }}><Accordion.Root type="single" value="0">{#each snapshot.config.webAccounts as account, index (index)}<Accordion.Item value={String(index)}><Accordion.Trigger><span class="flex min-w-0 flex-1 items-center gap-3"><span class="shrink-0">{t("account")} {index + 1}</span><span class="min-w-0 flex-1 truncate text-sm font-normal text-muted-foreground">{account.username || t("commonDisabled")}</span><Badge variant={account.username ? "default" : "outline"}>{account.username ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger><Accordion.Content class="pt-3"><Field.Group><Field.Field><Field.Label for={`account-user-${index}`}>{t("username")}</Field.Label><Input id={`account-user-${index}`} autocomplete="username" bind:value={account.username} /></Field.Field><Field.Field><Field.Label for={`account-pass-${index}`}>{t("password")}</Field.Label><Input id={`account-pass-${index}`} type="password" autocomplete="new-password" bind:value={account.password} /><Field.Description>{t("passwordHint")}</Field.Description></Field.Field></Field.Group></Accordion.Content></Accordion.Item>{/each}</Accordion.Root></form><div class="flex justify-end"><Button type="submit" form="security-form" disabled={securityResult.state === "loading"}>{securityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div><ActionResult result={securityResult} title={t("resultTitle")} {locale} /></section>
+					<section class="flex flex-col gap-5"><div><h2 class="font-semibold">{t("accountTitle")}</h2><p class="text-sm text-muted-foreground">{t("accountDescription")}</p></div><form id="security-form" onsubmit={(event) => { event.preventDefault(); void save((value) => securityResult = value, accountValues()); }}><Accordion.Root type="single" value="0">{#each snapshot.config.webAccounts as account, index (index)}<Accordion.Item value={String(index)}><Accordion.Trigger><span class="flex min-w-0 flex-1 items-center gap-3"><span class="shrink-0">{t("account")} {index + 1}</span><span class="min-w-0 flex-1 truncate text-sm font-normal text-muted-foreground">{account.username || t("commonDisabled")}</span><Badge variant={account.username ? "default" : "outline"}>{account.username ? t("commonEnabled") : t("commonDisabled")}</Badge></span></Accordion.Trigger><Accordion.Content class="pt-3"><Field.Group><Field.Field><Field.Label for={`account-user-${index}`}>{t("username")}</Field.Label><Input id={`account-user-${index}`} autocomplete="username" bind:value={account.username} /></Field.Field><Field.Field><Field.Label for={`account-pass-${index}`}>{t("password")}</Field.Label><Input id={`account-pass-${index}`} type="password" autocomplete="new-password" bind:value={account.password} /><Field.Description>{t("passwordHint")}</Field.Description></Field.Field></Field.Group></Accordion.Content></Accordion.Item>{/each}</Accordion.Root></form><ActionResult result={securityResult} title={t("resultTitle")} {locale} /><div class="flex justify-end"><Button type="submit" form="security-form" disabled={formBusy || securityResult.state === "loading"}>{securityResult.state === "loading" ? t("commonSaving") : t("commonSave")}</Button></div></section>
 				</section>
 			{/if}
 		</div>

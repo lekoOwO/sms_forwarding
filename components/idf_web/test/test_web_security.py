@@ -753,6 +753,55 @@ int main() {
         return subprocess.run([str(binary)], check=False, capture_output=True, text=True)
 
 
+def run_crash_summary_safety_seam(source: str):
+    task_body = function_body(source, "crash_summary_task_class")
+    elf_body = function_body(source, "crash_summary_elf_prefix")
+    harness = f'''
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+static const char* crash_summary_task_class(const char* raw)
+{{{task_body}}}
+
+static bool crash_summary_elf_prefix(std::string& out, const uint8_t* raw)
+{{{elf_body}}}
+
+int main()
+{{
+    assert(std::string(crash_summary_task_class("idf_web_job")) == "idf_web_job");
+    assert(std::string(crash_summary_task_class("idf_web_job_extra")) == "other");
+    assert(std::string(crash_summary_task_class("private_task")) == "other");
+    assert(std::string(crash_summary_task_class(nullptr)) == "other");
+
+    const uint8_t valid[] = {{'0', '1', 'a', 'b', '2', '3', 'c', 'd'}};
+    std::string prefix = "stale";
+    assert(crash_summary_elf_prefix(prefix, valid));
+    assert(prefix == "01ab23cd");
+
+    const uint8_t invalid[] = {{'0', '1', 'a', 'b', '2', '3', 'c', 'G'}};
+    prefix = "stale";
+    assert(!crash_summary_elf_prefix(prefix, invalid));
+    assert(prefix.empty());
+    prefix = "stale";
+    assert(!crash_summary_elf_prefix(prefix, nullptr));
+    assert(prefix.empty());
+    return 0;
+}}
+'''
+    with tempfile.TemporaryDirectory() as temp_dir:
+        harness_path = Path(temp_dir) / "crash_summary_safety.cpp"
+        binary_path = Path(temp_dir) / "crash_summary_safety"
+        harness_path.write_text(harness)
+        subprocess.run(
+            ["g++", "-std=c++17", "-fno-exceptions", "-Wall", "-Wextra", "-Werror",
+             str(harness_path), "-o", str(binary_path)],
+            check=True,
+        )
+        return subprocess.run([str(binary_path)], check=False, capture_output=True, text=True)
+
+
 def main() -> None:
     harness = r'''
 #include <cassert>
@@ -1047,6 +1096,20 @@ int main() {
         "psa_key_derivation_abort(&operation)", "psa_key_derivation_setup(&operation, 0)", 1))
 
     source = (WEB / "idf_web.cpp").read_text()
+    crash_summary = run_crash_summary_safety_seam(source)
+    assert crash_summary.returncode == 0, crash_summary.stderr
+    crash_handler = function_body(source, "handle_crash_summary")
+    assert crash_handler.index("check_auth_strict(req)") < crash_handler.index(
+        "esp_core_dump_image_get"
+    )
+    assert crash_handler.index("esp_core_dump_image_get") < crash_handler.index(
+        "esp_core_dump_image_check()"
+    )
+    assert "esp_core_dump_image_erase" not in crash_handler
+    assert "idf_log_" not in crash_handler
+    assert "new (std::nothrow) esp_core_dump_summary_t{}" in crash_handler
+    assert "CONFIG_ESP_COREDUMP_SUMMARY_STACKDUMP_SIZE" in crash_handler
+    assert 'register_handler(s_server, "/api/diagnostics/crash-summary", HTTP_GET, handle_crash_summary)' in source
     push_save = run_push_save_seam(source)
     assert push_save.returncode == 0, push_save.stderr
     old_push_save = run_push_save_seam(source, legacy_enabled=True)
@@ -1107,7 +1170,8 @@ int main() {
     assert "handle_ota_update" not in source
     registered = set(re.findall(r'register_handler\(s_server, "([^"]+)"', source))
     assert registered == {
-        "/", "/tools", "/sms", "/assets/*", "/api/config", "/api/esim", "/api/jobs", "/query", "/save", "/wifi",
+        "/", "/tools", "/sms", "/assets/*", "/api/config", "/api/esim", "/api/jobs",
+        "/api/diagnostics/crash-summary", "/query", "/save", "/wifi",
         "/wifiscan", "/wificonfig", "/apstatus", "/log", "/at", "/ping", "/flight",
         "/modem", "/sendsms", "/api/config/export", "/api/config/restore/start",
         "/api/config/restore/chunk", "/api/config/restore/finish", "/api/ota/start",

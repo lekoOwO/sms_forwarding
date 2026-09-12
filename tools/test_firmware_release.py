@@ -284,10 +284,10 @@ class FirmwareVersionTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
         version = json.loads(VERSION.read_text(encoding="utf-8"))
-        self.assertEqual({"releaseVersion": "1.1.4", "devBuild": 20}, version)
+        self.assertEqual({"releaseVersion": "1.1.4", "devBuild": 21}, version)
         header = HEADER.read_text(encoding="utf-8")
-        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.1.4 (20)"', header)
-        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "20"', header)
+        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.1.4 (21)"', header)
+        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "21"', header)
 
     def test_build_mode_selects_the_public_firmware_version(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -298,7 +298,7 @@ class FirmwareVersionTests(unittest.TestCase):
                 'int main() { std::cout << FIRMWARE_DISPLAY_VERSION; }\n',
                 encoding="utf-8",
             )
-            for release_mode, expected in (("0", "20"), ("1", "1.1.4 (20)")):
+            for release_mode, expected in (("0", "21"), ("1", "1.1.4 (21)")):
                 binary = work / f"version-{release_mode}"
                 compile_result = subprocess.run(
                     [

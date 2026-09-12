@@ -167,3 +167,39 @@ The ignored test private key remains mode 0600. Encrypted configuration backups 
 - 本次沒有另寫設定、還原、啟用 SIM 資料、探測 CA、執行保活或測試推送。
   本次證據限於 TEST-key WiFi OTA、啟動健康、Web 內容與可攜設定保留。
   表單互動與 HTTP／HTTPS 傳輸使用本機回歸驗證，未執行真實行動傳輸測試。
+
+## 2026-09-12 dev21／counter51 儲存回歸
+
+- 這次使用同一個 TEST-key 裝置與 WiFi OTA。counter51 通過健康檢查，
+  `pending=0`、映像有效，驗證金鑰沒有變更。production、USB recovery 與
+  TEST-key USB recovery 三個 profile 都完成建置；映像大小分別為 1,570,544、
+  1,579,472 與 1,579,472 bytes。TEST profile 保持
+  `CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=64`。
+- counter50 的目標反組譯顯示 `std::swap<IdfConfig>` frame 約 3,376 bytes。
+  與 save job call chain 合計約 6,032 bytes，接近 6,144-byte task stack。
+  這支持原值儲存時的 stack 壓力是 panic 的候選原因。修正改用既有
+  `IdfConfig` move assignment；相同測試由 RED 變為 GREEN，新的 target frame
+  為 32 bytes。
+- 去識別化 JTAG backtrace 與 source call chain 相符：`idf_web_job` task 的
+  `api_job_task`、
+  `run_save_job`、`handle_modern_save`、`idf_config_save_heartbeat`、
+  `finish_config_update` 到 `replace_config`。相關實作在
+  `components/idf_web/idf_web.cpp` 與 `components/idf_config/idf_config.cpp`；
+  只保留函式與 frame 證據，沒有保存使用者資料。
+- 舊檢查在 swap 版本因 host stack frame 4,592 bytes 失敗；修正後
+  `tools/test_idf_config_updates.py` 通過，設定 persistence、Web security
+  與 codec 的 focused checks 都通過。設定 update、persistence 與 codec
+  合計 9 項通過。既有完整 Mock／browser UI 套件為 58/58 PASS。
+- 實機只提交一次原值 heartbeat：`disabled`、interval 6。Brave 146 與
+  Puppeteer 25 收到 HTTP 202，job 到達 `ACTION_CONFIG_SAVED` terminal，
+  成功結果位於 Save 按鈕上方，spinner 停止且按鈕恢復。裝置 boot id 不變，
+  uptime 只增加。
+- 保存前後的認證加密備份都是 863 bytes、schema 7。RAM-only 解密比較顯示
+  803-byte payload 逐 byte 相同；`heartbeat=false`、interval 6、
+  `kaEnabled=false`、`dataEnabled=false` 與 network mode 0 都保留。
+  比較沒有輸出或寫入明文，也不涵蓋備份刻意排除的裝置本地身份欄位。
+- 本輪沒有使用 SIM data、保活、CA probe、push 或 SMS。診斷 core capture
+  只有截斷／無效資料，沒有可信的 PC、backtrace 或 ELF 對應；檔名中的
+  capture counter 不代表 ELF 身分，因此不作進一步 panic 結論。
+- Web gzip bundle 為 184,127 bytes，與候選 bundle 逐 byte 相同。這份 TEST-key
+  硬體紀錄不提升 production OTA readiness。
