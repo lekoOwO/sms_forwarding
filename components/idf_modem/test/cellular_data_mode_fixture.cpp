@@ -3,22 +3,25 @@
 #include <string>
 #include <vector>
 
-struct IdfSimSettingsView {
+struct CellularFixtureSimSettingsView {
     bool dataEnabled = false;
     std::string apn;
 };
 
-struct IdfModemStatus {
+struct CellularFixtureModemStatus {
     int ceregStat = 1;
     std::string cellIp;
 };
 
-static IdfModemStatus status;
+using IdfSimSettingsView = CellularFixtureSimSettingsView;
+using IdfModemStatus = CellularFixtureModemStatus;
+
+static CellularFixtureModemStatus status;
 static bool cgact_ok = true;
 static bool ip_available = false;
 static std::vector<std::string> commands;
 
-static IdfModemStatus idf_modem_get_status() { return status; }
+static CellularFixtureModemStatus idf_modem_get_status() { return status; }
 static bool idf_modem_data_activation_allowed(int cereg_stat) { return cereg_stat == 1; }
 
 static std::string idf_util_trim_copy(const std::string& value)

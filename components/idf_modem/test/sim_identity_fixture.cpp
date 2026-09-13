@@ -122,9 +122,10 @@ static bool configure_sms_and_registration()
     return true;
 }
 static void set_phase(const char* phase) { s_status.phase = phase; }
-struct IdfSimSettingsView {
+struct SimIdentityFixtureSettingsView {
     bool dataEnabled = false;
 };
+using IdfSimSettingsView = SimIdentityFixtureSettingsView;
 static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000;
 static bool data_enabled = false;
 static IdfSimSettingsView idf_config_get_sim_settings_view() { return {data_enabled}; }
