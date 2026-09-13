@@ -253,6 +253,7 @@ class LintGateTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         expected = {
             "runs-on": "ubuntu-24.04",
+            "timeout-minutes": "5",
             "permissions": {"contents": "read"},
             "steps": [
                 {
