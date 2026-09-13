@@ -1,6 +1,7 @@
 #include "idf_lpa_rsp.h"
 
 #include "idf_esim_codec.h"
+#include "idf_log.h"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@ constexpr std::size_t kMaxCiKeyBytes = 128U;
 constexpr std::size_t kMaxOtpkBytes = 128U;
 constexpr std::size_t kMaxOidBytes = 64U;
 constexpr std::size_t kHashBytes = 32U;
+constexpr std::size_t kMaxStatusCodeBytes = 32U;
 constexpr std::size_t kMaxBase64EncodedBytes =
     ((IDF_LPA_RSP_MAX_OBJECT_BYTES + 2U) / 3U) * 4U;
 
@@ -99,6 +101,50 @@ bool is_json_space(unsigned char value) noexcept
            value == static_cast<unsigned char>('\n');
 }
 
+bool valid_status_code_token(std::string_view value) noexcept
+{
+    if (value.empty() || value.size() > kMaxStatusCodeBytes) return false;
+    bool need_digit = true;
+    for (const char character : value) {
+        if (character == '.') {
+            if (need_digit) return false;
+            need_digit = true;
+        } else if (character >= '0' && character <= '9') {
+            need_digit = false;
+        } else {
+            return false;
+        }
+    }
+    return !need_digit;
+}
+
+const char* safe_status_for_log(std::string_view status) noexcept
+{
+    if (status == "Failed") return "Failed";
+    if (status == "Expired") return "Expired";
+    if (status == "Executed-WithWarning") return "Executed-WithWarning";
+    if (status == "Executed-Success") return "Executed-Success";
+    return "other";
+}
+
+const char* status_code_for_log(const std::string& value) noexcept
+{
+    if (valid_status_code_token(value)) return value.c_str();
+    return value.empty() ? "missing" : "invalid";
+}
+
+void log_status_for_diagnostics(const char* operation,
+                                std::string_view status,
+                                const std::string& subject_code,
+                                const std::string& reason_code) noexcept
+{
+    idf_logf("ES9+ %s status=%s subjectCode=%s reasonCode=%s",
+             operation ? operation : "response",
+             safe_status_for_log(status),
+             status_code_for_log(subject_code),
+             status_code_for_log(reason_code));
+}
+
 class JsonScanner {
 public:
     explicit JsonScanner(std::string_view input) : input_(input) {}
@@ -117,8 +163,10 @@ public:
         return true;
     }
 
-    bool get_header_function_status(std::string& out,
-                                    LpaRspError& error)
+    bool get_header_function_status_details(std::string& out,
+                                            std::string& subject_code,
+                                            std::string& reason_code,
+                                            LpaRspError& error)
     {
         skip_space();
         if (!consume('{')) return fail(error, LpaRspError::json_malformed);
@@ -143,8 +191,7 @@ public:
             if (!consume(':')) return fail(error, LpaRspError::json_malformed);
             skip_space();
             if (key == "header") {
-                if (!parse_nested_object_member(
-                        "functionExecutionStatus", "status", out, error)) {
+                if (!parse_header_object(out, subject_code, reason_code, error)) {
                     return false;
                 }
                 header_found = true;
@@ -163,37 +210,89 @@ public:
     }
 
 private:
-    bool parse_nested_object_member(std::string_view wanted_parent,
-                                    std::string_view wanted,
-                                    std::string& out,
-                                    LpaRspError& error)
+    bool parse_status_code_data(std::string& subject_code,
+                                std::string& reason_code,
+                                LpaRspError& error)
     {
         if (!consume('{')) return fail(error, LpaRspError::json_type);
         std::array<std::string_view, kMaxJsonKeys> keys = {};
         std::size_t key_count = 0U;
-        bool parent_found = false;
         skip_space();
-        if (consume('}')) return fail(error, LpaRspError::json_missing);
+        if (consume('}')) return true;
         while (true) {
             std::string_view key;
             if (!parse_string_view(key)) return fail(error, LpaRspError::json_malformed);
-            for (std::size_t i = 0U; i < key_count; ++i) {
-                if (keys[i] == key) return fail(error, LpaRspError::json_duplicate);
+            for (std::size_t index = 0U; index < key_count; ++index) {
+                if (keys[index] == key) return fail(error, LpaRspError::json_duplicate);
             }
             if (key_count == keys.size()) return fail(error, LpaRspError::json_malformed);
             keys[key_count++] = key;
             skip_space();
             if (!consume(':')) return fail(error, LpaRspError::json_malformed);
             skip_space();
-            if (key == wanted_parent) {
+            if (key == "subjectCode" || key == "reasonCode") {
+                if (position_ >= input_.size() || input_[position_] != '"') {
+                    if (!skip_value(0U, error)) return false;
+                    return fail(error, LpaRspError::json_type);
+                }
+                std::string_view value;
+                if (!parse_string_view(value)) return fail(error, LpaRspError::json_malformed);
+                std::string& target = key == "subjectCode" ? subject_code : reason_code;
+                target.clear();
+                if (valid_status_code_token(value)) {
+                    target.assign(value.data(), value.size());
+                } else {
+                    // Keep only a fixed marker; never copy an invalid or oversized code.
+                    target = "!";
+                }
+            } else if (!skip_value(0U, error)) {
+                return false;
+            }
+            skip_space();
+            if (consume('}')) return true;
+            if (!consume(',')) return fail(error, LpaRspError::json_malformed);
+            skip_space();
+        }
+    }
+
+    bool parse_function_status(std::string& status,
+                               std::string& subject_code,
+                               std::string& reason_code,
+                               LpaRspError& error)
+    {
+        if (!consume('{')) return fail(error, LpaRspError::json_type);
+        std::array<std::string_view, kMaxJsonKeys> keys = {};
+        std::size_t key_count = 0U;
+        bool status_found = false;
+        skip_space();
+        if (consume('}')) return fail(error, LpaRspError::json_missing);
+        while (true) {
+            std::string_view key;
+            if (!parse_string_view(key)) return fail(error, LpaRspError::json_malformed);
+            for (std::size_t index = 0U; index < key_count; ++index) {
+                if (keys[index] == key) return fail(error, LpaRspError::json_duplicate);
+            }
+            if (key_count == keys.size()) return fail(error, LpaRspError::json_malformed);
+            keys[key_count++] = key;
+            skip_space();
+            if (!consume(':')) return fail(error, LpaRspError::json_malformed);
+            skip_space();
+            if (key == "status") {
+                if (status_found) return fail(error, LpaRspError::json_duplicate);
+                if (position_ >= input_.size() || input_[position_] != '"') {
+                    if (!skip_value(0U, error)) return false;
+                    return fail(error, LpaRspError::json_type);
+                }
+                std::string_view value;
+                if (!parse_string_view(value)) return fail(error, LpaRspError::json_malformed);
+                status.assign(value.data(), value.size());
+                status_found = true;
+            } else if (key == "statusCodeData") {
                 if (position_ >= input_.size() || input_[position_] != '{') {
                     if (!skip_value(0U, error)) return false;
                     return fail(error, LpaRspError::json_type);
                 }
-                bool nested_found = false;
-                if (!parse_object_member(wanted, out, nested_found, error)) return false;
-                if (!nested_found) return fail(error, LpaRspError::json_missing);
-                parent_found = true;
+                if (!parse_status_code_data(subject_code, reason_code, error)) return false;
             } else if (!skip_value(0U, error)) {
                 return false;
             }
@@ -202,8 +301,44 @@ private:
             if (!consume(',')) return fail(error, LpaRspError::json_malformed);
             skip_space();
         }
-        if (!parent_found) return fail(error, LpaRspError::json_missing);
-        return true;
+        return status_found ? true : fail(error, LpaRspError::json_missing);
+    }
+
+    bool parse_header_object(std::string& status,
+                             std::string& subject_code,
+                             std::string& reason_code,
+                             LpaRspError& error)
+    {
+        if (!consume('{')) return fail(error, LpaRspError::json_type);
+        std::array<std::string_view, kMaxJsonKeys> keys = {};
+        std::size_t key_count = 0U;
+        bool status_found = false;
+        skip_space();
+        if (consume('}')) return fail(error, LpaRspError::json_missing);
+        while (true) {
+            std::string_view key;
+            if (!parse_string_view(key)) return fail(error, LpaRspError::json_malformed);
+            for (std::size_t index = 0U; index < key_count; ++index) {
+                if (keys[index] == key) return fail(error, LpaRspError::json_duplicate);
+            }
+            if (key_count == keys.size()) return fail(error, LpaRspError::json_malformed);
+            keys[key_count++] = key;
+            skip_space();
+            if (!consume(':')) return fail(error, LpaRspError::json_malformed);
+            skip_space();
+            if (key == "functionExecutionStatus") {
+                if (status_found) return fail(error, LpaRspError::json_duplicate);
+                if (!parse_function_status(status, subject_code, reason_code, error)) return false;
+                status_found = true;
+            } else if (!skip_value(0U, error)) {
+                return false;
+            }
+            skip_space();
+            if (consume('}')) break;
+            if (!consume(',')) return fail(error, LpaRspError::json_malformed);
+            skip_space();
+        }
+        return status_found ? true : fail(error, LpaRspError::json_missing);
     }
 
     bool parse_object_member(std::string_view wanted,
@@ -825,6 +960,110 @@ bool pir_fail(std::uint32_t& sequence_number,
     return fail(error, value);
 }
 
+bool parse_notification_metadata(
+    const idf_esim_internal::Tlv& metadata,
+    bool require_install,
+    std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspNotificationOperation& operation,
+    LpaRspError& error)
+{
+    static constexpr std::uint8_t kMetadata[] = {0xBFU, 0x2FU};
+    static constexpr std::uint8_t kSequence[] = {0x80U};
+    static constexpr std::uint8_t kOperation[] = {0x81U};
+    static constexpr std::uint8_t kAddress[] = {0x0CU};
+    static constexpr std::uint8_t kIccid[] = {0x5AU};
+    sequence_number = 0U;
+    operation = LpaRspNotificationOperation::install;
+    clear_string(notification_address);
+    if (!tag_matches(metadata, kMetadata, sizeof(kMetadata))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_root);
+    }
+    bool duplicate_sequence = false;
+    bool duplicate_operation = false;
+    bool duplicate_address = false;
+    const idf_esim_internal::Tlv* sequence = unique_child(
+        metadata, kSequence, sizeof(kSequence), duplicate_sequence);
+    const idf_esim_internal::Tlv* operation_field = unique_child(
+        metadata, kOperation, sizeof(kOperation), duplicate_operation);
+    const idf_esim_internal::Tlv* address = unique_child(
+        metadata, kAddress, sizeof(kAddress), duplicate_address);
+    bool duplicate_iccid = false;
+    const idf_esim_internal::Tlv* iccid = unique_child(
+        metadata, kIccid, sizeof(kIccid), duplicate_iccid);
+    if (duplicate_sequence || duplicate_operation || duplicate_address || duplicate_iccid ||
+        !sequence || !operation_field || !address || address->value.empty()) {
+        return pir_fail(sequence_number, notification_address, error,
+                        duplicate_sequence || duplicate_operation || duplicate_address || duplicate_iccid
+                            ? LpaRspError::der_duplicate
+                            : LpaRspError::field_missing);
+    }
+    for (const idf_esim_internal::Tlv& child : metadata.children) {
+        if (!tag_matches(child, kSequence, sizeof(kSequence)) &&
+            !tag_matches(child, kOperation, sizeof(kOperation)) &&
+            !tag_matches(child, kAddress, sizeof(kAddress)) &&
+            !tag_matches(child, kIccid, sizeof(kIccid))) {
+            return pir_fail(sequence_number, notification_address, error,
+                            LpaRspError::der_malformed);
+        }
+    }
+    if (metadata.children.size() < 3U || metadata.children.size() > 4U ||
+        !tag_matches(metadata.children[0], kSequence, sizeof(kSequence)) ||
+        !tag_matches(metadata.children[1], kOperation, sizeof(kOperation)) ||
+        !tag_matches(metadata.children[2], kAddress, sizeof(kAddress)) ||
+        (metadata.children.size() == 4U &&
+         !tag_matches(metadata.children[3], kIccid, sizeof(kIccid))) ||
+        (iccid && !valid_iccid(iccid->value))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    std::uint32_t parsed_sequence = 0U;
+    if (!canonical_nonnegative_integer(sequence->value, 4U, parsed_sequence) ||
+        operation_field->value.size() != 2U) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    const std::uint16_t operation_value =
+        static_cast<std::uint16_t>(operation_field->value[0]) << 8U |
+        operation_field->value[1];
+    switch (operation_value) {
+    case 0x0780U:
+        operation = LpaRspNotificationOperation::install;
+        break;
+    case 0x0640U:
+        operation = LpaRspNotificationOperation::enable;
+        break;
+    case 0x0520U:
+        operation = LpaRspNotificationOperation::disable;
+        break;
+    case 0x0410U:
+        operation = LpaRspNotificationOperation::delete_profile;
+        break;
+    default:
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (require_install && operation != LpaRspNotificationOperation::install) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    if (address->value.size() > 253U || !printable_ascii(address->value)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::address_mismatch);
+    }
+    const std::string_view parsed_address(
+        reinterpret_cast<const char*>(address->value.data()), address->value.size());
+    if (!valid_smdp_host(parsed_address)) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::address_mismatch);
+    }
+    sequence_number = parsed_sequence;
+    notification_address.assign(parsed_address.data(), parsed_address.size());
+    error = LpaRspError::none;
+    return true;
+}
+
 const std::uint8_t* expected_root_tag(LpaRspDerObject kind, std::size_t& size) noexcept
 {
     static constexpr std::uint8_t kSequence[] = {0x30U};
@@ -992,11 +1231,15 @@ bool idf_lpa_rsp_json_get_string(std::string_view json,
 
 bool idf_lpa_rsp_parse_status(std::string_view json,
                               bool& success,
-                              LpaRspError& error)
+                              LpaRspError& error,
+                              const char* operation)
 {
     success = false;
     std::string status;
+    std::string subject_code;
+    std::string reason_code;
     if (json.size() > IDF_LPA_RSP_MAX_JSON_BYTES) {
+        if (operation) log_status_for_diagnostics(operation, {}, subject_code, reason_code);
         return fail(error, LpaRspError::input_too_large);
     }
     // SGP.22 v2.6 §§6.5.1.2–6.5.1.4 and 6.5.2.6–6.5.2.9 define the ES9+
@@ -1004,16 +1247,25 @@ bool idf_lpa_rsp_parse_status(std::string_view json,
     // parser is deliberately limited to that envelope; HandleNotification
     // response handling remains an HTTP-204 transport concern.
     JsonScanner scanner(json);
-    const bool parsed = scanner.get_header_function_status(status, error);
+    const bool parsed = scanner.get_header_function_status_details(
+        status, subject_code, reason_code, error);
     if (!parsed) {
+        if (operation) log_status_for_diagnostics(operation, status, subject_code, reason_code);
         clear_string(status);
+        clear_string(subject_code);
+        clear_string(reason_code);
         return false;
     }
     if (status != "Executed-Success") {
+        if (operation) log_status_for_diagnostics(operation, status, subject_code, reason_code);
         clear_string(status);
+        clear_string(subject_code);
+        clear_string(reason_code);
         return fail(error, LpaRspError::server_error);
     }
     clear_string(status);
+    clear_string(subject_code);
+    clear_string(reason_code);
     error = LpaRspError::none;
     success = true;
     return true;
@@ -1841,7 +2093,8 @@ static bool parse_installation_notification(
     bool& installed,
     std::uint32_t& sequence_number,
     std::string& notification_address,
-    LpaRspError& error)
+    LpaRspError& error,
+    const idf_esim_internal::Tlv* parsed_root = nullptr)
 {
     installed = false;
     error = LpaRspError::none;
@@ -1863,14 +2116,18 @@ static bool parse_installation_notification(
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::transaction_mismatch);
     }
-    if (!valid_smdp_host(expected_activation_host)) {
+    if (!expected_activation_host.empty() && !valid_smdp_host(expected_activation_host)) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::address_mismatch);
     }
 
     SensitiveTlv holder;
-    if (!parse_der_root(object, object_size, holder, error)) {
-        return pir_fail(sequence_number, notification_address, error, error);
+    const idf_esim_internal::Tlv* root = parsed_root;
+    if (!root) {
+        if (!parse_der_root(object, object_size, holder, error)) {
+            return pir_fail(sequence_number, notification_address, error, error);
+        }
+        root = &holder.value;
     }
     static constexpr std::uint8_t kPir[] = {0xBFU, 0x37U};
     static constexpr std::uint8_t kData[] = {0xBFU, 0x27U};
@@ -1889,21 +2146,21 @@ static bool parse_installation_notification(
     static constexpr std::uint8_t kSimaResponse[] = {0x04U};
     static constexpr std::uint8_t kInteger[] = {0x02U};
 
-    if (!tag_matches(holder.value, kPir, sizeof(kPir))) {
+    if (!tag_matches(*root, kPir, sizeof(kPir))) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::der_root);
     }
     bool duplicate_data = false;
     bool duplicate_signature = false;
     const idf_esim_internal::Tlv* data = unique_child(
-        holder.value, kData, sizeof(kData), duplicate_data);
+        *root, kData, sizeof(kData), duplicate_data);
     const idf_esim_internal::Tlv* signature = unique_child(
-        holder.value, kSignature, sizeof(kSignature), duplicate_signature);
+        *root, kSignature, sizeof(kSignature), duplicate_signature);
     if (duplicate_data || duplicate_signature) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::der_duplicate);
     }
-    for (const idf_esim_internal::Tlv& child : holder.value.children) {
+    for (const idf_esim_internal::Tlv& child : root->children) {
         if (!tag_matches(child, kData, sizeof(kData)) &&
             !tag_matches(child, kSignature, sizeof(kSignature))) {
             return pir_fail(sequence_number, notification_address, error,
@@ -1914,9 +2171,9 @@ static bool parse_installation_notification(
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::field_missing);
     }
-    if (holder.value.children.size() != 2U ||
-        !tag_matches(holder.value.children[0], kData, sizeof(kData)) ||
-        !tag_matches(holder.value.children[1], kSignature, sizeof(kSignature))) {
+    if (root->children.size() != 2U ||
+        !tag_matches(root->children[0], kData, sizeof(kData)) ||
+        !tag_matches(root->children[1], kSignature, sizeof(kSignature))) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::der_malformed);
     }
@@ -2033,7 +2290,8 @@ static bool parse_installation_notification(
     const std::string_view parsed_address(
         reinterpret_cast<const char*>(address->value.data()), address->value.size());
     if (!valid_smdp_host(parsed_address) ||
-        !equal_ascii_ci(address->value, expected_activation_host)) {
+        (!expected_activation_host.empty() &&
+         !equal_ascii_ci(address->value, expected_activation_host))) {
         return pir_fail(sequence_number, notification_address, error,
                         LpaRspError::address_mismatch);
     }
@@ -2151,6 +2409,53 @@ static bool parse_installation_notification(
     return true;
 }
 
+bool parse_other_signed_notification(
+    const std::uint8_t* object,
+    std::size_t object_size,
+    bool& installed,
+    std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspNotificationOperation& operation,
+    LpaRspError& error,
+    const idf_esim_internal::Tlv* parsed_root = nullptr)
+{
+    installed = false;
+    sequence_number = 0U;
+    operation = LpaRspNotificationOperation::install;
+    clear_string(notification_address);
+    SensitiveTlv holder;
+    const idf_esim_internal::Tlv* root = parsed_root;
+    if (!root) {
+        if (!parse_der_root(object, object_size, holder, error)) {
+            return pir_fail(sequence_number, notification_address, error, error);
+        }
+        root = &holder.value;
+    }
+    static constexpr std::uint8_t kOtherSigned[] = {0x30U};
+    static constexpr std::uint8_t kMetadata[] = {0xBFU, 0x2FU};
+    static constexpr std::uint8_t kSignature[] = {0x5FU, 0x37U};
+    if (!tag_matches(*root, kOtherSigned, sizeof(kOtherSigned))) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_root);
+    }
+    // OtherSignedNotification 的四个字段顺序是协议结构的一部分；此处只做
+    // 有界 DER/字段检查，不执行 eUICC 签章或证书链验证。
+    if (root->children.size() != 4U ||
+        !tag_matches(root->children[0], kMetadata, sizeof(kMetadata)) ||
+        !tag_matches(root->children[1], kSignature, sizeof(kSignature)) ||
+        !tag_matches(root->children[2], kOtherSigned, sizeof(kOtherSigned)) ||
+        !tag_matches(root->children[3], kOtherSigned, sizeof(kOtherSigned)) ||
+        root->children[1].value.empty() ||
+        root->children[1].value.size() > kMaxSignatureBytes ||
+        root->children[2].value.empty() || root->children[3].value.empty()) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    return parse_notification_metadata(root->children[0], false,
+                                       sequence_number, notification_address,
+                                       operation, error);
+}
+
 bool idf_lpa_rsp_parse_profile_installation_notification(
     const std::uint8_t* object, std::size_t object_size,
     const std::uint8_t* expected_transaction, std::size_t expected_transaction_size,
@@ -2184,4 +2489,42 @@ bool idf_lpa_rsp_parse_pending_installation_notification(
 {
     return parse_installation_notification(object, object_size, nullptr, 0,
         expected_activation_host, true, installed, sequence_number, notification_address, error);
+}
+
+bool idf_lpa_rsp_parse_pending_notification(
+    const std::uint8_t* object, std::size_t object_size,
+    bool& installed, std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspNotificationOperation& operation,
+    LpaRspError& error)
+{
+    installed = false;
+    sequence_number = 0U;
+    operation = LpaRspNotificationOperation::install;
+    const bool output_alias = ranges_overlap(object, object_size, notification_address.data(),
+                                             notification_address.capacity());
+    if (output_alias) {
+        return pir_fail(sequence_number, notification_address, error,
+                        LpaRspError::der_malformed);
+    }
+    clear_string(notification_address);
+    SensitiveTlv holder;
+    if (!parse_der_root(object, object_size, holder, error)) {
+        return pir_fail(sequence_number, notification_address, error, error);
+    }
+    static constexpr std::uint8_t kPir[] = {0xBFU, 0x37U};
+    static constexpr std::uint8_t kOtherSigned[] = {0x30U};
+    if (tag_matches(holder.value, kPir, sizeof(kPir))) {
+        const bool parsed = parse_installation_notification(
+            object, object_size, nullptr, 0U, {}, true, installed,
+            sequence_number, notification_address, error, &holder.value);
+        if (parsed) operation = LpaRspNotificationOperation::install;
+        return parsed;
+    }
+    if (tag_matches(holder.value, kOtherSigned, sizeof(kOtherSigned))) {
+        return parse_other_signed_notification(object, object_size, installed,
+                                                sequence_number, notification_address,
+                                                operation, error, &holder.value);
+    }
+    return pir_fail(sequence_number, notification_address, error, LpaRspError::der_root);
 }

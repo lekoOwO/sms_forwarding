@@ -18,12 +18,27 @@ HOST_CPP = r'''
 
 #include <array>
 #include <cassert>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using Error = LpaRspError;
+
+static std::vector<std::string> log_lines;
+
+void idf_logf(const char* format, ...)
+{
+    char line[256] = {};
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    assert(length >= 0 && static_cast<std::size_t>(length) < sizeof(line));
+    log_lines.emplace_back(line, static_cast<std::size_t>(length));
+}
 
 static std::vector<uint8_t> tlv(std::initializer_list<uint8_t> tag,
                                 const std::vector<uint8_t>& value)
@@ -127,6 +142,15 @@ static std::vector<uint8_t> profile_installation_result(
         signed_data,
         tlv({0x5F, 0x37}, {0xCC, 0xDD}),
     }));
+}
+
+static std::vector<uint8_t> other_signed_notification(
+    std::vector<uint8_t> operation = {0x06, 0x40},
+    std::vector<uint8_t> address = {'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'})
+{
+    const auto certificate = sequence({tlv({0x02}, {0x01})});
+    return sequence({notification_metadata({0x02}, operation, address),
+                     tlv({0x5F, 0x37}, {0xAA, 0xBB}), certificate, certificate});
 }
 
 static void expect_der_kind(LpaRspDerObject kind,
@@ -384,6 +408,36 @@ int main()
         no_transaction.size(), "edge.example", installed, notification_sequence,
         notification_host, error));
     assert(!installed && notification_sequence == 0 && notification_host.empty());
+    LpaRspNotificationOperation operation = LpaRspNotificationOperation::install;
+    assert(idf_lpa_rsp_parse_pending_notification(historical_success.data(),
+        historical_success.size(), installed, notification_sequence, notification_host,
+        operation, error));
+    assert(installed && notification_sequence == 1 && notification_host == "edge.example" &&
+        operation == LpaRspNotificationOperation::install);
+    const auto other_signed = other_signed_notification();
+    assert(idf_lpa_rsp_parse_pending_notification(other_signed.data(), other_signed.size(),
+        installed, notification_sequence, notification_host, operation, error));
+    assert(!installed && notification_sequence == 2 && notification_host == "edge.example" &&
+        operation == LpaRspNotificationOperation::enable);
+    for (const auto& operation_value : {
+             std::vector<uint8_t>{0x07, 0x80}, std::vector<uint8_t>{0x05, 0x20},
+             std::vector<uint8_t>{0x04, 0x10}}) {
+        const auto notification = other_signed_notification(operation_value);
+        assert(idf_lpa_rsp_parse_pending_notification(notification.data(), notification.size(),
+            installed, notification_sequence, notification_host, operation, error));
+        assert(!installed && notification_sequence == 2);
+    }
+    const auto truncated_other = sequence({notification_metadata()});
+    assert(!idf_lpa_rsp_parse_pending_notification(truncated_other.data(), truncated_other.size(),
+        installed, notification_sequence, notification_host, operation, error));
+    assert(!installed && notification_sequence == 0 && notification_host.empty() &&
+        error == Error::der_malformed);
+    const auto url_address = other_signed_notification({0x06, 0x40},
+        {'h', 't', 't', 'p', ':', '/', '/', 'e', 'd', 'g', 'e', '.', 'e', 'x', 'a', 'm', 'p', 'l', 'e'});
+    assert(!idf_lpa_rsp_parse_pending_notification(url_address.data(), url_address.size(),
+        installed, notification_sequence, notification_host, operation, error));
+    assert(!installed && notification_sequence == 0 && notification_host.empty() &&
+        error == Error::address_mismatch);
     bool success = false;
     assert(idf_lpa_rsp_parse_status(
                R"({"header":{"functionExecutionStatus":{"status":"Executed-Success"}},"transactionId":"0102"})",
@@ -445,6 +499,27 @@ int main()
                success, error));
     assert(error == Error::server_error);
     assert(std::string(idf_lpa_rsp_error_name(error)).find("server-secret") == std::string::npos);
+    log_lines.clear();
+    assert(!idf_lpa_rsp_parse_status(
+               R"({"header":{"functionExecutionStatus":{"status":"Failed","statusCodeData":{"subjectCode":"8.1","reasonCode":"9.2"}}}})",
+               success, error, "AuthenticateClient"));
+    assert(!log_lines.empty());
+    assert(log_lines.back() ==
+           "ES9+ AuthenticateClient status=Failed subjectCode=8.1 reasonCode=9.2");
+    log_lines.clear();
+    assert(!idf_lpa_rsp_parse_status(
+               R"({"header":{"functionExecutionStatus":{"status":"Failed","statusCodeData":{"subjectCode":"server-secret","reasonCode":"12..3"}}}})",
+               success, error, "InitiateAuthentication"));
+    assert(log_lines.size() == 1U);
+    assert(log_lines.back() ==
+           "ES9+ InitiateAuthentication status=Failed subjectCode=invalid reasonCode=invalid");
+    log_lines.clear();
+    assert(!idf_lpa_rsp_parse_status(
+               R"({"header":{"functionExecutionStatus":{"status":"Failed","statusCodeData":{"subjectCode":"123456789012345678901234567890123","reasonCode":"7"}}}})",
+               success, error, "AuthenticateClient"));
+    assert(log_lines.size() == 1U);
+    assert(log_lines.back() ==
+           "ES9+ AuthenticateClient status=Failed subjectCode=invalid reasonCode=7");
     assert(!idf_lpa_rsp_parse_status("{}", success, error));
     assert(error == Error::json_missing);
     assert(!idf_lpa_rsp_parse_status("{}trailing", success, error));
@@ -1182,6 +1257,10 @@ class RspProtocolTest(unittest.TestCase):
             root = Path(directory)
             harness = root / "rsp_fixture.cpp"
             binary = root / "rsp_fixture"
+            (root / "idf_log.h").write_text(
+                "#pragma once\nvoid idf_logf(const char*, ...);\n",
+                encoding="utf-8",
+            )
             harness.write_text(HOST_CPP, encoding="utf-8")
             compile_result = subprocess.run(
                 [
@@ -1193,6 +1272,8 @@ class RspProtocolTest(unittest.TestCase):
                     "-pedantic",
                     "-fno-exceptions",
                     "-fno-rtti",
+                    "-I",
+                    str(root),
                     "-I",
                     str(COMPONENT / "include"),
                     "-I",

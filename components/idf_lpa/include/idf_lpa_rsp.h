@@ -44,7 +44,8 @@ const char* idf_lpa_rsp_error_name(LpaRspError error) noexcept;
 
 bool idf_lpa_rsp_parse_status(std::string_view json,
                               bool& success,
-                              LpaRspError& error);
+                              LpaRspError& error,
+                              const char* operation = nullptr);
 
 bool idf_lpa_rsp_json_get_string(std::string_view json,
                                  std::string_view key,
@@ -219,4 +220,20 @@ bool idf_lpa_rsp_parse_pending_installation_notification(
     bool& installed,
     std::uint32_t& sequence_number,
     std::string& notification_address,
+    LpaRspError& error);
+
+enum class LpaRspNotificationOperation : std::uint8_t {
+    install,
+    enable,
+    disable,
+    delete_profile,
+};
+
+// 解析 BF37 或 OtherSigned 待处理通知；只返回有界 metadata，不验证签章。
+// 地址仍须是合法 SM-DP+ 主机名，调用者负责按当前交易决定是否发送。
+bool idf_lpa_rsp_parse_pending_notification(
+    const std::uint8_t* object, std::size_t object_size,
+    bool& installed, std::uint32_t& sequence_number,
+    std::string& notification_address,
+    LpaRspNotificationOperation& operation,
     LpaRspError& error);

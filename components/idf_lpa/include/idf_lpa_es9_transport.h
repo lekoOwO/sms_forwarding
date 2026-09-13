@@ -62,4 +62,6 @@ bool idf_lpa_es9_get_bound_profile_package(
     const LpaRspProfileMetadata& expected_metadata,
     std::vector<std::uint8_t>& profile_installation_result,
     std::string& safe_message,
-    IdfLpaEs9TransportError& error);
+    IdfLpaEs9TransportError& error,
+    std::size_t* bpp_encoded_chars = nullptr,
+    std::size_t* bpp_decoded_bytes = nullptr);

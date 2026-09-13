@@ -143,6 +143,46 @@ endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(sms_forwarding_idf)
+
+# Keep the shared pinned ESP-IDF installation immutable. Prepare the official
+# cross-signed synthetic-root validity backport in the build tree and replace
+# only the mbedtls certificate-bundle source after ESP-IDF has created its
+# component target.
+if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+  idf_component_get_property(SMS_MBEDTLS_LIB mbedtls COMPONENT_LIB)
+  idf_build_get_property(SMS_IDF_PYTHON PYTHON)
+  idf_build_get_property(SMS_IDF_PATH IDF_PATH)
+  set(SMS_TLS_PATCH_SCRIPT
+      "${CMAKE_SOURCE_DIR}/tools/patch_idf_tls_source.py")
+  set(SMS_TLS_PATCH_INPUT
+      "${SMS_IDF_PATH}/components/mbedtls/esp_crt_bundle/esp_crt_bundle.c")
+  set(SMS_TLS_PATCH_OUTPUT
+      "${CMAKE_BINARY_DIR}/sms_patched_esp_crt_bundle.c")
+
+  execute_process(
+    COMMAND "${SMS_IDF_PYTHON}" "${SMS_TLS_PATCH_SCRIPT}"
+            --input "${SMS_TLS_PATCH_INPUT}"
+            --output "${SMS_TLS_PATCH_OUTPUT}"
+    RESULT_VARIABLE SMS_TLS_PATCH_RESULT
+  )
+  if(NOT SMS_TLS_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to prepare the pinned ESP-IDF TLS backport")
+  endif()
+
+  get_target_property(SMS_MBEDTLS_SOURCES ${SMS_MBEDTLS_LIB} SOURCES)
+  list(FIND SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_INPUT}" SMS_TLS_SOURCE_INDEX)
+  if(SMS_TLS_SOURCE_INDEX EQUAL -1)
+    message(FATAL_ERROR
+            "Pinned ESP-IDF mbedtls source list did not contain esp_crt_bundle.c")
+  endif()
+  list(REMOVE_ITEM SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_INPUT}")
+  list(APPEND SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_OUTPUT}")
+  set_property(TARGET ${SMS_MBEDTLS_LIB} PROPERTY SOURCES
+               "${SMS_MBEDTLS_SOURCES}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${SMS_TLS_PATCH_SCRIPT}")
+endif()
+
 idf_build_set_property(COMPILE_DEFINITIONS "FIRMWARE_IS_RELEASE=${FIRMWARE_IS_RELEASE}" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "SMS_USB_RECOVERY=${SMS_USB_RECOVERY_VALUE}" APPEND)
 idf_build_set_property(COMPILE_DEFINITIONS "SMS_OTA_TEST_KEY=${SMS_OTA_TEST_KEY_VALUE}" APPEND)

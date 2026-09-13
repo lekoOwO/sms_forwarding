@@ -896,8 +896,12 @@ bool idf_lpa_es9_get_bound_profile_package(
     const LpaRspProfileMetadata& expected_metadata,
     std::vector<std::uint8_t>& profile_installation_result,
     std::string& safe_message,
-    IdfLpaEs9TransportError& error)
+    IdfLpaEs9TransportError& error,
+    std::size_t* bpp_encoded_chars,
+    std::size_t* bpp_decoded_bytes)
 {
+    if (bpp_encoded_chars) *bpp_encoded_chars = 0U;
+    if (bpp_decoded_bytes) *bpp_decoded_bytes = 0U;
     const bool host_pir_overlap = input_overlaps_output(smdp_host,
                                                         profile_installation_result);
     const bool request_pir_overlap = input_overlaps_output(request_json,
@@ -941,6 +945,16 @@ bool idf_lpa_es9_get_bound_profile_package(
 #else
     Deadline deadline(IDF_LPA_ES9_BPP_TRANSACTION_TIMEOUT_MS);
     IdfLpaBppStream bpp(expected_transaction_id, expected_metadata);
+    std::size_t encoded_bpp_chars = 0U;
+    std::size_t decoded_bpp_bytes = 0U;
+    const auto capture_bpp_counts = [&]() {
+        encoded_bpp_chars = bpp.encoded_bpp_chars();
+        decoded_bpp_bytes = bpp.decoded_bpp_bytes();
+    };
+    const auto publish_bpp_counts = [&]() {
+        if (bpp_encoded_chars) *bpp_encoded_chars = encoded_bpp_chars;
+        if (bpp_decoded_bytes) *bpp_decoded_bytes = decoded_bpp_bytes;
+    };
     std::string url;
     url.reserve(8U + smdp_host.size() +
                 std::string_view("/gsma/rsp2/es9plus/getBoundProfilePackage").size());
@@ -955,6 +969,8 @@ bool idf_lpa_es9_get_bound_profile_package(
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
+        capture_bpp_counts();
+        publish_bpp_counts();
         bpp.abort();
         secure_clear(url);
         return fail(error, IdfLpaEs9TransportError::client_init);
@@ -979,6 +995,7 @@ bool idf_lpa_es9_get_bound_profile_package(
         result = IdfLpaEs9TransportError::transport;
     }
     if (result == IdfLpaEs9TransportError::none) {
+        capture_bpp_counts();
         if (deadline.expired()) {
             result = IdfLpaEs9TransportError::timeout;
         } else {
@@ -993,11 +1010,14 @@ bool idf_lpa_es9_get_bound_profile_package(
         }
     }
     if (result != IdfLpaEs9TransportError::none) {
+        if (encoded_bpp_chars == 0U && decoded_bpp_bytes == 0U) capture_bpp_counts();
+        publish_bpp_counts();
         bpp.abort();
         secure_clear(profile_installation_result);
         secure_clear(safe_message);
         return fail(error, result);
     }
+    publish_bpp_counts();
     error = IdfLpaEs9TransportError::none;
     return true;
 #endif

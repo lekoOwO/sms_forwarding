@@ -83,6 +83,8 @@ HOST_CPP = r'''
 
 FakeCardState fake_card;
 
+void idf_logf(const char*, ...) {}
+
 static_assert(IDF_LPA_BPP_MAX_ENCODED_BYTES == 1536U * 1024U);
 static_assert(IDF_LPA_BPP_MAX_DECODED_BYTES == 1024U * 1024U);
 static_assert(IDF_LPA_BPP_MAX_SEGMENT_BYTES == 30720U);
@@ -721,9 +723,52 @@ int main()
         "\"status\":\"Executed-Success\"}}}";
     result = {0xA5U};
     message = "bpp-first sentinel";
-    assert(execute(bpp_first, "001122", result, message, 5U) != ESP_OK);
+    assert(execute(bpp_first, "001122", result, message, 5U, false, 0,
+                   valid_bpp_segment_count(true, 1U, 1U)) == ESP_OK);
+    assert(result == std::vector<std::uint8_t>({0x90U, 0x00U}));
+    assert(message.empty());
+    assert(fake_card.begin_calls == static_cast<int>(valid_bpp_segment_count(true, 1U, 1U)));
+    assert(!fake_card.wire_segments.back().empty());
+    assert_session_closed_once();
+
+    const std::string bpp_first_wrong_transaction =
+        "{\"boundProfilePackage\":\"" + encoded +
+        "\",\"transactionId\":\"001123\",\"header\":{\"functionExecutionStatus\":{"
+        "\"status\":\"Executed-Success\"}}}";
+    result = {0xA5U};
+    message = "bpp-first transaction sentinel";
+    assert(execute(bpp_first_wrong_transaction, "001122", result, message, 5U, false, 0,
+                   valid_bpp_segment_count(true, 1U, 1U)) != ESP_OK);
     assert(result.empty());
-    assert(fake_card.begin_calls == 0);
+    assert(fake_card.begin_calls == static_cast<int>(valid_bpp_segment_count(true, 1U, 1U)));
+    assert(fake_card.wire_segments.back().empty());
+    assert_session_closed_once();
+
+    const std::string bpp_first_failed_status =
+        "{\"boundProfilePackage\":\"" + encoded +
+        "\",\"transactionId\":\"001122\",\"header\":{\"functionExecutionStatus\":{"
+        "\"status\":\"Failed\"}}}";
+    result = {0xA5U};
+    message = "bpp-first status sentinel";
+    assert(execute(bpp_first_failed_status, "001122", result, message, 5U, false, 0,
+                   valid_bpp_segment_count(true, 1U, 1U)) != ESP_OK);
+    assert(result.empty());
+    assert(fake_card.begin_calls == static_cast<int>(valid_bpp_segment_count(true, 1U, 1U)));
+    assert(fake_card.wire_segments.back().empty());
+    assert_session_closed_once();
+
+    const std::string bpp_first_truncated =
+        "{\"boundProfilePackage\":\"" + encoded.substr(0U, encoded.size() - 4U) +
+        "\",\"transactionId\":\"001122\",\"header\":{\"functionExecutionStatus\":{"
+        "\"status\":\"Executed-Success\"}}}";
+    result = {0xA5U};
+    message = "bpp-first truncation sentinel";
+    assert(execute(bpp_first_truncated, "001122", result, message, 5U, false, 0,
+                   valid_bpp_segment_count(true, 1U, 1U)) != ESP_OK);
+    assert(result.empty());
+    assert(fake_card.begin_calls < static_cast<int>(valid_bpp_segment_count(true, 1U, 1U)) ||
+           fake_card.wire_segments.back().empty());
+    assert_session_closed_once();
 
     const std::string unknown_after_bpp =
         "{\"header\":{\"functionExecutionStatus\":{\"status\":\"Executed-Success\"}},"
@@ -731,7 +776,8 @@ int main()
         "\",\"note\":1}";
     result = {0xA5U};
     message = "trailing sentinel";
-    assert(execute(unknown_after_bpp, "001122", result, message, 5U) != ESP_OK);
+    assert(execute(unknown_after_bpp, "001122", result, message, 5U, false, 0,
+                   valid_bpp_segment_count(true, 1U, 1U)) != ESP_OK);
     assert(result.empty());
 
     auto expect_rejected = [&](std::string_view json,
@@ -989,6 +1035,9 @@ class BppHostTest(unittest.TestCase):
             stubs.mkdir()
             (stubs / "esp_err.h").write_text(ESP_ERR_H, encoding="utf-8")
             (stubs / "idf_esim_lpa.h").write_text(CARD_H, encoding="utf-8")
+            (stubs / "idf_log.h").write_text(
+                "#pragma once\nvoid idf_logf(const char*, ...);\n", encoding="utf-8"
+            )
             fixture = root / "bpp_fixture.cpp"
             fixture.write_text(HOST_CPP, encoding="utf-8")
             binary = root / "bpp_fixture"
