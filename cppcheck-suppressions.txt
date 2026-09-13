@@ -39,7 +39,7 @@ useStlAlgorithm:components/idf_lpa/idf_lpa_activation_code.cpp:25
 useStlAlgorithm:components/idf_lpa/idf_lpa_activation_code.cpp:67
 useStlAlgorithm:components/idf_lpa/idf_lpa_bpp.cpp:179
 useStlAlgorithm:components/idf_lpa/idf_lpa_bpp.cpp:317
-useStlAlgorithm:components/idf_lpa/idf_lpa_install.cpp:90
+useStlAlgorithm:components/idf_lpa/idf_lpa_install.cpp:171
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:571
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:605
 useStlAlgorithm:components/idf_lpa/idf_lpa_rsp.cpp:620
