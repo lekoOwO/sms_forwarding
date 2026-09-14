@@ -1438,7 +1438,8 @@ static bool process_forward_one()
     const IdfPushForwardView cfg = idf_config_get_push_forward_view();
     IdfForwardDecision fd = idf_config_evaluate_forward_rules(cfg.forwardRules, job.sender, job.text);
     if (fd.matched && fd.drop) {
-        idf_logf("Forwarding rule matched: discard SMS id=%u", static_cast<unsigned>(job.inboxId));
+        idf_logf("Forwarding rule matched at line=%u: discard SMS id=%u",
+                 static_cast<unsigned>(fd.line), static_cast<unsigned>(job.inboxId));
         idf_inbox_mark_forwarded(job.inboxId);
         s_busy.store(false, std::memory_order_relaxed);
         return true;

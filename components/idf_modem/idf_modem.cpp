@@ -1727,7 +1727,7 @@ static bool try_unlock_sim(bool allow_puk)
     send_ok("AT+CMEE=1", 1200);
     std::string state = query_sim_state();
     if (state == "ready") {
-        // ICCID 是 PIN 凭据的主键；读取它不应依赖网络注册完成。
+        // ICCID is the primary key for PIN credentials; read it without waiting for network registration.
         IdfModemStatus status = idf_modem_get_status();
         std::string iccid = is_iccid_text(status.iccid) ? status.iccid : query_current_iccid();
         set_sim_status("ready", false, "SIM is ready", iccid);
@@ -2071,9 +2071,10 @@ static bool apply_configured_data_mode_once(const IdfSimSettingsView& cfg, uint3
         } else if (!apn.empty()) {
             idf_log_line("APN contains invalid characters. CGDCONT not sent at startup");
         }
-        bool ok = send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
-        if (ok) sample_cell_ip_once();
-        return ok;
+        send_ok("AT+CGACT=1,1", active_timeout_ms, &resp);
+        // Some modem firmware reports ERROR when the PDP is already active;
+        // the address query is the usable-state check.
+        return sample_cell_ip_once();
     }
 
     bool ok = send_ok("AT+CGACT=0,1", inactive_timeout_ms, &resp);
@@ -3203,6 +3204,7 @@ static void modem_task(void*)
     uint8_t sim_unlock_retry_level = 0;
     TickType_t last_detail = 0;
     TickType_t last_health = 0;
+    TickType_t last_cell_ip = 0;
     int health_fail_count = 0;
     int dereg_count = 0;
     bool rlos_only_seen = false;
@@ -3231,6 +3233,7 @@ static void modem_task(void*)
             dereg_count = 0;
             rlos_only_seen = false;
             last_health = 0;
+            last_cell_ip = 0;
             last_identity = now;
             identity_retry_level = 0;
             last_sim_unlock_check = now;
@@ -3294,6 +3297,14 @@ static void modem_task(void*)
         if (sim_ready && (web_active || startup_sampling || identity_retry_due) && at_channel_idle_now()) {
             if (force_sample) {
                 s_status_sample_requests.store(0, std::memory_order_relaxed);
+            }
+            if (last_cell_ip == 0 ||
+                now - last_cell_ip > pdMS_TO_TICKS(MODEM_DATA_MODE_RETRY_GAP_MS)) {
+                const IdfSimSettingsView sim_cfg = idf_config_get_sim_settings_view();
+                if (sim_cfg.dataEnabled && idf_modem_get_status().cellIp.empty()) {
+                    sample_cell_ip_once();
+                    last_cell_ip = now;
+                }
             }
             if (startup_sampling || force_sample || last_signal == 0 ||
                 now - last_signal > pdMS_TO_TICKS(SIGNAL_INTERVAL_WEB_MS)) {

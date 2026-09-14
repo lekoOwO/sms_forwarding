@@ -39,6 +39,7 @@ static IdfSimCredential credential;
 static unsigned failed_pin_records = 0, successful_pin_records = 0;
 static std::vector<std::string> commands, recovery_events;
 static std::vector<uint64_t> identity_samples;
+static unsigned cell_ip_samples = 0;
 static std::string sampled_iccid;
 static std::string cached_iccid;
 
@@ -121,6 +122,18 @@ static bool configure_sms_and_registration()
     return true;
 }
 static void set_phase(const char* phase) { s_status.phase = phase; }
+struct SimIdentityFixtureSettingsView {
+    bool dataEnabled = false;
+};
+using IdfSimSettingsView = SimIdentityFixtureSettingsView;
+static constexpr uint32_t MODEM_DATA_MODE_RETRY_GAP_MS = 10000;
+static bool data_enabled = false;
+static IdfSimSettingsView idf_config_get_sim_settings_view() { return {data_enabled}; }
+static bool sample_cell_ip_once()
+{
+    ++cell_ip_samples;
+    return false;
+}
 #include "sim_iteration.inc"
 
 static void reset_fixture()
@@ -136,6 +149,7 @@ static void reset_fixture()
     pin_result = ESP_FAIL;
     failed_pin_records = 0; successful_pin_records = 0;
     commands.clear(); recovery_events.clear(); identity_samples.clear(); sampled_iccid.clear();
+    cell_ip_samples = 0; data_enabled = false;
     cached_iccid.clear();
 }
 
@@ -303,6 +317,30 @@ static void test_retry()
     complete_identity = true;
     now_ms += 600000; missing_identity.step();
     assert(identity_samples.size() == 10);
+
+    reset_fixture();
+    OwnerIteration missing_cell_ip;
+    missing_cell_ip.sim_ready = true;
+    missing_cell_ip.registered = true;
+    missing_cell_ip.post_register_done = true;
+    data_enabled = true;
+    complete_identity = true;
+    s_last_web_poll_us = esp_timer_get_time();
+    missing_cell_ip.step();
+    assert(cell_ip_samples == 1);
+    now_ms += MODEM_DATA_MODE_RETRY_GAP_MS - 1;
+    s_last_web_poll_us = esp_timer_get_time();
+    missing_cell_ip.step();
+    assert(cell_ip_samples == 1);
+    now_ms += 2;
+    s_last_web_poll_us = esp_timer_get_time();
+    missing_cell_ip.step();
+    assert(cell_ip_samples == 2);
+    data_enabled = false;
+    now_ms += MODEM_DATA_MODE_RETRY_GAP_MS;
+    s_last_web_poll_us = esp_timer_get_time();
+    missing_cell_ip.step();
+    assert(cell_ip_samples == 2);
 
     reset_fixture();
     OwnerIteration busy;

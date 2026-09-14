@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -19,6 +20,38 @@ const browserCandidates = [
 ].filter((candidate) => candidate && existsSync(candidate));
 const browserExecutable = browserCandidates[0];
 const browserAvailable = Boolean(process.env.UI_BROWSER_URL || browserExecutable);
+const ownedBrowserCleanupTestAvailable = Boolean(browserExecutable) && !process.env.UI_BROWSER_URL && process.platform === "linux";
+
+test("owned browser cleanup terminates detached browser descendants", { skip: !ownedBrowserCleanupTestAvailable ? "Requires a local owned Linux browser" : false }, async () => {
+	let browser;
+	let userDataDir;
+	let shared = false;
+	let processGroup;
+	try {
+		try {
+			({ browser, userDataDir, shared } = await launchBrowser());
+			processGroup = browser.process()?.pid;
+			assert.ok(processGroup);
+			const beforeClose = await waitForProcessGroupDescendant(processGroup);
+			assert.ok(beforeClose.some((pid) => pid !== processGroup), "owned browser must expose a detached descendant before cleanup");
+		} finally {
+			try {
+				await closeBrowser(browser, shared);
+			} finally {
+				if (userDataDir) rmSync(userDataDir, { recursive: true, force: true });
+			}
+		}
+		assert.deepEqual(await waitForProcessGroupExit(processGroup), [], "owned browser cleanup must terminate its detached descendants");
+	} finally {
+		for (const pid of processGroupMembers(processGroup)) {
+			try {
+				process.kill(pid, "SIGKILL");
+			} catch {
+				// A descendant can exit between the snapshot and this emergency cleanup.
+			}
+		}
+	}
+});
 
 test("heartbeat save reaches terminal feedback above its button without collapsing the form", { skip: !browserAvailable ? "No local Chromium-compatible executable" : false }, async (t) => {
 	const server = await listen(createApp({ webRoot: WEB_ROOT, openApiPath: OPENAPI_PATH, authRequired: false }));
@@ -734,13 +767,40 @@ async function closeBrowser(browser, shared) {
 		browser.disconnect();
 		return;
 	}
-	const child = browser.process();
-	browser.disconnect();
-	if (!child || child.exitCode !== null || child.signalCode !== null) return;
-	await new Promise((resolveClose) => {
-		child.once("exit", resolveClose);
-		child.kill("SIGKILL");
-	});
+	await browser.close();
+}
+
+function processGroupMembers(processGroup) {
+	if (!processGroup) return [];
+	return execFileSync("ps", ["-eo", "pid=,pgid="], { encoding: "utf8" })
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => line.trim().split(/\s+/).map(Number))
+		.filter(([, group]) => group === processGroup)
+		.map(([pid]) => pid);
+}
+
+async function waitForProcessGroupDescendant(processGroup) {
+	const deadline = Date.now() + 5000;
+	let members;
+	do {
+		members = processGroupMembers(processGroup);
+		if (members.some((pid) => pid !== processGroup)) return members;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	} while (Date.now() < deadline);
+	return members;
+}
+
+async function waitForProcessGroupExit(processGroup) {
+	const deadline = Date.now() + 5000;
+	let members;
+	do {
+		members = processGroupMembers(processGroup);
+		if (members.length === 0) return members;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	} while (Date.now() < deadline);
+	return members;
 }
 
 async function waitForRoute(page, hash) {

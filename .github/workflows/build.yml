@@ -39,6 +39,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
 
     steps:
       - name: Checkout repository
@@ -217,7 +218,8 @@ jobs:
       - name: Install host crypto test dependencies
         run: |
           apt-get update
-          apt-get install --no-install-recommends -y libssl-dev
+          apt-get install --no-install-recommends -y libssl-dev python3-cryptography
+          printf '%s\n' "$IDF_PATH/../tools/cmake/4.0.3/bin" >> "$GITHUB_PATH"
 
       - name: Run host contract tests
         shell: bash
@@ -231,6 +233,9 @@ jobs:
           python3 components/idf_lpa/test/test_rsp.py
           python3 components/idf_lpa/test/test_es9_transport.py
           python3 components/idf_lpa/test/test_bpp.py
+          python3 components/idf_lpa/test/test_install.py
+          python3 components/idf_lpa/test/test_activation_code.py
+          python3 tools/test_tls_certificate_bundle.py --native
           python3 components/idf_push/test/test_push_runtime.py
           python3 components/idf_sms/test/test_sms_retention_policy.py
           python3 components/idf_sms/test/test_multipart.py
@@ -242,6 +247,7 @@ jobs:
           python3 tools/test_ota_observability.py
           python3 tools/test_usb_recovery.py
           python3 components/idf_web/test/test_web_security.py
+          python3 components/idf_web/test/test_esim_install.py
           python3 -m unittest components/idf_web/test/test_diagnostics.py
           python3 -m unittest components/idf_web/test/test_keepalive_ca.py components/idf_modem/test/test_keepalive.py
           python3 tests/test_document_languages.py

@@ -1516,10 +1516,12 @@ struct RemoteCloseTranscript {
 IdfModemHttpsRunResult run_remote_close_transcript(RemoteCloseTranscript& transcript,
                                                    IdfModemHttpsPostResult& result,
                                                    bool get_request = false,
-                                                   bool plain_keepalive = false)
+                                                   bool plain_keepalive = false,
+                                                   std::string_view request_url = {})
 {
     IdfModemHttpsPostRequest request;
-    request.url = "https://fixture.example/notify";
+    request.url = request_url.empty() ? "https://fixture.example/notify"
+                                      : std::string(request_url);
     request.body = "{}";
     if (get_request) {
         request.method = IdfModemHttpsMethod::Get;
@@ -1618,6 +1620,20 @@ void check_remote_close_transcripts()
     assert(run_remote_close_transcript(get_request, result, true) == IdfModemHttpsRunResult::ok);
     assert(result.ok && get_request.sent_wire ==
            "GET /notify HTTP/1.1\r\nHost: fixture.example\r\nConnection: close\r\n\r\n");
+
+    std::string long_post_url = "https://fixture.example/";
+    long_post_url.append(2048U - long_post_url.size(), 'p');
+    RemoteCloseTranscript long_post{RemoteCloseMode::data_then_disconnect};
+    result = {};
+    assert(run_remote_close_transcript(long_post, result, false, false, long_post_url) ==
+           IdfModemHttpsRunResult::ok);
+    assert(result.ok);
+    const std::string long_post_path =
+        long_post_url.substr(std::string("https://fixture.example").size());
+    assert(long_post.sent_wire ==
+           "POST " + long_post_path +
+           " HTTP/1.1\r\nHost: fixture.example\r\nContent-Type: application/json\r\n"
+           "Content-Length: 2\r\nConnection: close\r\n\r\n{}");
 
     fixture_vtask_delay_calls = 0;
     RemoteCloseTranscript no_data_then_data{RemoteCloseMode::response_read_no_data_then_data};
@@ -2242,9 +2258,10 @@ void check_invalid_request_stages()
     request.method = IdfModemHttpsMethod::Post;
     request.body = "{}";
     request.contentType = "application/json";
+    constexpr size_t kExpectedPostUrlLimit = 2048;
     request.url = "https://a/";
-    request.url.append(IDF_MODEM_HTTPS_POST_MAX_URL - request.url.size(), 'p');
-    assert(request.url.size() == IDF_MODEM_HTTPS_POST_MAX_URL);
+    request.url.append(kExpectedPostUrlLimit - request.url.size(), 'p');
+    assert(request.url.size() == kExpectedPostUrlLimit);
     assert(idf_modem_https_validate_request(request, error));
     request.url.push_back('p');
     assert(!idf_modem_https_validate_request(request, error));

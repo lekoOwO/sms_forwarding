@@ -29,6 +29,17 @@ class InstallContractTest(unittest.TestCase):
             (temp / "esp_timer.h").write_text(
                 "#pragma once\n#include <cstdint>\nint64_t esp_timer_get_time();\n"
             )
+            (temp / "esp_heap_caps.h").write_text(
+                "#pragma once\n#include <cstddef>\n#include <cstdint>\n#include \"esp_err.h\"\n"
+                "constexpr unsigned MALLOC_CAP_8BIT = 1U;\n"
+                "std::size_t heap_caps_get_free_size(unsigned);\n"
+                "std::size_t heap_caps_get_minimum_free_size(unsigned);\n"
+                "esp_err_t heap_caps_monitor_local_minimum_free_size_start();\n"
+                "esp_err_t heap_caps_monitor_local_minimum_free_size_stop();\n"
+            )
+            (temp / "idf_log.h").write_text(
+                "#pragma once\nvoid idf_logf(const char*, ...);\n"
+            )
             fixture = temp / "fixture"
             subprocess.run(
                 [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pedantic",

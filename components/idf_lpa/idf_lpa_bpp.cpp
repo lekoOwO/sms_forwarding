@@ -340,6 +340,7 @@ public:
     }
 
     bool valid_expected_metadata() const noexcept { return expected_metadata_valid_; }
+    std::size_t decoded_bytes() const noexcept { return decoded_bytes_; }
 
     esp_err_t feed(const std::uint8_t* data, std::size_t length, std::string& message)
     {
@@ -356,6 +357,9 @@ public:
                 state_ = State::second_sequence_or_profile;
             }
             if (state_ == State::profile_child && sequence_remaining_ == 0U) {
+                if (final_segment_pending_) {
+                    return reject(ESP_ERR_INVALID_RESPONSE, message);
+                }
                 if (child_count_ == 0U || outer_remaining_ != 0U) {
                     return reject(ESP_ERR_INVALID_RESPONSE, message);
                 }
@@ -391,6 +395,11 @@ public:
                 return reject(ESP_ERR_INVALID_RESPONSE, message);
             }
             sequence_active_ = false;
+            if (final_segment_pending_) {
+                const esp_err_t error = finish_segment(message, true);
+                if (error != ESP_OK) return error;
+                final_segment_pending_ = false;
+            }
             state_ = State::done;
         }
         if (state_ != State::done || !header_.sensitive_storage_is_zero() ||
@@ -422,6 +431,7 @@ public:
         segment_count_ = 0U;
         element_count_ = 0U;
         sequence_active_ = false;
+        final_segment_pending_ = false;
         state_ = State::failed;
     }
 
@@ -431,7 +441,8 @@ public:
                installation_result_.empty() && value_remaining_ == 0U &&
                outer_remaining_ == 0U && sequence_remaining_ == 0U && child_count_ == 0U &&
                decoded_bytes_ == 0U && segment_count_ == 0U && element_count_ == 0U &&
-               !sequence_active_ && metadata_wire_.empty() && metadata_plaintext_.empty() &&
+               !sequence_active_ && !final_segment_pending_ && metadata_wire_.empty() &&
+               metadata_plaintext_.empty() &&
                expected_metadata_.profile_name.empty() && expected_metadata_.service_provider_name.empty() &&
                !expected_metadata_valid_ && !collecting_metadata_;
     }
@@ -891,9 +902,11 @@ private:
             state_ = State::profile_sequence_header;
             break;
         case ValueKind::profile_child:
-            {
-                const esp_err_t finish_error = finish_segment(
-                    message, sequence_remaining_ == 0U && outer_remaining_ == 0U);
+            if (sequence_remaining_ == 0U && outer_remaining_ == 0U) {
+                // Keep the final block pending until the JSON envelope is complete.
+                final_segment_pending_ = true;
+            } else {
+                const esp_err_t finish_error = finish_segment(message, false);
                 if (finish_error != ESP_OK) return finish_error;
             }
             ++child_count_;
@@ -923,11 +936,14 @@ private:
     std::size_t pending_parent_header_size_ = 0U;
     std::size_t pending_parent_length_ = 0U;
     bool sequence_active_ = false;
+    bool final_segment_pending_ = false;
 };
 
 class BppBase64Decoder final {
 public:
     explicit BppBase64Decoder(BppDerStreamParser& parser) : parser_(parser) {}
+
+    std::size_t encoded_chars() const noexcept { return encoded_chars_; }
 
     esp_err_t feed(char character, std::string& message)
     {
@@ -1025,6 +1041,15 @@ public:
     }
 
     ~Impl() { abort(); }
+
+    std::size_t encoded_bpp_chars() const noexcept
+    {
+        return decoder_.encoded_chars() != 0U ? decoder_.encoded_chars() : last_encoded_bpp_chars_;
+    }
+    std::size_t decoded_bpp_bytes() const noexcept
+    {
+        return der_.decoded_bytes() != 0U ? der_.decoded_bytes() : last_decoded_bpp_bytes_;
+    }
 
     esp_err_t feed(const char* data, std::size_t length, std::string& message)
     {
@@ -1147,6 +1172,8 @@ private:
     {
         if (cleanup_done_) return;
         ++cleanup_count_;
+        last_encoded_bpp_chars_ = decoder_.encoded_chars();
+        last_decoded_bpp_bytes_ = der_.decoded_bytes();
         der_.abort();
         decoder_.abort();
         clear_sensitive_state();
@@ -1320,6 +1347,12 @@ private:
         JsonFrame& frame = frames_[depth_ - 1U];
         if (frame.member_count >= kJsonMaxMembers || string_length_ > kJsonMaxKeyBytes) {
             return fail(ESP_ERR_INVALID_SIZE, message);
+        }
+        if (depth_ == 1U && bpp_seen_) {
+            const std::string_view key(string_value_.data(), string_length_);
+            if (key != "header" && key != "transactionId") {
+                return fail(ESP_ERR_INVALID_RESPONSE, message);
+            }
         }
         const std::uint64_t hash = key_hash(string_value_.data(), string_length_);
         for (std::size_t i = 0U; i < frame.member_count; ++i) {
@@ -1527,9 +1560,6 @@ private:
         if ((root_transaction || status_value || root_bpp) && character != '"') {
             return fail(ESP_ERR_INVALID_RESPONSE, message);
         }
-        if (root_bpp && (!status_seen_ || !transaction_seen_)) {
-            return fail(ESP_ERR_INVALID_RESPONSE, message);
-        }
         if (character == '{' || character == '[') {
             const esp_err_t error = push_frame(
                 character == '{' ? JsonFrameKind::object : JsonFrameKind::array, message);
@@ -1640,9 +1670,6 @@ private:
         case JsonFrameState::object_after_value:
             if (is_json_space(static_cast<unsigned char>(character))) return ESP_OK;
             if (character == ',') {
-                if (depth_ == 1U && bpp_seen_) {
-                    return fail(ESP_ERR_INVALID_RESPONSE, message);
-                }
                 frame.state = JsonFrameState::object_need_key;
                 return ESP_OK;
             }
@@ -1711,6 +1738,10 @@ private:
     bool failed_ = false;
     bool complete_ = false;
     std::size_t cleanup_count_ = 0U;
+    // Counters are non-sensitive and retained after parser cleanup so transport can report
+    // bytes consumed on a late response error without retaining any response data.
+    std::size_t last_encoded_bpp_chars_ = 0U;
+    std::size_t last_decoded_bpp_bytes_ = 0U;
     bool cleanup_done_ = false;
 };
 
@@ -1747,6 +1778,16 @@ esp_err_t IdfLpaBppStream::finish(std::vector<std::uint8_t>& installation_result
         return ESP_ERR_NO_MEM;
     }
     return impl_->finish(installation_result, safe_message);
+}
+
+std::size_t IdfLpaBppStream::encoded_bpp_chars() const noexcept
+{
+    return impl_ == nullptr ? 0U : impl_->encoded_bpp_chars();
+}
+
+std::size_t IdfLpaBppStream::decoded_bpp_bytes() const noexcept
+{
+    return impl_ == nullptr ? 0U : impl_->decoded_bpp_bytes();
 }
 
 void IdfLpaBppStream::abort() noexcept

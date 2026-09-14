@@ -169,11 +169,12 @@ SMTP 僅使用 WiFi。推送在 4G-only 模式選擇 cellular 路徑。
 Cellular 推送要求通道啟用 cellular 並使用 HTTPS 目標。
 CA 必須綁定目標 origin，且 hash 相符。
 GET 與 POST 推送都可使用符合上述條件的 cellular 路徑。
-cellular GET 只接受 HTTPS、空 request body 與固定 GET method，rendered URL 上限為 4096 bytes；POST URL 上限維持 240 bytes，body 上限維持 4096 bytes。
+cellular GET 只接受 HTTPS、空 request body 與固定 GET method，rendered URL 上限為 4096 bytes；POST URL 上限為 2048 bytes，body 上限維持 4096 bytes。
 模組、home registration 與 PDP 前置檢查仍須通過，資料與漫遊限制不因選擇路徑而放寬。
 
 目前 `idf_modem_https` 使用 modem 的 MIP socket 提供 TCP。
-ESP32 上的 Mbed TLS 執行 CA 與 hostname 驗證，並傳送 HTTPS。
+ESP32 上的 Mbed TLS 使用 cellular request 的 provisioned CA 執行 CA 與 hostname 驗證，並傳送 HTTPS。
+此 cellular MIP trust path 與 WiFi push、SMTP STARTTLS 及 ES9 使用的 native ESP certificate bundle 分開。
 此路徑與下方 Arduino 歷史紀錄中的 MHTTP 路徑不同。
 
 [Counter42 R15](hardware-counter37.md#counter42-r15-successful-cellular-evidence) 記錄一次 cellular HTTP 200 與已確認的 cleanup。
@@ -234,7 +235,8 @@ timeout 原因。確認等待最多五分鐘，背景工作會自行逾時，不
 遮蔽的既有設定檔與確認時的顯示名稱，不回傳 EID、ICCID、伺服器位址或原始協定錯誤。
 已安裝但通知未完成仍回報成功並附上提醒，避免提示使用者重複安裝。
 
-目前只支援一般三欄啟用碼（可有 `LPA:` 前綴），拒絕額外選項與含政策規則限制的設定檔。
+啟用碼 parser 接受三至七欄（可有 `LPA:` 前綴）。Installer 接受已驗證的額外欄位；格式錯誤或不支援的欄位仍 fail closed。
+這些 host tests 不宣稱 provider 對額外欄位的語義，也不接受含政策規則限制的設定檔。
 每個網路、卡片階段各自有界，不另設可能中斷卡片載入的整體工作 TTL。工作狀態只保留
 最新一筆，直到下一工作或重新開機；瀏覽器以精確工作 ID 輪詢。Host fixture 與編譯檢查
 不代表實機、電信業者或端到端安裝已通過驗證。

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -6,6 +7,163 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 PUSH = ROOT / "components/idf_push"
+
+
+def production_definition(source: str, name: str) -> str:
+    match = re.search(
+        rf"(?m)^(?:static\s+)?[^\n;{{}}]*\b{name}\s*\([^;]*?\)\s*\{{",
+        source,
+    )
+    if not match:
+        raise AssertionError(f"missing function: {name}")
+    start = match.end()
+    depth = 1
+    for index in range(start, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return match.group() + source[start:index] + "}\n"
+    raise AssertionError(f"unterminated function: {name}")
+
+
+def run_forward_discard_fixture(source: str, root: Path, binary: Path) -> subprocess.CompletedProcess[str]:
+    config_source = root / "components/idf_config/idf_config.cpp"
+    push_text = source
+    config_text = config_source.read_text()
+    state = push_text[push_text.index("static constexpr size_t PUSH_QUEUE_MAX"):push_text.index(
+        "static bool ensure_init()"
+    )]
+    fixture = r'''
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <regex.h>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "idf_forward_rules.h"
+
+constexpr int IDF_MAX_PUSH_CHANNELS = 5;
+constexpr int portMAX_DELAY = -1;
+constexpr int pdTRUE = 1;
+using SemaphoreHandle_t = void*;
+
+struct IdfPushTestJobState {};
+struct IdfPushChannel {
+    bool enabled = false;
+    uint8_t type = 0;
+    std::string name;
+};
+struct IdfPushForwardView {
+    std::string notificationLocale;
+    std::string forwardRules;
+    bool pushEnabled = true;
+    bool emailEnabled = false;
+    bool emailConfigured = false;
+    IdfPushChannel pushChannels[IDF_MAX_PUSH_CHANNELS];
+};
+
+static IdfPushForwardView forward_config;
+static bool queued_job_available = true;
+static std::string last_log;
+static std::vector<uint32_t> forwarded;
+static unsigned push_enqueue_calls = 0;
+static unsigned email_enqueue_calls = 0;
+static bool locked = false;
+
+'''
+    fixture += state + "\n"
+    fixture += "static ForwardJob queued_job;\n"
+    fixture += production_definition(config_text, "idf_config_translate_perl_classes") + "\n"
+    fixture += production_definition(config_text, "idf_config_evaluate_forward_rules") + "\n"
+    fixture += r'''
+static bool ensure_init() { return true; }
+static void wake_worker() {}
+static bool pop_forward_job(ForwardJob& out) {
+    if (!queued_job_available) return false;
+    queued_job_available = false;
+    out = queued_job;
+    return true;
+}
+static IdfPushForwardView idf_config_get_push_forward_view() { return forward_config; }
+static int64_t esp_timer_get_time() { return 1000000; }
+static int xSemaphoreTake(SemaphoreHandle_t, int) {
+    assert(!locked);
+    locked = true;
+    return pdTRUE;
+}
+static void xSemaphoreGive(SemaphoreHandle_t) {
+    assert(locked);
+    locked = false;
+}
+static void idf_logf(const char* format, ...) {
+    char buffer[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    last_log = buffer;
+}
+static void idf_log_line(const char* line) { last_log = line ? line : ""; }
+static void idf_inbox_mark_forwarded(uint32_t id) { forwarded.push_back(id); }
+static void idf_inbox_set_forwarded(uint32_t, bool) {}
+static bool channel_valid(const IdfPushChannel& channel) { return channel.enabled; }
+static int push_queue_free_locked() { return IDF_MAX_PUSH_CHANNELS; }
+static int email_queue_depth_locked() { return 0; }
+static uint32_t register_forward_completion_locked(uint32_t, uint8_t) { return 1; }
+static void cancel_forward_completion_locked(uint32_t) {}
+static bool enqueue_push_job_locked(uint8_t, const std::string&, const std::string&,
+                                    const std::string&, uint8_t, uint32_t, bool,
+                                    uint32_t, uint32_t, bool) {
+    ++push_enqueue_calls;
+    return false;
+}
+static bool enqueue_email_job_locked(const std::string&, const std::string&,
+                                     uint8_t, uint32_t, uint32_t, uint32_t) {
+    ++email_enqueue_calls;
+    return false;
+}
+static void requeue_forward_later(ForwardJob&, const char*, bool = true) {}
+static std::string local_phone_number() { return {}; }
+static std::string utf8_truncate(const std::string& value, size_t) { return value; }
+static const char* idf_push_sms_supplement_label(const std::string&) { return ""; }
+
+'''
+    fixture += production_definition(push_text, "process_forward_one") + r'''
+
+int main() {
+    forward_config.pushChannels[0].enabled = true;
+    forward_config.forwardRules = "#!forward-rules-csv-v1\nkw,\"not\nthis\",drop\nkw,discard,drop";
+    queued_job.sender = "sender";
+    queued_job.text = "discard";
+    queued_job.inboxId = 73;
+    assert(process_forward_one());
+    assert(!queued_job_available);
+    assert(forwarded == std::vector<uint32_t>{73});
+    assert(push_enqueue_calls == 0 && email_enqueue_calls == 0);
+    assert(last_log == "Forwarding rule matched at line=3: discard SMS id=73");
+    assert(!s_busy.load(std::memory_order_relaxed));
+}
+'''
+    source_path = binary.with_suffix(".cpp")
+    source_path.write_text(fixture)
+    return subprocess.run(
+        [
+            "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+            "-Wno-unused-function", "-Wno-unused-variable",
+            "-I", str(root / "components/idf_config/include"),
+            str(source_path), "-o", str(binary),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def main() -> None:
@@ -396,6 +554,29 @@ int main() {
             assert mutated_run.returncode != 0, name
 
     source = (PUSH / "idf_push.cpp").read_text()
+    with tempfile.TemporaryDirectory() as fixture_dir:
+        fixture_root = Path(fixture_dir)
+        current_binary = fixture_root / "forward_discard_current"
+        current_compile = run_forward_discard_fixture(source, ROOT, current_binary)
+        assert current_compile.returncode == 0, current_compile.stderr
+        current_run = subprocess.run([str(current_binary)], check=False,
+                                     capture_output=True, text=True)
+        assert current_run.returncode == 0, current_run.stderr
+
+        new_log = (
+            'idf_logf("Forwarding rule matched at line=%u: discard SMS id=%u",\n'
+            '                 static_cast<unsigned>(fd.line), static_cast<unsigned>(job.inboxId));'
+        )
+        old_log = 'idf_logf("Forwarding rule matched: discard SMS id=%u", static_cast<unsigned>(job.inboxId));'
+        old_source = source.replace(new_log, old_log, 1)
+        assert old_source != source
+        old_binary = fixture_root / "forward_discard_old_log"
+        old_compile = run_forward_discard_fixture(old_source, ROOT, old_binary)
+        assert old_compile.returncode == 0, old_compile.stderr
+        old_run = subprocess.run([str(old_binary)], check=False,
+                                 capture_output=True, text=True)
+        assert old_run.returncode != 0, "discard log mutation survived"
+
     header = (PUSH / "include/idf_push.h").read_text()
     core_header = (PUSH / "include/idf_push_core.h").read_text()
     core_source = (PUSH / "idf_push_core.cpp").read_text()

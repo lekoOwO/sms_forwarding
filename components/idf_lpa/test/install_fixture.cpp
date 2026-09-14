@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
@@ -17,6 +18,37 @@ static constexpr char kActivation[] = "LPA:1$edge.example$ABC-012";
 static constexpr char kHost[] = "edge.example";
 static int64_t now_us = 1000000;
 int64_t esp_timer_get_time() { return now_us; }
+static std::size_t heap_free_calls = 0U;
+static bool heap_monitor_start_ok = true;
+static std::size_t heap_monitor_stop_calls = 0U;
+static std::vector<std::string> log_lines;
+
+std::size_t heap_caps_get_free_size(unsigned)
+{
+    return heap_free_calls++ == 0U ? 90000U : 87000U;
+}
+
+std::size_t heap_caps_get_minimum_free_size(unsigned) { return 81000U; }
+esp_err_t heap_caps_monitor_local_minimum_free_size_start()
+{
+    return heap_monitor_start_ok ? ESP_OK : ESP_FAIL;
+}
+esp_err_t heap_caps_monitor_local_minimum_free_size_stop()
+{
+    ++heap_monitor_stop_calls;
+    return ESP_OK;
+}
+
+void idf_logf(const char* format, ...)
+{
+    char line[256] = {};
+    va_list arguments;
+    va_start(arguments, format);
+    const int length = std::vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    assert(length >= 0 && static_cast<std::size_t>(length) < sizeof(line));
+    log_lines.emplace_back(line, static_cast<std::size_t>(length));
+}
 
 static void* confirmation_storage = nullptr;
 static size_t confirmation_capacity = 0;
@@ -96,12 +128,23 @@ static Bytes pir(const Bytes& transaction, uint8_t number = 1,
         tlv({0xA2}, result)})), kSignature}));
 }
 
+static Bytes other_signed(uint8_t number, uint16_t operation = 0x0640U,
+                          std::string_view host = kHost)
+{
+    const Bytes metadata = tlv({0xBF, 0x2F}, join({
+        tlv({0x80}, {number}),
+        tlv({0x81}, {static_cast<uint8_t>(operation >> 8U), static_cast<uint8_t>(operation)}),
+        tlv({0x0C}, text_bytes(host))}));
+    return tlv({0x30}, join({metadata, kSignature, kCertificate, kCertificate}));
+}
+
 struct Fixture {
     bool require_cc = false;
     bool bad_challenge = false;
     bool wrong_client_transaction = false;
     bool download_failure = false;
     bool notification_failure = false;
+    std::string notification_failure_host;
     bool removal_failure = false;
     bool rejected_install = false;
     bool wrong_pir_transaction = false;
@@ -248,7 +291,7 @@ bool idf_lpa_es9_post_json(IdfLpaEs9Operation op, std::string_view host,
                           std::string_view request, std::string& response,
                           IdfLpaEs9TransportError& error)
 {
-    assert(host == kHost);
+    if (op != IdfLpaEs9Operation::handle_notification) assert(host == kHost);
     error = IdfLpaEs9TransportError::none;
     response.clear();
     const std::string status = R"({"header":{"functionExecutionStatus":{"status":"Executed-Success"}},)";
@@ -297,9 +340,17 @@ bool idf_lpa_es9_post_json(IdfLpaEs9Operation op, std::string_view host,
     g.events.push_back("notify");
     ++g.notifications;
     const Bytes pending = binary_field(request, "pendingNotification");
-    assert(pending == pir(kTransaction, 1, kHost, !g.rejected_install) ||
-           pending == pir({0x77}, 9));
-    if (g.notification_failure) {
+    if (pending == pir(kTransaction, 1, kHost, !g.rejected_install) ||
+        pending == pir({0x77}, 9) || pending == other_signed(2) ||
+        pending == other_signed(8) || pending == other_signed(10)) {
+        assert(host == kHost);
+    } else if (pending == pir({0x88}, 8, "other.example") ||
+               pending == other_signed(8, 0x0640U, "other.example")) {
+        assert(host == "other.example");
+    } else {
+        assert(false);
+    }
+    if (g.notification_failure || host == g.notification_failure_host) {
         response = "private server detail";
         error = IdfLpaEs9TransportError::transport;
         return false;
@@ -310,10 +361,13 @@ bool idf_lpa_es9_post_json(IdfLpaEs9Operation op, std::string_view host,
 bool idf_lpa_es9_get_bound_profile_package(std::string_view host,
     std::string_view request, std::string_view transaction,
     const LpaRspProfileMetadata& expected_metadata, Bytes& result,
-    std::string&, IdfLpaEs9TransportError& error)
+    std::string&, IdfLpaEs9TransportError& error,
+    std::size_t* encoded_bpp_chars, std::size_t* decoded_bpp_bytes)
 {
     g.events.push_back("download");
     ++g.downloads;
+    if (encoded_bpp_chars) *encoded_bpp_chars = 1234U;
+    if (decoded_bpp_bytes) *decoded_bpp_bytes = 567U;
     assert(host == kHost && transaction == "0102");
     assert(expected_metadata.profile_name == "Travel" &&
            expected_metadata.service_provider_name == "Carrier" && !expected_metadata.has_policy_rules);
@@ -362,7 +416,29 @@ static IdfLpaInstallResult run(esp_err_t expected, IdfLpaConfirmationCallback ca
     return result;
 }
 
-static void reset() { g = {}; now_us = 1000000; }
+static void reset()
+{
+    g = {};
+    now_us = 1000000;
+    heap_free_calls = 0U;
+    heap_monitor_start_ok = true;
+    heap_monitor_stop_calls = 0U;
+    log_lines.clear();
+}
+
+static void accepts_valid_optional_activation_fields()
+{
+    reset();
+    IdfLpaInstallResult result;
+    const esp_err_t actual = idf_lpa_install_profile(
+        "LPA:1$edge.example$ABC-012$cc$provider$label$extra",
+        confirmation, progress, nullptr, result);
+    assert(actual == ESP_OK);
+    assert(result.installed && !result.notification_pending);
+    assert(g.confirmations == 1 && g.downloads == 1 && g.notifications == 1);
+    assert(g.events == std::vector<std::string>({"pending", "imei", "material", "initiate",
+        "authenticate_card", "authenticate_client", "prepare_card", "download", "notify", "remove"}));
+}
 
 static void successful_install_requires_metadata_consent_without_enabling()
 {
@@ -371,9 +447,28 @@ static void successful_install_requires_metadata_consent_without_enabling()
     assert(result.installed && !result.notification_pending && result.error == IdfLpaInstallError::none);
     assert(g.confirmations == 1 && g.downloads == 1 && g.notifications == 1);
     assert(g.removed == std::vector<uint32_t>{1});
+    assert(!log_lines.empty());
+    assert(log_lines.back() ==
+           "eSIM download resources: result=none bppEncodedBytes=1234 "
+           "bppDecodedBytes=567 freeHeapAtStart=90000 minimumFreeHeap=81000 "
+           "freeHeapAtEnd=87000");
     assert(g.events == std::vector<std::string>({"pending", "imei", "material", "initiate",
         "authenticate_card", "authenticate_client", "prepare_card", "download", "notify", "remove"}));
     assert(g.stages.back() == IdfLpaInstallStage::completed);
+}
+
+static void heap_monitor_start_failure_is_not_reported_as_zero_heap()
+{
+    reset();
+    heap_monitor_start_ok = false;
+    const auto result = run(ESP_OK);
+    assert(result.installed);
+    assert(heap_monitor_stop_calls == 0U);
+    assert(!log_lines.empty());
+    assert(log_lines.back() ==
+           "eSIM download resources: result=none bppEncodedBytes=1234 "
+           "bppDecodedBytes=567 freeHeapAtStart=90000 minimumFreeHeap=n/a "
+           "freeHeapAtEnd=87000");
 }
 
 static void confirmation_is_required_once_and_expires_before_card_download()
@@ -459,19 +554,52 @@ static void installation_result_survives_notification_failures()
         assert(!uncertain.installed && uncertain.error == IdfLpaInstallError::installation_uncertain);
         assert(g.downloads == 1 && g.notifications == 0 && g.removed.empty());
         assert(g.cancellations.empty());
+        assert(!log_lines.empty());
+        assert(log_lines.back() ==
+               "eSIM download resources: result=installation_uncertain bppEncodedBytes=1234 "
+               "bppDecodedBytes=567 freeHeapAtStart=90000 minimumFreeHeap=81000 "
+               "freeHeapAtEnd=87000");
     }
 }
 
-static void recovers_same_host_only_and_blocks_new_auth_until_acknowledged()
+static void recovers_ordered_hosts_and_blocks_current_host_until_acknowledged()
 {
     reset(); g.pending = join({pir({0x88}, 8, "other.example"), pir({0x77}, 9)});
     assert(run(ESP_OK).installed);
-    assert(g.removed == std::vector<uint32_t>({9, 1}));
+    assert(g.removed == std::vector<uint32_t>({9, 8, 1}));
     assert(g.events[0] == "pending" && g.events[1] == "notify" && g.events[2] == "remove");
+    reset(); g.pending = join({pir({0x77}, 9), other_signed(8)});
+    assert(run(ESP_OK).installed);
+    assert(g.removed == std::vector<uint32_t>({8, 9, 1}));
+    reset();
+    g.pending = join({pir({0x77}, 9), pir({0x88}, 8, "other.example")});
+    g.notification_failure_host = "other.example";
+    assert(run(ESP_OK).installed);
+    assert(g.removed == std::vector<uint32_t>({9, 1}));
+    assert(g.notifications == 3);
+    reset();
+    g.pending = join({pir({0x77}, 9), pir({0x88}, 8, "other.example")});
+    g.notification_failure_host = kHost;
+    const auto current_pending = run(ESP_FAIL);
+    assert(!current_pending.installed && current_pending.notification_pending);
+    assert(g.removed == std::vector<uint32_t>({8}));
+    assert(g.downloads == 0 && g.notifications == 2);
+    reset();
+    g.pending = join({pir({0x77}, 9), other_signed(10),
+                      other_signed(8, 0x0640U, "other.example")});
+    g.notification_failure_host = kHost;
+    const auto same_host_pending = run(ESP_FAIL);
+    assert(!same_host_pending.installed && same_host_pending.notification_pending);
+    assert(g.removed == std::vector<uint32_t>({8}));
+    assert(g.downloads == 0 && g.notifications == 2);
     reset(); g.pending = pir({0x77}, 9); g.notification_failure = true;
     const auto pending = run(ESP_FAIL);
     assert(!pending.installed && pending.notification_pending && g.removed.empty());
     assert(g.events == std::vector<std::string>({"pending", "notify"}));
+    reset(); g.pending = join({pir({0x77}, 9), other_signed(9, 0x0640U, "EDGE.EXAMPLE")});
+    assert(run(ESP_ERR_INVALID_RESPONSE).error == IdfLpaInstallError::protocol);
+    assert(g.events == std::vector<std::string>{"pending"});
+    assert(g.notifications == 0 && g.downloads == 0 && g.removed.empty());
     reset(); g.pending = {0xBF, 0x37, 0x04, 0x00};
     assert(run(ESP_ERR_INVALID_RESPONSE).error == IdfLpaInstallError::protocol);
     assert(g.events == std::vector<std::string>{"pending"});
@@ -484,6 +612,15 @@ static void recovers_same_host_only_and_blocks_new_auth_until_acknowledged()
     assert(g.notifications == 0 && g.downloads == 0);
 }
 
+static void recovers_other_signed_notification_before_new_authentication()
+{
+    reset();
+    g.pending = other_signed(2);
+    const auto result = run(ESP_OK);
+    assert(result.installed && !result.notification_pending);
+    assert(g.removed == std::vector<uint32_t>({2, 1}));
+}
+
 int main()
 {
     IdfLpaInstallResult result;
@@ -491,17 +628,23 @@ int main()
            ESP_ERR_INVALID_ARG);
     assert(result.error == IdfLpaInstallError::invalid_activation);
     assert(g.events.empty());
-    for (const char* activation : {"LPA:1$edge.example$ABC-012$1.2.3", "1$edge.example$ABC-012$$1"}) {
-        assert(idf_lpa_install_profile(activation, nullptr, nullptr, nullptr, result) == ESP_ERR_NOT_SUPPORTED);
-        assert(result.error == IdfLpaInstallError::unsupported_activation_options && g.events.empty());
+    for (const char* activation : {"LPA:1$edge.example$ABC-012$", "1$edge.example$ABC-012$$1"}) {
+        assert(idf_lpa_install_profile(activation, nullptr, nullptr, nullptr, result) == ESP_ERR_INVALID_ARG);
+        assert(result.error == IdfLpaInstallError::invalid_activation && g.events.empty());
     }
+    const std::string overlong_optional = "LPA:1$edge.example$ABC-012$" + std::string(65U, 'x');
+    assert(idf_lpa_install_profile(overlong_optional, nullptr, nullptr, nullptr, result) == ESP_ERR_INVALID_ARG);
+    assert(result.error == IdfLpaInstallError::invalid_activation && g.events.empty());
     assert(idf_lpa_install_profile("LPA:1$edge.example$abc-012", nullptr, nullptr, nullptr, result) ==
            ESP_ERR_INVALID_ARG);
     assert(result.error == IdfLpaInstallError::invalid_activation && g.events.empty());
     successful_install_requires_metadata_consent_without_enabling();
+    heap_monitor_start_failure_is_not_reported_as_zero_heap();
     confirmation_is_required_once_and_expires_before_card_download();
     consent_decline_and_policy_restrictions_postpone_without_terminating_order();
     rejects_unbound_protocol_before_card_side_effects();
     installation_result_survives_notification_failures();
-    recovers_same_host_only_and_blocks_new_auth_until_acknowledged();
+    recovers_ordered_hosts_and_blocks_current_host_until_acknowledged();
+    recovers_other_signed_notification_before_new_authentication();
+    accepts_valid_optional_activation_fields();
 }

@@ -417,9 +417,13 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("idf_modem_data_activation_allowed", data_mode)
         self.assertLess(data_mode.index("idf_modem_data_activation_allowed"),
                         data_mode.index('"AT+CGACT=1,1"'))
+        self.assertIn("return sample_cell_ip_once();", data_mode)
         startup = function_body(source, "apply_startup_data_mode")
         self.assertIn("idf_modem_data_activation_allowed", startup)
         owner_loop = function_body(source, "modem_task")
+        self.assertIn("TickType_t last_cell_ip = 0;", owner_loop)
+        self.assertIn("if (sim_cfg.dataEnabled && idf_modem_get_status().cellIp.empty())", owner_loop)
+        self.assertIn("sample_cell_ip_once();", owner_loop)
         first_cereg = owner_loop.index('send_ok("AT+CEREG?"')
         first_data_setup = owner_loop.index("apply_startup_data_mode(stat)")
         self.assertLess(first_cereg, first_data_setup)
@@ -428,6 +432,33 @@ class UartOwnerContractTest(unittest.TestCase):
         self.assertIn("Continuing read-only registration probes", owner_loop)
         self.assertIn("reg_patch.modemReady = (stat == 1 || stat == 5)", owner_loop)
         self.assertIn("bool now_ready = (stat == 1 || stat == 5)", owner_loop)
+
+    def test_data_mode_fixture_uses_ip_state_after_cgact(self):
+        compiler = shutil.which("g++")
+        self.assertIsNotNone(compiler, "the cellular data fixture requires g++")
+        fixture = SOURCE.parent / "test" / "cellular_data_mode_fixture.cpp"
+        self.assertTrue(fixture.exists(), "missing executable cellular data fixture")
+        source = SOURCE.read_text()
+        body = function_body(source, "apply_configured_data_mode_once")
+        signature = (
+            "static bool apply_configured_data_mode_once("
+            "const IdfSimSettingsView& cfg, uint32_t active_timeout_ms,\n"
+            "                                            uint32_t inactive_timeout_ms)\n"
+            "{\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            (directory_path / "data_mode_runtime.inc").write_text(signature + body + "}\n")
+            binary = directory_path / "cellular_data_mode_fixture"
+            compile_result = subprocess.run(
+                [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                 "-I", directory, str(fixture), "-o", str(binary)],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            run_result = subprocess.run([str(binary)], check=False,
+                                        capture_output=True, text=True)
+            self.assertEqual(run_result.returncode, 0, run_result.stderr)
 
     def test_sms_health_keeps_rlos_restricted_without_reset(self):
         source = SOURCE.read_text()

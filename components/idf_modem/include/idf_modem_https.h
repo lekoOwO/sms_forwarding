@@ -8,7 +8,7 @@
 #include <vector>
 
 // Keep modem-native HTTPS requests small enough for one owner slot and one UART transaction.
-static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_URL = 240;
+static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_URL = 2048;
 static constexpr size_t IDF_MODEM_HTTPS_GET_MAX_URL = 4096;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_BODY = 4096;
 static constexpr size_t IDF_MODEM_HTTPS_POST_MAX_CONTENT_TYPE = 96;

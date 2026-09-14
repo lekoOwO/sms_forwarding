@@ -1,22 +1,50 @@
 #include "idf_lpa_install.h"
 
-#include <algorithm>
 #include <array>
 #include <initializer_list>
 #include <utility>
 #include <vector>
 
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "idf_esim_codec.h"
 #include "idf_esim_lpa.h"
 #include "idf_lpa_activation_code.h"
 #include "idf_lpa_es9_transport.h"
+#include "idf_log.h"
 #include "idf_modem.h"
 
 namespace {
 
 using Bytes = std::vector<uint8_t>;
 constexpr size_t kMaxPendingNotifications = 16U;
+
+struct PendingNotification {
+    size_t offset = 0U;
+    size_t length = 0U;
+    uint32_t sequence = 0U;
+    std::string address;
+};
+
+int compare_ascii_ci(std::string_view left, std::string_view right) noexcept
+{
+    const size_t common = left.size() < right.size() ? left.size() : right.size();
+    for (size_t index = 0U; index < common; ++index) {
+        unsigned char left_byte = static_cast<unsigned char>(left[index]);
+        unsigned char right_byte = static_cast<unsigned char>(right[index]);
+        if (left_byte >= static_cast<unsigned char>('a') &&
+            left_byte <= static_cast<unsigned char>('z')) {
+            left_byte = static_cast<unsigned char>(left_byte - 'a' + 'A');
+        }
+        if (right_byte >= static_cast<unsigned char>('a') &&
+            right_byte <= static_cast<unsigned char>('z')) {
+            right_byte = static_cast<unsigned char>(right_byte - 'a' + 'A');
+        }
+        if (left_byte != right_byte) return left_byte < right_byte ? -1 : 1;
+    }
+    if (left.size() == right.size()) return 0;
+    return left.size() < right.size() ? -1 : 1;
+}
 
 void zero_bytes(void* storage, size_t length)
 {
@@ -73,6 +101,59 @@ struct InstallData {
         zero_bytes(transaction_bytes.data(), transaction_bytes.size());
         zero_bytes(hash_cc.data(), hash_cc.size());
     }
+};
+
+class DownloadDiagnosticsGuard final {
+public:
+    explicit DownloadDiagnosticsGuard(const IdfLpaInstallResult& result)
+        : result_(result)
+    {
+        free_heap_at_start = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        minimum_monitor_started =
+            heap_caps_monitor_local_minimum_free_size_start() == ESP_OK;
+    }
+
+    ~DownloadDiagnosticsGuard()
+    {
+        if (minimum_monitor_started) {
+            minimum_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+            (void)heap_caps_monitor_local_minimum_free_size_stop();
+        }
+        free_heap_at_end = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+        if (minimum_monitor_started) {
+            idf_logf("eSIM download resources: result=%s bppEncodedBytes=%u "
+                     "bppDecodedBytes=%u freeHeapAtStart=%u minimumFreeHeap=%u "
+                     "freeHeapAtEnd=%u",
+                     idf_lpa_install_error_name(result_.error),
+                     static_cast<unsigned>(bpp_encoded_chars),
+                     static_cast<unsigned>(bpp_decoded_bytes),
+                     static_cast<unsigned>(free_heap_at_start),
+                     static_cast<unsigned>(minimum_free_heap),
+                     static_cast<unsigned>(free_heap_at_end));
+        } else {
+            idf_logf("eSIM download resources: result=%s bppEncodedBytes=%u "
+                     "bppDecodedBytes=%u freeHeapAtStart=%u minimumFreeHeap=n/a "
+                     "freeHeapAtEnd=%u",
+                     idf_lpa_install_error_name(result_.error),
+                     static_cast<unsigned>(bpp_encoded_chars),
+                     static_cast<unsigned>(bpp_decoded_bytes),
+                     static_cast<unsigned>(free_heap_at_start),
+                     static_cast<unsigned>(free_heap_at_end));
+        }
+    }
+
+    DownloadDiagnosticsGuard(const DownloadDiagnosticsGuard&) = delete;
+    DownloadDiagnosticsGuard& operator=(const DownloadDiagnosticsGuard&) = delete;
+
+    std::size_t bpp_encoded_chars = 0U;
+    std::size_t bpp_decoded_bytes = 0U;
+
+private:
+    const IdfLpaInstallResult& result_;
+    std::size_t free_heap_at_start = 0U;
+    std::size_t minimum_free_heap = 0U;
+    std::size_t free_heap_at_end = 0U;
+    bool minimum_monitor_started = false;
 };
 
 esp_err_t fail(IdfLpaInstallResult& result, IdfLpaInstallError error, esp_err_t code)
@@ -164,7 +245,8 @@ bool cancel_session(InstallData& data, std::string_view host, LpaRspCancelReason
     release_sensitive(data.text);
     if (!post(data, IdfLpaEs9Operation::cancel_session, host)) return false;
     bool success = false;
-    return idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error) && success;
+    return idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error,
+                                    "CancelSession") && success;
 }
 
 esp_err_t recover_notifications(InstallData& data, std::string_view host,
@@ -187,28 +269,88 @@ esp_err_t recover_notifications(InstallData& data, std::string_view host,
                                                 data.safe_message))
             return fail(result, IdfLpaInstallError::protocol, ESP_ERR_INVALID_RESPONSE);
     }
+
+    std::vector<PendingNotification> notifications;
+    notifications.reserve(count);
     position = offset;
-    static constexpr uint8_t kPir[] = {0xBF, 0x37};
     while (position < end) {
         if (!idf_esim_internal::parse_tlv_span(data.pending, end, position, entry,
                                                data.safe_message))
             return fail(result, IdfLpaInstallError::protocol, ESP_ERR_INVALID_RESPONSE);
-        if (!idf_esim_internal::tag_is(data.pending, entry, kPir)) continue;
         bool installed = false;
         uint32_t number = 0;
-        if (!idf_lpa_rsp_parse_pending_installation_notification(
-                data.pending.data() + entry.offset, entry.encoded_length(), host,
-                installed, number, data.notification_host, data.rsp_error)) {
-            if (data.rsp_error == LpaRspError::address_mismatch) continue;
+        LpaRspNotificationOperation operation = LpaRspNotificationOperation::install;
+        std::string address;
+        if (!idf_lpa_rsp_parse_pending_notification(
+                data.pending.data() + entry.offset, entry.encoded_length(), installed, number,
+                address, operation, data.rsp_error)) {
             return fail(result, IdfLpaInstallError::protocol, ESP_ERR_INVALID_RESPONSE);
         }
-        if (!notification(data, data.pending.data() + entry.offset, entry.encoded_length(), number)) {
-            result.notification_pending = true;
-            return fail(result, IdfLpaInstallError::notification_pending, ESP_FAIL);
+        (void)installed;
+        (void)operation;
+        notifications.push_back(PendingNotification{entry.offset, entry.encoded_length(),
+                                                     number, std::move(address)});
+    }
+
+    auto notification_less = [](const PendingNotification& left,
+                                const PendingNotification& right) {
+        const int address_order = compare_ascii_ci(left.address, right.address);
+        return address_order != 0 ? address_order < 0 : left.sequence < right.sequence;
+    };
+    // 卡片待处理列表很小；插入排序不引入额外分配，也固定同主机的序号顺序。
+    for (size_t index = 1U; index < notifications.size(); ++index) {
+        PendingNotification current = std::move(notifications[index]);
+        size_t insert_at = index;
+        while (insert_at > 0U && notification_less(current, notifications[insert_at - 1U])) {
+            notifications[insert_at] = std::move(notifications[insert_at - 1U]);
+            --insert_at;
         }
+        notifications[insert_at] = std::move(current);
+    }
+    for (size_t index = 1U; index < notifications.size(); ++index) {
+        if (notifications[index - 1U].sequence == notifications[index].sequence &&
+            compare_ascii_ci(notifications[index - 1U].address,
+                             notifications[index].address) == 0) {
+            return fail(result, IdfLpaInstallError::protocol, ESP_ERR_INVALID_RESPONSE);
+        }
+    }
+
+    esp_err_t current_host_error = ESP_OK;
+    std::string current_host_message;
+    size_t group_begin = 0U;
+    while (group_begin < notifications.size()) {
+        size_t group_end = group_begin + 1U;
+        while (group_end < notifications.size() &&
+               compare_ascii_ci(notifications[group_begin].address,
+                                notifications[group_end].address) == 0) {
+            ++group_end;
+        }
+        esp_err_t group_error = ESP_OK;
+        for (size_t index = group_begin; index < group_end; ++index) {
+            const PendingNotification& pending_notification = notifications[index];
+            data.notification_host = pending_notification.address;
+            clear_sensitive(data.safe_message);
+            if (!notification(data, data.pending.data() + pending_notification.offset,
+                              pending_notification.length, pending_notification.sequence)) {
+                group_error = ESP_FAIL;
+                break;
+            }
+        }
+        if (group_error != ESP_OK &&
+            compare_ascii_ci(notifications[group_begin].address, host) == 0) {
+            result.notification_pending = true;
+            current_host_error = group_error;
+            current_host_message = data.safe_message;
+        }
+        // 其他 SM-DP+ 的失败只延后该主机群组；继续处理独立群组。
+        group_begin = group_end;
     }
     release_sensitive(data.pending);
     release_sensitive(data.response_json);
+    if (current_host_error != ESP_OK) {
+        if (!current_host_message.empty()) data.safe_message = current_host_message;
+        return fail(result, IdfLpaInstallError::notification_pending, current_host_error);
+    }
     return ESP_OK;
 }
 
@@ -223,15 +365,14 @@ esp_err_t idf_lpa_install_profile(std::string_view activation_code,
     result = {};
     const auto stage = [&](IdfLpaInstallStage current) { if (progress) progress(context, current); };
     stage(IdfLpaInstallStage::validating);
-    if (activation_code.size() <= IDF_LPA_INSTALL_MAX_ACTIVATION_BYTES &&
-        std::count(activation_code.begin(), activation_code.end(), '$') > 2)
-        return fail(result, IdfLpaInstallError::unsupported_activation_options, ESP_ERR_NOT_SUPPORTED);
     LpaActivationCode parsed;
     if (!idf_lpa_parse_activation_code(activation_code, parsed))
         return fail(result, IdfLpaInstallError::invalid_activation, ESP_ERR_INVALID_ARG);
-    InstallData data;
-    if (!idf_lpa_rsp_validate_matching_id(parsed.matching_id(), data.rsp_error))
+    LpaRspError matching_id_error = LpaRspError::none;
+    if (!idf_lpa_rsp_validate_matching_id(parsed.matching_id(), matching_id_error))
         return fail(result, IdfLpaInstallError::invalid_activation, ESP_ERR_INVALID_ARG);
+    DownloadDiagnosticsGuard diagnostics_guard(result);
+    InstallData data;
     stage(IdfLpaInstallStage::recovering_notifications);
     esp_err_t error = recover_notifications(data, parsed.smdp_host(), result);
     if (error != ESP_OK) return error;
@@ -251,7 +392,8 @@ esp_err_t idf_lpa_install_profile(std::string_view activation_code,
     if (!post(data, IdfLpaEs9Operation::initiate_authentication, parsed.smdp_host()))
         return fail(result, IdfLpaInstallError::server, ESP_FAIL);
     bool success = false;
-    if (!idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error) || !success ||
+    if (!idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error,
+                                  "InitiateAuthentication") || !success ||
         !idf_lpa_rsp_json_get_string(data.response_json, "transactionId", data.transaction,
                                       data.rsp_error) ||
         !idf_lpa_rsp_decode_transaction_id(data.transaction, data.transaction_bytes,
@@ -287,7 +429,8 @@ esp_err_t idf_lpa_install_profile(std::string_view activation_code,
         release_sensitive(data.text);
         if (!post(data, IdfLpaEs9Operation::authenticate_client, parsed.smdp_host()))
             return fail(result, IdfLpaInstallError::server, ESP_FAIL);
-        if (!idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error) || !success ||
+        if (!idf_lpa_rsp_parse_status(data.response_json, success, data.rsp_error,
+                                      "AuthenticateClient") || !success ||
             !idf_lpa_rsp_json_get_string(data.response_json, "transactionId", data.text,
                                           data.rsp_error) ||
             !idf_lpa_rsp_transaction_id_matches(data.text, data.transaction_bytes.data(),
@@ -345,7 +488,9 @@ esp_err_t idf_lpa_install_profile(std::string_view activation_code,
         stage(IdfLpaInstallStage::downloading);
         bpp_started = true;
         if (!idf_lpa_es9_get_bound_profile_package(parsed.smdp_host(), data.request_json,
-                data.transaction, data.metadata, data.response, data.safe_message, data.transport_error))
+                data.transaction, data.metadata, data.response, data.safe_message,
+                data.transport_error, &diagnostics_guard.bpp_encoded_chars,
+                &diagnostics_guard.bpp_decoded_bytes))
             return fail(result, IdfLpaInstallError::installation_uncertain, ESP_FAIL);
         release_sensitive(data.metadata.profile_name);
         release_sensitive(data.metadata.service_provider_name);
