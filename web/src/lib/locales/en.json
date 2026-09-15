@@ -434,6 +434,7 @@
 	"diagnosticCellIpPresent": "Cellular IP recorded in the cache",
 	"diagnosticCellIpAbsent": "No cellular IP recorded in the cache",
 	"diagnosticOperatorUnavailable": "The modem did not provide an operator name",
+	"diagnosticOperatorKnown": "{value}",
 	"diagnosticWifiConnected": "WiFi connected",
 	"diagnosticWifiDisconnected": "WiFi disconnected",
 	"diagnosticModeMinimum": "Minimum functionality",

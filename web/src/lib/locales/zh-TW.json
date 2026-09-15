@@ -434,6 +434,7 @@
 	"diagnosticCellIpPresent": "快取中已有行動 IP",
 	"diagnosticCellIpAbsent": "快取中沒有行動 IP",
 	"diagnosticOperatorUnavailable": "模組未提供電信業者名稱",
+	"diagnosticOperatorKnown": "{value}",
 	"diagnosticWifiConnected": "WiFi 已連線",
 	"diagnosticWifiDisconnected": "WiFi 未連線",
 	"diagnosticModeMinimum": "最低功能模式",
