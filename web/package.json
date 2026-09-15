@@ -6,10 +6,11 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build && node scripts/package.mjs",
+		"generate:operator-names": "node scripts/generate-operator-names.mjs",
 		"lint": "cd .. && eslint --suppressions-location eslint-suppressions.json eslint.config.js mock_server web/scripts web/src web/vite.config.ts",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
-		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+		"check": "node scripts/generate-operator-names.mjs --check && svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"
 	},
 	"devDependencies": {

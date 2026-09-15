@@ -1,11 +1,16 @@
 // 3GPP TS 27.007 §8.5 / §10.1.22；只解讀有來源定義的碼值。
 // https://www.etsi.org/deliver/etsi_ts/127000_127099/127007/17.06.00_60/ts_127007v170600p.pdf
+import { formatOperatorName } from "./operator-names.js";
+
+export { formatOperatorName };
+
 /**
  * @param {string} field
  * @param {unknown} value
+ * @param {string} [locale="en"]
  * @returns {{key: string, value?: string} | null}
  */
-export function diagnosticValue(field, value) {
+export function diagnosticValue(field, value, locale = "en") {
 	const unknown = { key: "diagnosticUnknown" };
 	if (field === "registration") {
 		const keys = ["Idle", "Home", "Searching", "Denied", "Unknown", "Roaming", "Reserved", "Reserved", "Emergency", "Reserved", "Reserved", "Restricted"];
@@ -32,7 +37,11 @@ export function diagnosticValue(field, value) {
 	}
 	if (field === "pdpActive") return typeof value === "boolean"
 		? { key: value ? "diagnosticCellIpPresent" : "diagnosticCellIpAbsent" } : unknown;
-	if (field === "operator" && (value === null || value === "")) return { key: "diagnosticOperatorUnavailable" };
+	if (field === "operator") {
+		if (value === null || value === "") return { key: "diagnosticOperatorUnavailable" };
+		const name = formatOperatorName(value, locale);
+		return name === value ? null : { key: "diagnosticOperatorKnown", value: String(name) };
+	}
 	if (field === "wifiStatus") return { key: value === 3 ? "diagnosticWifiConnected" : value === 6 ? "diagnosticWifiDisconnected" : "diagnosticUnknown" };
 	if (field === "mode") return { key: value === 0 ? "diagnosticModeMinimum" : value === 1 ? "diagnosticModeFull" : value === 4 ? "diagnosticModeRadioOff" : "diagnosticUnknown" };
 	return null;

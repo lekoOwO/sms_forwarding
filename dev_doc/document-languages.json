@@ -57,6 +57,14 @@
       "language": "zh-TW"
     },
     {
+      "path": "dev_doc/operator-names.md",
+      "language": "en"
+    },
+    {
+      "path": "web/data/NOTICE.md",
+      "language": "en"
+    },
+    {
       "path": "mock_server/AGENTS.md",
       "language": "en"
     },
