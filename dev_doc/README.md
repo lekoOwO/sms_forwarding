@@ -9,6 +9,7 @@
 - [hardware-counter37.md](hardware-counter37.md)：counter36–45 的去識別化 ML307 parser 與 cellular 硬體觀察及證據邊界。
 - [hardware-evidence.md](hardware-evidence.md)：硬體歷史、TEST-key OTA、counter46–47 更新與設定保留的去識別化驗收。
 - [openapi.json](openapi.json)：管理 API 的 machine-readable request 與 response contract。
+- [operator-names.md](operator-names.md)：Web UI 離線 MCC/MNC 業者名稱資料、來源與更新程序。
 - [forward-rules-fixtures.json](forward-rules-fixtures.json)：CSV 與舊 Tab 轉發規則的合成驗證案例。
 - [config-schema/README.md](config-schema/README.md)：版本化設定格式、加密備份與產生器。
 - [document-languages.json](document-languages.json)：文件語言與三語等價群組。

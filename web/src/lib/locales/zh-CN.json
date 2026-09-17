@@ -434,6 +434,7 @@
 	"diagnosticCellIpPresent": "缓存中已有移动 IP",
 	"diagnosticCellIpAbsent": "缓存中没有移动 IP",
 	"diagnosticOperatorUnavailable": "模块未提供运营商名称",
+	"diagnosticOperatorKnown": "{value}",
 	"diagnosticWifiConnected": "WiFi 已连接",
 	"diagnosticWifiDisconnected": "WiFi 未连接",
 	"diagnosticModeMinimum": "最低功能模式",

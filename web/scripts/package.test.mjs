@@ -124,16 +124,22 @@ test("diagnostic result renders unavailable values without hiding valid zero", a
 			server.ssrLoadModule("svelte/server"), server.ssrLoadModule("/src/lib/components/ActionResult.svelte")
 		]);
 		const { body } = render(component.default, { props: {
-			result: { state: "success", code: "ACTION_QUERY_OK", data: { manufacturer: "", model: "   ", registration: 0 }, detail: "" },
+			result: { state: "success", code: "ACTION_QUERY_OK", data: { manufacturer: "", model: "   ", registration: 0, operator: "46697" }, detail: "" },
 			title: "Result", locale: "en"
 		} });
 		const values = [...body.matchAll(/<dd\b[^>]*>([\s\S]*?)<\/dd>/g)].map((match) => match[1].replace(/<!--.*?-->/g, ""));
-		assert.equal(values.length, 3);
+		assert.equal(values.length, 4);
 		assert.ok(values[0].trim().length > 0, "empty modem data must have a visible unavailable label");
 		assert.match(values[0], /Not available/);
 		assert.match(values[1], /Not available/);
 		assert.match(values[2], /Not registered/);
 		assert.match(values[2], /registration: 0/);
+		assert.match(values[3], /Taiwan Mobile/);
+		const { body: traditional } = render(component.default, { props: {
+			result: { state: "success", code: "ACTION_QUERY_OK", data: { operator: "46697" }, detail: "" },
+			title: "Result", locale: "zh-TW"
+		} });
+		assert.match(traditional, /台灣大哥大/);
 		assert.doesNotMatch(body, /<details\b|<summary\b/, "raw data has one shared entry instead of per-field disclosures");
 		assert.equal([...body.matchAll(/data-result-raw-trigger/g)].length, 1);
 		const { body: signal } = render(component.default, { props: {

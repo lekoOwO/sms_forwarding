@@ -30,7 +30,7 @@
 	}
 
 	function displayValue(key: string, value: string | number | boolean | null): string {
-		const diagnostic = diagnosticValue(key, value);
+		const diagnostic = diagnosticValue(key, value, locale);
 		return diagnostic
 			? translate(locale, diagnostic.key as TranslationKey).replace("{value}", diagnostic.value ?? "")
 			: formatValue(value, fields[key]?.unit);
