@@ -601,7 +601,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         current = '{"releaseVersion":"1.1.4","devBuild":15}\n'
         cases = (
             ("normal", '{"releaseVersion":"1.1.4","devBuild":14}\n', "previous", False, True),
-            ("metadata-missing", None, "previous", False, False),
+            ("metadata-missing", None, "previous", False, True),
+            ("counter-unchanged", '{"releaseVersion":"1.1.3","devBuild":15}\n', "previous", False, False),
+            ("counter-decreased", '{"releaseVersion":"1.1.4","devBuild":16}\n', "previous", False, False),
             ("metadata-malformed", '{"releaseVersion":"1.1.4","devBuild":true}\n', "previous", False, False),
             ("previous-ref-missing", '{"releaseVersion":"1.1.4","devBuild":14}\n', "missing", False, False),
             ("zero-before", '{"releaseVersion":"1.1.4","devBuild":14}\n', "zero", False, False),
@@ -620,6 +622,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             '{"releaseVersion":"1.1.4","devBuild":15}\n',
             base_sha=True,
             base_ref="develop",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_branch_counter_gate_accepts_first_version_file_on_master(self):
+        result = run_branch_counter_gate(
+            None, '{"releaseVersion":"1.1.4","devBuild":15}\n',
+            base_sha=True, base_ref="master",
         )
         self.assertEqual(0, result.returncode, result.stderr)
 
@@ -689,7 +698,3 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 )
                 published_assets = command[3:first_option]
                 self.assertEqual(expected[1:], published_assets)
-
-
-if __name__ == "__main__":
-    unittest.main()
