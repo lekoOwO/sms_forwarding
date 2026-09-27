@@ -63,7 +63,7 @@ def load_workflow() -> dict[str, object]:
     _, permissions_block = yaml_node(text, 0, "permissions")
     permissions = {"contents": yaml_node(permissions_block, 2, "contents")[0]}
     jobs: dict[str, object] = {}
-    for job_name in ("build", "prerelease", "release"):
+    for job_name in ("build", "prerelease", "release", "release_key_check"):
         _, job = yaml_node(text, 2, job_name)
         parsed: dict[str, object] = {}
         for field in ("if", "environment", "container"):
@@ -108,6 +108,7 @@ def condition_matches(condition: str, **context: str) -> bool:
         "github.ref": context["ref"],
         "github.base_ref": context.get("base", ""),
         "needs.build.outputs.ota_runtime_ready": context.get("ota_ready", "false"),
+        "inputs.verify_signing_key": context.get("verify_key", "false"),
     }
 
     def starts_with(match: re.Match[str]) -> str:
@@ -125,6 +126,10 @@ def condition_matches(condition: str, **context: str) -> bool:
         r"(github\.(?:event_name|ref|base_ref)|needs\.build\.outputs\.ota_runtime_ready)\s*==\s*'([^']*)'",
         equals,
         expression,
+    )
+    expression = expression.replace(
+        "inputs.verify_signing_key == true",
+        "True" if values["inputs.verify_signing_key"] == "true" else "False",
     )
     expression = expression.replace("&&", " and ").replace("||", " or ")
     expression = " ".join(expression.split())
@@ -284,10 +289,10 @@ class FirmwareVersionTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
         version = json.loads(VERSION.read_text(encoding="utf-8"))
-        self.assertEqual({"releaseVersion": "1.1.4", "devBuild": 23}, version)
+        self.assertEqual({"releaseVersion": "1.0.0", "devBuild": 26}, version)
         header = HEADER.read_text(encoding="utf-8")
-        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.1.4 (23)"', header)
-        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "23"', header)
+        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.0.0 (26)"', header)
+        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "26"', header)
 
     def test_build_mode_selects_the_public_firmware_version(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -298,7 +303,7 @@ class FirmwareVersionTests(unittest.TestCase):
                 'int main() { std::cout << FIRMWARE_DISPLAY_VERSION; }\n',
                 encoding="utf-8",
             )
-            for release_mode, expected in (("0", "23"), ("1", "1.1.4 (23)")):
+            for release_mode, expected in (("0", "26"), ("1", "1.0.0 (26)")):
                 binary = work / f"version-{release_mode}"
                 compile_result = subprocess.run(
                     [
@@ -534,6 +539,46 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 context = {"event": event, "ref": ref, "base": base, "ota_ready": ready}
                 self.assertEqual(expected_pre, condition_matches(prerelease, **context))
                 self.assertEqual(expected_release, condition_matches(release, **context))
+
+    def test_release_key_check_requires_explicit_manual_opt_in_and_never_publishes(self):
+        workflow = load_workflow()
+        job = workflow["jobs"]["release_key_check"]
+        condition = job["if"]
+        for event, ref, verify, expected in (
+            ("workflow_dispatch", "refs/tags/v1.0.0", "true", True),
+            ("workflow_dispatch", "refs/tags/v1.0.0", "false", False),
+            ("workflow_dispatch", "refs/heads/master", "true", False),
+            ("workflow_dispatch", "refs/heads/develop", "true", False),
+            ("push", "refs/heads/master", "true", False),
+            ("pull_request", "refs/pull/1/merge", "true", False),
+        ):
+            with self.subTest(event=event, ref=ref, verify=verify):
+                self.assertEqual(expected, condition_matches(
+                    condition, event=event, ref=ref, verify_key=verify
+                ))
+
+        self.assertEqual("release", job["environment"])
+        self.assertEqual("read", job["permissions"]["contents"])
+        job_text = json.dumps(job)
+        workflow_text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(
+            workflow_text,
+            r"verify_signing_key:\n\s+description:.*\n\s+required: false\n\s+type: boolean\n\s+default: false",
+        )
+        self.assertIn("OTA_SIGNING_PRIVATE_KEY", workflow_text.split("release_key_check:", 1)[1])
+        self.assertIn("sign-ota-release.py", job_text)
+        self.assertNotIn("contents: write", job_text)
+        self.assertNotIn("gh release create", job_text)
+        signer_step = named_step(workflow, "release_key_check", "Verify production OTA signer without publishing")
+        self.assertIn("Configured release signer matches the firmware trust key.", signer_step["run"])
+        self.assertIn('rm -f "$scratch/private.pem"', signer_step["run"])
+        self.assertNotIn('echo "$OTA_SIGNING_PRIVATE_KEY"', signer_step["run"])
+        self.assertIn('key-check-out/sms-forwarder-${RELEASE_VERSION}.smsota', signer_step["run"])
+        upload_step = named_step(workflow, "release_key_check", "Upload OTA package for hardware validation")
+        self.assertEqual(
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            upload_step["uses"],
+        )
 
         monotonic = named_step(workflow, "build", "Verify Dev build increased")["if"]
         for event, ref, base, expected in (

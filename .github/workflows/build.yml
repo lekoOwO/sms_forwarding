@@ -6,6 +6,12 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      verify_signing_key:
+        description: Verify the configured production OTA signer without publishing a release
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -417,3 +423,52 @@ jobs:
             exit 1
           fi
           gh release create "$GITHUB_REF_NAME" "$OTA_ASSET" "$FULL_ASSET" --generate-notes
+
+  release_key_check:
+    if: >-
+      github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') &&
+      inputs.verify_signing_key == true
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download verified firmware input
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: esp-idf-firmware-bin
+          path: release-input
+
+      - name: Verify production OTA signer without publishing
+        env:
+          OTA_SIGNING_PRIVATE_KEY: ${{ secrets.OTA_SIGNING_PRIVATE_KEY }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          DEV_BUILD: ${{ needs.build.outputs.dev_build }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          scratch="$(mktemp -d "$RUNNER_TEMP/release-key-check.XXXXXX")"
+          trap 'rm -f "$scratch/private.pem" "$scratch/check.smsota"; rmdir "$scratch"' EXIT
+          echo 'df6f2cd2a298f52c589823e8bee923c7cd7f6c379985207031958875bb5a3d02  release-input/scripts/sign-ota-release.py' | sha256sum --check
+          printf '%s' "$OTA_SIGNING_PRIVATE_KEY" > "$scratch/private.pem"
+          OTA_COUNTER=$((DEV_BUILD * 2 + 1))
+          python3 release-input/scripts/sign-ota-release.py \
+            release-input/build/idf/sms_forwarding_idf.bin "$scratch/check.smsota" \
+            --private-key "$scratch/private.pem" \
+            --version "$RELEASE_VERSION" \
+            --counter "$OTA_COUNTER" \
+            --expected-public-sha256 a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735
+          mkdir -p key-check-out
+          cp "$scratch/check.smsota" "key-check-out/sms-forwarder-${RELEASE_VERSION}.smsota"
+          echo 'Configured release signer matches the firmware trust key.'
+
+      - name: Upload OTA package for hardware validation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp-idf-ota-preflight
+          path: key-check-out/*.smsota
+          if-no-files-found: error
+          retention-days: 1
