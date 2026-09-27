@@ -139,8 +139,8 @@ jobs:
             exit 1
           fi
           if ! previous_json=$(git show "${previous_ref}:firmware-version.json" 2>/dev/null); then
-            echo "Previous commit has no firmware-version.json: $previous_ref" >&2
-            exit 1
+            echo "First firmware-version.json; no previous devBuild to compare: $previous_ref"
+            exit 0
           fi
           if ! previous_build=$(python3 scripts/generate-firmware-version.py --print-dev-build <<<"$previous_json"); then
             echo "Previous firmware-version.json is invalid: $previous_ref" >&2
