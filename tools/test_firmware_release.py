@@ -545,8 +545,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         job = workflow["jobs"]["release_key_check"]
         condition = job["if"]
         for event, ref, verify, expected in (
-            ("workflow_dispatch", "refs/heads/master", "true", True),
-            ("workflow_dispatch", "refs/heads/master", "false", False),
+            ("workflow_dispatch", "refs/tags/v1.0.0", "true", True),
+            ("workflow_dispatch", "refs/tags/v1.0.0", "false", False),
+            ("workflow_dispatch", "refs/heads/master", "true", False),
             ("workflow_dispatch", "refs/heads/develop", "true", False),
             ("push", "refs/heads/master", "true", False),
             ("pull_request", "refs/pull/1/merge", "true", False),
@@ -572,6 +573,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("Configured release signer matches the firmware trust key.", signer_step["run"])
         self.assertIn('rm -f "$scratch/private.pem"', signer_step["run"])
         self.assertNotIn('echo "$OTA_SIGNING_PRIVATE_KEY"', signer_step["run"])
+        self.assertIn('key-check-out/sms-forwarder-${RELEASE_VERSION}.smsota', signer_step["run"])
+        upload_step = named_step(workflow, "release_key_check", "Upload OTA package for hardware validation")
+        self.assertEqual(
+            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            upload_step["uses"],
+        )
 
         monotonic = named_step(workflow, "build", "Verify Dev build increased")["if"]
         for event, ref, base, expected in (

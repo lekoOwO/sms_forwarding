@@ -426,7 +426,7 @@ jobs:
 
   release_key_check:
     if: >-
-      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' &&
+      github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v') &&
       inputs.verify_signing_key == true
     needs: build
     runs-on: ubuntu-latest
@@ -461,4 +461,14 @@ jobs:
             --version "$RELEASE_VERSION" \
             --counter "$OTA_COUNTER" \
             --expected-public-sha256 a3b8325cb8bbff1acaa402b7f1a39124b1297462da44f4c57b60929c996c4735
+          mkdir -p key-check-out
+          cp "$scratch/check.smsota" "key-check-out/sms-forwarder-${RELEASE_VERSION}.smsota"
           echo 'Configured release signer matches the firmware trust key.'
+
+      - name: Upload OTA package for hardware validation
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp-idf-ota-preflight
+          path: key-check-out/*.smsota
+          if-no-files-found: error
+          retention-days: 1
