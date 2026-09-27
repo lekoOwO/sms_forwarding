@@ -475,12 +475,15 @@ esp_err_t idf_web_ota_migration_recover()
     esp_ota_img_states_t other_state;
     const esp_err_t other_error = esp_ota_get_state_partition(other, &other_state);
     if (other_error != ESP_OK) return finish(other_error);
-    // Accept only the ESP-IDF documented non-VALID states for the alternate slot.
+    bool other_valid = false;
     switch (other_state) {
     case ESP_OTA_IMG_NEW:
     case ESP_OTA_IMG_INVALID:
     case ESP_OTA_IMG_ABORTED:
     case ESP_OTA_IMG_UNDEFINED:
+        break;
+    case ESP_OTA_IMG_VALID:
+        other_valid = true;
         break;
     default:
         return finish(ESP_ERR_INVALID_STATE);
@@ -506,7 +509,8 @@ esp_err_t idf_web_ota_migration_recover()
         if (address_error != ESP_OK) return finish(address_error);
     }
     if (!idf_web_ota_migration_recovery_allowed(
-            state, accepted, pending, pending_address)) return finish(ESP_ERR_INVALID_STATE);
+            state, accepted, pending, pending_address, other_valid,
+            SMS_OTA_TEST_KEY == 0)) return finish(ESP_ERR_INVALID_STATE);
     const esp_err_t mark_error = esp_ota_mark_app_valid_cancel_rollback();
     if (mark_error != ESP_OK) return finish(mark_error);
     const esp_err_t readback_error = esp_ota_get_state_partition(running, &raw_state);
@@ -554,6 +558,13 @@ esp_err_t idf_web_ota_health_check(bool http_live, bool management_reachable,
         if (state == IdfWebOtaImageState::PendingVerify) esp_ota_mark_app_invalid_rollback_and_reboot();
         return finish(ESP_FAIL);
     }
+#if SMS_USB_RECOVERY && !FIRMWARE_IS_RELEASE && !SMS_OTA_TEST_KEY
+    if (idf_web_ota_migration_wait_required(
+            state, accepted, pending, pending_address, deadline_expired)) {
+        nvs_close(handle);
+        return finish(ESP_ERR_NOT_FINISHED);
+    }
+#endif
     HealthContext context{handle};
     const IdfWebOtaHealthPlatform platform = {
         &context, bind_health_pending_address, mark_health_valid,

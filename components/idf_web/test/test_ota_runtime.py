@@ -419,11 +419,19 @@ int main() {
     assert(idf_web_ota_health_decide(S::PendingVerify, true, true, false, 31, 30, 0x1f0000, 0x1f0000) == D::Rollback);
     assert(idf_web_ota_health_decide(S::Valid, true, true, false, 30, 31, 0x1f0000, 0x1f0000) == D::CommitAccepted);
     assert(idf_web_ota_health_decide(S::Valid, true, true, false, 31, 0, 0x1f0000, 0) == D::None);
-    assert(idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0));
-    assert(!idf_web_ota_migration_recovery_allowed(S::Valid, 0, 0, 0));
-    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 1, 0, 0));
-    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 1, 0));
-    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0x1f0000));
+    assert(idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0, false, false));
+    assert(idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0, true, true));
+    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0, true, false));
+    assert(!idf_web_ota_migration_recovery_allowed(S::Valid, 0, 0, 0, false, true));
+    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 1, 0, 0, true, true));
+    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 1, 0, true, true));
+    assert(!idf_web_ota_migration_recovery_allowed(S::PendingVerify, 0, 0, 0x1f0000, true, true));
+    assert(idf_web_ota_migration_wait_required(S::PendingVerify, 0, 0, 0, false));
+    assert(!idf_web_ota_migration_wait_required(S::PendingVerify, 0, 0, 0, true));
+    assert(!idf_web_ota_migration_wait_required(S::PendingVerify, 1, 0, 0, false));
+    assert(!idf_web_ota_migration_wait_required(S::PendingVerify, 0, 1, 0, false));
+    assert(!idf_web_ota_migration_wait_required(S::PendingVerify, 0, 0, 0x1f0000, false));
+    assert(!idf_web_ota_migration_wait_required(S::Valid, 0, 0, 0, false));
 
     HealthFake legacy;
     assert(idf_web_ota_apply_health(S::PendingVerify, true, true, false, 30, 31,
