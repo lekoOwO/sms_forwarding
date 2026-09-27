@@ -1,0 +1,16 @@
+{
+  "name": "sms-forwarding-mock-server",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
+  },
+  "dependencies": {
+    "express": "5.2.1"
+  },
+  "devDependencies": {
+    "puppeteer-core": "25.0.4"
+  }
+}

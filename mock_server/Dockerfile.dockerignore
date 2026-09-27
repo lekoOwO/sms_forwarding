@@ -1,0 +1,15 @@
+**
+!mock_server
+mock_server/**
+!mock_server/Dockerfile
+!mock_server/Dockerfile.dockerignore
+!mock_server/package.json
+!mock_server/package-lock.json
+!mock_server/server.mjs
+!web
+web/**
+!web/src
+web/src/**
+!web/src/lib
+web/src/lib/**
+!web/src/lib/forward-rules.js

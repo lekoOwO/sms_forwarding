@@ -1,0 +1,21 @@
+[
+  {"rules":"#!forward-rules-csv-v1\nkw,通知,\"drop,email,5\"\nkw,通知,1", "sender":"", "text":"測試通知", "valid":true, "matched":true, "drop":true, "email":true, "mask":16, "line":1},
+  {"rules":"#!forward-rules-csv-v1\n\r\nkw,OTP,email,\r\n", "sender":"", "text":"OTP", "valid":true, "matched":true, "drop":false, "email":true, "mask":0, "line":2},
+  {"rules":"#!forward-rules-csv-v1\nkw,OTP,\"email,1\"", "sender":"", "text":"OTP 123", "valid":true, "matched":true, "drop":false, "email":true, "mask":1, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,\"a,\"\"b\"\"\",2", "sender":"", "text":"a,\"b\"", "valid":true, "matched":true, "drop":false, "email":false, "mask":2, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,\"line1\nline2\",drop", "sender":"", "text":"line1\nline2", "valid":true, "matched":true, "drop":true, "email":false, "mask":0, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,,drop\nkw,OTP,", "sender":"", "text":"OTP", "valid":true, "matched":true, "drop":false, "email":false, "mask":0, "line":2},
+  {"rules":"#!forward-rules-csv-v1\nkw,OTP,drop,0\nre,otp,5,1\nkw,OTP,email", "sender":"", "text":"OTP", "valid":true, "matched":true, "drop":false, "email":false, "mask":16, "line":2},
+  {"rules":"#!forward-rules-csv-v1\nfrom,^09\\d+,email", "sender":"09123", "text":"", "valid":true, "matched":true, "drop":false, "email":true, "mask":0, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,OTP,drop", "sender":"", "text":"otp", "valid":true, "matched":false, "drop":false, "email":false, "mask":0, "line":0},
+  {"rules":"kw\tA,B\temail,01\nkw\tA\tdrop", "sender":"", "text":"A,B", "valid":true, "matched":true, "drop":false, "email":true, "mask":1, "line":1},
+  {"rules":"kw,A,drop\nignored\nkw\tA\t2\tanything", "sender":"", "text":"A", "valid":true, "matched":true, "drop":false, "email":false, "mask":2, "line":3},
+  {"rules":"#!forward-rules-csv-v1\nre,[,email", "valid":false, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,\"missing,email", "valid":false, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,A,email,1,extra", "valid":false, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,A,unknown", "valid":false, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,A,unknown\nkw,\"unfinished", "valid":false, "line":1},
+  {"rules":"#!forward-rules-csv-v1\nkw,\"a\nb\",email\nkw,A,email,maybe", "valid":false, "line":3},
+  {"rules":"#!forward-rules-csv-v1\nre,[,drop,0", "sender":"", "text":"[", "valid":true, "matched":false, "drop":false, "email":false, "mask":0, "line":0},
+  {"rules":"#!forward-rules-csv-v1\r\nkw,A,drop", "sender":"", "text":"A", "valid":true, "matched":false, "drop":false, "email":false, "mask":0, "line":0}
+]

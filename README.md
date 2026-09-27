@@ -1,112 +1,85 @@
-# 低成本短信转发器
+# 低成本簡訊轉發器
 
-> 当前分支为新方案，2022年的老方案请前往[luatos分支](https://github.com/chenxuuu/sms_forwarding/tree/old-luatos)。  
-本项目**仅用于接收短信**与进行保号相关功能。  
-多卡控制、通话、拨号、开放接口、自动化等功能，永远不会考虑支持，请勿提出相关需求。
+[繁體中文](README.md) | [简体中文](README.zh-CN.md) | [English](README.en.md)
 
-[后台页面演示](https://sms.j2.cx/)
+用 ESP32-C3 與 ML307 系列 4G 模組，把 SIM 卡收到的簡訊轉發到 Email 或推送服務。日常設定、查看簡訊與診斷都可在瀏覽器完成。
 
-本项目旨在使用低成本的硬件设备，实现短信的自动转发功能，支持多种推送方式同时启用。
+[下載韌體](https://github.com/lekoOwO/sms_forwarding/releases) · [試用管理頁](https://lekoowo.github.io/sms_forwarding/) · [回報問題](https://github.com/lekoOwO/sms_forwarding/issues)
 
-> 视频教程：[B站视频](https://www.bilibili.com/video/BV1cSmABYEiX)
+Demo 不會連接真實裝置，也不會執行備份、還原或韌體更新。
 
-<img src="assets/photo.png" width="200" />
+## 可以做什麼
 
-## 功能
+- 將簡訊轉發到 Email，或同時使用最多五個推送通道。
+  - 支援 Bark、Telegram、Discord Webhook、Gotify、ntfy、釘釘、飛書、PushPlus、Server 醬，以及自訂 GET／JSON 請求。
+- 依來源號碼或內容設定轉發規則；可用手機編輯 CSV、測試規則，並自訂通知標題與內容。
+- 在管理頁查看、發送簡訊，查詢訊號、SIM 與模組資訊；診斷原值可點按或用鍵盤展開。
+- 保存最多五組 WiFi，設定心跳通知，匯出加密設定備份。
+- 設定 HTTP 或 HTTPS 行動網路保活下載，HTTPS 憑證可在管理頁設定。
+- 管理相容 eSIM 卡的設定檔，實際功能依卡片、模組與電信業者而異。
+- 管理頁提供繁體中文、簡體中文與英文。
 
-- 支持使用通用AT指令与模块进行通信
-- 开启后支持通过WEB界面配置短信转发参数、查询当前状态
-- **支持多达5个推送通道同时启用**，每个通道可独立配置
-- 支持将收到的短信转发到指定的邮箱
-- 支持通过WEB界面主动发送短信，以便消耗余额
-- 支持通过WEB界面进行Ping测试，以极低的成本消耗余额
-- 支持长短信自动合并（30秒超时）
-- 支持管理员短信远程发送短信和重启设备
+## 準備硬體
 
-## 推送通道支持
+- ESP32-C3 開發板，至少 4 MB Flash。
+- ML307 系列模組、可接收簡訊的 SIM 卡與合適的天線。
+- 穩定電源、USB 線，以及首次設定用的 WiFi 網路。
 
-支持以下7种推送方式，可同时启用多个通道：
+以下接線以 ESP32-C3 Super Mini 與 ML307R-DC 轉接板為例。其他板型請先確認供電電壓，勿將裸模組直接接到 5V。
 
-| 推送方式 | 说明 | 需要配置 |
-|---------|------|---------|
-| **POST JSON** | 通用HTTP POST | URL |
-| **Bark** | iOS推送服务 | Bark服务器URL |
-| **GET请求** | URL参数方式 | URL |
-| **钉钉机器人** | 企业群通知 | Webhook URL，可选Secret加签 |
-| **PushPlus** | 微信公众号推送 | Token |
-| **Server酱** | 微信推送服务 | SendKey |
-| **自定义模板** | 灵活的JSON模板 | URL + 请求体模板 |
-| **飞书机器人** | 自定义通知 | Webhook URL |
+<img src="assets/photo.png" width="200" alt="ESP32-C3 與 ML307R-DC 簡訊轉發器" />
 
-### 推送格式说明
+| ESP32-C3 | ML307R-DC |
+|---|---|
+| GPIO 3 (TX) | RX |
+| GPIO 4 (RX) | TX |
+| GPIO 5 | EN |
+| GND | GND |
+| 5V | VCC (5V) |
 
-- **POST JSON**: `{"sender":"发送者号码","message":"短信内容","timestamp":"时间戳"}`
-- **Bark**: `{"title":"发送者号码","body":"短信内容"}`
-- **GET请求**: `URL?sender=xxx&message=xxx&timestamp=xxx`（自动URL编码）
-- **钉钉机器人**: 文本消息格式，支持加签验证
-- **PushPlus**: 使用Token推送，支持HTML格式
-- **Server酱**: 使用SendKey推送，支持Markdown格式
-- **自定义模板**: 使用`{sender}`、`{message}`、`{timestamp}`占位符
-- **飞书机器人**: 文本消息格式，支持加签验证
+## 首次使用
 
-|状态信息|主动ping|
-|-|-|
-|![](assets/status.png)|![](assets/ping.png)|
+1. 從 [Releases](https://github.com/lekoOwO/sms_forwarding/releases) 下載 `sms-forwarder-VERSION.bin`。標示 Pre-release 的版本供測試使用。
+2. 使用樂鑫 [Flash Download Tool](https://docs.espressif.com/projects/esp-test-tools/en/latest/esp32c3/production_stage/tools/flash_download_tool.html) 或 [ESP Launchpad](https://espressif.github.io/esp-launchpad/)，將完整映像燒錄至 `0x0`。
+3. 裝置找不到已保存的 WiFi 時，連線至 `SMS-Forwarder-XXXXXX`，密碼為 `sms-forwarder-setup`。
+4. 開啟 `http://192.168.1.1`，選擇家中或辦公室的 WiFi 並輸入密碼。
+5. 配網完成後，讓電腦或手機連回同一個區域網路。開啟配網頁顯示的裝置位址。
+6. 使用帳號 `admin`、密碼 `admin123` 登入，並立即修改管理密碼。
+7. 設定 Email 或推送通道，使用通道測試確認通知能送達。
 
-## 硬件搭配
+## 日常設定
 
-若没有焊接能力，希望直接使用成品，可选直接购以下套件（我看过了，和自己做的成本一样）  
-支持**移动/联通/电信卡**：
+### 轉發規則
 
-- [小蓝鲸WIFI短信宝](https://item.taobao.com/item.htm?id=1003711355912)（找客服问）
-- [4G FPC天线](https://item.taobao.com/item.htm?id=1003711355912&skuId=6162872574943)，与开发板同购
+管理頁提供互動式 CSV 編輯與語法檢查。輸入來源號碼與簡訊文字即可測試規則。
+測試不會儲存設定或發送通知；Demo 結果只供示範。
+舊 Tab 轉發規則仍可使用。管理頁可將規則轉換為 CSV，確認內容後再儲存。
 
-如果希望自行焊接硬件，参考下面的硬件搭配，总成本约¥27.8（会有浮动，可按实际自行组合搭配）  
-仅支持**移动/联通卡**：
+### 行動傳送與保活
 
-- ESP32C3开发板，实测选用[ESP32C3 Super Mini](https://item.taobao.com/item.htm?id=852057780489&skuId=5813710390565)，¥9.5包邮
-- ML307R-DC开发板，实测选用[小蓝鲸ML307R-DC核心板](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥16.3包邮
-- [4G FPC天线](https://item.taobao.com/item.htm?id=797466121802&skuId=5722077108045)，¥2，与核心板同购
+Email 只透過 WiFi 傳送。使用 4G 推送前，請確認行動網路可用，並啟用通道的行動網路功能與 HTTPS 憑證。目前不支援漫遊時的 4G 推送。實際可用性取決於模組、SIM 卡與網路。
 
+行動網路保活會使用 SIM 資料，可能產生費用；需要相容模組與本網註冊。
+保活支援 HTTP 與 HTTPS。HTTP 未加密，網址請勿包含敏感資訊；HTTPS 需先設定目標憑證。
+HTTPS 保活有獨立的憑證設定入口，不需要建立推送通道。
 
-## 硬件连接
+## 備份與更新
 
-ESP32C3 与 ML307R-DC 通过串口（UART）连接，接线如下：
+管理頁可匯出加密的 `.smscfg` 設定備份。請將備份檔案與密碼片語分開保存。備份包含 WiFi、Email 與推送憑證。
 
-```
-┌───────────────────────────────────────────────┐
-|                                               |
-|   ESP32C3 Super Mini      ML307R-DC核心板     |
-| ┌───────────────────┐    ┌─────────────────┐ |
-└─┼─ GPIO5 (MODEM_EN) │    │                 │ |
-  │       GPIO3 (TX) ─┼───►│ RX              │ |
-  │                   │    │             EN ─┼─┘
-  │       GPIO4 (RX) ◄┼────┤ TX              │ 
-  │                   │    │                 │ 
-  │              GND ─┼────┤ GND             │ 
-  │                   │    │                 │ 
-  │               5V ─┼────┤ VCC (5V)        |
-  │                   │    │                 │
-  └───────────────────┘    └─────────────────┘
-                           │                 │
-                           │  SIM卡槽        │
-                           │  (插入Nano SIM) │
-                           │                 │
-                           │  天线接口       │
-                           │  (连接4G天线)   │
-                           └─────────────────┘
-```
+Web 韌體更新只接受適用於本裝置的已簽章 `.smsota` 套件。如果下載頁只有 `.bin`，請使用 USB 燒錄方式。請勿把 `.bin` 上傳到 Web 更新頁。
 
-可通过USB连接ESP32C3进行编程和供电，正常工作时，可通过网页与模组进行AT通信，方便调试。
+目前開發版下載提供 USB 完整映像，正式簽章 OTA 套件尚未開放發佈。
 
-## 软件组成
+## 使用前請注意
 
-- ESP32C3运行自己的`Arduino`固件，负责连接WiFi和接收ML307R-DC发送过来的短信数据，然后转发到指定HTTP接口或邮箱
-- ML307R-DC运行默认的AT固件，不用动
+- 管理頁使用明文 HTTP。只在可信任的區域網路使用，不要直接公開到 Internet。
+- 收件匣與寄件匣不會永久保存簡訊，裝置重啟後會清空。
+- 裝置不會執行簡訊內容中的遠端控制命令。
+- 發送簡訊或使用行動數據可能產生電信費用。
 
-需要在`Arduino IDE`中单独安装这些库：
+## 開發與致謝
 
-- **ReadyMail** by Mobizt
-- **pdulib** by David Henry
+原始碼建置、架構與測試說明統一放在 [開發文件](dev_doc/README.md)。本專案使用 [MIT 授權](LICENSE)。
 
-需要在`Arduino IDE`中安装ESP32开发板支持，参考[官方文档](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html)，版型选`MakerGO ESP32 C3 SuperMini`。
+本專案衍生自 [MineSunshineone/sms_forwarding](https://github.com/MineSunshineone/sms_forwarding)。感謝上游維護者與貢獻者，也感謝 [LINUX DO](https://linux.do) 社群的交流與分享。

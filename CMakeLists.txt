@@ -1,0 +1,190 @@
+cmake_minimum_required(VERSION 3.22.1)
+
+# 原生 ESP-IDF 固件工程入口；Arduino fallback 已移除。
+file(READ "${CMAKE_CURRENT_LIST_DIR}/firmware-version.json" FIRMWARE_VERSION_JSON)
+string(JSON FIRMWARE_RELEASE_VERSION GET "${FIRMWARE_VERSION_JSON}" releaseVersion)
+set(PROJECT_VER "${FIRMWARE_RELEASE_VERSION}")
+if(DEFINED ENV{FIRMWARE_IS_RELEASE})
+  set(FIRMWARE_IS_RELEASE_DEFAULT "$ENV{FIRMWARE_IS_RELEASE}")
+else()
+  set(FIRMWARE_IS_RELEASE_DEFAULT "0")
+endif()
+if(DEFINED ENV{FIRMWARE_IS_RELEASE})
+  set(FIRMWARE_IS_RELEASE "${FIRMWARE_IS_RELEASE_DEFAULT}" CACHE STRING "Use the release firmware display version" FORCE)
+else()
+  set(FIRMWARE_IS_RELEASE "${FIRMWARE_IS_RELEASE_DEFAULT}" CACHE STRING "Use the release firmware display version")
+endif()
+if(NOT FIRMWARE_IS_RELEASE MATCHES "^[01]$")
+  message(FATAL_ERROR "FIRMWARE_IS_RELEASE must be 0 or 1")
+endif()
+
+if(DEFINED ENV{SMS_USB_RECOVERY})
+  set(SMS_USB_RECOVERY_DEFAULT "$ENV{SMS_USB_RECOVERY}")
+else()
+  set(SMS_USB_RECOVERY_DEFAULT "0")
+endif()
+if(DEFINED ENV{SMS_USB_RECOVERY})
+  set(SMS_USB_RECOVERY "${SMS_USB_RECOVERY_DEFAULT}" CACHE STRING "Enable the development USB recovery path" FORCE)
+else()
+  set(SMS_USB_RECOVERY "${SMS_USB_RECOVERY_DEFAULT}" CACHE STRING "Enable the development USB recovery path")
+endif()
+if(NOT SMS_USB_RECOVERY MATCHES "^[01]$")
+  message(FATAL_ERROR "SMS_USB_RECOVERY must be 0 or 1")
+endif()
+if(FIRMWARE_IS_RELEASE AND SMS_USB_RECOVERY)
+  message(FATAL_ERROR "SMS_USB_RECOVERY cannot be enabled in a release firmware")
+endif()
+if(SMS_USB_RECOVERY)
+  set(SMS_USB_RECOVERY_VALUE 1)
+else()
+  set(SMS_USB_RECOVERY_VALUE 0)
+endif()
+
+set(SMS_OTA_TEST_CACHE_EXISTS FALSE)
+if(EXISTS "${CMAKE_BINARY_DIR}/CMakeCache.txt")
+  set(SMS_OTA_TEST_CACHE_EXISTS TRUE)
+endif()
+if(DEFINED ENV{SMS_OTA_TEST_KEY})
+  set(SMS_OTA_TEST_KEY_DEFAULT "$ENV{SMS_OTA_TEST_KEY}")
+elseif(DEFINED SMS_OTA_TEST_KEY AND NOT SMS_OTA_TEST_CACHE_EXISTS)
+  set(SMS_OTA_TEST_KEY_DEFAULT "${SMS_OTA_TEST_KEY}")
+else()
+  set(SMS_OTA_TEST_KEY_DEFAULT "0")
+endif()
+set(SMS_OTA_TEST_KEY "${SMS_OTA_TEST_KEY_DEFAULT}" CACHE STRING "Use the non-production OTA test key" FORCE)
+if(NOT SMS_OTA_TEST_KEY MATCHES "^[01]$")
+  message(FATAL_ERROR "SMS_OTA_TEST_KEY must be 0 or 1")
+endif()
+if(SMS_OTA_TEST_KEY AND FIRMWARE_IS_RELEASE)
+  message(FATAL_ERROR "SMS_OTA_TEST_KEY cannot be enabled in a release firmware")
+endif()
+if(SMS_OTA_TEST_KEY AND NOT SMS_USB_RECOVERY)
+  message(FATAL_ERROR "SMS_OTA_TEST_KEY requires USB recovery development profile")
+endif()
+if(DEFINED ENV{SMS_OTA_TEST_FAIL_HEALTH})
+  set(SMS_OTA_TEST_FAIL_HEALTH_DEFAULT "$ENV{SMS_OTA_TEST_FAIL_HEALTH}")
+elseif(DEFINED SMS_OTA_TEST_FAIL_HEALTH AND NOT SMS_OTA_TEST_CACHE_EXISTS)
+  set(SMS_OTA_TEST_FAIL_HEALTH_DEFAULT "${SMS_OTA_TEST_FAIL_HEALTH}")
+else()
+  set(SMS_OTA_TEST_FAIL_HEALTH_DEFAULT "0")
+endif()
+set(SMS_OTA_TEST_FAIL_HEALTH "${SMS_OTA_TEST_FAIL_HEALTH_DEFAULT}" CACHE STRING
+    "Force the isolated dev OTA health rollback path" FORCE)
+if(NOT SMS_OTA_TEST_FAIL_HEALTH MATCHES "^[01]$")
+  message(FATAL_ERROR "SMS_OTA_TEST_FAIL_HEALTH must be 0 or 1")
+endif()
+if(SMS_OTA_TEST_FAIL_HEALTH AND
+   (FIRMWARE_IS_RELEASE OR NOT SMS_USB_RECOVERY OR NOT SMS_OTA_TEST_KEY))
+  message(FATAL_ERROR
+    "SMS_OTA_TEST_FAIL_HEALTH requires non-release USB recovery with the OTA test key")
+endif()
+if(DEFINED ENV{SMS_OTA_TEST_PUBLIC_KEY})
+  set(SMS_OTA_TEST_PUBLIC_KEY_DEFAULT "$ENV{SMS_OTA_TEST_PUBLIC_KEY}")
+elseif(DEFINED SMS_OTA_TEST_PUBLIC_KEY AND NOT SMS_OTA_TEST_CACHE_EXISTS)
+  set(SMS_OTA_TEST_PUBLIC_KEY_DEFAULT "${SMS_OTA_TEST_PUBLIC_KEY}")
+else()
+  set(SMS_OTA_TEST_PUBLIC_KEY_DEFAULT "")
+endif()
+set(SMS_OTA_TEST_PUBLIC_KEY "${SMS_OTA_TEST_PUBLIC_KEY_DEFAULT}" CACHE FILEPATH
+    "Generated non-production OTA public key" FORCE)
+if(SMS_OTA_TEST_KEY)
+  set(SMS_OTA_TEST_KEY_DIR "${CMAKE_CURRENT_LIST_DIR}/build/idf-ota-test")
+  if(SMS_OTA_TEST_FAIL_HEALTH)
+    set(SMS_OTA_TEST_PROFILE_DIR
+        "${CMAKE_CURRENT_LIST_DIR}/build/idf-ota-test-fail-health")
+  else()
+    set(SMS_OTA_TEST_PROFILE_DIR "${SMS_OTA_TEST_KEY_DIR}")
+  endif()
+  if(IS_SYMLINK "${CMAKE_CURRENT_LIST_DIR}/build"
+     OR NOT IS_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}/build"
+     OR IS_SYMLINK "${SMS_OTA_TEST_KEY_DIR}"
+     OR NOT IS_DIRECTORY "${SMS_OTA_TEST_KEY_DIR}"
+     OR IS_SYMLINK "${SMS_OTA_TEST_PROFILE_DIR}"
+     OR NOT IS_DIRECTORY "${SMS_OTA_TEST_PROFILE_DIR}")
+    message(FATAL_ERROR "SMS_OTA_TEST_KEY requires real OTA test build directories")
+  endif()
+  get_filename_component(SMS_OTA_TEST_KEY_REAL "${SMS_OTA_TEST_KEY_DIR}" REALPATH)
+  if(NOT SMS_OTA_TEST_PUBLIC_KEY OR NOT IS_ABSOLUTE "${SMS_OTA_TEST_PUBLIC_KEY}"
+     OR IS_SYMLINK "${SMS_OTA_TEST_PUBLIC_KEY}"
+     OR NOT EXISTS "${SMS_OTA_TEST_PUBLIC_KEY}"
+     OR IS_DIRECTORY "${SMS_OTA_TEST_PUBLIC_KEY}")
+    message(FATAL_ERROR "SMS_OTA_TEST_KEY requires a generated public key path")
+  endif()
+  execute_process(
+    COMMAND test -f "${SMS_OTA_TEST_PUBLIC_KEY}"
+    RESULT_VARIABLE SMS_OTA_TEST_PUBLIC_KEY_REGULAR_RESULT
+    OUTPUT_QUIET ERROR_QUIET
+  )
+  if(NOT "${SMS_OTA_TEST_PUBLIC_KEY_REGULAR_RESULT}" STREQUAL "0")
+    message(FATAL_ERROR "SMS_OTA_TEST_PUBLIC_KEY must be a regular file")
+  endif()
+  get_filename_component(SMS_OTA_TEST_PUBLIC_KEY_REAL "${SMS_OTA_TEST_PUBLIC_KEY}" REALPATH)
+  file(RELATIVE_PATH SMS_OTA_TEST_PUBLIC_KEY_REL
+       "${SMS_OTA_TEST_KEY_REAL}" "${SMS_OTA_TEST_PUBLIC_KEY_REAL}")
+  if(IS_ABSOLUTE "${SMS_OTA_TEST_PUBLIC_KEY_REL}"
+     OR "${SMS_OTA_TEST_PUBLIC_KEY_REL}" MATCHES "^\\.\\.")
+    message(FATAL_ERROR "SMS_OTA_TEST_PUBLIC_KEY must stay inside build/idf-ota-test")
+  endif()
+  get_filename_component(SMS_OTA_TEST_PUBLIC_KEY_NAME "${SMS_OTA_TEST_PUBLIC_KEY}" NAME)
+  if(NOT SMS_OTA_TEST_PUBLIC_KEY_NAME STREQUAL "ota_test_public_key.der.b64")
+    message(FATAL_ERROR "SMS_OTA_TEST_PUBLIC_KEY must name generated ota_test_public_key.der.b64")
+  endif()
+endif()
+if(SMS_OTA_TEST_KEY)
+  set(SMS_OTA_TEST_KEY_VALUE 1)
+else()
+  set(SMS_OTA_TEST_KEY_VALUE 0)
+endif()
+if(SMS_OTA_TEST_FAIL_HEALTH)
+  set(SMS_OTA_TEST_FAIL_HEALTH_VALUE 1)
+else()
+  set(SMS_OTA_TEST_FAIL_HEALTH_VALUE 0)
+endif()
+
+include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+project(sms_forwarding_idf)
+
+# Keep the shared pinned ESP-IDF installation immutable. Prepare the official
+# cross-signed synthetic-root validity backport in the build tree and replace
+# only the mbedtls certificate-bundle source after ESP-IDF has created its
+# component target.
+if(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+  idf_component_get_property(SMS_MBEDTLS_LIB mbedtls COMPONENT_LIB)
+  idf_build_get_property(SMS_IDF_PYTHON PYTHON)
+  idf_build_get_property(SMS_IDF_PATH IDF_PATH)
+  set(SMS_TLS_PATCH_SCRIPT
+      "${CMAKE_SOURCE_DIR}/tools/patch_idf_tls_source.py")
+  set(SMS_TLS_PATCH_INPUT
+      "${SMS_IDF_PATH}/components/mbedtls/esp_crt_bundle/esp_crt_bundle.c")
+  set(SMS_TLS_PATCH_OUTPUT
+      "${CMAKE_BINARY_DIR}/sms_patched_esp_crt_bundle.c")
+
+  execute_process(
+    COMMAND "${SMS_IDF_PYTHON}" "${SMS_TLS_PATCH_SCRIPT}"
+            --input "${SMS_TLS_PATCH_INPUT}"
+            --output "${SMS_TLS_PATCH_OUTPUT}"
+    RESULT_VARIABLE SMS_TLS_PATCH_RESULT
+  )
+  if(NOT SMS_TLS_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR "Failed to prepare the pinned ESP-IDF TLS backport")
+  endif()
+
+  get_target_property(SMS_MBEDTLS_SOURCES ${SMS_MBEDTLS_LIB} SOURCES)
+  list(FIND SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_INPUT}" SMS_TLS_SOURCE_INDEX)
+  if(SMS_TLS_SOURCE_INDEX EQUAL -1)
+    message(FATAL_ERROR
+            "Pinned ESP-IDF mbedtls source list did not contain esp_crt_bundle.c")
+  endif()
+  list(REMOVE_ITEM SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_INPUT}")
+  list(APPEND SMS_MBEDTLS_SOURCES "${SMS_TLS_PATCH_OUTPUT}")
+  set_property(TARGET ${SMS_MBEDTLS_LIB} PROPERTY SOURCES
+               "${SMS_MBEDTLS_SOURCES}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${SMS_TLS_PATCH_SCRIPT}")
+endif()
+
+idf_build_set_property(COMPILE_DEFINITIONS "FIRMWARE_IS_RELEASE=${FIRMWARE_IS_RELEASE}" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "SMS_USB_RECOVERY=${SMS_USB_RECOVERY_VALUE}" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS "SMS_OTA_TEST_KEY=${SMS_OTA_TEST_KEY_VALUE}" APPEND)
+idf_build_set_property(COMPILE_DEFINITIONS
+  "SMS_OTA_TEST_FAIL_HEALTH=${SMS_OTA_TEST_FAIL_HEALTH_VALUE}" APPEND)

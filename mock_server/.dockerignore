@@ -1,0 +1,4 @@
+node_modules
+test
+AGENTS.md
+npm-debug.log*
