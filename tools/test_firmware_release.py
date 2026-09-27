@@ -486,6 +486,35 @@ class OtaSignerTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_ci_packages_firmware_with_a_disposable_test_key(self):
+        workflow = load_workflow()
+        script = named_step(workflow, "build", "Build test-only OTA package")["run"]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            image = work / "build/idf/sms_forwarding_idf.bin"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"ci-firmware-image")
+            (work / "scripts").symlink_to(ROOT / "scripts", target_is_directory=True)
+            runner_temp = work / "runner-temp"
+            runner_temp.mkdir()
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], cwd=work,
+                env={**os.environ, "RUNNER_TEMP": str(runner_temp), "DEV_BUILD": "0"},
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            package = (work / "dist/sms-forwarder-dev-0-ci-test.smsota").read_bytes()
+            self.assertEqual(b"SMSOTA1\n", package[:8])
+            length = struct.unpack(">I", package[8:12])[0]
+            manifest = json.loads(package[12:12 + length])
+            self.assertEqual("dev-0-ci-test", manifest["version"])
+            self.assertEqual(1, manifest["releaseCounter"])
+            self.assertEqual(hashlib.sha256(image.read_bytes()).hexdigest(), manifest["sha256"])
+            offset = 12 + length
+            signature_length = struct.unpack(">H", package[offset:offset + 2])[0]
+            self.assertEqual(image.read_bytes(), package[offset + 2 + signature_length:])
+            self.assertEqual([], list(runner_temp.iterdir()))
+
     def test_event_matrix_only_publishes_from_automatic_develop_or_tag_pushes(self):
         workflow = load_workflow()
         prerelease = workflow["jobs"]["prerelease"]["if"]
