@@ -101,7 +101,11 @@ IdfWebOtaHealthDecision idf_web_ota_health_decide(
 
 bool idf_web_ota_migration_recovery_allowed(
     IdfWebOtaImageState state, uint32_t accepted, uint32_t pending,
-    uint32_t pending_address);
+    uint32_t pending_address, bool alternate_slot_valid,
+    bool allow_valid_alternate);
+bool idf_web_ota_migration_wait_required(
+    IdfWebOtaImageState state, uint32_t accepted, uint32_t pending,
+    uint32_t pending_address, bool deadline_expired);
 
 struct IdfWebOtaHealthPlatform {
     void* context = nullptr;
