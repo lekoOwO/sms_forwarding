@@ -288,6 +288,32 @@ jobs:
             0x8000 build/idf/partition_table/partition-table.bin \
             0x10000 build/idf/sms_forwarding_idf.bin
 
+      - name: Build test-only OTA package
+        shell: bash
+        env:
+          DEV_BUILD: ${{ steps.version.outputs.dev_build }}
+        run: |
+          umask 077
+          TEST_KEY=$(mktemp "$RUNNER_TEMP/ota-ci-test.XXXXXX.pem")
+          trap 'rm -f "$TEST_KEY"' EXIT
+          openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$TEST_KEY"
+          PUBLIC_SHA256=$(openssl pkey -in "$TEST_KEY" -pubout -outform DER | sha256sum | cut -d ' ' -f 1)
+          mkdir -p dist
+          python3 scripts/sign-ota-release.py \
+            build/idf/sms_forwarding_idf.bin "dist/sms-forwarder-dev-${DEV_BUILD}-ci-test.smsota" \
+            --private-key "$TEST_KEY" \
+            --version "dev-${DEV_BUILD}-ci-test" \
+            --counter 1 \
+            --expected-public-sha256 "$PUBLIC_SHA256"
+
+      - name: Upload test-only OTA package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: esp-idf-ota-ci-test
+          path: dist/*-ci-test.smsota
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Upload verified firmware inputs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
