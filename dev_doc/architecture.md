@@ -243,7 +243,7 @@ timeout 原因。確認等待最多五分鐘，背景工作會自行逾時，不
 
 ## 已簽章 OTA
 
-Release workflow 只有在 readiness gate 通過時才提供 `.smsota`。USB 完整映像使用 `.bin`，且不能上傳至 Web OTA。
+Release workflow 在 CI 通過並驗證 production 簽章金鑰後提供 `.smsota` 與 USB 完整 `.bin`。USB 完整映像不能上傳至 Web OTA。
 
 瀏覽器將 `.smsota` 拆成 manifest、P-256 簽章與 firmware payload。韌體依序驗證簽章、target、release counter、長度與 SHA-256。
 
@@ -264,8 +264,7 @@ USB recovery 的使用者 `ota-state` 會顯示執行中韌體用於簽章驗證
 SubjectPublicKeyInfo DER SHA-256。這只是可觀察的 trust key identity，不是
 attestation；被修改的韌體仍可回報任意值。`public_key_sha256: null` 只表示較舊韌體
 無法觀察此欄位，不表示 production key。
-`components/idf_web/OTA_RUNTIME_READY` 仍不存在。Production hardware rollback/replay evidence 與 matching production private key 仍不可用。
-TEST-key OTA 已有 [實機驗收](hardware-evidence.md)，但 production OTA 發佈尚未開放。
+TEST-key OTA 已有 [實機驗收](hardware-evidence.md)。Production 簽章金鑰由發佈 job 驗證；硬體驗收紀錄只涵蓋各筆記錄所測試的 profile 與版本。
 
 ## 分區
 

@@ -6,7 +6,7 @@
 目前程式行為見 [系統架構](architecture.md)，操作流程見 [開發指南](development.md)。
 Counter36–45 的 parser 分類與 cellular 傳輸細節保留在 [專門報告](hardware-counter37.md)。
 
-TEST-key OTA 成功不代表 production 金鑰可用，也不開放正式 OTA 發佈。
+TEST-key OTA 紀錄涵蓋該測試 profile；production 簽章金鑰由發佈 workflow 驗證。
 CI 與 host fixtures 不能取代實機傳輸、電信時序或 provider 送達驗證。
 
 ## 2026-08-16 Arduino 歷史 TLS 紀錄
@@ -66,8 +66,7 @@ A replay of the accepted counter returned HTTP 400 `ACTION_OTA_MANIFEST_INVALID`
 The active slot, accepted counter, and pending state stayed unchanged.
 
 This record proves the TEST-key package pipeline, health rollback, and replay rejection.
-It does not prove production signing-key ownership or authorize a release.
-Keep `components/idf_web/OTA_RUNTIME_READY` absent. The formal release gate must fail closed.
+Production signing-key ownership is verified separately by the release workflow.
 
 The ignored test private key remains mode 0600. Encrypted configuration backups remain retained.
 
