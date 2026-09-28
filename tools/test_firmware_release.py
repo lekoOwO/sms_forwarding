@@ -289,10 +289,10 @@ class FirmwareVersionTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
 
         version = json.loads(VERSION.read_text(encoding="utf-8"))
-        self.assertEqual({"releaseVersion": "1.0.0", "devBuild": 27}, version)
+        self.assertEqual({"releaseVersion": "1.0.0", "devBuild": 28}, version)
         header = HEADER.read_text(encoding="utf-8")
-        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.0.0 (27)"', header)
-        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "27"', header)
+        self.assertIn('#define FIRMWARE_RELEASE_LABEL "1.0.0 (28)"', header)
+        self.assertIn('#define FIRMWARE_DEV_BUILD_TEXT "28"', header)
 
     def test_build_mode_selects_the_public_firmware_version(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -303,7 +303,7 @@ class FirmwareVersionTests(unittest.TestCase):
                 'int main() { std::cout << FIRMWARE_DISPLAY_VERSION; }\n',
                 encoding="utf-8",
             )
-            for release_mode, expected in (("0", "27"), ("1", "1.0.0 (27)")):
+            for release_mode, expected in (("0", "28"), ("1", "1.0.0 (28)")):
                 binary = work / f"version-{release_mode}"
                 compile_result = subprocess.run(
                     [
@@ -525,18 +525,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
         prerelease = workflow["jobs"]["prerelease"]["if"]
         release = workflow["jobs"]["release"]["if"]
         cases = (
-            ("push", "refs/heads/develop", "", "true", True, False),
-            ("push", "refs/heads/master", "", "true", False, False),
-            ("push", "refs/tags/v1.1.4", "", "true", False, True),
-            ("push", "refs/tags/v1.1.4", "", "false", False, False),
-            ("workflow_dispatch", "refs/heads/develop", "", "true", False, False),
-            ("workflow_dispatch", "refs/tags/v1.1.4", "", "true", False, False),
-            ("pull_request", "refs/pull/7/merge", "develop", "true", False, False),
-            ("pull_request", "refs/pull/8/merge", "master", "true", False, False),
+            ("push", "refs/heads/develop", "", True, False),
+            ("push", "refs/heads/master", "", False, False),
+            ("push", "refs/tags/v1.1.4", "", False, True),
+            ("workflow_dispatch", "refs/heads/develop", "", False, False),
+            ("workflow_dispatch", "refs/tags/v1.1.4", "", False, False),
+            ("pull_request", "refs/pull/7/merge", "develop", False, False),
+            ("pull_request", "refs/pull/8/merge", "master", False, False),
         )
-        for event, ref, base, ready, expected_pre, expected_release in cases:
-            with self.subTest(event=event, ref=ref, base=base, ready=ready):
-                context = {"event": event, "ref": ref, "base": base, "ota_ready": ready}
+        for event, ref, base, expected_pre, expected_release in cases:
+            with self.subTest(event=event, ref=ref, base=base):
+                context = {"event": event, "ref": ref, "base": base}
                 self.assertEqual(expected_pre, condition_matches(prerelease, **context))
                 self.assertEqual(expected_release, condition_matches(release, **context))
 
@@ -626,8 +625,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("OTA_SIGNING_PRIVATE_KEY", build_text)
         self.assertNotIn("OTA_SIGNING_PRIVATE_KEY", prerelease_text)
         self.assertIn("OTA_SIGNING_PRIVATE_KEY", release_text)
-        self.assertIn("components/idf_web/OTA_RUNTIME_READY", build_text)
-        self.assertNotIn("OTA_RUNTIME_READY", release_text.replace("ota_runtime_ready", ""))
+        self.assertNotIn("OTA_RUNTIME_READY", build_text)
+        self.assertNotIn("OTA_RUNTIME_READY", release_text)
 
         signer_script = named_step(workflow, "release", "Build signed OTA package")["run"]
         pinned = re.search(r"([0-9a-f]{64})  release-input/scripts/sign-ota-release.py", signer_script)

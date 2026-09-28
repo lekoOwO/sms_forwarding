@@ -302,7 +302,7 @@ python3 tools/device.py --device /dev/serial/by-id/usb-... flash-app --slot app1
 `public_key_sha256`；回報格式錯誤、
 未知 offset 或 NVS 型別錯誤時停止，且不會清除 metadata。
 TEST-key 的更新、rollback 與 replay 驗收見 [實機驗證紀錄](hardware-evidence.md)。
-此證據不適用於 production 金鑰；正式發佈仍受下方 readiness gate 限制。
+此證據涵蓋 TEST-key profile；production 簽章由 Release job 驗證。
 此 fingerprint 只是執行中韌體所回報的 observable trust key，不是 attestation。
 `null` 只會在有效回退至較舊韌體的 legacy response 後出現，表示 key identity
 無法觀察；它不代表 production key，也不能用於宣稱裝置未遭修改。
@@ -392,17 +392,18 @@ partition table、`appcfg` 或 `coredump`，但會更新 `otadata` 與 NVS 的 O
 python3 scripts/generate-firmware-version.py --check
 ```
 
-`develop` 的成功 push 會建立只含 USB 完整 `.bin` 的 Dev Pre-release。此 job 不受 OTA readiness gate 影響。
+`develop` 的成功 push 會建立只含 USB 完整 `.bin` 的 Dev Pre-release。
 
-`master` 上相符的 `vMAJOR.MINOR.PATCH` tag 只有在 `components/idf_web/OTA_RUNTIME_READY` 存在時才會執行正式 `release` job。
-目前此檔案缺席，因此 workflow 會跳過整個正式 `release` job，不會發佈 USB `.bin` 或 `.smsota`。
+推送與 `master` HEAD、`releaseVersion` 相符的 `vMAJOR.MINOR.PATCH` tag 後，CI 會驗證版本計數、執行測試並建置韌體。
+成功後，`release` job 使用 production 私鑰簽署 `.smsota`，確認 public key 指紋與韌體一致，再發佈包含 USB 完整 `.bin` 與 `.smsota` 的 GitHub Release。
+使用者從 Release 下載韌體安裝。實機驗證的版本、輸入與結果另外記錄於 [實機驗證紀錄](hardware-evidence.md)。
 
 只有 `release` environment 可以讀取 OTA private key。Build 與 Pre-release job 不可取得此 key。
 
 裝置只保存 public key。不要將 private key、測試憑證或未遮蔽 secret 寫入 repository。
 
-目前沒有可用的 matching production private key。TEST-key 的套件更新、health rollback 與 replay rejection
-已有 [實機證據](hardware-evidence.md)，但不證明 production 簽章金鑰可用。正式 OTA 發佈 gate 維持關閉。
+可對版本 tag 手動執行 workflow，設定 `verify_signing_key=true`，取得 production 簽章預檢產物。
+此預檢驗證金鑰並產生套件；正式發佈由 tag push 觸發。
 
 ### 2026-08-27 TEST-key OTA hardware evidence
 
