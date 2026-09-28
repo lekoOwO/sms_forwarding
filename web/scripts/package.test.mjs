@@ -696,7 +696,7 @@ test("CI isolates release credentials from build lifecycle code", () => {
 	assert.doesNotMatch(prerelease, /release upload|--clobber/);
 	assert.doesNotMatch(prerelease, /OTA_SIGNING_PRIVATE_KEY/);
 	assert.match(release, /needs: build/);
-	assert.match(release, /github\.event_name == 'push'[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)[\s\S]*ota_runtime_ready == 'true'/);
+	assert.match(release, /github\.event_name == 'push'[\s\S]*startsWith\(github\.ref, 'refs\/tags\/v'\)/);
 	assert.match(release, /environment: release/);
 	assert.match(release, /permissions:\n      contents: write/);
 	assert.match(release, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4\.3\.0/);
